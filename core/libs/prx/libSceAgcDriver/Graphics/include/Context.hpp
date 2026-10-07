@@ -163,6 +163,7 @@ struct Context {
     const PlaceholderImages* placeholderImages = nullptr;
     bool clipDistance = false;
     bool cullDistance = false;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
