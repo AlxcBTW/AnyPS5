@@ -7,7 +7,9 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <string>
 #include <utility>
+#include <vector>
 
 using namespace ShaderRecompiler;
 
@@ -100,10 +102,30 @@ struct Builder {
     std::uint32_t eliminate() {
         return MaskedSelectEliminator{}.Eliminate(program).removedSelects;
     }
+
+    IrValue& ancillary() {
+        return emit(IrOpcode::GetBuiltin, IrType::U32, {&constant(static_cast<std::uint32_t>(StageInputKind::PackedAncillary)), &constant(0u)});
+    }
+
+    std::vector<MaskedSelectRefusal> explain() {
+        return MaskedSelectEliminator{}.Eliminate(program, true).refusals;
+    }
 };
 
 bool removed(const IrValue& value) {
     return value.Parent() == nullptr;
+}
+
+bool refusedAs(const std::vector<MaskedSelectRefusal>& refusals, const IrValue& select, MaskedSelectRefusalReason reason, std::initializer_list<const char*> parts = {}) {
+    for (const auto& refusal : refusals) {
+        if (refusal.select != select.Id()) continue;
+        bool ok = refusal.reason == reason && refusal.line.rfind("[ancillary] shader 0x0 select #" + std::to_string(select.Id()) + " kept, " + std::string(MaskedSelectRefusalCode(reason)) + ": ", 0) == 0;
+        for (const char* part : parts) ok = ok && refusal.line.find(part) != std::string::npos;
+        if (!ok) std::fprintf(stderr, "  expected %s, got: %s\n", std::string(MaskedSelectRefusalCode(reason)).c_str(), refusal.line.c_str());
+        return ok;
+    }
+    std::fprintf(stderr, "  no refusal recorded for #%u (%zu recorded)\n", select.Id(), refusals.size());
+    return false;
 }
 
 bool expect(const char* name, bool condition) {
@@ -695,6 +717,197 @@ int main() {
 
     passed &= run("an atomic keeps the select", [&] {
         return !guarded(IrOpcode::SharedAtomicIAdd32, true, false);
+    });
+
+    passed &= run("only selects that keep the ancillary word are explained, and explaining removes the same selects", [] {
+        Builder plain;
+        auto& exec = plain.mask(16u);
+        auto& lane = plain.lane();
+        plain.keep(plain.select(exec, plain.add(plain.select(exec, plain.add(lane, 1u), lane), 2u), lane));
+        Builder ancillary;
+        auto& kept = ancillary.mask(16u);
+        auto& word = ancillary.ancillary();
+        auto& written = ancillary.select(kept, ancillary.add(word, 1u), word);
+        auto& next = ancillary.select(kept, ancillary.add(written, 2u), word);
+        ancillary.keep(next);
+        const auto stats = MaskedSelectEliminator{}.Eliminate(ancillary.program, true);
+        return plain.explain().empty() && stats.removedSelects == 1u && removed(written) && stats.refusals.size() == 1u && refusedAs(stats.refusals, next, MaskedSelectRefusalReason::ObservableUse, {"#", "ReferenceU32"});
+    });
+
+    passed &= run("a walk that runs out of steps is reported with its step count and what more steps give", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        std::vector<IrValue*> lows;
+        std::vector<IrValue*> highs;
+        for (std::uint32_t root = 0; root < 2u; ++root) {
+            const auto [low, high] = b.ballotWords(b.mask(48u + root));
+            lows.push_back(low);
+            highs.push_back(high);
+        }
+        for (std::size_t index = 2; index < 200u; ++index) {
+            lows.push_back(&b.wordAnd(*lows[index - 1u], *lows[index - 2u]));
+            highs.push_back(&b.wordAnd(*highs[index - 1u], *highs[index - 2u]));
+        }
+        b.keep(b.select(b.threadBit(*lows.back(), *highs.back()), b.add(written, 2u), old));
+        const auto refusals = b.explain();
+        return !removed(written) && refusedAs(refusals, written, MaskedSelectRefusalReason::VisitLimit, {"the walk used 4096 of 4096 steps", "with 262144 steps it stops instead"});
+    });
+
+    passed &= run("a select inside a loop is reported as loop-select", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        IrBlock& head = *b.block;
+        IrBlock& loop = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        head.AddBranch(&loop);
+        loop.AddBranch(&loop);
+        loop.AddBranch(&exit);
+        b.block = &loop;
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        b.keep(b.select(exec, b.add(written, 2u), old));
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::LoopSelect, {"the select is inside a loop"});
+    });
+
+    passed &= run("a use inside a loop of a mask computed inside a loop is reported as loop-mask", [] {
+        Builder b;
+        auto& old = b.ancillary();
+        IrBlock& entry = *b.block;
+        IrBlock& first = b.newBlock();
+        IrBlock& middle = b.newBlock();
+        IrBlock& second = b.newBlock();
+        entry.AddBranch(&first);
+        first.AddBranch(&first);
+        first.AddBranch(&middle);
+        middle.AddBranch(&second);
+        second.AddBranch(&second);
+        b.block = &first;
+        auto& bound = b.phi(IrType::U32, entry, b.constant(64u));
+        auto& exec = b.emit(IrOpcode::ULessThan32, IrType::Bool, {&b.lane(), &bound});
+        bound.AddPhiOperand(&first, &b.emit(IrOpcode::ISub32, IrType::U32, {&bound, &b.constant(8u)}));
+        b.block = &middle;
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        b.block = &second;
+        b.keep(b.select(exec, b.add(written, 2u), old));
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::LoopMask, {"IAdd32 is inside a loop"});
+    });
+
+    passed &= run("an exec carried around a loop that revives lanes is reported as loop-exec", [] {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(40u));
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [savedLow, savedHigh] = b.ballotWords(exec);
+        IrBlock& entry = *b.block;
+        IrBlock& header = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        entry.AddBranch(&header);
+        header.AddBranch(&header);
+        header.AddBranch(&exit);
+        b.block = &header;
+        auto& low = b.phi(IrType::U32, entry, *savedLow);
+        auto& high = b.phi(IrType::U32, entry, *savedHigh);
+        auto& value = b.phi(IrType::U32, entry, written);
+        auto& loopExec = b.threadBit(low, high);
+        auto& next = b.select(loopExec, b.add(value, 2u), value);
+        b.keep(b.select(loopExec, b.add(value, 3u), old));
+        const auto [revivedLow, revivedHigh] = b.ballotWords(wide);
+        low.AddPhiOperand(&header, revivedLow);
+        high.AddPhiOperand(&header, revivedHigh);
+        value.AddPhiOperand(&header, &next);
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::LoopExec, {"loop rule", "lane bit of #", "Phi"});
+    });
+
+    passed &= run("an export under an exec made by s_wqm is reported as wqm", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [low, high] = b.ballotWords(exec);
+        auto& wide = b.emit(IrOpcode::CompositeConstructU64, IrType::U64, {low, high});
+        auto& quads = b.emit(IrOpcode::WqmU64, IrType::U64, {&wide});
+        auto& quadLow = b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &b.constant(0u)});
+        auto& quadHigh = b.emit(IrOpcode::CompositeExtractU64, IrType::U32, {&quads, &b.constant(1u)});
+        b.emit(IrOpcode::SetAttribute, IrType::Void, {&b.emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&written, &old, &old, &old}), &b.threadBit(quadLow, quadHigh)});
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::WholeQuadMode, {"SetAttribute runs under", "s_wqm word", "helper lanes are active"});
+    });
+
+    passed &= run("an implicit-LOD sample is reported as derivative, a lane read as cross-lane", [] {
+        Builder sample;
+        sample.program.Resources().stage = IrShaderStage::Pixel;
+        MemoryInfo memory;
+        memory.kind = ResourceKind::Image;
+        sample.program.Resources().memoryInfo.push_back(memory);
+        auto& exec = sample.mask(16u);
+        auto& old = sample.ancillary();
+        auto& written = sample.select(exec, sample.add(old, 1u), old);
+        auto& address = sample.emit(IrOpcode::MakeImageAddress, IrType::ImageAddress, {&written, &old});
+        auto& sampled = sample.emit(IrOpcode::ImageSampleRaw, IrType::U32x4, {&sample.emit(IrOpcode::GetImageResource, IrType::ImageResource, {}), &sample.emit(IrOpcode::GetSamplerResource, IrType::SamplerResource, {}), &address});
+        sample.keep(sample.select(exec, sample.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&sampled, &sample.constant(0u)}), old));
+        Builder lanes;
+        auto& laneExec = lanes.mask(16u);
+        auto& laneOld = lanes.ancillary();
+        auto& laneWritten = lanes.select(laneExec, lanes.add(laneOld, 1u), laneOld);
+        lanes.keep(lanes.select(laneExec, lanes.emit(IrOpcode::DppMoveU32, IrType::U32, {&laneWritten, &laneExec}), laneOld));
+        return refusedAs(sample.explain(), written, MaskedSelectRefusalReason::Derivative, {"ImageSampleRaw takes its LOD from the quad"}) &&
+               refusedAs(lanes.explain(), laneWritten, MaskedSelectRefusalReason::CrossLane, {"DppMoveU32 reads other lanes"});
+    });
+
+    passed &= run("an export or a later write under a wider exec is reported as exec-reactivated", [] {
+        Builder exported;
+        auto& wide = exported.mask(48u);
+        auto& exec = exported.logicalAnd(wide, exported.mask(16u));
+        auto& old = exported.ancillary();
+        auto& written = exported.select(exec, exported.add(old, 1u), old);
+        exported.emit(IrOpcode::SetAttribute, IrType::Void, {&exported.emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&written, &old, &old, &old}), &wide});
+        Builder rewritten;
+        auto& wider = rewritten.mask(48u);
+        auto& narrow = rewritten.logicalAnd(wider, rewritten.mask(16u));
+        auto& word = rewritten.ancillary();
+        auto& first = rewritten.select(narrow, rewritten.add(word, 1u), word);
+        rewritten.keep(rewritten.select(wider, rewritten.add(first, 2u), word));
+        return refusedAs(exported.explain(), written, MaskedSelectRefusalReason::ExecReactivated, {"SetAttribute runs under #", "does not imply the mask", "the proof stopped at #", "ULessThan32"}) &&
+               refusedAs(rewritten.explain(), first, MaskedSelectRefusalReason::ExecReactivated, {"ReferenceU32 reads the value after #", "SelectU32 wrote it under #"});
+    });
+
+    passed &= run("a branch condition or a store's exec made from the value is reported as observable-use", [] {
+        Builder branch;
+        auto& exec = branch.mask(16u);
+        auto& old = branch.ancillary();
+        auto& written = branch.select(exec, branch.add(old, 1u), old);
+        branch.emit(IrOpcode::Reference, IrType::Void, {&branch.emit(IrOpcode::INotEqual32, IrType::Bool, {&written, &branch.constant(0u)})});
+        Builder store;
+        auto& storeExec = store.mask(16u);
+        auto& word = store.ancillary();
+        auto& stored = store.select(storeExec, store.add(word, 1u), word);
+        store.emit(IrOpcode::WriteSharedU32, IrType::Void, {&word, &word, &store.emit(IrOpcode::INotEqual32, IrType::Bool, {&stored, &store.constant(0u)})});
+        return refusedAs(branch.explain(), written, MaskedSelectRefusalReason::ObservableUse, {"Reference is neither lane-local nor guarded by an exec"}) &&
+               refusedAs(store.explain(), stored, MaskedSelectRefusalReason::ObservableUse, {"WriteSharedU32 uses the value as its exec"});
+    });
+
+    passed &= run("an exec proof deeper than its limit is reported as implication-depth", [] {
+        Builder b;
+        auto& exec = b.mask(32u);
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrValue* later = &exec;
+        for (std::uint32_t kill = 0; kill < 70u; ++kill) later = &b.logicalAnd(*later, b.mask(31u - kill % 30u));
+        b.keep(b.select(*later, b.add(written, 2u), old));
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::ImplicationDepth, {"deeper than the limit"});
+    });
+
+    passed &= run("a use in a block the entry does not reach is reported as unreached", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        b.keep(b.select(exec, b.add(written, 2u), old));
+        b.block = &b.newBlock();
+        b.keep(b.add(written, 3u));
+        return refusedAs(b.explain(), written, MaskedSelectRefusalReason::Unreached, {"is in a block the entry does not reach"});
     });
 
     return passed ? 0 : 1;
