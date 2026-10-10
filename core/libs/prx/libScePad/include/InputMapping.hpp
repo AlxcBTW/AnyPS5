@@ -82,6 +82,9 @@ InputConfiguration ParseInputConfiguration(std::istream& stream, const std::file
 std::filesystem::path DefaultInputDirectory();
 std::string InputProfileName(std::string_view titleId);
 InputConfiguration LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId);
+std::string SourceName(const InputBinding& binding);
+std::vector<std::string> DescribeBindings(const InputConfiguration& configuration);
+std::string MouseCaptureHint(const InputConfiguration& configuration, bool captured);
 
 }
 

@@ -14,8 +14,16 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
-PadInput::PadInput() : keyboardMouse(Pad::LoadInputConfiguration(Pad::DefaultInputDirectory(), GetAppTitleId_nid_postfix().value)) {
-    for (const auto& source : keyboardMouse.Configuration().sources) APS5_LOG_OUT("Pad: input configuration %s", source.string().c_str());
+PadInput::PadInput(DisplayWindow& window)
+    : window(window), keyboardMouse(Pad::LoadInputConfiguration(Pad::DefaultInputDirectory(), GetAppTitleId_nid_postfix().value)) {
+    const auto& configuration = keyboardMouse.Configuration();
+    if (configuration.sources.empty()) {
+        APS5_LOG_OUT("Pad: no %s, so the built-in keyboard and mouse bindings apply; create that file to change them",
+            (Pad::DefaultInputDirectory() / "anyps5-input.ini").string().c_str());
+    }
+    for (const auto& source : configuration.sources) APS5_LOG_OUT("Pad: input configuration %s", source.string().c_str());
+    for (const auto& line : Pad::DescribeBindings(configuration)) APS5_LOG_OUT("Pad: %s", line.c_str());
+    window.SetStatus(Pad::MouseCaptureHint(configuration, false));
     openFirstAvailableController();
 }
 
@@ -113,6 +121,7 @@ void PadInput::setMouseMode(bool enabled) {
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_SYSTEM_SCALE, "0");
     if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) != 0) throw std::runtime_error(std::string("Pad: relative mouse mode failed: ") + SDL_GetError());
     keyboardMouse.SetMouseMode(enabled);
+    window.SetStatus(Pad::MouseCaptureHint(keyboardMouse.Configuration(), enabled));
 }
 
 PadInputState PadInput::sampleController() const {
@@ -192,7 +201,7 @@ PadInputState PadInput::sampleController() const {
     return result;
 }
 
-void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
+void PadInput::HandleEvent(const SDL_Event& event) {
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
         openController(event.cdevice.which);
         return;

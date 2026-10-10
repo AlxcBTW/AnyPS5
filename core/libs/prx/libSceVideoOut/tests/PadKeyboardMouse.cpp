@@ -537,6 +537,31 @@ void testDefaultBindings() {
     check(overridden.back().state.buttons == 0 && overridden.back().state.sticks[1] == 0, "new defaults can be replaced in the ini file");
 }
 
+void testDescribeBindings() {
+    const auto lines = Pad::DescribeBindings(defaults());
+    const std::vector<std::string> expected{
+        "Sticks: left W A S D, right T F G H; Middle click puts the mouse on the right stick; hold Left Alt for 50% tilt",
+        "Buttons: Cross Return/Space/X, Circle C, Square Z/Left click, Triangle I/V, L1 Q/Mouse 5, R1 E/Right Alt, L2 R/Mouse 4, R2 Right click, "
+        "L3 Left Shift/Right Shift, R3 Left Ctrl/Right Ctrl, Options Escape",
+        "D-pad: up Up/Wheel up, right Right, down Down/Wheel down, left Left; touch pad: left Backspace, right Tab; fullscreen F11"};
+    check(lines.size() == expected.size(), "three summary lines");
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        check(lines[index] == expected[index], "summary line " + std::to_string(index + 1) + " reads '" + lines[index] + "'");
+    }
+    const auto custom = Pad::DescribeBindings(parse("LeftStickUp = KEY:Up\nRightStickUp = KEY:I\nRightStickUp = KEY:Keypad 8\nStickModifierScale = 0.3\nL2 = MOUSE:Right\n"));
+    check(custom[0] == "Sticks: left Up A S D, right I F G H; Middle click puts the mouse on the right stick; hold Left Alt for 30% tilt", "summary follows the ini file: " + custom[0]);
+    check(custom[1].find("L2 Right click") != std::string::npos, "summary shows a replaced binding");
+}
+
+void testMouseCaptureHint() {
+    check(Pad::MouseCaptureHint(defaults(), false) == "Middle-click to capture the mouse", "hint while free");
+    check(Pad::MouseCaptureHint(defaults(), true) == "Mouse captured, middle-click to release", "hint while captured");
+    const auto key = parse("ToggleMouse = KEY:F8\n");
+    check(Pad::MouseCaptureHint(key, false) == "Press F8 to capture the mouse", "hint for a key");
+    check(Pad::MouseCaptureHint(key, true) == "Mouse captured, press F8 to release", "captured hint for a key");
+    check(Pad::MouseCaptureHint(parse("ToggleMouse = MOUSE:X1\n"), false) == "Press mouse button 4 to capture the mouse", "hint for a side button");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -559,6 +584,33 @@ void testTraceRoundTrip() {
     check(events[4].setMouseMode && !events[4].mouseMode, "mouse mode line");
     std::istringstream bad("5 move 1\n");
     check(expectFailure([&bad] { PadSimulation::ReadTrace(bad); }).find("trace line 1") != std::string::npos, "malformed trace line");
+}
+
+int printBindings(int argc, char** argv) {
+    constexpr const char* Usage = "usage: pad_keyboard_mouse_tests --bindings [--config ini | --dir directory [--title id]]";
+    std::string configPath;
+    std::string directory;
+    std::string title;
+    for (int index = 2; index < argc; ++index) {
+        const std::string_view argument = argv[index];
+        if (argument == "--config" && index + 1 < argc) configPath = argv[++index];
+        else if (argument == "--dir" && index + 1 < argc) directory = argv[++index];
+        else if (argument == "--title" && index + 1 < argc) title = argv[++index];
+        else throw std::runtime_error(Usage);
+    }
+    Pad::InputConfiguration configuration = Pad::DefaultInputConfiguration();
+    if (!configPath.empty()) {
+        std::ifstream file(configPath);
+        if (!file) throw std::runtime_error("cannot read " + configPath);
+        configuration = Pad::ParseInputConfiguration(file, configPath);
+    } else if (!directory.empty()) {
+        configuration = Pad::LoadInputConfiguration(directory, title);
+    }
+    for (const auto& source : configuration.sources) std::printf("Pad: input configuration %s\n", source.string().c_str());
+    for (const auto& line : Pad::DescribeBindings(configuration)) std::printf("Pad: %s\n", line.c_str());
+    std::printf("Title: %s\n", Pad::MouseCaptureHint(configuration, false).c_str());
+    std::printf("Title while captured: %s\n", Pad::MouseCaptureHint(configuration, true).c_str());
+    return 0;
 }
 
 int replay(int argc, char** argv) {
@@ -605,6 +657,7 @@ int replay(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--replay") return replay(argc, argv);
+        if (argc > 1 && std::string_view(argv[1]) == "--bindings") return printBindings(argc, argv);
         const std::pair<const char*, std::function<void()>> tests[] = {
             {"defaults", testDefaults},
             {"settings parse", testSettingsParse},
@@ -627,6 +680,8 @@ int main(int argc, char** argv) {
             {"slow reporting mouse", testSlowReportingMouse},
             {"replay release", testReplayRelease},
             {"default bindings", testDefaultBindings},
+            {"describe bindings", testDescribeBindings},
+            {"mouse capture hint", testMouseCaptureHint},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };

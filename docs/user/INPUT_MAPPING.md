@@ -39,6 +39,16 @@ These defaults differ from earlier versions:
 
 Every default can be replaced in `anyps5-input.ini`.
 
+At start-up the log lists the bindings in effect on three lines that start with `Pad:`, for example:
+
+```text
+Pad: Sticks: left W A S D, right T F G H; Middle click puts the mouse on the right stick; hold Left Alt for 50% tilt
+Pad: Buttons: Cross Return/Space/X, Circle C, Square Z/Left click, Triangle I/V, L1 Q/Mouse 5, R1 E/Right Alt, L2 R/Mouse 4, R2 Right click, L3 Left Shift/Right Shift, R3 Left Ctrl/Right Ctrl, Options Escape
+Pad: D-pad: up Up/Wheel up, right Right, down Down/Wheel down, left Left; touch pad: left Backspace, right Tab; fullscreen F11
+```
+
+Without an `anyps5-input.ini`, the log also names the path where one would be read. The window title ends with how to capture the mouse, such as `Middle-click to capture the mouse`, and while it is captured, how to release it: `Mouse captured, middle-click to release`.
+
 ## Configuration file
 
 Each non-empty line has the form `Action = Type:Value`, or `Setting = number` for the [keyboard stick](#analog-keyboard-sticks) and [mouse](#mouse-as-the-right-stick) settings. Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
@@ -135,4 +145,4 @@ Middle-click captures the mouse, as in a game. Saving one of the `.ini` files up
 pad_keyboard_mouse_tests --replay <file> --poll 16 --dir <game directory> --title <TITLE ID>
 ```
 
-`--poll` sets how often, in milliseconds, the replay samples the pad, like a game's frame time. Both programs take `--config <ini>` to read a single file instead of a directory.
+`--poll` sets how often, in milliseconds, the replay samples the pad, like a game's frame time. `pad_keyboard_mouse_tests --bindings --dir <game directory> --title <TITLE ID>` prints the binding summary and the title hints a game run would show. Both programs take `--config <ini>` to read a single file instead of a directory.

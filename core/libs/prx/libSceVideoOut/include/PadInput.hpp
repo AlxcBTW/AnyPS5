@@ -11,9 +11,9 @@ class DisplayWindow;
 
 class PadInput {
 public:
-    PadInput();
+    explicit PadInput(DisplayWindow& window);
     ~PadInput();
-    void HandleEvent(const SDL_Event& event, DisplayWindow& window);
+    void HandleEvent(const SDL_Event& event);
     void Update();
 
 private:
@@ -26,6 +26,7 @@ private:
     void applyOutput();
     void enableSensors();
 
+    DisplayWindow& window;
     Pad::KeyboardMouse keyboardMouse;
     SDL_GameController* controller = nullptr;
     PadInputState controllerState{};
