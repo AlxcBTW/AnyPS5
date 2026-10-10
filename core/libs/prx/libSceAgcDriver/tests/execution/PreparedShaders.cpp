@@ -6,6 +6,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -64,8 +65,15 @@ void Run(AgcDriver::VulkanDevice& device) {
     const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
     ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
     RunUnregistered(device, request);
+    AgcDriver::DriverDetail::ShaderSnapshot withoutSpecials{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
+    withoutSpecials.header.resize(sizeof(Shader));
+    Require(AgcDriver::DriverDetail::SourceHandleFor(withoutSpecials, 0, request) != nullptr && withoutSpecials.prepared->entries.size() == 1, "a registered compute shader without specials was not prepared at dispatch");
     AgcDriver::DriverDetail::ShaderSnapshot snapshot{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
+    Shader withSpecials{};
+    ShaderSpecialRegs specials{};
+    withSpecials.specials = &specials;
     snapshot.header.resize(sizeof(Shader));
+    std::memcpy(snapshot.header.data(), &withSpecials, sizeof(withSpecials));
     ExpectFailure([&] { static_cast<void>(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request)); }, "artifact is missing");
     const auto handle = ShaderRecompiler::PrepareShader(request);
     snapshot.prepared->entries.push_back({0, handle});
@@ -189,6 +197,30 @@ void PrepareMultisampledStorage(AgcDriver::VulkanDevice& device) {
     ExpectFailure([&] { static_cast<void>(PrepareShader(request)); }, "storage image multisampling is unavailable on the target device");
 }
 
+void RegistrationWithoutSpecials() {
+    alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
+    struct Header {
+        Shader shader{};
+        std::array<ShaderRegister, 7> registers{};
+    } header;
+    const auto address = reinterpret_cast<std::uintptr_t>(code.data());
+    header.shader.file_header = 0x34333231u;
+    header.shader.version = 0x18;
+    header.shader.header_size = sizeof(header);
+    header.shader.shader_size = sizeof(code);
+    header.shader.code = code.data();
+    header.shader.sh_registers = header.registers.data();
+    header.shader.num_sh_registers = header.registers.size();
+    header.registers = {{{0x20c, static_cast<std::uint32_t>(address >> 8u)}, {0x20d, static_cast<std::uint32_t>(address >> 40u)}, {0x207, 1}, {0x208, 1}, {0x209, 1}, {0x212, 0}, {0x213, 0}}};
+    AgcDriverRegisterShader_nid_postfix(&header.shader);
+    std::vector<std::uint32_t> commands;
+    for (const auto reg : header.registers) commands.insert(commands.end(), {0xc0017600u, reg.offset, reg.value});
+    for (const std::uint32_t initiator : {0x8041u, 0x41u}) commands.insert(commands.end(), {0xc0031500u, 1, 1, 1, initiator});
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    sceAgcDriverSubmitAcb(0x20, &packet);
+    AgcDriverWaitIdle_nid_postfix();
+}
+
 void Registration(bool indirect) {
     alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
     struct Header {
@@ -272,6 +304,7 @@ int main(int argc, char** argv) {
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
         device.reset();
+        RegistrationWithoutSpecials();
         Registration(argc == 2);
         std::cout << "prepared shader and transactional registration tests passed\n";
         return 0;

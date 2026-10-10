@@ -167,6 +167,22 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
     transaction.Commit();
 }
 
+namespace {
+
+bool PreparedAtDispatch(const ShaderSnapshot& snapshot) {
+    if (snapshot.header.empty()) return true;
+    if (snapshot.type != 0 || snapshot.header.size() < sizeof(Shader)) return false;
+    Shader header;
+    std::memcpy(&header, snapshot.header.data(), sizeof(header));
+    return header.specials == nullptr;
+}
+
+const char* DispatchPreparationReason(const ShaderSnapshot& snapshot) {
+    return snapshot.header.empty() ? "was not registered" : "has no specials to give its wave size";
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
@@ -175,9 +191,9 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
     }
-    if (snapshot.header.empty()) {
+    if (PreparedAtDispatch(snapshot)) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+        APS5_LOG_ERR("Compute shader 0x%llx %s; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress), DispatchPreparationReason(snapshot));
         auto handle = ShaderRecompiler::PrepareShader(request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
@@ -216,9 +232,9 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
-    if (snapshot.header.empty()) {
+    if (PreparedAtDispatch(snapshot)) {
         if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+        APS5_LOG_ERR("Compute shader 0x%llx %s; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress), DispatchPreparationReason(snapshot));
         auto handle = ShaderRecompiler::PrepareShader(request);
         invocationRequest = request;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
@@ -342,6 +358,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
     if (userCount > 32) throw std::runtime_error("AGC driver: static user SGPR count exceeds the register bank");
     if (stage == Stage::Compute) {
         compute = Graphics::DecodeComputeStageInfo(state.shader, snapshot.header);
+        if (header.specials == nullptr) return {};
         const auto special = ReadHeaderArray(snapshot, header.specials, 1).front();
         wave = (special.dispatch_modifier & 0x8000u) != 0 ? 32u : 64u;
     } else if (stage == Stage::Fragment) {
