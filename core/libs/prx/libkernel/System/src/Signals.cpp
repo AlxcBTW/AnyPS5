@@ -9,10 +9,19 @@
 
 extern "C" int* APS5_VABI __error_nid_postfix();
 extern "C" int APS5_VABI getpid_nid_postfix(void);
+extern "C" [[noreturn]] void APS5_VABI longjmp_nid_postfix(void* buffer, int value);
 
 struct GuestSignalSet {
     std::uint32_t bits[4];
 };
+
+struct GuestSigjmpBuffer {
+    std::uint64_t registers[9];
+    GuestSignalSet mask;
+    int saveMask;
+    int reserved;
+};
+static_assert(sizeof(GuestSigjmpBuffer) == 96 && offsetof(GuestSigjmpBuffer, mask) == 72 && offsetof(GuestSigjmpBuffer, saveMask) == 88);
 
 struct GuestSigaction {
     std::uintptr_t handler;
@@ -28,6 +37,7 @@ constexpr int GuestSigkill = 9;
 constexpr int GuestSigstop = 17;
 constexpr int SaRestart = 0x2;
 constexpr int SaSiginfo = 0x40;
+constexpr int SigSetmask = 3;
 std::atomic<GuestHandler> handlers[MaxSignal + 1]{};
 static_assert(std::atomic<GuestHandler>::is_always_lock_free);
 std::atomic<std::uint32_t> blockedMask{0};
@@ -161,6 +171,11 @@ int APS5_VABI _sigprocmask_nid_postfix(int how, const GuestSignalSet* set, Guest
 int APS5_VABI sigprocmask_nid_postfix(int how, const void* set, void* previousSet) {
     return _sigprocmask_nid_postfix(how, static_cast<const GuestSignalSet*>(set),
                                     static_cast<GuestSignalSet*>(previousSet));
+}
+
+[[noreturn]] void APS5_VABI siglongjmp_nid_postfix(GuestSigjmpBuffer* buffer, int value) {
+    if (buffer->saveMask != 0) _sigprocmask_nid_postfix(SigSetmask, &buffer->mask, nullptr);
+    longjmp_nid_postfix(buffer, value);
 }
 }
 

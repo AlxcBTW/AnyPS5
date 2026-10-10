@@ -23,6 +23,7 @@ asm(".text\n"
     "    mov %r15, 56(%rdi)\n"
     "    stmxcsr 64(%rdi)\n"
     "    fnstcw 68(%rdi)\n"
+    "    movl $0, 88(%rdi)\n"
     "    xor %eax, %eax\n"
     "    ret\n"
     APS5_ASM_FUNCTION("longjmp_nid_postfix")

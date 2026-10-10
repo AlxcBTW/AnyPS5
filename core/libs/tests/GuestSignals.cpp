@@ -16,6 +16,17 @@ int APS5_VABI _is_signal_return_nid_postfix(std::uint64_t);
 struct GuestSignalSet {
     std::uint32_t bits[4];
 };
+struct GuestSigjmpBuffer {
+    std::uint64_t registers[9];
+    GuestSignalSet mask;
+    int saveMask;
+    int reserved;
+};
+static_assert(sizeof(GuestSigjmpBuffer) == 96);
+extern "C" {
+[[gnu::returns_twice]] int APS5_VABI setjmp_nid_postfix(GuestSigjmpBuffer*);
+[[noreturn]] void APS5_VABI siglongjmp_nid_postfix(GuestSigjmpBuffer*, int);
+}
 struct GuestSigaction {
     std::uintptr_t handler;
     int flags;
@@ -33,7 +44,37 @@ void APS5_VABI Callback(int value) {
     handlerReturn = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
 }
 static void Require(bool value) { if (!value) std::abort(); }
+static GuestSigjmpBuffer jumpBuffer;
+static std::uint32_t BlockedSignals() {
+    GuestSignalSet current{};
+    Require(sigprocmask_nid_postfix(1, nullptr, &current) == 0);
+    return current.bits[0];
+}
+static void CheckSiglongjmp() {
+    const GuestSignalSet saved{{1u << 1, 0, 0, 0}};
+    const GuestSignalSet changed{{1u << 14, 0, 0, 0}};
+    Require(sigprocmask_nid_postfix(3, &saved, nullptr) == 0);
+    std::memset(&jumpBuffer, 0xa5, sizeof(jumpBuffer));
+    const int restored = setjmp_nid_postfix(&jumpBuffer);
+    if (restored == 0) {
+        Require(jumpBuffer.saveMask == 0);
+        jumpBuffer.mask = saved;
+        jumpBuffer.saveMask = 1;
+        Require(sigprocmask_nid_postfix(3, &changed, nullptr) == 0);
+        siglongjmp_nid_postfix(&jumpBuffer, 7);
+    }
+    Require(restored == 7 && BlockedSignals() == saved.bits[0]);
+    const int kept = setjmp_nid_postfix(&jumpBuffer);
+    if (kept == 0) {
+        Require(sigprocmask_nid_postfix(3, &changed, nullptr) == 0);
+        siglongjmp_nid_postfix(&jumpBuffer, 0);
+    }
+    Require(kept == 1 && BlockedSignals() == changed.bits[0]);
+    const GuestSignalSet none{};
+    Require(sigprocmask_nid_postfix(3, &none, nullptr) == 0);
+}
 int main() {
+    CheckSiglongjmp();
     const auto invalid = reinterpret_cast<Handler>(static_cast<std::uintptr_t>(-1));
     const auto ignore = reinterpret_cast<Handler>(std::uintptr_t{1});
     Require(signal_nid_postfix(9, Callback) == invalid);
