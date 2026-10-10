@@ -3,6 +3,8 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
+#include <istream>
 #include <vector>
 #include "SDL_scancode.h"
 #include "SDL_mouse.h"
@@ -11,9 +13,23 @@
 
 namespace Pad {
 
-inline constexpr int MousePollIntervalMs = 33;
 inline constexpr int WheelPressDurationMs = 80;
-inline constexpr double MouseSensitivity = 1.0;
+
+struct InputSettings {
+    double mouseSensitivity = 1.0;
+    double mouseVerticalScale = 1.0;
+    double mouseCurve = 1.0;
+    double mouseDeadzoneOffset = 0.2;
+    double mouseMaxSpeed = 1.0;
+    double mouseSmoothingMs = 10.0;
+    double mouseDecayMs = 30.0;
+};
+
+struct InputConfiguration {
+    std::vector<InputBinding> bindings;
+    InputSettings settings;
+    std::filesystem::path source;
+};
 
 inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_F11, MouseButton::None, InputControl::ToggleFullscreen},
@@ -51,7 +67,8 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Down, -1}
 };
 
-std::vector<InputBinding> LoadInputMapping();
+InputConfiguration ParseInputConfiguration(std::istream& stream, const std::filesystem::path& source);
+InputConfiguration LoadInputConfiguration();
 
 }
 
