@@ -13,8 +13,7 @@ namespace {
 
 enum class Tininess {
     None,
-    ExponentsOnly,
-    Full,
+    Checked,
 };
 
 void Require(bool value, const std::string& message) {
@@ -40,12 +39,11 @@ void Check(const std::string& name, const std::vector<std::uint32_t>& words, Rdn
     std::uint32_t tinyCompares = 0u;
     for (const auto* value : block.Instructions()) {
         if (value->Opcode() == IrOpcode::UMulHi) ++multiplyHigh;
-        if (value->Opcode() == IrOpcode::ULessThan32 && value->Argument(1)->HasImmediate() && value->Argument(1)->ImmediateU32() == 128u) ++tinyCompares;
+        if (value->Opcode() == IrOpcode::ULessThan32 && value->Argument(1)->HasImmediate() && value->Argument(1)->ImmediateU32() == 0x207fffffu) ++tinyCompares;
     }
     const std::uint32_t expectedCompares = expected == Tininess::None ? 0u : 1u;
-    const std::uint32_t expectedMultiplyHigh = expected == Tininess::Full ? 1u : 0u;
     Require(tinyCompares == expectedCompares, name + " emits " + std::to_string(tinyCompares) + " tiny product checks, expected " + std::to_string(expectedCompares));
-    Require(multiplyHigh == expectedMultiplyHigh, name + " emits " + std::to_string(multiplyHigh) + " significand products, expected " + std::to_string(expectedMultiplyHigh));
+    Require(multiplyHigh == 0u, name + " emits " + std::to_string(multiplyHigh) + " significand products, expected none");
 }
 
 void CheckFoldedSource(const std::string& name, const std::vector<std::uint32_t>& words, RdnaOpcode opcode, IrOpcode product, std::uint32_t index, std::uint32_t expected) {
@@ -65,22 +63,22 @@ void CheckFoldedSource(const std::string& name, const std::vector<std::uint32_t>
 
 int main() {
     try {
-        Check("v_mul_f32 v5, v6, v7", {0x100a0f06u}, RdnaOpcode::VMulF32, Tininess::Full);
+        Check("v_mul_f32 v5, v6, v7", {0x100a0f06u}, RdnaOpcode::VMulF32, Tininess::Checked);
         Check("v_mul_f32 v5, 2.0, v7", {0x100a0ef4u}, RdnaOpcode::VMulF32, Tininess::None);
         Check("v_mul_f32 v5, -4.0, v7", {0x100a0ef7u}, RdnaOpcode::VMulF32, Tininess::None);
         Check("v_mul_f32 v5, 1.0, v7", {0x100a0ef2u}, RdnaOpcode::VMulF32, Tininess::None);
         Check("v_mul_f32 v5, 0x7f800000, v7", {0x100a0effu, 0x7f800000u}, RdnaOpcode::VMulF32, Tininess::None);
         Check("v_mul_f32 v5, 0x00400000, v7", {0x100a0effu, 0x00400000u}, RdnaOpcode::VMulF32, Tininess::None);
         Check("v_mul_f32 v5, 1, v7", {0x100a0e81u}, RdnaOpcode::VMulF32, Tininess::None);
-        Check("v_mul_f32 v5, 0.5, v7", {0x100a0ef0u}, RdnaOpcode::VMulF32, Tininess::ExponentsOnly);
-        Check("v_mul_f32 v5, 0x3e800000, v7", {0x100a0effu, 0x3e800000u}, RdnaOpcode::VMulF32, Tininess::ExponentsOnly);
-        Check("v_mul_f32 v5, 0x3f7fffff, v7", {0x100a0effu, 0x3f7fffffu}, RdnaOpcode::VMulF32, Tininess::Full);
-        Check("v_mul_f32 v5, 0.15915494, v7", {0x100a0ef8u}, RdnaOpcode::VMulF32, Tininess::Full);
+        Check("v_mul_f32 v5, 0.5, v7", {0x100a0ef0u}, RdnaOpcode::VMulF32, Tininess::Checked);
+        Check("v_mul_f32 v5, 0x3e800000, v7", {0x100a0effu, 0x3e800000u}, RdnaOpcode::VMulF32, Tininess::Checked);
+        Check("v_mul_f32 v5, 0x3f7fffff, v7", {0x100a0effu, 0x3f7fffffu}, RdnaOpcode::VMulF32, Tininess::Checked);
+        Check("v_mul_f32 v5, 0.15915494, v7", {0x100a0ef8u}, RdnaOpcode::VMulF32, Tininess::Checked);
         Check("v_mul_legacy_f32 v5, 4.0, v7", {0x0e0a0ef6u}, RdnaOpcode::VMulLegacyF32, Tininess::None);
         Check("v_fmamk_f32 v5, v6, 0x40400000, v7", {0x580a0f06u, 0x40400000u}, RdnaOpcode::VMadmkF32, Tininess::None);
-        Check("v_fmaak_f32 v5, v6, v7, 0x40400000", {0x5a0a0f06u, 0x40400000u}, RdnaOpcode::VMadakF32, Tininess::Full);
+        Check("v_fmaak_f32 v5, v6, v7, 0x40400000", {0x5a0a0f06u, 0x40400000u}, RdnaOpcode::VMadakF32, Tininess::Checked);
         Check("v_fma_f32 v5, v6, -|2.0|, v7", {0xd54b0205u, 0x441de906u}, RdnaOpcode::VFmaF32, Tininess::None);
-        Check("v_fma_f32 v5, v6, -|0.5|, v7", {0xd54b0205u, 0x441de106u}, RdnaOpcode::VFmaF32, Tininess::ExponentsOnly);
+        Check("v_fma_f32 v5, v6, -|0.5|, v7", {0xd54b0205u, 0x441de106u}, RdnaOpcode::VFmaF32, Tininess::Checked);
         Check("v_mul_f32 v5, 2.0, v7 with f32 denormals kept", {0x100a0ef4u}, RdnaOpcode::VMulF32, Tininess::None, 0xf0u);
         Check("v_mul_f32 v5, v6, v7 with f32 denormals kept", {0x100a0f06u}, RdnaOpcode::VMulF32, Tininess::None, 0xf0u);
         CheckFoldedSource("v_fma_f32 v5, v6, -|2.0|, v7", {0xd54b0205u, 0x441de906u}, RdnaOpcode::VFmaF32, IrOpcode::FPFma32, 1u, 0xc0000000u);
