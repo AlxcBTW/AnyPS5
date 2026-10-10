@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "SDL_events.h"
 #include "SDL_scancode.h"
 #include "SDL_mouse.h"
 
@@ -16,6 +17,12 @@
 namespace Pad {
 
 inline constexpr int WheelPressDurationMs = 80;
+
+enum class KeyboardMouseTarget : std::uint8_t {
+    Both,
+    Pad,
+    Native
+};
 
 struct InputSettings {
     double mouseSensitivity = 1.0;
@@ -29,6 +36,7 @@ struct InputSettings {
     double keyboardRampMs = 0.0;
     double triggerRampMs = 0.0;
     double triggerWheelStep = 0.0;
+    KeyboardMouseTarget keyboardMouseTarget = KeyboardMouseTarget::Both;
 };
 
 struct InputConfiguration {
@@ -88,6 +96,8 @@ InputConfiguration LoadInputConfiguration(const std::filesystem::path& directory
 std::string SourceName(const InputBinding& binding);
 std::vector<std::string> DescribeBindings(const InputConfiguration& configuration);
 std::string MouseCaptureHint(const InputConfiguration& configuration, bool captured);
+bool IsKeyboardMouseEvent(const SDL_Event& event);
+bool DeliverToNative(const InputSettings& settings, const SDL_Event& event);
 
 }
 

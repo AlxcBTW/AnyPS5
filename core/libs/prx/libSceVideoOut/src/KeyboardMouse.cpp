@@ -238,6 +238,7 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
 }
 
 PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const {
+    if (configuration.settings.keyboardMouseTarget == KeyboardMouseTarget::Native) return controller;
     PadInputState state = controller;
     state.touchLeft = false;
     state.touchRight = false;
