@@ -104,6 +104,52 @@ void requireExactPostDominators(const ControlFlowGraph& graph, const char* name)
     }
 }
 
+void requireDominatedMerges(const ControlFlowGraph& graph, const char* name) {
+    for (const auto& block : graph.blocks) {
+        const auto merge = block.terminator.mergeBlock;
+        if (merge != InvalidControlFlowId && !graph.Dominates(block.id, merge)) {
+            throw std::runtime_error(std::string(name) + ": header " + std::to_string(block.id) + " does not dominate its merge " + std::to_string(merge));
+        }
+    }
+}
+
+std::uint32_t originalBlock(const ControlFlowGraph& graph, std::uint32_t blockId) {
+    for (std::size_t step = 0; step <= graph.blocks.size(); ++step) {
+        const auto& block = graph.FindBlock(blockId);
+        if (block.instructionBegin != block.instructionEnd) return block.instructionBegin / 2;
+        if (block.terminator.kind != TerminatorKind::Branch || block.terminator.gotoVariable != InvalidControlFlowId) break;
+        blockId = block.terminator.trueBlock;
+    }
+    throw std::runtime_error("block " + std::to_string(blockId) + " does not lead to an original block");
+}
+
+void requireOriginalBranches(const ControlFlowGraph& graph, const std::vector<std::vector<std::uint32_t>>& successors, const char* name) {
+    std::vector<bool> seen(successors.size(), false);
+    for (const auto& block : graph.blocks) {
+        if (block.instructionBegin == block.instructionEnd) continue;
+        const auto original = block.instructionBegin / 2;
+        std::vector<std::uint32_t> targets;
+        if (block.terminator.kind == TerminatorKind::Branch) targets = {originalBlock(graph, block.terminator.trueBlock)};
+        if (block.terminator.kind == TerminatorKind::ConditionalBranch) targets = {originalBlock(graph, block.terminator.trueBlock), originalBlock(graph, block.terminator.falseBlock)};
+        if (targets != successors[original]) {
+            throw std::runtime_error(std::string(name) + ": block " + std::to_string(original) + " no longer branches to its original targets");
+        }
+        seen[original] = true;
+    }
+    if (std::find(seen.begin(), seen.end(), false) != seen.end()) {
+        throw std::runtime_error(std::string(name) + ": an original block is missing");
+    }
+}
+
+void requireStructuredLoop(const std::vector<std::vector<std::uint32_t>>& successors, const char* name) {
+    auto graph = makeGraph(successors);
+    Structurizer{}.Structurize(graph);
+    requireExactPostDominators(graph, name);
+    requireStructuredBranches(graph, name);
+    requireDominatedMerges(graph, name);
+    requireOriginalBranches(graph, successors, name);
+}
+
 std::vector<std::vector<std::uint32_t>> originalPostDominators(const ControlFlowGraph& graph) {
     std::vector<std::uint32_t> all;
     for (std::uint32_t id = 0; id < graph.blocks.size(); ++id) all.push_back(id);
@@ -238,17 +284,14 @@ int main() {
         Structurizer{}.Structurize(innerEndingExit);
         requireExactPostDominators(innerEndingExit, "an inner loop exit that ends the program");
         requireStructuredBranches(innerEndingExit, "an inner loop exit that ends the program");
+        requireStructuredLoop({{1}, {2, 4}, {3, 4}, {4, 5}, {1, 6}, {1}, {}}, "nested selections in a loop with two latches");
+        requireStructuredLoop({{1}, {5, 2}, {5, 3}, {6, 4}, {7, 5}, {8, 1}, {1}, {1}, {}}, "nested selections on the false side in a loop with three latches");
+        requireStructuredLoop({{1}, {2, 5}, {3, 4}, {5, 6}, {5}, {1, 7}, {1}, {}}, "an if-else in a loop whose one arm continues");
         auto earlyReturn = makeGraph({{2, 1}, {4, 2}, {3, 5}, {5}, {}, {}});
         Structurizer{}.Structurize(earlyReturn);
         requireExactPostDominators(earlyReturn, "an early return inside a selection that joins its parent's merge");
         requireStructuredBranches(earlyReturn, "an early return inside a selection that joins its parent's merge");
-        for (const auto& block : earlyReturn.blocks) {
-            const auto merge = block.terminator.mergeBlock;
-            if (merge != InvalidControlFlowId && !earlyReturn.Dominates(block.id, merge)) {
-                std::fprintf(stderr, "an early return inside a selection: header %u does not dominate its merge %u\n", block.id, merge);
-                return 1;
-            }
-        }
+        requireDominatedMerges(earlyReturn, "an early return inside a selection that joins its parent's merge");
         std::vector<std::vector<std::uint32_t>> diamonds;
         for (std::uint32_t diamond = 0; diamond < 50u; ++diamond) {
             const auto head = diamond * 3u;
