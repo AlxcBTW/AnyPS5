@@ -1343,6 +1343,9 @@ void Structurizer::Structurize(ControlFlowGraph& graph) const {
             } catch (const std::runtime_error&) {
                 std::rethrow_exception(error);
             }
+            if (!hasStructuredConstructs(graph)) {
+                std::rethrow_exception(error);
+            }
         }
     }
 }
@@ -1725,6 +1728,91 @@ void Structurizer::verifyReducibility(const ControlFlowGraph& graph) const {
     if (graph.unsupported || graph.irreducible) {
         throw std::runtime_error(graph.unsupportedReason.empty() ? std::string("unsupported CFG") : graph.unsupportedReason);
     }
+}
+
+bool Structurizer::hasStructuredConstructs(const ControlFlowGraph& graph) const {
+    auto structural = graph;
+    for (auto& block : structural.blocks) {
+        if (block.terminator.mergeBlock != InvalidControlFlowId) {
+            block.successors.push_back(block.terminator.mergeBlock);
+        }
+        if (block.terminator.loopHeader) {
+            block.successors.push_back(block.terminator.continueBlock);
+        }
+    }
+    rebuildPredecessors(structural);
+    computeDominatorTree(structural);
+    computePostDominators(structural);
+    const auto inRegion = [&](const BasicBlock& header, std::uint32_t blockId) {
+        return structural.Dominates(header.id, blockId) && !structural.Dominates(header.terminator.mergeBlock, blockId);
+    };
+    const auto inContinue = [&](const BasicBlock& header, std::uint32_t blockId) {
+        return structural.Dominates(header.terminator.continueBlock, blockId) && structural.PostDominates(header.terminator.continueBlock, blockId);
+    };
+    const auto inConstruct = [&](const BasicBlock& header, std::uint32_t blockId) {
+        return inRegion(header, blockId) && !(header.terminator.loopHeader && inContinue(header, blockId));
+    };
+    const auto innermostLoop = [&](std::uint32_t blockId) {
+        const BasicBlock* innermost = nullptr;
+        for (const auto& header : graph.blocks) {
+            if (header.terminator.loopHeader && inRegion(header, blockId) && (innermost == nullptr || structural.Dominates(innermost->id, header.id))) {
+                innermost = &header;
+            }
+        }
+        return innermost;
+    };
+    const auto exitsLoop = [](const BasicBlock* loop, std::uint32_t target) {
+        return loop != nullptr && (target == loop->terminator.mergeBlock || target == loop->terminator.continueBlock);
+    };
+    for (const auto& block : graph.blocks) {
+        const auto& terminator = block.terminator;
+        for (const auto successor : block.successors) {
+            const auto& target = graph.FindBlock(successor);
+            if (structural.Dominates(successor, block.id) && (!target.terminator.loopHeader || target.terminator.continueBlock != block.id)) {
+                return false;
+            }
+        }
+        if (terminator.kind == TerminatorKind::ConditionalBranch && !terminator.loopHeader && terminator.mergeBlock == InvalidControlFlowId && terminator.trueBlock != terminator.falseBlock) {
+            const auto* loop = innermostLoop(block.id);
+            if (!exitsLoop(loop, terminator.trueBlock) && !exitsLoop(loop, terminator.falseBlock)) {
+                return false;
+            }
+        }
+        if (terminator.mergeBlock == InvalidControlFlowId) {
+            continue;
+        }
+        if (terminator.mergeBlock == block.id || !structural.Dominates(block.id, terminator.mergeBlock)) {
+            return false;
+        }
+        if (terminator.loopHeader && (terminator.continueBlock == terminator.mergeBlock || !structural.Dominates(block.id, terminator.continueBlock))) {
+            return false;
+        }
+        const auto* loop = terminator.loopHeader ? &block : innermostLoop(block.id);
+        for (const auto& member : graph.blocks) {
+            if (inConstruct(block, member.id)) {
+                if (member.id != block.id && member.terminator.mergeBlock != InvalidControlFlowId && !inConstruct(block, member.terminator.mergeBlock)) {
+                    return false;
+                }
+                if (member.id != block.id && !std::all_of(member.predecessors.begin(), member.predecessors.end(), [&](std::uint32_t predecessor) { return inConstruct(block, predecessor); })) {
+                    return false;
+                }
+                if (!std::all_of(member.successors.begin(), member.successors.end(), [&](std::uint32_t successor) { return inConstruct(block, successor) || successor == terminator.mergeBlock || exitsLoop(loop, successor); })) {
+                    return false;
+                }
+            } else if (terminator.loopHeader && inContinue(block, member.id)) {
+                if (!std::all_of(member.successors.begin(), member.successors.end(), [&](std::uint32_t successor) { return inContinue(block, successor) || successor == block.id || successor == terminator.mergeBlock; })) {
+                    return false;
+                }
+            }
+        }
+        if (terminator.loopHeader) {
+            const auto& predecessors = graph.FindBlock(terminator.continueBlock).predecessors;
+            if (!std::all_of(predecessors.begin(), predecessors.end(), [&](std::uint32_t predecessor) { return inConstruct(block, predecessor) || inContinue(block, predecessor); })) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 }
