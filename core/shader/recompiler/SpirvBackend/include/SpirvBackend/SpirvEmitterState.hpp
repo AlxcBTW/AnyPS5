@@ -102,6 +102,7 @@ struct SpirvEmitterState {
     bool splitSubgroup = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool robustBufferAccess2 = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;

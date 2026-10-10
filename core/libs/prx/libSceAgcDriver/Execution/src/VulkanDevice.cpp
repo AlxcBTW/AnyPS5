@@ -218,6 +218,7 @@ struct VulkanDevice::State {
     bool shaderClock = false;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
+    bool robustBufferAccess2 = false;
     // VK_EXT_descriptor_indexing with non-uniform image array indexing (bindless image tables in
     // graphics stages, and compute workgroups wider than a wave).
     bool descriptorIndexing = false;
@@ -1324,9 +1325,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
     }
-    if (robustness2.nullDescriptor == VK_TRUE) {
+    state->robustBufferAccess2 = robustness2.robustBufferAccess2 == VK_TRUE && enabled.robustBufferAccess == VK_TRUE && std::getenv("APS5_NO_ROBUST_BUFFER_ACCESS2") == nullptr;
+    APS5_LOG_OUT("Vulkan robustness2 robustBufferAccess2=%u", static_cast<unsigned>(state->robustBufferAccess2));
+    if (robustness2.nullDescriptor == VK_TRUE || state->robustBufferAccess2) {
+        const bool nullDescriptor = robustness2.nullDescriptor == VK_TRUE;
         robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-        robustness2.nullDescriptor = VK_TRUE;
+        robustness2.robustBufferAccess2 = state->robustBufferAccess2 ? VK_TRUE : VK_FALSE;
+        robustness2.nullDescriptor = nullDescriptor ? VK_TRUE : VK_FALSE;
         robustness2.pNext = bdaFeatures.pNext;
         bdaFeatures.pNext = &robustness2;
         deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
@@ -2699,6 +2704,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.robustBufferAccess2 = state->robustBufferAccess2;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
     if (state->meshShader) {
