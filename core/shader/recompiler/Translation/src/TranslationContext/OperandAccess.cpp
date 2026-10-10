@@ -25,11 +25,6 @@ bool keepsProductOutOfTinyRange(const IrValue& factor) {
     return exponent == 0u || exponent >= 127u;
 }
 
-bool hasUnitSignificand(const IrValue& factor) {
-    const IrValue* bits = constantF32Bits(factor);
-    return bits != nullptr && (bits->ImmediateU32() & 0x007fffffu) == 0u;
-}
-
 }
 
 const RdnaOperand& TranslationContext::sourceAt(const RdnaInstruction& inst, std::uint32_t index) {
@@ -157,13 +152,8 @@ IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* 
     if ((f32DenormalFlush & 2u) == 0u || keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)) return IrF32(*product);
     IrValue& lhsBits = ir.BitCastU32(*lhs);
     IrValue& rhsBits = ir.BitCastU32(*rhs);
-    const auto exponent = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::BitFieldUExtract, IrType::U32, {&bits, &ir.Constant(23u), &ir.Constant(8u)}); };
-    const auto significand = [&](IrValue& bits) -> IrValue& { return ir.BitwiseOr(ir.BitwiseAnd(bits, ir.Constant(0x007fffffu)), ir.Constant(0x00800000u)); };
-    IrValue& lhsExponent = exponent(lhsBits);
-    IrValue& rhsExponent = exponent(rhsBits);
-    const auto finiteNonZero = [&](IrValue& value) -> IrValue& { return ir.LogicalAnd(ir.INotEqual(value, ir.Constant(0u)), ir.INotEqual(value, ir.Constant(0xffu))); };
-    IrValue& carry = hasUnitSignificand(*lhs) || hasUnitSignificand(*rhs) ? ir.Constant(0u) : ir.Select(ir.UGreaterThan(ir.Emit(IrOpcode::UMulHi, IrType::U32, {&significand(lhsBits), &significand(rhsBits)}), ir.Constant(0x7fffu)), ir.Constant(1u), ir.Constant(0u));
-    IrValue* tiny = &ir.LogicalAnd(ir.LogicalAnd(finiteNonZero(lhsExponent), finiteNonZero(rhsExponent)), ir.ULessThan(ir.IAdd(ir.IAdd(lhsExponent, rhsExponent), carry), ir.Constant(128u)));
+    IrValue& scaled = ir.BitwiseAnd(ir.BitCastU32(ir.Emit(IrOpcode::FPMul32, IrType::F32, {&ir.Emit(IrOpcode::FPMul32, IrType::F32, {lhs, &ir.ConstantF32(0x1p64f)}), rhs})), ir.Constant(0x7fffffffu));
+    IrValue* tiny = &ir.ULessThan(ir.ISub(scaled, ir.Constant(1u)), ir.Constant(0x207fffffu));
     if (addend != nullptr) tiny = &ir.LogicalAnd(*tiny, ir.IEqual(ir.BitwiseAnd(ir.BitCastU32(*addend), ir.Constant(0x7fffffffu)), ir.Constant(0u)));
     IrValue& sign = ir.BitwiseAnd(ir.BitwiseXor(lhsBits, rhsBits), ir.Constant(0x80000000u));
     return IrF32(ir.Emit(IrOpcode::SelectF32, IrType::F32, {tiny, &ir.BitCastF32(sign), product}));
