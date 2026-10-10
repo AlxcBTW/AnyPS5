@@ -3,16 +3,45 @@
 
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace ShaderRecompiler {
 
+enum class MaskedSelectRefusalReason : std::uint8_t {
+    VisitLimit,
+    LoopSelect,
+    LoopMask,
+    LoopExec,
+    WholeQuadMode,
+    Derivative,
+    CrossLane,
+    ExecReactivated,
+    ObservableUse,
+    ImplicationDepth,
+    Unreached,
+};
+
+[[nodiscard]] std::string_view MaskedSelectRefusalCode(MaskedSelectRefusalReason reason);
+
+struct MaskedSelectRefusal {
+    std::uint32_t select = 0;
+    MaskedSelectRefusalReason reason = MaskedSelectRefusalReason::ObservableUse;
+    std::string line;
+};
+
 struct MaskedSelectEliminationStats {
     std::uint32_t removedSelects = 0;
+    std::vector<MaskedSelectRefusal> refusals;
 };
+
+[[nodiscard]] bool AncillaryTraceEnabled();
 
 class MaskedSelectEliminator {
 public:
     [[nodiscard]] MaskedSelectEliminationStats Eliminate(IrProgram& program) const;
+    [[nodiscard]] MaskedSelectEliminationStats Eliminate(IrProgram& program, bool explain) const;
 };
 
 }
