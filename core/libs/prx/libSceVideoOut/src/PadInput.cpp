@@ -238,6 +238,10 @@ void PadInput::HandleEvent(const SDL_Event& event) {
     if (event.type != SDL_MOUSEMOTION) publish();
 }
 
+bool PadInput::DeliversToNative(const SDL_Event& event) const {
+    return Pad::DeliverToNative(keyboardMouse.Configuration().settings, event);
+}
+
 void PadInput::Update() {
     if (controller != nullptr) SDL_GameControllerUpdate();
     applyOutput();

@@ -102,6 +102,18 @@ KeyboardRampMs = 150
 StickModifierScale = 0.35
 ```
 
+## Games with their own keyboard and mouse support
+
+Some PS5 games read a keyboard and mouse themselves, besides the controller. AnyPS5 passes the keyboard and mouse to those games, and by default also turns them into pad input, so such a game may see a key twice: once as the key, once as the pad button it is bound to. `KeyboardMouseTarget` chooses where keyboard and mouse input goes:
+
+| Value | Keys and mouse drive the pad | The game's own keyboard and mouse support receives them | Suits |
+| --- | --- | --- | --- |
+| `both` (default) | yes | yes | Most games: a game without its own keyboard support ignores the second path. |
+| `pad` | yes | no | Games that only make sense with a controller but react to keys on their own, for example typing into a field or opening a menu on a letter key. |
+| `native` | no | yes | Games with full keyboard and mouse support, so each key acts once and the game can show its keyboard prompts. A connected controller still drives the pad. |
+
+`ToggleMouse` and `ToggleFullscreen` work with every value; with `native`, capturing the mouse keeps the pointer inside the window for the game's own mouse support. Set it per game in a [profile](#per-game-profiles), for example `KeyboardMouseTarget = native` in `anyps5-input.<TITLE ID>.ini`.
+
 ## Analog triggers
 
 A key or mouse button bound to L2 or R2 presses the trigger fully at once, as a button does. Two settings make the triggers analog:

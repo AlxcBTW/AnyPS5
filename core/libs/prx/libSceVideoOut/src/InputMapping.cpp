@@ -77,6 +77,18 @@ constexpr auto settings = std::array{
     InputSetting{"TriggerWheelStep", &Pad::InputSettings::triggerWheelStep, 0.0, 1.0}
 };
 
+struct InputChoice {
+    std::string_view name;
+    std::array<std::string_view, 3> values;
+    void (*apply)(Pad::InputSettings& settings, std::size_t value);
+};
+
+constexpr auto choices = std::array{
+    InputChoice{"KeyboardMouseTarget", {"both", "pad", "native"}, [](Pad::InputSettings& settings, std::size_t value) {
+        settings.keyboardMouseTarget = static_cast<Pad::KeyboardMouseTarget>(value);
+    }}
+};
+
 std::string upper(std::string_view value) {
     std::string result(value);
     std::transform(result.begin(), result.end(), result.begin(), [](unsigned char character) {
@@ -97,6 +109,31 @@ const InputSetting* findSetting(std::string_view name) {
         if (upper(setting.name) == normalized) return &setting;
     }
     return nullptr;
+}
+
+const InputChoice* findChoice(std::string_view name) {
+    const auto normalized = upper(name);
+    for (const auto& choice : choices) {
+        if (upper(choice.name) == normalized) return &choice;
+    }
+    return nullptr;
+}
+
+void applyChoice(const InputChoice& choice, std::string_view value, Pad::InputSettings& settings) {
+    std::string allowed;
+    std::size_t count = 0;
+    for (std::size_t index = 0; index < choice.values.size(); ++index) {
+        if (choice.values[index].empty()) continue;
+        if (upper(choice.values[index]) == upper(value)) {
+            choice.apply(settings, index);
+            return;
+        }
+        ++count;
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        allowed += std::string(index == 0 ? "" : index + 1 == count ? " or " : ", ") + std::string(choice.values[index]);
+    }
+    throw std::runtime_error(std::string(choice.name) + " must be " + allowed);
 }
 
 std::string formatNumber(double value) {
@@ -225,6 +262,15 @@ Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const
 
         const auto actionName = trim(content.substr(0, separator));
         const auto source = trim(content.substr(separator + 1));
+        if (const auto* choice = findChoice(actionName)) {
+            if (!givenSettings.insert(upper(choice->name)).second) invalidLine(path, lineNumber, std::string(choice->name) + " is given twice");
+            try {
+                applyChoice(*choice, source, configuration.settings);
+            } catch (const std::runtime_error& error) {
+                invalidLine(path, lineNumber, error.what());
+            }
+            continue;
+        }
         if (const auto* setting = findSetting(actionName)) {
             if (!givenSettings.insert(upper(setting->name)).second) invalidLine(path, lineNumber, std::string(setting->name) + " is given twice");
             try {
@@ -328,7 +374,31 @@ std::vector<std::string> Pad::DescribeBindings(const InputConfiguration& configu
     }
     const auto fullscreen = sources(InputControl::ToggleFullscreen, PadButton::None);
     if (!fullscreen.empty()) other += "; fullscreen " + fullscreen;
-    return {sticks, buttons, other};
+    std::vector<std::string> lines{sticks, buttons, other};
+    if (configuration.settings.keyboardMouseTarget == KeyboardMouseTarget::Pad) {
+        lines.push_back("Target: pad only; the game's own keyboard and mouse support gets nothing");
+    } else if (configuration.settings.keyboardMouseTarget == KeyboardMouseTarget::Native) {
+        lines.push_back("Target: native only; keys and the mouse reach the game's own keyboard and mouse support, not the pad");
+    }
+    return lines;
+}
+
+bool Pad::IsKeyboardMouseEvent(const SDL_Event& event) {
+    switch (event.type) {
+        case SDL_KEYDOWN:
+        case SDL_KEYUP:
+        case SDL_MOUSEMOTION:
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+        case SDL_MOUSEWHEEL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool Pad::DeliverToNative(const InputSettings& settings, const SDL_Event& event) {
+    return settings.keyboardMouseTarget != KeyboardMouseTarget::Pad || !IsKeyboardMouseEvent(event);
 }
 
 std::string Pad::MouseCaptureHint(const InputConfiguration& configuration, bool captured) {

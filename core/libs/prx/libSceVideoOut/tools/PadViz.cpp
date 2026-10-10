@@ -814,6 +814,9 @@ private:
         settingRow(inner, rowY += Row, innerWidth, "Ramp", format("%.0f ms", settings.keyboardRampMs));
         settingRow(inner, rowY += Row, innerWidth, "Trigger ramp", format("%.0f ms", settings.triggerRampMs));
         settingRow(inner, rowY += Row, innerWidth, "Trigger wheel step", settings.triggerWheelStep > 0.0 ? format("%.2f", settings.triggerWheelStep) : std::string("off"));
+        const char* target = settings.keyboardMouseTarget == Pad::KeyboardMouseTarget::Pad ? "pad only"
+            : settings.keyboardMouseTarget == Pad::KeyboardMouseTarget::Native ? "game only, not the pad" : "pad and game";
+        settingRow(inner, rowY += Row, innerWidth, "Keys and mouse reach", target);
 
         rowY += Row + 14.0;
         groupLabel(inner, rowY, "LIVE");

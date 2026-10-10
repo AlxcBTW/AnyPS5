@@ -578,7 +578,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                     throw ProcessShutdown{};
                 }
                 padInput.HandleEvent(event);
-                if (window.Handle() != nullptr) {
+                if (window.Handle() != nullptr && padInput.DeliversToNative(event)) {
                     mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                     keyboardInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                 }

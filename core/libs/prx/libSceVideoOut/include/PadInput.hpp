@@ -14,6 +14,7 @@ public:
     explicit PadInput(DisplayWindow& window);
     ~PadInput();
     void HandleEvent(const SDL_Event& event);
+    bool DeliversToNative(const SDL_Event& event) const;
     void Update();
 
 private:

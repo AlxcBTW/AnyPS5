@@ -638,6 +638,45 @@ void testAnalogTriggers() {
     check(levels[850].state.analogButtonsR2 == 0, "losing focus drops the throttle");
 }
 
+void testKeyboardMouseTarget() {
+    check(defaults().settings.keyboardMouseTarget == Pad::KeyboardMouseTarget::Both, "both by default");
+    check(parse("KeyboardMouseTarget = Native\n").settings.keyboardMouseTarget == Pad::KeyboardMouseTarget::Native, "native parsed, any case");
+    check(parse("keyboardmousetarget = pad\n").settings.keyboardMouseTarget == Pad::KeyboardMouseTarget::Pad, "pad parsed");
+    check(expectFailure([] { parse("KeyboardMouseTarget = keyboard\n"); }).find("test.ini:1: KeyboardMouseTarget must be both, pad or native") != std::string::npos, "unknown target");
+    check(expectFailure([] { parse("KeyboardMouseTarget = pad\nKeyboardMouseTarget = both\n"); }).find("given twice") != std::string::npos, "duplicate target");
+
+    const std::vector<SDL_Event> inputs{KeyEvent(SDL_SCANCODE_W, true), KeyEvent(SDL_SCANCODE_W, false), PadSimulation::MotionEvent(3, 1),
+        PadSimulation::ButtonEvent(SDL_BUTTON_LEFT, true), PadSimulation::ButtonEvent(SDL_BUTTON_LEFT, false), PadSimulation::WheelEvent(1)};
+    SDL_Event textInput{};
+    textInput.type = SDL_TEXTINPUT;
+    for (const auto& [target, native] : {std::pair{"both", true}, std::pair{"pad", false}, std::pair{"native", true}}) {
+        const auto settings = parse(std::string("KeyboardMouseTarget = ") + target + "\n").settings;
+        for (const auto& event : inputs) check(Pad::DeliverToNative(settings, event) == native, std::string("native delivery of input events with ") + target);
+        check(Pad::DeliverToNative(settings, PadSimulation::FocusLostEvent()), std::string("window events always reach the native libraries with ") + target);
+        check(Pad::DeliverToNative(settings, textInput), std::string("text input is not a key event with ") + target);
+    }
+
+    const std::vector<TimedEvent> events{At(0.0, KeyEvent(SDL_SCANCODE_W, true)), At(0.0, PadSimulation::ButtonEvent(SDL_BUTTON_RIGHT, true)),
+        At(0.0, KeyEvent(SDL_SCANCODE_SPACE, true)), At(10.0, KeyEvent(SDL_SCANCODE_F7, true))};
+    const auto both = Simulate(defaults(), events, 1.0, 20.0);
+    check(both[5].state.sticks[1] == 0 && both[5].state.analogButtonsR2 == 255 && both[5].state.buttons != 0, "both: keys drive the pad");
+    const auto padOnly = Simulate(parse("KeyboardMouseTarget = pad\n"), events, 1.0, 20.0);
+    check(padOnly[5].state.sticks == both[5].state.sticks && padOnly[5].state.buttons == both[5].state.buttons, "pad: keys drive the pad");
+    const auto nativeOnly = Simulate(parse("KeyboardMouseTarget = native\n"), events, 1.0, 20.0);
+    check(nativeOnly[5].state.sticks == std::array<std::uint8_t, 4>{128, 128, 128, 128} && nativeOnly[5].state.buttons == 0 && nativeOnly[5].state.analogButtonsR2 == 0,
+        "native: keys leave the pad alone");
+    Pad::KeyboardMouse keyboardMouse(parse("KeyboardMouseTarget = native\n"));
+    const auto now = Pad::KeyboardMouse::Clock::time_point{} + std::chrono::hours(1);
+    check(keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F7, true), now).toggleMouse, "native: F7 still captures the mouse for the game's own mouse support");
+    check(keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_F11, true), now).toggleFullscreen, "native: F11 still toggles fullscreen");
+    PadInputState controller;
+    controller.sticks = {1, 2, 3, 4};
+    controller.analogButtonsL2 = 7;
+    check(keyboardMouse.Compose(controller).sticks == controller.sticks && keyboardMouse.Compose(controller).analogButtonsL2 == 7, "native: a controller still drives the pad");
+    check(Pad::DescribeBindings(parse("KeyboardMouseTarget = pad\n")).back().starts_with("Target: pad only"), "the summary names the pad target");
+    check(Pad::DescribeBindings(defaults()).size() == 3, "the default summary has no target line");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -760,6 +799,7 @@ int main(int argc, char** argv) {
             {"mouse capture hint", testMouseCaptureHint},
             {"capture hotkey and safety", testCaptureHotkeyAndSafety},
             {"analog triggers", testAnalogTriggers},
+            {"keyboard and mouse target", testKeyboardMouseTarget},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };
