@@ -287,6 +287,18 @@ int main() {
         auto exitJunction = makeGraph({{1}, {2, 3}, {9}, {4, 6}, {5, 9}, {1}, {7, 8}, {9}, {1}, {}});
         Structurizer{}.Structurize(exitJunction);
         requireStructuredBranches(exitJunction, "shared loop exit junctions retain structured branches");
+        const std::vector<std::vector<std::uint32_t>> trampolineExits{{1}, {3, 2}, {9}, {7, 4}, {6, 5}, {1}, {9}, {2, 8}, {4}, {}};
+        const std::vector<std::uint32_t> trampolineExitWords{1080, 1140, 1080, 1140, 1140, 0, 1080, 1140, 0, 1200};
+        auto trampolineExit = makeGraph(trampolineExits);
+        for (auto& block : trampolineExit.blocks) {
+            std::sort(block.successors.begin(), block.successors.end());
+            block.estimatedSpirvWords = trampolineExitWords[block.id];
+        }
+        Structurizer{}.Structurize(trampolineExit);
+        requireExactPostDominators(trampolineExit, "a shared loop exit behind s_branch trampolines with large blocks");
+        requireStructuredBranches(trampolineExit, "a shared loop exit behind s_branch trampolines with large blocks");
+        requireDominatedMerges(trampolineExit, "a shared loop exit behind s_branch trampolines with large blocks");
+        requireOriginalBranches(trampolineExit, trampolineExits, "a shared loop exit behind s_branch trampolines with large blocks");
         auto nested = makeGraph({{1}, {2}, {5, 3}, {5, 4}, {7}, {6, 7}, {}, {1}});
         Structurizer{}.Structurize(nested);
         requireExactPostDominators(nested, "nested selections");
