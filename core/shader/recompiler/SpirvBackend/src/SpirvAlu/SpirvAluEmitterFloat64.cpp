@@ -298,6 +298,15 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
             if (rounding16 == 1u) limit = Select(state, u32, negative, ConstantU32(state, 0x40effc00u), ConstantU32(state, 0x40f00000u));
             if (rounding16 == 2u) limit = Select(state, u32, negative, ConstantU32(state, 0x40f00000u), ConstantU32(state, 0x40effc00u));
             rounded = ToF64(state, Join(state, SelectBits(state, overflow, {ConstantU32(state, 0u), Binary(state, spv::OpBitwiseOr, u32, sign, limit)}, bits)));
+            if (rounding16 == 2u) {
+                const auto boolean = TypeBool(state);
+                const auto zeroBits = [&](F64Bits value, std::uint32_t highMask) {
+                    return Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, value.high, ConstantU32(state, highMask)), ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, value.low, ConstantU32(state, 0u)));
+                };
+                const auto positiveZeros = Binary(state, spv::OpLogicalAnd, boolean, zeroBits(Split(state, FromF64(state, product)), 0xffffffffu), zeroBits(Split(state, FromF64(state, FromF32Exact(state, base))), 0xffffffffu));
+                const auto negativeZero = Binary(state, spv::OpLogicalAnd, boolean, zeroBits(Split(state, FromF64(state, sum)), 0x7fffffffu), Unary(state, spv::OpLogicalNot, boolean, positiveZeros));
+                rounded = ToF64(state, Join(state, SelectBits(state, negativeZero, {ConstantU32(state, 0u), ConstantU32(state, 0x80000000u)}, Split(state, FromF64(state, rounded)))));
+            }
         }
     }
     const auto finite = F32BitsOfRounded(state, rounded);
