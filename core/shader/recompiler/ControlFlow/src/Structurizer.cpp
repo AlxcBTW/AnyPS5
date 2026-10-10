@@ -480,7 +480,7 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
         return globalMerge;
     }
 
-    if (routeLeavingExits && graph.Dominates(block.id, loop->continueBlock) && reachesWithinIteration(graph, *loop, trueTarget, loop->continueBlock) && reachesWithinIteration(graph, *loop, falseTarget, loop->continueBlock)) {
+    if (routeLeavingExits && reachesWithinIteration(graph, *loop, trueTarget, loop->continueBlock) && reachesWithinIteration(graph, *loop, falseTarget, loop->continueBlock)) {
         return joinWithinIteration(graph, *loop, trueTarget, falseTarget, loop->continueBlock);
     }
     if (isLoopControlGateway(graph, *loop, trueTarget) && graph.Dominates(block.id, trueTarget) && isInsideLoopConstruct(graph, *loop, falseTarget)) {
