@@ -203,7 +203,7 @@ void Run(const Context& context) {
     const auto other = StorageRefusal(context, address, ReusedExtent);
     Require(other.empty(), "a " + Size(ReusedExtent) + " storage view over the memory of a " + Size(DepthExtent) + " D16 surface did not take the storage path: " + other);
     const auto own = StorageRefusal(context, address, DepthExtent);
-    Require(own.find("storage image access to depth/stencil surface") != std::string::npos, "a " + Size(DepthExtent) + " storage view of a " + Size(DepthExtent) + " D16 surface was not refused" + (own.empty() ? std::string() : ": " + own));
+    Require(own.find("storage image access to depth surface") != std::string::npos, "a " + Size(DepthExtent) + " storage view of a " + Size(DepthExtent) + " D16 surface was not refused" + (own.empty() ? std::string() : ": " + own));
 }
 
 }
