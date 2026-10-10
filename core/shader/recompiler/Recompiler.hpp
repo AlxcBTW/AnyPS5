@@ -237,6 +237,7 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    bool robustBufferAccess2 = false;
 };
 
 struct BindingLayout {
