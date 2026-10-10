@@ -553,6 +553,7 @@ private:
                 releaseInput();
                 continue;
             }
+            if (event.type == SDL_WINDOWEVENT) continue;
             const bool input = event.type == SDL_MOUSEWHEEL || event.type == SDL_MOUSEMOTION || event.type == SDL_KEYDOWN || event.type == SDL_KEYUP ||
                 event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
             if (!input) continue;
@@ -561,6 +562,7 @@ private:
             if (event.type == SDL_MOUSEMOTION && keyboardMouse->MouseMode()) mouseCounts.push_back({now, std::hypot(event.motion.xrel, event.motion.yrel)});
             const auto requests = keyboardMouse->HandleEvent(event, now);
             if (requests.toggleMouse) setMouseMode(!keyboardMouse->MouseMode());
+            if (requests.releaseMouse) releaseInput();
         }
     }
 
@@ -902,7 +904,7 @@ private:
         bool passed = true;
         if (frame == 1) {
             passed = expect(state.sticks == std::array<std::uint8_t, 4>{128, 128, 128, 128}, "sticks start centered") &&
-                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), false) == "Middle-click to capture the mouse", "the capture hint names the middle click");
+                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), false) == "Middle-click or press F7 to capture the mouse", "the capture hint names the middle click and F7");
         }
         if (frame == 2) passed = expect(state.sticks[1] == 0, "W tilts the left stick up") && expect(canvas->Count(Palette::Accent) > 50, "the stick point is drawn");
         if (frame == 3) passed = expect(state.sticks[1] == Pad::StickByte(-0.5), "the stick modifier halves the tilt");
@@ -910,7 +912,7 @@ private:
         if (frame == 5) passed = expect(state.sticks[1] == 128 && state.buttons == 0, "released keys center the stick");
         if (frame == 6) {
             passed = expect(keyboardMouse->MouseMode(), "middle click captures the mouse") &&
-                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), true) == "Mouse captured, middle-click to release", "the captured hint names the release");
+                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), true) == "Mouse captured, middle-click or press F7 to release", "the captured hint names the release");
         }
         if (frame == SelftestFrames) {
             passed = expect(state.sticks[2] >= Pad::StickByte(0.2) && state.sticks[3] < 128, "mouse motion tilts the right stick right and up") &&

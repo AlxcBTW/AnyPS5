@@ -155,6 +155,12 @@ void Pad::KeyboardMouse::Release() {
 
 Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock::time_point now) {
     InputRequests requests;
+    if (event.type == SDL_WINDOWEVENT) {
+        if (event.window.event != SDL_WINDOWEVENT_FOCUS_LOST && event.window.event != SDL_WINDOWEVENT_CLOSE) return requests;
+        Release();
+        requests.releaseMouse = mouseMode;
+        return requests;
+    }
     if (event.type == SDL_MOUSEMOTION) {
         if (mouseMode) mouse.Move(event.motion.xrel, event.motion.yrel);
         return requests;
@@ -176,6 +182,11 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
     const bool mouseButton = event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
     if (!keyboard && !mouseButton) return requests;
     if (keyboard && event.key.repeat != 0) return requests;
+    if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_TAB && (event.key.keysym.mod & KMOD_ALT) != 0) {
+        Release();
+        requests.releaseMouse = mouseMode;
+        return requests;
+    }
     advanceKeys(now);
     const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
     for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {

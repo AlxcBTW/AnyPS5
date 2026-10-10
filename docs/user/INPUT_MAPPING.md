@@ -25,7 +25,7 @@ The built-in bindings follow PC habits: the left hand covers movement and the fa
 | Touch pad | `Backspace` (left half), `Tab` (right half) |
 | D-pad | Arrow keys; the wheel presses up and down |
 | Walk (`StickModifier`) | `Left Alt` |
-| Mouse on the right stick (`ToggleMouse`) | Middle click |
+| Mouse on the right stick (`ToggleMouse`) | Middle click, `F7` |
 | Fullscreen | `F11` |
 
 These defaults differ from earlier versions:
@@ -36,18 +36,19 @@ These defaults differ from earlier versions:
 | L1 | `Q` | `Q`, mouse button 5 | The thumb reaches it while the mouse steers the camera. |
 | Cross, Square, Triangle | `Space` and `Return`; left click; `I` | adds `X`, `Z`, `V` | `Z` `X` `C` `V` form a row of face buttons for the left hand, as in RPCS3; `I` needs the right hand. |
 | `Left Alt` | R1 | walk at reduced tilt | PC games walk on Alt. R1 stays on `E` and `Right Alt`. |
+| `ToggleMouse` | middle click | middle click, `F7` | A key toggles the capture too, also on mice without a middle button. `F7` is the mouse-to-stick key in shadPS4; `F10` is avoided because Windows treats it as the menu key and other tools use it. |
 
 Every default can be replaced in `anyps5-input.ini`.
 
 At start-up the log lists the bindings in effect on three lines that start with `Pad:`, for example:
 
 ```text
-Pad: Sticks: left W A S D, right T F G H; Middle click puts the mouse on the right stick; hold Left Alt for 50% tilt
+Pad: Sticks: left W A S D, right T F G H; Middle click/F7 puts the mouse on the right stick; hold Left Alt for 50% tilt
 Pad: Buttons: Cross Return/Space/X, Circle C, Square Z/Left click, Triangle I/V, L1 Q/Mouse 5, R1 E/Right Alt, L2 R/Mouse 4, R2 Right click, L3 Left Shift/Right Shift, R3 Left Ctrl/Right Ctrl, Options Escape
 Pad: D-pad: up Up/Wheel up, right Right, down Down/Wheel down, left Left; touch pad: left Backspace, right Tab; fullscreen F11
 ```
 
-Without an `anyps5-input.ini`, the log also names the path where one would be read. The window title ends with how to capture the mouse, such as `Middle-click to capture the mouse`, and while it is captured, how to release it: `Mouse captured, middle-click to release`.
+Without an `anyps5-input.ini`, the log also names the path where one would be read. The window title ends with how to capture the mouse, such as `Middle-click or press F7 to capture the mouse`, and while it is captured, how to release it: `Mouse captured, middle-click or press F7 to release`.
 
 ## Configuration file
 
@@ -103,7 +104,7 @@ StickModifierScale = 0.35
 
 ## Mouse as the right stick
 
-`ToggleMouse` (the middle mouse button by default) captures the mouse and drives the right stick from how fast the mouse moves. Capture uses raw relative input, so the pointer speed and acceleration set in the operating system don't apply. Press it again, or switch to another window, to release the mouse.
+`ToggleMouse` (the middle mouse button or `F7` by default) captures the mouse and drives the right stick from how fast the mouse moves. Capture uses raw relative input, so the pointer speed and acceleration set in the operating system don't apply. Press it again to release the mouse. Capture also ends, and every held key is let go, when the window loses focus, including through Alt+Tab, so the pointer is never stuck in the game window.
 
 The stick tilts in the direction the mouse moves, and further the faster it moves. Any movement tilts the stick at least `MouseDeadzoneOffset`, so slow movement isn't lost inside the game's own deadzone. When the mouse stops, the stick eases back and is centered `MouseDecayMs` after the last movement. Speed is measured in counts per second over the time between updates, so the same hand speed gives the same tilt at any frame rate. A mouse that reports only 125 or 250 times per second lands an uneven number of reports in each frame, which makes a steady movement waver; raise `MouseSmoothingMs` to 20 or 25 for such a mouse.
 

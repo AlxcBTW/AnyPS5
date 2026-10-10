@@ -53,6 +53,13 @@ inline SDL_Event ButtonEvent(Uint8 button, bool down) {
     return event;
 }
 
+inline SDL_Event FocusLostEvent() {
+    SDL_Event event{};
+    event.type = SDL_WINDOWEVENT;
+    event.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+    return event;
+}
+
 inline SDL_Event WheelEvent(int direction) {
     SDL_Event event{};
     event.type = SDL_MOUSEWHEEL;
@@ -114,6 +121,7 @@ inline std::vector<Sample> Simulate(const Pad::InputConfiguration& configuration
             }
             const auto requests = keyboardMouse.HandleEvent(timed.event, now);
             if (requests.toggleMouse) keyboardMouse.SetMouseMode(!keyboardMouse.MouseMode());
+            if (requests.releaseMouse) keyboardMouse.SetMouseMode(false);
         }
         keyboardMouse.Advance(now);
         samples.push_back({ms, keyboardMouse.Compose(PadInputState{})});

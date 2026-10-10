@@ -540,7 +540,7 @@ void testDefaultBindings() {
 void testDescribeBindings() {
     const auto lines = Pad::DescribeBindings(defaults());
     const std::vector<std::string> expected{
-        "Sticks: left W A S D, right T F G H; Middle click puts the mouse on the right stick; hold Left Alt for 50% tilt",
+        "Sticks: left W A S D, right T F G H; Middle click/F7 puts the mouse on the right stick; hold Left Alt for 50% tilt",
         "Buttons: Cross Return/Space/X, Circle C, Square Z/Left click, Triangle I/V, L1 Q/Mouse 5, R1 E/Right Alt, L2 R/Mouse 4, R2 Right click, "
         "L3 Left Shift/Right Shift, R3 Left Ctrl/Right Ctrl, Options Escape",
         "D-pad: up Up/Wheel up, right Right, down Down/Wheel down, left Left; touch pad: left Backspace, right Tab; fullscreen F11"};
@@ -549,17 +549,51 @@ void testDescribeBindings() {
         check(lines[index] == expected[index], "summary line " + std::to_string(index + 1) + " reads '" + lines[index] + "'");
     }
     const auto custom = Pad::DescribeBindings(parse("LeftStickUp = KEY:Up\nRightStickUp = KEY:I\nRightStickUp = KEY:Keypad 8\nStickModifierScale = 0.3\nL2 = MOUSE:Right\n"));
-    check(custom[0] == "Sticks: left Up A S D, right I F G H; Middle click puts the mouse on the right stick; hold Left Alt for 30% tilt", "summary follows the ini file: " + custom[0]);
+    check(custom[0] == "Sticks: left Up A S D, right I F G H; Middle click/F7 puts the mouse on the right stick; hold Left Alt for 30% tilt", "summary follows the ini file: " + custom[0]);
     check(custom[1].find("L2 Right click") != std::string::npos, "summary shows a replaced binding");
 }
 
 void testMouseCaptureHint() {
-    check(Pad::MouseCaptureHint(defaults(), false) == "Middle-click to capture the mouse", "hint while free");
-    check(Pad::MouseCaptureHint(defaults(), true) == "Mouse captured, middle-click to release", "hint while captured");
+    check(Pad::MouseCaptureHint(defaults(), false) == "Middle-click or press F7 to capture the mouse", "hint while free: " + Pad::MouseCaptureHint(defaults(), false));
+    check(Pad::MouseCaptureHint(defaults(), true) == "Mouse captured, middle-click or press F7 to release", "hint while captured");
     const auto key = parse("ToggleMouse = KEY:F8\n");
     check(Pad::MouseCaptureHint(key, false) == "Press F8 to capture the mouse", "hint for a key");
     check(Pad::MouseCaptureHint(key, true) == "Mouse captured, press F8 to release", "captured hint for a key");
     check(Pad::MouseCaptureHint(parse("ToggleMouse = MOUSE:X1\n"), false) == "Press mouse button 4 to capture the mouse", "hint for a side button");
+}
+
+void testCaptureHotkeyAndSafety() {
+    const auto speed = Pad::MouseFullTiltCountsPerSecond;
+    std::vector<TimedEvent> events{At(0.0, KeyEvent(SDL_SCANCODE_F7, true)), At(1.0, KeyEvent(SDL_SCANCODE_F7, false))};
+    PadSimulation::AppendMotion(events, 0.0, 100.0, speed, 0.0);
+    events.push_back(At(100.0, KeyEvent(SDL_SCANCODE_F7, true)));
+    PadSimulation::AppendMotion(events, 100.0, 100.0, speed, 0.0);
+    const auto toggled = Simulate(defaults(), events, 1.0, 200.0);
+    check(toggled[90].state.sticks[2] == 255, "F7 captures the mouse for the right stick");
+    check(toggled[150].state.sticks[2] == 128, "F7 again releases it");
+
+    std::vector<TimedEvent> focus{At(0.0, PadSimulation::ButtonEvent(SDL_BUTTON_MIDDLE, true)), At(0.0, KeyEvent(SDL_SCANCODE_W, true))};
+    PadSimulation::AppendMotion(focus, 0.0, 200.0, speed, 0.0);
+    focus.push_back(At(100.0, PadSimulation::FocusLostEvent()));
+    std::stable_sort(focus.begin(), focus.end(), [](const TimedEvent& left, const TimedEvent& right) { return left.ms < right.ms; });
+    const auto lost = Simulate(defaults(), focus, 1.0, 200.0);
+    check(lost[90].state.sticks[2] == 255 && lost[90].state.sticks[1] == 0, "captured and walking before the focus loss");
+    check(lost[150].state.sticks[2] == 128 && lost[150].state.sticks[1] == 128, "losing focus releases the mouse and every key");
+
+    std::vector<TimedEvent> altTab{At(0.0, PadSimulation::ButtonEvent(SDL_BUTTON_MIDDLE, true)), At(100.0, KeyEvent(SDL_SCANCODE_LALT, true))};
+    PadSimulation::AppendMotion(altTab, 0.0, 200.0, speed, 0.0);
+    auto tab = KeyEvent(SDL_SCANCODE_TAB, true);
+    tab.key.keysym.mod = KMOD_LALT;
+    altTab.push_back(At(100.0, tab));
+    std::stable_sort(altTab.begin(), altTab.end(), [](const TimedEvent& left, const TimedEvent& right) { return left.ms < right.ms; });
+    const auto switched = Simulate(defaults(), altTab, 1.0, 200.0);
+    check(switched[90].state.sticks[2] == 255, "captured before Alt+Tab");
+    check(switched[150].state.sticks[2] == 128 && !switched[150].state.touchRight, "Alt+Tab releases the mouse and does not touch the touch pad");
+
+    const auto key = parse("ToggleMouse = KEY:F8\n");
+    check(Pad::MouseCaptureHint(key, false) == "Press F8 to capture the mouse", "a ToggleMouse line replaces both defaults");
+    const auto both = parse("ToggleMouse = KEY:F8\nToggleMouse = MOUSE:X1\n");
+    check(Pad::MouseCaptureHint(both, true) == "Mouse captured, press F8 or press mouse button 4 to release", "the hint lists every capture binding");
 }
 
 void testWheelPress() {
@@ -682,6 +716,7 @@ int main(int argc, char** argv) {
             {"default bindings", testDefaultBindings},
             {"describe bindings", testDescribeBindings},
             {"mouse capture hint", testMouseCaptureHint},
+            {"capture hotkey and safety", testCaptureHotkeyAndSafety},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };
