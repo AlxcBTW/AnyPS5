@@ -19,9 +19,9 @@ PadInput::PadInput(DisplayWindow& window)
     const auto& configuration = keyboardMouse.Configuration();
     if (configuration.sources.empty()) {
         APS5_LOG_OUT("Pad: no %s, so the built-in keyboard and mouse bindings apply; create that file to change them",
-            (Pad::DefaultInputDirectory() / "anyps5-input.ini").string().c_str());
+            Pad::PathToUtf8(Pad::DefaultInputDirectory() / "anyps5-input.ini").c_str());
     }
-    for (const auto& source : configuration.sources) APS5_LOG_OUT("Pad: input configuration %s", source.string().c_str());
+    for (const auto& source : configuration.sources) APS5_LOG_OUT("Pad: input configuration %s", Pad::PathToUtf8(source).c_str());
     for (const auto& line : Pad::DescribeBindings(configuration)) APS5_LOG_OUT("Pad: %s", line.c_str());
     window.SetStatus(Pad::MouseCaptureHint(configuration, false));
     openFirstAvailableController();

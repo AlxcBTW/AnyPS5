@@ -213,14 +213,14 @@ Pad::InputBinding parseBinding(const InputAction& action, std::string_view sourc
 }
 
 [[noreturn]] void invalidLine(const std::filesystem::path& path, std::size_t line, const std::string& reason) {
-    throw std::runtime_error("Pad: invalid input mapping " + path.string() + ":" + std::to_string(line) + ": " + reason);
+    throw std::runtime_error("Pad: invalid input mapping " + Pad::PathToUtf8(path) + ":" + std::to_string(line) + ": " + reason);
 }
 
 void loadLayer(Pad::InputConfiguration& configuration, const std::filesystem::path& path, bool required) {
     std::ifstream file(path);
     if (!file) {
         if (required || std::filesystem::exists(path)) {
-            throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
+            throw std::runtime_error("Pad: cannot read input mapping '" + Pad::PathToUtf8(path) + "'");
         }
         return;
     }
@@ -233,10 +233,29 @@ Pad::InputConfiguration Pad::DefaultInputConfiguration() {
     return InputConfiguration{{InputMapping.begin(), InputMapping.end()}, {}, {}};
 }
 
+std::filesystem::path Pad::PathFromUtf8(std::string_view text) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(text.data()), text.size()));
+}
+
+std::string Pad::PathToUtf8(const std::filesystem::path& path) {
+    const auto text = path.u8string();
+    return std::string(reinterpret_cast<const char*>(text.data()), text.size());
+}
+
 std::filesystem::path Pad::DefaultInputDirectory() {
     std::unique_ptr<char, decltype(&SDL_free)> basePath(SDL_GetBasePath(), SDL_free);
-    if (basePath) return std::filesystem::path(basePath.get());
+    if (basePath) return PathFromUtf8(basePath.get());
     return {};
+}
+
+std::filesystem::path Pad::ConfiguredInputPath() {
+#ifdef _WIN32
+    const wchar_t* configured = _wgetenv(L"ANYPS5_INPUT_CONFIG");
+    return configured != nullptr ? std::filesystem::path(configured) : std::filesystem::path{};
+#else
+    const char* configured = std::getenv("ANYPS5_INPUT_CONFIG");
+    return configured != nullptr ? PathFromUtf8(configured) : std::filesystem::path{};
+#endif
 }
 
 std::string Pad::InputProfileName(std::string_view titleId) {
@@ -303,7 +322,7 @@ Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const
             invalidLine(path, lineNumber, error.what());
         }
     }
-    if (stream.bad()) throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
+    if (stream.bad()) throw std::runtime_error("Pad: cannot read input mapping '" + PathToUtf8(path) + "'");
 
     return configuration;
 }
@@ -427,9 +446,9 @@ std::string Pad::MouseCaptureHint(const InputConfiguration& configuration, bool 
 
 Pad::InputConfiguration Pad::LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId) {
     auto configuration = DefaultInputConfiguration();
-    const char* configuredPath = std::getenv("ANYPS5_INPUT_CONFIG");
-    const bool explicitPath = configuredPath != nullptr && configuredPath[0] != '\0';
-    loadLayer(configuration, explicitPath ? std::filesystem::path(configuredPath) : directory / "anyps5-input.ini", explicitPath);
+    const auto configuredPath = ConfiguredInputPath();
+    const bool explicitPath = !configuredPath.empty();
+    loadLayer(configuration, explicitPath ? configuredPath : directory / "anyps5-input.ini", explicitPath);
     const auto profile = InputProfileName(titleId);
     if (!profile.empty()) loadLayer(configuration, directory / profile, false);
     return configuration;
