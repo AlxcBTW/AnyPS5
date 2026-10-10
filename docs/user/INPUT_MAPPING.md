@@ -4,7 +4,7 @@ AnyPS5 accepts SDL-mapped game controllers as well as its built-in keyboard and 
 
 For an Xbox-layout controller, A/B/X/Y map to Cross/Circle/Square/Triangle, LB/RB map to L1/R1, and LT/RT map to analog L2/R2. Start maps to Options. D-pad and stick-click buttons are supported. On a PlayStation controller, the touchpad click button is forwarded; finger touch coordinates are not implemented.
 
-Each non-empty line has the form `Action = Type:Value`, or `Setting = number` for the [mouse settings](#mouse-as-the-right-stick). Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
+Each non-empty line has the form `Action = Type:Value`, or `Setting = number` for the [keyboard stick](#analog-keyboard-sticks) and [mouse](#mouse-as-the-right-stick) settings. Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
 
 Supported input sources are:
 
@@ -14,7 +14,7 @@ Supported input sources are:
 
 Game-controller bindings are enabled automatically and are not affected by keyboard or mouse overrides in this file.
 
-Supported actions are `Cross`, `Circle`, `Triangle`, `Square`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `Options`, `Up`, `Right`, `Down`, `Left`, `LeftStickLeft`, `LeftStickRight`, `LeftStickUp`, `LeftStickDown`, `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown`, `TouchLeft`, `TouchRight`, `ToggleMouse`, and `ToggleFullscreen`.
+Supported actions are `Cross`, `Circle`, `Triangle`, `Square`, `L1`, `R1`, `L2`, `R2`, `L3`, `R3`, `Options`, `Up`, `Right`, `Down`, `Left`, `LeftStickLeft`, `LeftStickRight`, `LeftStickUp`, `LeftStickDown`, `RightStickLeft`, `RightStickRight`, `RightStickUp`, `RightStickDown`, `TouchLeft`, `TouchRight`, `StickModifier`, `ToggleMouse`, and `ToggleFullscreen`.
 
 For example, this changes Cross to F or Space, moves the left stick to IJKL, uses the mouse buttons for Square and R2, and keeps all other built-in bindings:
 
@@ -32,13 +32,31 @@ ToggleMouse = MOUSE:Middle
 
 An invalid line reports the file and line number and stops input initialization. If the configured file does not exist or cannot be read, AnyPS5 reports an error. With no `anyps5-input.ini` and no `ANYPS5_INPUT_CONFIG`, the built-in mapping is used.
 
+## Analog keyboard sticks
+
+A stick key tilts its stick fully. Hold `StickModifier` (Z by default) to tilt only part of the way, for walking or for fine flight control. Each stick axis is independent, so holding two neighbouring keys tilts both axes fully. Holding opposite keys centers that axis, and releasing one of them tilts toward the other.
+
+Settings go in the same file as the bindings, one `Setting = number` per line. Setting names are case-insensitive, and each may appear once in a file.
+
+| Setting | Default | Range | Effect |
+| --- | --- | --- | --- |
+| `StickModifierScale` | `0.5` | 0.05 to 1 | Tilt while `StickModifier` is held, as a fraction of full tilt. |
+| `KeyboardRampMs` | `0` | 0 to 2000 | Milliseconds a stick key takes to tilt from center to full, and to return. 0 tilts at once; a ramp lets a short tap give a small tilt. |
+
+For example, for a flight game where throttle and yaw sit on the left stick:
+
+```ini
+KeyboardRampMs = 150
+StickModifierScale = 0.35
+```
+
 ## Mouse as the right stick
 
 `ToggleMouse` (the middle mouse button by default) captures the mouse and drives the right stick from how fast the mouse moves. Capture uses raw relative input, so the pointer speed and acceleration set in the operating system don't apply. Press it again, or switch to another window, to release the mouse.
 
 The stick tilts in the direction the mouse moves, and further the faster it moves. Any movement tilts the stick at least `MouseDeadzoneOffset`, so slow movement isn't lost inside the game's own deadzone. When the mouse stops, the stick eases back and is centered `MouseDecayMs` after the last movement. Speed is measured in counts per second over the time between updates, so the same hand speed gives the same tilt at any frame rate. A mouse that reports only 125 or 250 times per second lands an uneven number of reports in each frame, which makes a steady movement waver; raise `MouseSmoothingMs` to 20 or 25 for such a mouse.
 
-These settings go in the same file, one `Setting = number` per line. Setting names are case-insensitive, and each may appear once.
+The mouse settings go in the same file:
 
 | Setting | Default | Range | Effect |
 | --- | --- | --- | --- |

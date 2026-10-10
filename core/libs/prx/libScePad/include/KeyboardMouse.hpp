@@ -51,12 +51,18 @@ public:
     const InputConfiguration& Configuration() const;
 
 private:
+    std::array<double, 4> keyTargets() const;
+    void advanceKeys(Clock::time_point now);
+
     InputConfiguration configuration;
     std::vector<bool> pressed;
     std::vector<Clock::time_point> wheelReleaseTimes;
     MouseStick mouse;
+    std::array<double, 4> keyAxes{};
     Clock::time_point lastAdvance{};
+    Clock::time_point lastKeyAdvance{};
     bool advanced = false;
+    bool keysAdvanced = false;
     bool mouseMode = false;
 };
 
