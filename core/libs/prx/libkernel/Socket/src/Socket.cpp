@@ -73,6 +73,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (DescriptorSet(exceptfds, descriptor)) events |= KernelSocketPoll::Urgent;
         if (events == 0) continue;
         if (File::IsRandomDevice(descriptor)) devices.push_back({descriptor, events, static_cast<short>(events & (KernelSocketPoll::Readable | KernelSocketPoll::Writable))});
+        else if (descriptor <= 2) devices.push_back({descriptor, events, static_cast<short>(descriptor == 0 ? 0 : events & KernelSocketPoll::Writable)});
         else entries.push_back({descriptor, events, 0});
     }
     const auto sockets = entries.size();

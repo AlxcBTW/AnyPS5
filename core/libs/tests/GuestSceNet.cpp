@@ -382,6 +382,12 @@ int main() {
     Require(((random_readable[udp_receiver / 64] >> (udp_receiver % 64)) & 1u) == 0);
     Require(random_urgent[random / 64] == 0);
     Require(close_nid_postfix(random) == 0);
+    std::uint64_t stdio_readable[16]{1};
+    std::uint64_t stdio_writable[16]{6};
+    Require(select_nid_postfix(3, stdio_readable, stdio_writable, nullptr, poll_now) == 2);
+    Require(stdio_readable[0] == 0 && stdio_writable[0] == 6);
+    stdio_readable[0] = 1;
+    Require(select_nid_postfix(1, stdio_readable, nullptr, nullptr, poll_now) == 0 && stdio_readable[0] == 0);
     CheckMessages(udp_receiver, udp_sender, address);
     Require(sceNetSocketClose(udp_sender) == 0);
     Require(sceNetSocketClose(udp_receiver) == 0);
