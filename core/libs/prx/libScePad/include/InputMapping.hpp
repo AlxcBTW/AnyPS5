@@ -3,7 +3,12 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
+#include <istream>
+#include <string>
+#include <string_view>
 #include <vector>
+#include "SDL_events.h"
 #include "SDL_scancode.h"
 #include "SDL_mouse.h"
 
@@ -11,21 +16,55 @@
 
 namespace Pad {
 
-inline constexpr int MousePollIntervalMs = 33;
 inline constexpr int WheelPressDurationMs = 80;
-inline constexpr double MouseSensitivity = 1.0;
+
+enum class KeyboardMouseTarget : std::uint8_t {
+    Both,
+    Pad,
+    Native
+};
+
+enum class MouseStickSide : std::uint8_t {
+    Right,
+    Left
+};
+
+struct InputSettings {
+    double mouseSensitivity = 1.0;
+    double mouseVerticalScale = 1.0;
+    double mouseCurve = 1.0;
+    double mouseDeadzoneOffset = 0.2;
+    double mouseMaxSpeed = 1.0;
+    double mouseSmoothingMs = 10.0;
+    double mouseDecayMs = 30.0;
+    double stickModifierScale = 0.5;
+    double keyboardRampMs = 0.0;
+    double triggerRampMs = 0.0;
+    double triggerWheelStep = 0.0;
+    KeyboardMouseTarget keyboardMouseTarget = KeyboardMouseTarget::Both;
+    MouseStickSide mouseStick = MouseStickSide::Right;
+};
+
+struct InputConfiguration {
+    std::vector<InputBinding> bindings;
+    InputSettings settings;
+    std::vector<std::filesystem::path> sources;
+};
 
 inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_F11, MouseButton::None, InputControl::ToggleFullscreen},
     InputBinding{SDL_SCANCODE_RETURN, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_SPACE, MouseButton::None, InputControl::Button, PadButton::Cross},
+    InputBinding{SDL_SCANCODE_X, MouseButton::None, InputControl::Button, PadButton::Cross},
     InputBinding{SDL_SCANCODE_ESCAPE, MouseButton::None, InputControl::Button, PadButton::Options},
     InputBinding{SDL_SCANCODE_I, MouseButton::None, InputControl::Button, PadButton::Triangle},
+    InputBinding{SDL_SCANCODE_V, MouseButton::None, InputControl::Button, PadButton::Triangle},
     InputBinding{SDL_SCANCODE_C, MouseButton::None, InputControl::Button, PadButton::Circle},
+    InputBinding{SDL_SCANCODE_Z, MouseButton::None, InputControl::Button, PadButton::Square},
     InputBinding{SDL_SCANCODE_Q, MouseButton::None, InputControl::Button, PadButton::L1},
     InputBinding{SDL_SCANCODE_E, MouseButton::None, InputControl::Button, PadButton::R1},
-    InputBinding{SDL_SCANCODE_LALT, MouseButton::None, InputControl::Button, PadButton::R1},
     InputBinding{SDL_SCANCODE_RALT, MouseButton::None, InputControl::Button, PadButton::R1},
+    InputBinding{SDL_SCANCODE_R, MouseButton::None, InputControl::Button, PadButton::L2},
     InputBinding{SDL_SCANCODE_LSHIFT, MouseButton::None, InputControl::Button, PadButton::L3},
     InputBinding{SDL_SCANCODE_RSHIFT, MouseButton::None, InputControl::Button, PadButton::L3},
     InputBinding{SDL_SCANCODE_LCTRL, MouseButton::None, InputControl::Button, PadButton::R3},
@@ -44,14 +83,30 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_G, MouseButton::None, InputControl::RightStickDown},
     InputBinding{SDL_SCANCODE_BACKSPACE, MouseButton::None, InputControl::TouchLeft},
     InputBinding{SDL_SCANCODE_TAB, MouseButton::None, InputControl::TouchRight},
+    InputBinding{SDL_SCANCODE_LALT, MouseButton::None, InputControl::StickModifier},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Middle, InputControl::ToggleMouse},
+    InputBinding{SDL_SCANCODE_F7, MouseButton::None, InputControl::ToggleMouse},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Left, InputControl::Button, PadButton::Square},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::Right, InputControl::Button, PadButton::R2},
+    InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::X1, InputControl::Button, PadButton::L2},
+    InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::X2, InputControl::Button, PadButton::L1},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Up, 1},
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Down, -1}
 };
 
-std::vector<InputBinding> LoadInputMapping();
+InputConfiguration DefaultInputConfiguration();
+InputConfiguration ParseInputConfiguration(std::istream& stream, const std::filesystem::path& source, InputConfiguration base = DefaultInputConfiguration());
+std::filesystem::path PathFromUtf8(std::string_view text);
+std::string PathToUtf8(const std::filesystem::path& path);
+std::filesystem::path DefaultInputDirectory();
+std::filesystem::path ConfiguredInputPath();
+std::string InputProfileName(std::string_view titleId);
+InputConfiguration LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId);
+std::string SourceName(const InputBinding& binding);
+std::vector<std::string> DescribeBindings(const InputConfiguration& configuration);
+std::string MouseCaptureHint(const InputConfiguration& configuration, bool captured);
+bool IsKeyboardMouseEvent(const SDL_Event& event);
+bool DeliverToNative(const InputSettings& settings, const SDL_Event& event);
 
 }
 

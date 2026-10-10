@@ -9,6 +9,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/MouseInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardMouse.cpp
 )
 
 target_include_directories(libSceVideoOut PRIVATE
@@ -51,6 +52,30 @@ if(BUILD_TESTING)
     add_test_executable(pad_sdl_tests tests/PadSdl.cpp)
     target_link_libraries(pad_sdl_tests PRIVATE SDL2-static)
     add_test(NAME pad_sdl COMMAND pad_sdl_tests)
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(pad_keyboard_mouse_tests tests/PadKeyboardMouse.cpp src/KeyboardMouse.cpp src/InputMapping.cpp)
+    target_include_directories(pad_keyboard_mouse_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include)
+    target_link_libraries(pad_keyboard_mouse_tests PRIVATE SDL2-static)
+    if(MINGW)
+        target_compile_options(pad_keyboard_mouse_tests PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(pad_keyboard_mouse_tests PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_test(NAME pad_keyboard_mouse COMMAND pad_keyboard_mouse_tests)
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(pad_viz tools/PadViz.cpp src/KeyboardMouse.cpp src/InputMapping.cpp)
+    target_include_directories(pad_viz PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include)
+    target_include_directories(pad_viz SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/stb)
+    target_link_libraries(pad_viz PRIVATE SDL2-static)
+    if(MINGW)
+        target_compile_options(pad_viz PRIVATE -fasynchronous-unwind-tables)
+        target_link_options(pad_viz PRIVATE -static -static-libgcc -static-libstdc++)
+    endif()
+    add_test(NAME pad_viz COMMAND pad_viz --selftest)
+    set_tests_properties(pad_viz PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy")
 endif()
 
 if(BUILD_TESTING)

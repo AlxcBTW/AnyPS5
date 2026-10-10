@@ -556,7 +556,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 #if APS5_ENABLE_TIMING_LOG
         timingLog = std::make_unique<FrameTimingLog>();
 #endif
-        PadInput padInput;
+        PadInput padInput(window);
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
         while (!token.stop_requested()) {
@@ -577,8 +577,8 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                     LibcRequestExit_nid_postfix(0);
                     throw ProcessShutdown{};
                 }
-                padInput.HandleEvent(event, window);
-                if (window.Handle() != nullptr) {
+                padInput.HandleEvent(event);
+                if (window.Handle() != nullptr && padInput.DeliversToNative(event)) {
                     mouseInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                     keyboardInput.HandleEvent(event, SDL_GetWindowID(window.Handle()));
                 }

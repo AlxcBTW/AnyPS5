@@ -105,13 +105,12 @@ void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) co
 
 void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");
-    static const AppTitle title = GetAppTitle_nid_postfix();
-    static std::uint64_t fpsStart = sceKernelGetProcessTimeCounter();
-    static std::uint64_t frameNum = 0;
-    static std::uint64_t fpsFrames = 0;
-    static double currentFps = 0.0;
     const auto now = sceKernelGetProcessTimeCounter();
     const auto frequency = sceKernelGetProcessTimeCounterFrequency();
+    if (!fpsStarted) {
+        fpsStarted = true;
+        fpsStart = now;
+    }
     frameNum++;
     fpsFrames++;
     if (now - fpsStart >= frequency * 2) {
@@ -119,9 +118,20 @@ void DisplayWindow::UpdateTitle() {
         fpsStart = now;
         fpsFrames = 0;
     }
+    applyTitle();
+}
+
+void DisplayWindow::SetStatus(std::string text) {
+    status = std::move(text);
+    if (window != nullptr) applyTitle();
+}
+
+void DisplayWindow::applyTitle() {
+    static const AppTitle title = GetAppTitle_nid_postfix();
     char text[160];
     std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
-    SDL_SetWindowTitle(window, text);
+    const std::string full = status.empty() ? std::string(text) : std::string(text) + " | " + status;
+    SDL_SetWindowTitle(window, full.c_str());
 }
 
 void DisplayWindow::installSubclass() {

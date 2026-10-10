@@ -63,6 +63,24 @@ static void CheckTouchContact() {
     Pad::ReadState();
 }
 
+static void CheckAnalogTriggers() {
+    PadInputState partial;
+    partial.analogButtonsL2 = 100;
+    partial.analogButtonsR2 = 1;
+    partial.buttons = static_cast<std::uint32_t>(Pad::PadButton::L2) | static_cast<std::uint32_t>(Pad::PadButton::R2);
+    PadPublishInput_nid_postfix(partial);
+    auto data = Pad::ReadState();
+    Require(data.analog_buttons_l2 == 100);
+    Require(data.analog_buttons_r2 == 1);
+    PadInputState digital;
+    digital.buttons = static_cast<std::uint32_t>(Pad::PadButton::R2);
+    PadPublishInput_nid_postfix(digital);
+    data = Pad::ReadState();
+    Require(data.analog_buttons_r2 == 255);
+    Require(data.analog_buttons_l2 == 0);
+    PadPublishInput_nid_postfix(PadInputState{});
+}
+
 static void CheckReadStateHandle(int handle) {
     PadData data{};
     Require(scePadReadState(0, &data) == PAD_ERROR_INVALID_HANDLE);
@@ -99,6 +117,7 @@ int main() {
     Require(scePadGetHandle(user, 2, 0) == handle);
     CheckTiltCorrection(handle);
     CheckTouchContact();
+    CheckAnalogTriggers();
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
     Require(scePadSetVibrationMode(handle, 1) == 0);

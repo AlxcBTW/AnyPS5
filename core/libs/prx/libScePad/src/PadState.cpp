@@ -108,8 +108,8 @@ PadData Pad::ReadState() {
     data.left_stick_y = state.sticks[1];
     data.right_stick_x = state.sticks[2];
     data.right_stick_y = state.sticks[3];
-    data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (state.buttons & 0x100) != 0 ? 255 : 0);
-    data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (state.buttons & 0x200) != 0 ? 255 : 0);
+    data.analog_buttons_l2 = state.analogButtonsL2 != 0 ? state.analogButtonsL2 : (state.buttons & 0x100) != 0 ? 255 : 0;
+    data.analog_buttons_r2 = state.analogButtonsR2 != 0 ? state.analogButtonsR2 : (state.buttons & 0x200) != 0 ? 255 : 0;
 
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
