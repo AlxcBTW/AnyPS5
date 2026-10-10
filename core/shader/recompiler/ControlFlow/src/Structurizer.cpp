@@ -535,7 +535,7 @@ std::uint32_t iterationSelectionMerge(const ControlFlowGraph& graph, const Natur
     return *merge;
 }
 
-std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock& block) {
+std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock& block, bool routeLeavingExits = false) {
     const auto globalMerge = graph.FindNearestCommonPostDominator(block.terminator.trueBlock, block.terminator.falseBlock);
     const auto* loop = findInnermostContainingLoop(graph, block.id);
     const auto trueTarget = block.terminator.trueBlock;
@@ -567,6 +567,9 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
         return globalMerge;
     }
 
+    if (routeLeavingExits && graph.Dominates(block.id, loop->continueBlock) && reachesWithinIteration(graph, *loop, trueTarget, loop->continueBlock) && reachesWithinIteration(graph, *loop, falseTarget, loop->continueBlock)) {
+        return joinWithinIteration(graph, *loop, trueTarget, falseTarget, loop->continueBlock);
+    }
     if (isLoopControlGateway(graph, *loop, trueTarget) && graph.Dominates(block.id, trueTarget) && isInsideLoopConstruct(graph, *loop, falseTarget)) {
         return trueTarget;
     }
@@ -1155,6 +1158,19 @@ std::uint32_t nextGotoVariable(const ControlFlowGraph& graph) {
     return next;
 }
 
+bool hasSharedExitSelection(const ControlFlowGraph& graph, const NaturalLoop& loop) {
+    for (const auto id : loop.blocks) {
+        const auto& block = graph.FindBlock(id);
+        if (block.terminator.kind != TerminatorKind::ConditionalBranch) continue;
+        const auto globalMerge = graph.FindNearestCommonPostDominator(block.terminator.trueBlock, block.terminator.falseBlock);
+        if (globalMerge != InvalidControlFlowId && isInsideLoopConstruct(graph, loop, globalMerge)) continue;
+        for (const auto exit : loop.exitBlocks) {
+            if (exit != loop.mergeBlock && graph.Dominates(block.id, exit) && reachesWithinIteration(graph, loop, block.terminator.trueBlock, exit) && reachesWithinIteration(graph, loop, block.terminator.falseBlock, exit)) return true;
+        }
+    }
+    return false;
+}
+
 bool exitsLeaveConstruct(const ControlFlowGraph& graph, const NaturalLoop& loop) {
     std::vector<bool> visited(graph.blocks.size(), false);
     std::vector<std::uint32_t> pending;
@@ -1310,7 +1326,7 @@ bool splitOneSelectionMerge(ControlFlowGraph& graph, SplitBudget& budget, const 
             continue;
         }
 
-        const auto merge = findSelectionMerge(graph, block);
+        const auto merge = findSelectionMerge(graph, block, routeLeavingExits);
         if (merge == InvalidControlFlowId) {
             continue;
         }
@@ -1502,7 +1518,7 @@ void Structurizer::structurize(ControlFlowGraph& graph, bool privatizeReturns, b
             continue;
         }
 
-        const auto merge = findSelectionMerge(graph, block);
+        const auto merge = findSelectionMerge(graph, block, routeLeavingExits);
         if (merge == InvalidControlFlowId) {
             throw std::runtime_error("conditional block " + std::to_string(block.id) + " has no structured merge");
         }
@@ -1736,7 +1752,7 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph, bool routeL
 
         const NaturalLoop* unmerged = nullptr;
         for (const auto& loop : graph.naturalLoops) {
-            if (loop.exitBlocks.size() > 1u && (loop.mergeBlock == InvalidControlFlowId || (routeLeavingExits && exitsLeaveConstruct(graph, loop))) && (unmerged == nullptr || loop.blocks.size() < unmerged->blocks.size())) {
+            if (loop.exitBlocks.size() > 1u && (loop.mergeBlock == InvalidControlFlowId || (routeLeavingExits && (exitsLeaveConstruct(graph, loop) || hasSharedExitSelection(graph, loop)))) && (unmerged == nullptr || loop.blocks.size() < unmerged->blocks.size())) {
                 unmerged = &loop;
             }
         }
