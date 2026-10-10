@@ -1152,12 +1152,15 @@ static void CheckFailedCollectKeepsWrites() {
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 2, 0, 0, &phys) == 0);
     void* mapped = nullptr;
     Require(sceKernelMapDirectMemory(&mapped, page * 2, 3, 0, phys, 0) == 0);
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, page * 2, 3, 0, phys, 0) == 0);
     auto* shared = static_cast<volatile unsigned char*>(mapped);
     Require(collect(mapped, page * 2, count));
     shared[8] = 2;
     Require(sceKernelMprotect(const_cast<unsigned char*>(shared + page), page, 0) == 0);
     Require(!collect(mapped, page * 2, count));
     Require(collect(mapped, page, count) && count == 4);
+    Require(sceKernelMunmap(alias, page * 2) == 0);
     Require(sceKernelMunmap(mapped, page * 2) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page * 2) == 0);
 #endif
