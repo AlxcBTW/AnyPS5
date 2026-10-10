@@ -3,6 +3,7 @@
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/ShaderInfoCollector.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -427,7 +428,39 @@ static void HelperLoopRefused(LoopRead read) {
     }
     Require(false);
 }
-int main() {
+static void RefusalNamesOperands() {
+    IrProgram program;
+    static_cast<void>(HelperOnly(program, HelperRead::FullWaveExport));
+    try {
+        LowerMasked(program);
+    } catch (const std::runtime_error& error) {
+        const std::string text = error.what();
+        Require(text.find("unsupported live use (used by #") != std::string::npos);
+        Require(text.find(" SelectU32(#") != std::string::npos && text.find(" IEqual32, 0x5a3c9e17, ancillary))") != std::string::npos);
+        Require(text.find('?') == std::string::npos);
+        return;
+    }
+    Require(false);
+}
+static void HelperRefusalReason(HelperRead read, MaskedSelectRefusalReason reason, const char* part) {
+    IrProgram program;
+    const HelperProgram built = HelperOnly(program, read);
+    ConstantFolder().Fold(program);
+    DeadCodeEliminator().RemoveIdentities(program);
+    DeadCodeEliminator().Eliminate(program);
+    const auto stats = MaskedSelectEliminator().Eliminate(program, true);
+    const auto found = std::ranges::find_if(stats.refusals, [&](const MaskedSelectRefusal& refusal) { return refusal.select == built.written->Id(); });
+    Require(found != stats.refusals.end());
+    const MaskedSelectRefusal& refusal = *found;
+    Require(refusal.reason == reason);
+    Require(refusal.line.find("[ancillary] shader 0x0 select #" + std::to_string(built.written->Id()) + " kept, " + std::string(MaskedSelectRefusalCode(reason)) + ": ") == 0u);
+    Require(refusal.line.find(part) != std::string::npos);
+}
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--trace") {
+        HelperLanesRefused(HelperRead::FullWaveExport);
+        return 0;
+    }
     Extract(IrOpcode::BitFieldUExtract, 8u, 4u, StageInputKind::SampleId, 0u);
     Extract(IrOpcode::BitFieldUExtract, 9u, 2u, StageInputKind::SampleId, 1u);
     Extract(IrOpcode::BitFieldUExtract, 16u, 13u, StageInputKind::Layer, 0u);
@@ -476,4 +509,9 @@ int main() {
     HelperLoopOnly(LoopRead::ExportInside);
     HelperLoopOnly(LoopRead::UniformLoop);
     HelperLoopRefused(LoopRead::RevivedExportInside);
+    RefusalNamesOperands();
+    HelperRefusalReason(HelperRead::FullWaveExport, MaskedSelectRefusalReason::ExecReactivated, "; mask #");
+    HelperRefusalReason(HelperRead::FullWaveExport, MaskedSelectRefusalReason::ExecReactivated, "= not a helper lane");
+    HelperRefusalReason(HelperRead::DataTestExport, MaskedSelectRefusalReason::ExecReactivated, "SetAttribute runs under #");
+    HelperRefusalReason(HelperRead::Ballot, MaskedSelectRefusalReason::CrossLane, "Ballot reads other lanes");
 }
