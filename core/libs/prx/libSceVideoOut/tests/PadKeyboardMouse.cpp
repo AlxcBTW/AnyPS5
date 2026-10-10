@@ -727,6 +727,52 @@ void testNonAsciiPaths() {
     std::filesystem::remove_all(directory, ignored);
 }
 
+void testReportRateSmoothing() {
+    const double speed = 0.5 * Pad::MouseFullTiltCountsPerSecond;
+    const double expected = expectedDeflection(defaults().settings, 0.5);
+    for (const double reportHz : {125.0, 250.0, 1000.0}) {
+        std::vector<TimedEvent> events{PadSimulation::MouseModeAt(0.0, true)};
+        PadSimulation::AppendMotion(events, 0.0, 2000.0, speed, 0.0, reportHz);
+        for (const double poll : {16.7, 8.3, 6.9, 1.0}) {
+            using Clock = Pad::KeyboardMouse::Clock;
+            const auto origin = Clock::time_point{} + std::chrono::hours(1);
+            const auto at = [origin](double ms) { return origin + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(ms)); };
+            Pad::KeyboardMouse keyboardMouse(defaults());
+            keyboardMouse.Advance(at(0.0));
+            std::size_t next = 0;
+            double low = 1.0;
+            double high = 0.0;
+            for (double ms = poll; ms <= 2000.0; ms += poll) {
+                for (; next < events.size() && events[next].ms <= ms; ++next) {
+                    if (events[next].setMouseMode) keyboardMouse.SetMouseMode(true);
+                    else keyboardMouse.HandleEvent(events[next].event, at(ms));
+                }
+                keyboardMouse.Advance(at(ms));
+                if (ms < 1000.0) continue;
+                const double value = axis(keyboardMouse.Compose({}).sticks[2]);
+                low = std::min(low, value);
+                high = std::max(high, value);
+            }
+            const double rate = keyboardMouse.MouseReportRate();
+            check(reportHz >= 500.0 || std::abs(rate - reportHz) < 0.1 * reportHz, "measured " + std::to_string(rate) + " reports/s for a " + std::to_string(reportHz) + " Hz mouse at " + std::to_string(poll) + " ms polls");
+            const double smoothing = keyboardMouse.MouseSmoothingMs();
+            check(std::abs(smoothing - std::max(10.0, 3000.0 / reportHz)) < 0.15 * smoothing, "smoothing " + std::to_string(smoothing) + " ms for " + std::to_string(reportHz) + " Hz");
+            const double spread = high - low;
+            check(spread < 0.125, "a " + std::to_string(reportHz) + " Hz mouse at " + std::to_string(poll) + " ms polls wavers by " + std::to_string(spread));
+            check(std::abs((high + low) / 2.0 - expected) < 0.05, "and stays around the expected tilt");
+        }
+    }
+    Pad::MouseStick slow(defaults().settings);
+    for (int step = 0; step < 40; ++step) {
+        slow.Move(30, 0);
+        slow.Advance(0.025);
+    }
+    check(std::abs(slow.ReportRate() - 40.0) < 2.0 && slow.SmoothingMs() == Pad::MouseSmoothingLimitMs, "smoothing for very slow reports stops at 30 ms");
+    const auto off = parse("MouseSmoothingMs = 0\n");
+    Pad::KeyboardMouse keyboardMouse(off);
+    check(keyboardMouse.MouseSmoothingMs() == 0.0, "MouseSmoothingMs = 0 keeps smoothing off");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -852,6 +898,7 @@ int main(int argc, char** argv) {
             {"keyboard and mouse target", testKeyboardMouseTarget},
             {"mouse on the left stick", testMouseOnLeftStick},
             {"non-ASCII paths", testNonAsciiPaths},
+            {"report rate smoothing", testReportRateSmoothing},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };
