@@ -1259,6 +1259,12 @@ void verifyNarrowVertexWave() {
     const auto wide64 = prepared(culling, 64u);
     require(!wide64.empty() && reductions(wide64) == 0u, "narrow vertex wave: the NGG culling scan, keyed on lanes below 64 on 64 lanes, did not keep its DPP scan");
     require(prepares(patched({{6, 0x80060015u}}), 32u), "narrow vertex wave: the scan keyed on lanes below the vertex count in s3 did not prepare on 32 lanes");
+    static constexpr std::array<std::uint32_t, 3> noArithmetic{spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle};
+    const auto otherKeys = patched({{7, 0x360e0a82u}});
+    auto withoutArithmetic = vertex(otherKeys, 64u, 32u, 8u);
+    withoutArithmetic.target.supportedCapabilities = noArithmetic;
+    const auto shuffled = GetPreparedArtifact(*PrepareShader(withoutArithmetic)).spirv;
+    require(!shuffled.empty() && reductions(shuffled) == 0u, "narrow vertex wave: without subgroup arithmetic, the scan did not keep lane 31 as a shuffle with lane 63 read as 0");
     require(prepares(patched({{5, 0x7da82aa0u}, {6, 0xbf800000u}}), 32u), "narrow vertex wave: the scan keyed on lanes below 32 did not prepare on 32 lanes");
     expectFailure([&] { static_cast<void>(prepares(patched({{5, 0x7da82aa1u}, {6, 0xbf800000u}}), 32u)); }, lane63, "narrow vertex wave: a scan keyed on lanes below 33 read lane 63");
     expectFailure([&] { static_cast<void>(prepares(culling, 32u, 0u)); }, lane63, "narrow vertex wave: a scan keyed on a count from user data read lane 63");

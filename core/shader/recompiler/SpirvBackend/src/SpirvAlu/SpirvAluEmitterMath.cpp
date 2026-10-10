@@ -557,7 +557,8 @@ std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, c
     if (state.program.WaveSize() != 64u || (lane & 31u) != 31u) return std::nullopt;
     const auto stage = state.program.Resources().stage;
     auto scan = MatchHalfWaveScan(inst.Argument(0), stage, false);
-    if (!scan && HostSubgroupNarrowerThanWave(state) && state.hostSubgroupSize == 32u) scan = MatchHalfWaveScan(inst.Argument(0), stage, true);
+    const bool narrow = !scan && HostSubgroupNarrowerThanWave(state) && state.hostSubgroupSize == 32u;
+    if (narrow) scan = MatchHalfWaveScan(inst.Argument(0), stage, true);
     if (!scan) return std::nullopt;
     if (scan->reduction->floating) {
         if (lane < 32u || state.hostSubgroupSize > 32u) return std::nullopt;
@@ -565,7 +566,10 @@ std::optional<std::uint32_t> EmitHalfWaveReduction(SpirvValueEmitContext& ctx, c
     }
     const auto read = "v_readlane_b32 of lane " + std::to_string(lane) + " of a wave64 half-wave reduction scan";
     const auto& capabilities = state.supportedCapabilities;
-    if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) == capabilities.end()) ctx.Fail(inst, (read + " needs subgroup arithmetic, which the device lacks").c_str());
+    if (std::find(capabilities.begin(), capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityGroupNonUniformArithmetic)) == capabilities.end()) {
+        if (narrow) return lane >= 32u ? std::optional<std::uint32_t>(ConstantU32(state, scan->reduction->identity)) : std::nullopt;
+        ctx.Fail(inst, (read + " needs subgroup arithmetic, which the device lacks").c_str());
+    }
     if (state.hostSubgroupSize > 64u) ctx.Fail(inst, (read + " on a " + std::to_string(state.hostSubgroupSize) + "-lane host subgroup, which is wider than the wave").c_str());
     const auto identity = ConstantU32(state, scan->reduction->identity);
     if (lane >= 32u && state.hostSubgroupSize <= 32u) return identity;
