@@ -270,8 +270,9 @@ PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const
     }
     if (mouseMode) {
         const auto deflection = mouse.Deflection();
-        state.sticks[2] = StickByte(deflection[0]);
-        state.sticks[3] = StickByte(deflection[1]);
+        const std::size_t axis = configuration.settings.mouseStick == MouseStickSide::Left ? 0 : 2;
+        state.sticks[axis] = StickByte(deflection[0]);
+        state.sticks[axis + 1] = StickByte(deflection[1]);
     }
     const auto triggerByte = [](double value) { return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0)); };
     state.analogButtonsL2 = std::max(state.analogButtonsL2, triggerByte(std::max(triggerAxes[0], wheelTriggers[0])));

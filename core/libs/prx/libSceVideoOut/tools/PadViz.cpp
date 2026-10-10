@@ -600,9 +600,13 @@ private:
         constexpr double StickHeight = 456.0;
         constexpr double ButtonsHeight = 172.0;
         drawHeader(configuration);
-        drawStick(Margin, Top, StickWidth, StickHeight, 0, "Left stick", keysFor(configuration, 0));
-        drawStick(Margin + StickWidth + PanelGap, Top, StickWidth, StickHeight, 2, "Right stick",
-            keyboardMouse->MouseMode() ? "Mouse, captured" : keysFor(configuration, 2) + ", or the mouse");
+        const std::size_t mouseAxis = configuration.settings.mouseStick == Pad::MouseStickSide::Left ? 0 : 2;
+        const auto keysLine = [&](std::size_t axis) {
+            if (axis != mouseAxis) return keysFor(configuration, static_cast<int>(axis));
+            return keyboardMouse->MouseMode() ? std::string("Mouse, captured") : keysFor(configuration, static_cast<int>(axis)) + ", or the mouse";
+        };
+        drawStick(Margin, Top, StickWidth, StickHeight, 0, "Left stick", keysLine(0));
+        drawStick(Margin + StickWidth + PanelGap, Top, StickWidth, StickHeight, 2, "Right stick", keysLine(2));
         drawButtons(Margin, Top + StickHeight + PanelGap, StickWidth * 2.0 + PanelGap, ButtonsHeight);
         const double settingsX = Margin + (StickWidth + PanelGap) * 2.0;
         drawSettings(settingsX, Top, WindowWidth - Margin - settingsX, StickHeight + PanelGap + ButtonsHeight, configuration, now);
@@ -637,7 +641,7 @@ private:
         const double centerX = x + width / 2.0;
         const double centerY = y + 66.0 + Radius;
         const auto& settings = keyboardMouse->Configuration().settings;
-        const bool rightStick = axis == 2;
+        const bool rightStick = axis == (settings.mouseStick == Pad::MouseStickSide::Left ? 0u : 2u);
         const bool mouseStick = rightStick && keyboardMouse->MouseMode();
         canvas->Disc(centerX, centerY, Radius, Palette::Background);
         canvas->Line(centerX - Radius, centerY, centerX + Radius, centerY, 1.0, Palette::Raised);

@@ -151,6 +151,7 @@ The mouse settings go in the same file:
 | `MouseMaxSpeed` | `1.0` | 0.1 to 10 | Highest tracked speed, as a multiple of the full-tilt speed. Above 1, a fast flick keeps the stick at full tilt a little longer after the mouse stops. |
 | `MouseSmoothingMs` | `10` | 0 to 500 | Smoothing time constant in milliseconds. 0 follows every mouse report directly. |
 | `MouseDecayMs` | `30` | 1 to 1000 | Milliseconds without movement after which the stick is centered. |
+| `MouseStick` | `right` | `right` or `left` | The stick the captured mouse drives. `left` suits games that steer with the left stick, such as flight or top-down games. While the mouse is captured, the keys of that stick are ignored. |
 
 For example, for a game with a small deadzone that needs fast turns:
 
