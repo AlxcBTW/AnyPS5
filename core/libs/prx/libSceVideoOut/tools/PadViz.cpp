@@ -889,11 +889,11 @@ private:
             SDL_PushEvent(&copy);
         };
         if (frame == 2) push(PadSimulation::KeyEvent(SDL_SCANCODE_W, true));
-        if (frame == 3) push(PadSimulation::KeyEvent(SDL_SCANCODE_Z, true));
+        if (frame == 3) push(PadSimulation::KeyEvent(SDL_SCANCODE_LALT, true));
         if (frame == 4) push(PadSimulation::KeyEvent(SDL_SCANCODE_SPACE, true));
         if (frame == 5) {
             push(PadSimulation::KeyEvent(SDL_SCANCODE_W, false));
-            push(PadSimulation::KeyEvent(SDL_SCANCODE_Z, false));
+            push(PadSimulation::KeyEvent(SDL_SCANCODE_LALT, false));
             push(PadSimulation::KeyEvent(SDL_SCANCODE_SPACE, false));
         }
         if (frame == 6) {
@@ -904,7 +904,7 @@ private:
         if (frame == 20) {
             push(PadSimulation::KeyEvent(SDL_SCANCODE_W, true));
             push(PadSimulation::KeyEvent(SDL_SCANCODE_D, true));
-            push(PadSimulation::KeyEvent(SDL_SCANCODE_Z, true));
+            push(PadSimulation::KeyEvent(SDL_SCANCODE_LALT, true));
         }
     }
 
