@@ -88,8 +88,6 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
-// Write-watch prewalk (see BeginPrewalk): ranges a helper looked at and found clean, and memoized
-// collects that skipped marked blocks (all of their range for `prewalkSkipped`).
 std::atomic<std::uint64_t> prewalkLooks{0};
 std::atomic<std::uint64_t> prewalkClean{0};
 std::atomic<std::uint64_t> prewalkTrimmed{0};
@@ -735,9 +733,6 @@ struct WriteTracker {
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
     std::vector<std::uint32_t> cpuBlocks;
     std::vector<std::uint32_t> writtenBlocks;
-    // Per 64 KiB block, the generation of the last completed resetting walk that covered it whole,
-    // or of the last prewalk look that found it clean (see BeginPrewalk): every CPU write made before
-    // that generation was taken is stamped in `blocks`.
     std::vector<std::uint32_t> walkedBlocks;
     WriteWatchCoverage coverage;
 #else
@@ -970,8 +965,6 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 thread_local std::uint64_t threadCollectEpoch = 0;
-// The tracker generation when the calling thread's epoch began: a walk or a prewalk look with a
-// newer generation started after that ordering point.
 thread_local std::uint32_t threadEpochGeneration = 0;
 
 std::uint64_t currentCollectEpoch() {
@@ -1090,8 +1083,6 @@ bool prewalkEnabled() {
     return enabled;
 }
 
-// One per prewalk thread (see BeginPrewalk): looks at the ranges its owner posts, in order, and
-// marks the clean ones in walkedBlocks. A newer post abandons the rest of the current job.
 class Prewalker {
 public:
     void Start() {
@@ -1132,7 +1123,6 @@ private:
     std::condition_variable idle;
     WalkRanges job;
     std::uint64_t serial = 0;
-    // The owner's epoch generation when the job was posted: blocks marked after it are not looked at again.
     std::uint32_t since = 0;
     bool busy = false;
     bool stopping = false;
@@ -1141,8 +1131,6 @@ private:
 };
 
 void Prewalker::run() {
-    // Off the queue workers' cores: on a hybrid CPU the helper runs on the efficiency cores unless
-    // APS5_HELPER_AFFINITY_MASK names others.
     const auto& layout = CpuTopology::Get();
     if (CpuTopology::MaskFromEnvironment("APS5_HELPER_AFFINITY_MASK") != 0) CpuTopology::PinHelperThread("write-watch prewalk");
     else if (layout.hybrid) CpuTopology::PinTraced("write-watch prewalk", nullptr, layout.efficient);
@@ -1173,7 +1161,6 @@ void Prewalker::run() {
 
 void Prewalker::look(WriteTracker& tracker, std::uint64_t begin, std::uint64_t end, std::uint32_t ownerSince) {
     if (begin < tracker.base || end <= begin) return;
-    // Whole blocks inside the arena first, so a clean answer marks every block the range touches.
     auto first = tracker.base + (begin - tracker.base) / WriteBlockBytes * WriteBlockBytes;
     auto stop = std::min<std::uint64_t>(tracker.base + tracker.size, tracker.base + (end - tracker.base + WriteBlockBytes - 1) / WriteBlockBytes * WriteBlockBytes);
     if (stop <= first) return;
@@ -1204,8 +1191,6 @@ void Prewalker::look(WriteTracker& tracker, std::uint64_t begin, std::uint64_t e
     prewalkClean.fetch_add(1, std::memory_order_relaxed);
 }
 
-// The calling thread's walk log and helper. The log of an epoch is kept under the begin of its
-// first walk; that walk itself is left out, as the worker makes it right after posting.
 struct PrewalkOwner {
     bool enabled = false;
     std::uint64_t epoch = 0;
@@ -1245,16 +1230,12 @@ struct PrewalkOwner {
     }
 
     ~PrewalkOwner() {
-        // A thread that ends without EndPrewalk: its helper is stopped from a detached thread that
-        // keeps it alive, never joined here (a thread-exit destructor can hold the loader lock).
         if (!helper) return;
         std::thread([kept = helper] { kept->Stop(); }).detach();
     }
 };
 thread_local PrewalkOwner prewalkOwner;
 
-// Of [first, stop), the parts outside the 64 KiB blocks marked after `since` (partial blocks
-// included: a mark covers its whole block). Under the tracker mutex.
 void unmarkedPieces(const WriteTracker& tracker, std::uint32_t since, std::uint64_t first, std::uint64_t stop, WalkRanges& kept) {
     kept.clear();
     auto cursor = first;
