@@ -220,9 +220,8 @@ void PadInput::HandleEvent(const SDL_Event& event) {
         publish();
         return;
     }
-    if (event.type == SDL_WINDOWEVENT && (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST || event.window.event == SDL_WINDOWEVENT_CLOSE)) {
-        keyboardMouse.Release();
-        if (keyboardMouse.MouseMode()) setMouseMode(false);
+    if (event.type == SDL_WINDOWEVENT) {
+        if (keyboardMouse.HandleEvent(event, std::chrono::steady_clock::now()).releaseMouse) setMouseMode(false);
         publish();
         return;
     }
@@ -235,6 +234,7 @@ void PadInput::HandleEvent(const SDL_Event& event) {
     const auto requests = keyboardMouse.HandleEvent(event, std::chrono::steady_clock::now());
     if (requests.toggleFullscreen && window.Handle() != nullptr && event.key.windowID == SDL_GetWindowID(window.Handle())) window.ToggleFullscreen();
     if (requests.toggleMouse) setMouseMode(!keyboardMouse.MouseMode());
+    if (requests.releaseMouse) setMouseMode(false);
     if (event.type != SDL_MOUSEMOTION) publish();
 }
 

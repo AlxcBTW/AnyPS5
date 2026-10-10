@@ -330,19 +330,20 @@ std::vector<std::string> Pad::DescribeBindings(const InputConfiguration& configu
 }
 
 std::string Pad::MouseCaptureHint(const InputConfiguration& configuration, bool captured) {
-    const auto found = std::find_if(configuration.bindings.begin(), configuration.bindings.end(), [](const InputBinding& binding) {
-        return binding.control == InputControl::ToggleMouse;
-    });
-    if (found == configuration.bindings.end()) return {};
     std::string action;
-    switch (found->mouseButton) {
-        case MouseButton::Left: action = "left-click"; break;
-        case MouseButton::Middle: action = "middle-click"; break;
-        case MouseButton::Right: action = "right-click"; break;
-        case MouseButton::X1: action = "press mouse button 4"; break;
-        case MouseButton::X2: action = "press mouse button 5"; break;
-        case MouseButton::None: action = "press " + SourceName(*found); break;
+    for (const auto& binding : configuration.bindings) {
+        if (binding.control != InputControl::ToggleMouse) continue;
+        if (!action.empty()) action += " or ";
+        switch (binding.mouseButton) {
+            case MouseButton::Left: action += "left-click"; break;
+            case MouseButton::Middle: action += "middle-click"; break;
+            case MouseButton::Right: action += "right-click"; break;
+            case MouseButton::X1: action += "press mouse button 4"; break;
+            case MouseButton::X2: action += "press mouse button 5"; break;
+            case MouseButton::None: action += "press " + SourceName(binding); break;
+        }
     }
+    if (action.empty()) return {};
     if (captured) return "Mouse captured, " + action + " to release";
     action[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(action[0])));
     return action + " to capture the mouse";
