@@ -51,6 +51,7 @@ constexpr auto actions = std::array{
     InputAction{"RightStickDown", Pad::InputControl::RightStickDown, Pad::PadButton::None},
     InputAction{"TouchLeft", Pad::InputControl::TouchLeft, Pad::PadButton::None},
     InputAction{"TouchRight", Pad::InputControl::TouchRight, Pad::PadButton::None},
+    InputAction{"StickModifier", Pad::InputControl::StickModifier, Pad::PadButton::None},
     InputAction{"ToggleMouse", Pad::InputControl::ToggleMouse, Pad::PadButton::None},
     InputAction{"ToggleFullscreen", Pad::InputControl::ToggleFullscreen, Pad::PadButton::None}
 };
@@ -69,7 +70,9 @@ constexpr auto settings = std::array{
     InputSetting{"MouseDeadzoneOffset", &Pad::InputSettings::mouseDeadzoneOffset, 0.0, 0.9},
     InputSetting{"MouseMaxSpeed", &Pad::InputSettings::mouseMaxSpeed, 0.1, 10.0},
     InputSetting{"MouseSmoothingMs", &Pad::InputSettings::mouseSmoothingMs, 0.0, 500.0},
-    InputSetting{"MouseDecayMs", &Pad::InputSettings::mouseDecayMs, 1.0, 1000.0}
+    InputSetting{"MouseDecayMs", &Pad::InputSettings::mouseDecayMs, 1.0, 1000.0},
+    InputSetting{"StickModifierScale", &Pad::InputSettings::stickModifierScale, 0.05, 1.0},
+    InputSetting{"KeyboardRampMs", &Pad::InputSettings::keyboardRampMs, 0.0, 2000.0}
 };
 
 std::string upper(std::string_view value) {
