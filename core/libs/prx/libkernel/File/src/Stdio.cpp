@@ -443,14 +443,7 @@ int APS5_VABI chmod_nid_postfix(const char* path, int mode) {
 
 int APS5_VABI close_nid_postfix(int d) {
     if (d >= GuestSockets::FirstDescriptor) return GuestSockets::Close(d);
-    File::ForgetRandomDevice(d);
-#ifdef _WIN32
-    File::ForgetDirectoryDescriptor(d);
-    File::ForgetFileLock(d);
-    return _close(d);
-#else
-    return ::close(d);
-#endif
+    return PosixResult(sceKernelClose(d));
 }
 
 int APS5_VABI _close_nid_postfix(int descriptor) {
