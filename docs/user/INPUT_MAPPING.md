@@ -4,7 +4,7 @@ AnyPS5 accepts SDL-mapped game controllers as well as its built-in keyboard and 
 
 For an Xbox-layout controller, A/B/X/Y map to Cross/Circle/Square/Triangle, LB/RB map to L1/R1, and LT/RT map to analog L2/R2. Start maps to Options. D-pad and stick-click buttons are supported. On a PlayStation controller, the touchpad click button is forwarded; finger touch coordinates are not implemented.
 
-Each non-empty line has the form `Action = Type:Value`. Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
+Each non-empty line has the form `Action = Type:Value`, or `Setting = number` for the [mouse settings](#mouse-as-the-right-stick). Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
 
 Supported input sources are:
 
@@ -31,3 +31,31 @@ ToggleMouse = MOUSE:Middle
 ```
 
 An invalid line reports the file and line number and stops input initialization. If the configured file does not exist or cannot be read, AnyPS5 reports an error. With no `anyps5-input.ini` and no `ANYPS5_INPUT_CONFIG`, the built-in mapping is used.
+
+## Mouse as the right stick
+
+`ToggleMouse` (the middle mouse button by default) captures the mouse and drives the right stick from how fast the mouse moves. Capture uses raw relative input, so the pointer speed and acceleration set in the operating system don't apply. Press it again, or switch to another window, to release the mouse.
+
+The stick tilts in the direction the mouse moves, and further the faster it moves. Any movement tilts the stick at least `MouseDeadzoneOffset`, so slow movement isn't lost inside the game's own deadzone. When the mouse stops, the stick eases back and is centered `MouseDecayMs` after the last movement. Speed is measured in counts per second over the time between updates, so the same hand speed gives the same tilt at any frame rate. A mouse that reports only 125 or 250 times per second lands an uneven number of reports in each frame, which makes a steady movement waver; raise `MouseSmoothingMs` to 20 or 25 for such a mouse.
+
+These settings go in the same file, one `Setting = number` per line. Setting names are case-insensitive, and each may appear once.
+
+| Setting | Default | Range | Effect |
+| --- | --- | --- | --- |
+| `MouseSensitivity` | `1.0` | 0.01 to 100 | At 1.0, moving the mouse 3000 counts per second tilts the stick fully. That is about 5 cm per second at 1600 DPI. |
+| `MouseVerticalScale` | `1.0` | 0.1 to 10 | Multiplies vertical mouse speed, for games that pitch slower or faster than they turn. |
+| `MouseCurve` | `1.0` | 0.2 to 5 | Response exponent. Above 1 gives finer control at low speed; below 1 reaches large tilts sooner. |
+| `MouseDeadzoneOffset` | `0.2` | 0 to 0.9 | Smallest tilt any movement produces, as a fraction of full tilt. Set it just above the game's own deadzone: raise it if slow movement doesn't move the camera, lower it if small movements jump. |
+| `MouseMaxSpeed` | `1.0` | 0.1 to 10 | Highest tracked speed, as a multiple of the full-tilt speed. Above 1, a fast flick keeps the stick at full tilt a little longer after the mouse stops. |
+| `MouseSmoothingMs` | `10` | 0 to 500 | Smoothing time constant in milliseconds. 0 follows every mouse report directly. |
+| `MouseDecayMs` | `30` | 1 to 1000 | Milliseconds without movement after which the stick is centered. |
+
+For example, for a game with a small deadzone that needs fast turns:
+
+```ini
+MouseSensitivity = 1.6
+MouseDeadzoneOffset = 0.12
+MouseCurve = 1.3
+```
+
+Earlier versions sampled the mouse every 33 ms and tilted the stick at least halfway for any movement. `MouseDeadzoneOffset = 0.5`, `MouseSensitivity = 0.9`, `MouseSmoothingMs = 0` and `MouseDecayMs = 33` come close to that behaviour.

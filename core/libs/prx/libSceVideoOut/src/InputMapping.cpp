@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -53,6 +55,23 @@ constexpr auto actions = std::array{
     InputAction{"ToggleFullscreen", Pad::InputControl::ToggleFullscreen, Pad::PadButton::None}
 };
 
+struct InputSetting {
+    std::string_view name;
+    double Pad::InputSettings::* field;
+    double minimum;
+    double maximum;
+};
+
+constexpr auto settings = std::array{
+    InputSetting{"MouseSensitivity", &Pad::InputSettings::mouseSensitivity, 0.01, 100.0},
+    InputSetting{"MouseVerticalScale", &Pad::InputSettings::mouseVerticalScale, 0.1, 10.0},
+    InputSetting{"MouseCurve", &Pad::InputSettings::mouseCurve, 0.2, 5.0},
+    InputSetting{"MouseDeadzoneOffset", &Pad::InputSettings::mouseDeadzoneOffset, 0.0, 0.9},
+    InputSetting{"MouseMaxSpeed", &Pad::InputSettings::mouseMaxSpeed, 0.1, 10.0},
+    InputSetting{"MouseSmoothingMs", &Pad::InputSettings::mouseSmoothingMs, 0.0, 500.0},
+    InputSetting{"MouseDecayMs", &Pad::InputSettings::mouseDecayMs, 1.0, 1000.0}
+};
+
 std::string upper(std::string_view value) {
     std::string result(value);
     std::transform(result.begin(), result.end(), result.begin(), [](unsigned char character) {
@@ -65,6 +84,33 @@ std::string_view trim(std::string_view value) {
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())) != 0) value.remove_prefix(1);
     while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())) != 0) value.remove_suffix(1);
     return value;
+}
+
+const InputSetting* findSetting(std::string_view name) {
+    const auto normalized = upper(name);
+    for (const auto& setting : settings) {
+        if (upper(setting.name) == normalized) return &setting;
+    }
+    return nullptr;
+}
+
+std::string formatNumber(double value) {
+    std::array<char, 32> buffer{};
+    const auto [last, error] = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value);
+    return error == std::errc{} ? std::string(buffer.data(), last) : std::to_string(value);
+}
+
+double parseSetting(const InputSetting& setting, std::string_view value) {
+    double number = 0.0;
+    const auto* end = value.data() + value.size();
+    const auto [last, error] = std::from_chars(value.data(), end, number);
+    if (value.empty() || error != std::errc{} || last != end || !std::isfinite(number)) {
+        throw std::runtime_error(std::string(setting.name) + " must be a number");
+    }
+    if (number < setting.minimum || number > setting.maximum) {
+        throw std::runtime_error(std::string(setting.name) + " must be between " + formatNumber(setting.minimum) + " and " + formatNumber(setting.maximum));
+    }
+    return number;
 }
 
 const InputAction* findAction(std::string_view name) {
@@ -133,35 +179,35 @@ std::filesystem::path defaultConfigPath() {
 
 }
 
-std::vector<Pad::InputBinding> Pad::LoadInputMapping() {
-    std::vector<InputBinding> bindings(InputMapping.begin(), InputMapping.end());
-    const char* configuredPath = std::getenv("ANYPS5_INPUT_CONFIG");
-    const bool explicitPath = configuredPath != nullptr && configuredPath[0] != '\0';
-    const std::filesystem::path path = explicitPath ? configuredPath : defaultConfigPath();
-    std::ifstream file(path);
-    if (!file) {
-        if (explicitPath || std::filesystem::exists(path)) {
-            throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
-        }
-        return bindings;
-    }
-
+Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const std::filesystem::path& path) {
+    InputConfiguration configuration{{InputMapping.begin(), InputMapping.end()}, {}, path};
+    auto& bindings = configuration.bindings;
     std::unordered_set<std::string> overriddenActions;
+    std::unordered_set<std::string> givenSettings;
     std::string line;
     std::size_t lineNumber = 0;
-    while (std::getline(file, line)) {
+    while (std::getline(stream, line)) {
         ++lineNumber;
         if (lineNumber == 1 && line.starts_with("\xEF\xBB\xBF")) line.erase(0, 3);
         const auto comment = line.find_first_of("#;");
         const std::string_view content = trim(std::string_view(line).substr(0, comment));
         if (content.empty()) continue;
         const auto separator = content.find('=');
-        if (separator == std::string_view::npos) invalidLine(path, lineNumber, "expected Action = TYPE:VALUE");
+        if (separator == std::string_view::npos) invalidLine(path, lineNumber, "expected Action = TYPE:VALUE or Setting = number");
 
         const auto actionName = trim(content.substr(0, separator));
         const auto source = trim(content.substr(separator + 1));
+        if (const auto* setting = findSetting(actionName)) {
+            if (!givenSettings.insert(upper(setting->name)).second) invalidLine(path, lineNumber, std::string(setting->name) + " is given twice");
+            try {
+                configuration.settings.*(setting->field) = parseSetting(*setting, source);
+            } catch (const std::runtime_error& error) {
+                invalidLine(path, lineNumber, error.what());
+            }
+            continue;
+        }
         const auto* action = findAction(actionName);
-        if (action == nullptr) invalidLine(path, lineNumber, "unknown action '" + std::string(actionName) + "'");
+        if (action == nullptr) invalidLine(path, lineNumber, "unknown action or setting '" + std::string(actionName) + "'");
         if (source.empty()) invalidLine(path, lineNumber, "source is empty");
 
         try {
@@ -180,7 +226,21 @@ std::vector<Pad::InputBinding> Pad::LoadInputMapping() {
             invalidLine(path, lineNumber, error.what());
         }
     }
-    if (file.bad()) throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
+    if (stream.bad()) throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
 
-    return bindings;
+    return configuration;
+}
+
+Pad::InputConfiguration Pad::LoadInputConfiguration() {
+    const char* configuredPath = std::getenv("ANYPS5_INPUT_CONFIG");
+    const bool explicitPath = configuredPath != nullptr && configuredPath[0] != '\0';
+    const std::filesystem::path path = explicitPath ? configuredPath : defaultConfigPath();
+    std::ifstream file(path);
+    if (!file) {
+        if (explicitPath || std::filesystem::exists(path)) {
+            throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
+        }
+        return InputConfiguration{{InputMapping.begin(), InputMapping.end()}, {}, {}};
+    }
+    return ParseInputConfiguration(file, path);
 }
