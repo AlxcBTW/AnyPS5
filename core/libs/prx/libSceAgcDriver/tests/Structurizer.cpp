@@ -339,6 +339,7 @@ int main() {
         auto chain = makeGraph(diamonds);
         Structurizer{}.Structurize(chain);
         requireExactPostDominators(chain, "a chain of fifty selections");
+        requireStructuredLoop({{1}, {2, 8}, {3, 5}, {4, 8}, {7}, {6, 7}, {7, 8}, {1}, {}}, "nested selections sharing a loop continuation");
         auto sharedDiscard = makeGraph({{5, 1}, {4, 2}, {7, 3}, {7, 4}, {5}, {7, 6}, {}, {}});
         const std::vector<std::uint32_t> sharedDiscardWords{444, 1944, 68, 1128, 8, 2084, 148, 28};
         for (auto& block : sharedDiscard.blocks) {

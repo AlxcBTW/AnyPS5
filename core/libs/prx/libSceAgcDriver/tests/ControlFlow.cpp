@@ -409,6 +409,8 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     const std::vector<Program> programs{
+        {"nested selections share a loop continuation", "Synthetic loop with two nested selections and a shared continue; the inner selection does not dominate the continuation.",
+         {0x060202ffu, 0x3f800000u, 0x060202ffu, 0x3f810000u, 0x7d880084u, 0xbf870001u, 0xbf820018u, 0x060202ffu, 0x3f820000u, 0x7d880085u, 0xbf87000cu, 0x060202ffu, 0x3f850000u, 0x7d880088u, 0xbf870003u, 0x060202ffu, 0x3f870000u, 0xbf82fff0u, 0x060202ffu, 0x3f860000u, 0x7d880089u, 0xbf87fff9u, 0xbf820008u, 0x060202ffu, 0x3f830000u, 0x7d880086u, 0xbf870001u, 0xbf820003u, 0x060202ffu, 0x3f840000u, 0xbf82fff0u, 0x060202ffu, 0x3f880000u, 0xe0700000u, 0x80000100u, 0xbf810000u}, Split::None},
         {"reduced shared exit junction from the public CFG fuzz report", "Public reduced word stream from #2762; synthetic regression, not title data.",
          {0x060202f2u, 0x060202f4u, 0x7d880084u, 0xbf870001u, 0xbf820011u, 0x060202ffu, 0x3f820000u, 0x7d880085u, 0xbf870005u,
           0x060202ffu, 0x3f850000u, 0x7d880088u, 0xbf870009u, 0xbf82fff3u, 0x060202ffu, 0x3f840000u, 0x7d880087u, 0xbf870001u,
