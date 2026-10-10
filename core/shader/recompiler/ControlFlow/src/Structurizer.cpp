@@ -314,6 +314,61 @@ bool reachesWithinIteration(const ControlFlowGraph& graph, const NaturalLoop& lo
     return false;
 }
 
+std::uint32_t joinWithinIteration(const ControlFlowGraph& graph, const NaturalLoop& loop, std::uint32_t trueTarget, std::uint32_t falseTarget, std::uint32_t globalMerge) {
+    std::vector<std::uint32_t> reached;
+    std::vector<std::uint32_t> pending = {trueTarget, falseTarget};
+    while (!pending.empty()) {
+        const auto blockId = pending.back();
+        pending.pop_back();
+        if (blockId == globalMerge || contains(reached, blockId) || !isInsideLoopConstruct(graph, loop, blockId)) {
+            continue;
+        }
+        reached.push_back(blockId);
+        const auto& successors = graph.FindBlock(blockId).successors;
+        pending.insert(pending.end(), successors.begin(), successors.end());
+    }
+    std::vector<std::uint32_t> joining = {globalMerge};
+    for (std::size_t index = 0; index < joining.size(); ++index) {
+        for (const auto predecessor : graph.FindBlock(joining[index]).predecessors) {
+            if (contains(reached, predecessor) && !contains(joining, predecessor)) {
+                joining.push_back(predecessor);
+            }
+        }
+    }
+    sortUnique(joining);
+    if (!contains(joining, trueTarget) || !contains(joining, falseTarget)) {
+        return globalMerge;
+    }
+    std::vector<std::vector<std::uint32_t>> postDominators(graph.blocks.size());
+    for (const auto blockId : joining) {
+        postDominators[blockId] = blockId == globalMerge ? std::vector<std::uint32_t>{globalMerge} : joining;
+    }
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (const auto blockId : joining) {
+            if (blockId == globalMerge) {
+                continue;
+            }
+            auto next = joining;
+            for (const auto successor : graph.FindBlock(blockId).successors) {
+                if (contains(joining, successor)) {
+                    next = intersectSorted(next, postDominators[successor]);
+                }
+            }
+            addSortedUnique(next, blockId);
+            if (next != postDominators[blockId]) {
+                postDominators[blockId] = std::move(next);
+                changed = true;
+            }
+        }
+    }
+    const auto common = intersectSorted(postDominators[trueTarget], postDominators[falseTarget]);
+    const auto merge = std::find_if(common.begin(), common.end(), [&](std::uint32_t candidate) {
+        return std::all_of(common.begin(), common.end(), [&](std::uint32_t other) { return contains(postDominators[candidate], other); });
+    });
+    return merge == common.end() ? globalMerge : *merge;
+}
+
 std::vector<std::uint32_t> linearTail(const ControlFlowGraph& graph, std::uint32_t start) {
     std::vector<std::uint32_t> tail;
     for (auto blockId = start; !contains(tail, blockId);) {
@@ -543,6 +598,9 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
             if (const auto merge = iterationSelectionMerge(graph, *loop, block, globalMerge); merge != InvalidControlFlowId) {
                 return merge;
             }
+        }
+        if (trueJoins && isInsideLoopConstruct(graph, *loop, globalMerge)) {
+            return joinWithinIteration(graph, *loop, trueTarget, falseTarget, globalMerge);
         }
     }
     return globalMerge;
