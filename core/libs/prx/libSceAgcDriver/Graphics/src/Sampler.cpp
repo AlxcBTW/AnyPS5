@@ -12,6 +12,7 @@ namespace AgcDriver::Graphics {
         Require(descriptor.lodBias >= -context.limits.maxSamplerLodBias && descriptor.lodBias <= context.limits.maxSamplerLodBias, "guest sampler descriptor requests a LOD bias beyond the device limit");
         Require(!(descriptor.unnormalizedCoordinates && descriptor.compareEnable), "guest sampler descriptor with unnormalized coordinates enables depth comparison, which is not implemented");
         forcesDegamma = descriptor.forceDegamma;
+        disablesSingleLevelAnisotropy = descriptor.singleLevelAnisotropyDisabled;
 
         VkSamplerCreateInfo info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         VkSamplerReductionModeCreateInfoEXT reduction{VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO_EXT, nullptr, descriptor.reductionMode};
@@ -99,9 +100,20 @@ namespace AgcDriver::Graphics {
         return forcesDegamma;
     }
 
+    bool Sampler::DisablesSingleLevelAnisotropy() const {
+        return disablesSingleLevelAnisotropy;
+    }
+
     void RequireDegammaFormat(std::uint32_t guestFormat, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
             if (((samplerMask >> element) & 1u) != 0u && samplers[element]->ForcesDegamma() && !IsSrgbTextureFormat(guestFormat)) Require(false, "a texture of guest format " + std::to_string(guestFormat) + ", which is not sRGB, is sampled through a sampler that forces sRGB decoding, which is not implemented");
+        }
+    }
+
+    void RequireSingleLevelAnisotropy(bool singleLevel, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+        if (!singleLevel) return;
+        for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
+            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->DisablesSingleLevelAnisotropy()) Require(false, "a single-level texture is sampled through an anisotropic sampler with ANISO_OVERRIDE, which is not implemented");
         }
     }
 

@@ -28,6 +28,7 @@ struct GuestSamplerResource {
     bool compareEnable = false;
     VkCompareOp compareOp = VK_COMPARE_OP_NEVER;
     bool unnormalizedCoordinates = false;
+    bool singleLevelAnisotropyDisabled = false;
 };
 
 GuestSamplerResource DecodeSamplerResource(std::span<const std::uint32_t> words, bool unnormalizedProven = false, bool forceDegammaPaired = false);

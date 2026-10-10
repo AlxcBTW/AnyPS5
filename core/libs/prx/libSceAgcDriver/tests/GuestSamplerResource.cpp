@@ -221,6 +221,30 @@ void RunSamplerReductionTests(const Fields& base) {
     reject([&] { pointFiltered(pack(maxLinearMip)); }, "needs point filtering");
 }
 
+void RunAnisoOverrideTests(const Fields& base) {
+    Fields bilinear = base;
+    bilinear.anisoOverride = true;
+    Require(!DecodeSamplerResource(pack(bilinear)).singleLevelAnisotropyDisabled, "ANISO_OVERRIDE on a sampler without anisotropy changed it");
+    Fields anisotropic = bilinear;
+    anisotropic.xyMagFilter = 3;
+    anisotropic.xyMinFilter = 3;
+    anisotropic.maxAnisoRatio = 2;
+    const auto overridden = DecodeSamplerResource(pack(anisotropic));
+    Require(overridden.anisotropyEnable && overridden.singleLevelAnisotropyDisabled, "ANISO_OVERRIDE on an anisotropic sampler was not decoded");
+    anisotropic.anisoOverride = false;
+    Require(!DecodeSamplerResource(pack(anisotropic)).singleLevelAnisotropyDisabled, "an anisotropic sampler without ANISO_OVERRIDE disables single-level anisotropy");
+
+    Context context{};
+    context.limits.maxSamplerAnisotropy = 16.0f;
+    context.deviceProc = captureProc;
+    context.samplerAnisotropy = true;
+    const std::array samplers{std::make_shared<Sampler>(context, DecodeSamplerResource(pack(anisotropic))), std::make_shared<Sampler>(context, overridden)};
+    Require(!samplers[0]->DisablesSingleLevelAnisotropy() && samplers[1]->DisablesSingleLevelAnisotropy(), "sampler ANISO_OVERRIDE state is wrong");
+    RequireSingleLevelAnisotropy(true, 0b01u, samplers);
+    RequireSingleLevelAnisotropy(false, 0b11u, samplers);
+    reject([&] { RequireSingleLevelAnisotropy(true, 0b10u, samplers); }, "single-level texture is sampled through an anisotropic sampler with ANISO_OVERRIDE");
+}
+
 void RunSamplerCacheDegammaTests(const Fields& base) {
     Context context{};
     context.limits.maxSamplerAnisotropy = 1.0f;
@@ -410,9 +434,7 @@ void RunGuestSamplerResourceTests() {
     badPreclamp.pointPreclamp = true;
     rejectFields(badPreclamp, "point preclamping");
 
-    Fields badAnisoOverride = base;
-    badAnisoOverride.anisoOverride = true;
-    rejectFields(badAnisoOverride, "anisotropy override");
+    RunAnisoOverrideTests(base);
 
     Fields badBlendZero = base;
     badBlendZero.blendZeroPrt = true;
