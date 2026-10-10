@@ -24,6 +24,7 @@ private:
     void orderByDominance(ControlFlowGraph& graph) const;
     void clearStructuredTerminators(ControlFlowGraph& graph) const;
     void verifyReducibility(const ControlFlowGraph& graph) const;
+    bool hasStructuredConstructs(const ControlFlowGraph& graph) const;
 };
 
 }
