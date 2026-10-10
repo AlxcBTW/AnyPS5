@@ -5,6 +5,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace ShaderRecompiler;
@@ -16,8 +17,38 @@ enum class Tininess {
     Checked,
 };
 
+constexpr std::size_t TinyCheckInstructions = 6;
+
 void Require(bool value, const std::string& message) {
     if (!value) throw std::runtime_error("f32 constant factor: " + message);
+}
+
+std::unordered_set<const IrValue*> Cone(const IrValue* root, const std::unordered_set<const IrValue*>& instructions) {
+    std::unordered_set<const IrValue*> cone;
+    std::vector<const IrValue*> pending{root};
+    while (!pending.empty()) {
+        const IrValue* value = pending.back();
+        pending.pop_back();
+        if (!instructions.contains(value) || !cone.insert(value).second) continue;
+        for (const IrValue* argument : value->Arguments()) pending.push_back(argument);
+    }
+    return cone;
+}
+
+std::size_t TinyCheckSize(const std::string& name, const IrBlock& block, const IrValue* compare) {
+    const std::unordered_set<const IrValue*> instructions(block.Instructions().begin(), block.Instructions().end());
+    const auto tiny = Cone(compare, instructions);
+    for (const auto* value : block.Instructions()) {
+        if (value->Opcode() != IrOpcode::SelectF32 || !Cone(value->Argument(0), instructions).contains(compare)) continue;
+        const auto product = Cone(value->Argument(2), instructions);
+        std::size_t size = 0u;
+        for (const auto* instruction : tiny) {
+            if (!product.contains(instruction)) ++size;
+        }
+        return size;
+    }
+    Require(false, name + " selects no flushed product on its tiny product check");
+    return 0u;
 }
 
 const IrBlock& Translate(IrProgram& program, const std::string& name, const std::vector<std::uint32_t>& words, RdnaOpcode opcode, std::uint32_t floatMode) {
@@ -37,13 +68,20 @@ void Check(const std::string& name, const std::vector<std::uint32_t>& words, Rdn
     const auto& block = Translate(program, name, words, opcode, floatMode);
     std::uint32_t multiplyHigh = 0u;
     std::uint32_t tinyCompares = 0u;
+    const IrValue* tinyCompare = nullptr;
     for (const auto* value : block.Instructions()) {
         if (value->Opcode() == IrOpcode::UMulHi) ++multiplyHigh;
-        if (value->Opcode() == IrOpcode::ULessThan32 && value->Argument(1)->HasImmediate() && value->Argument(1)->ImmediateU32() == 0x207fffffu) ++tinyCompares;
+        if (value->Opcode() == IrOpcode::ULessThan32 && value->Argument(1)->HasImmediate() && value->Argument(1)->ImmediateU32() == 0x207fffffu) {
+            ++tinyCompares;
+            tinyCompare = value;
+        }
     }
     const std::uint32_t expectedCompares = expected == Tininess::None ? 0u : 1u;
     Require(tinyCompares == expectedCompares, name + " emits " + std::to_string(tinyCompares) + " tiny product checks, expected " + std::to_string(expectedCompares));
     Require(multiplyHigh == 0u, name + " emits " + std::to_string(multiplyHigh) + " significand products, expected none");
+    if (tinyCompare == nullptr) return;
+    const std::size_t size = TinyCheckSize(name, block, tinyCompare);
+    Require(size == TinyCheckInstructions, name + " checks the product for tininess with " + std::to_string(size) + " instructions the product does not need, expected " + std::to_string(TinyCheckInstructions));
 }
 
 void CheckFoldedSource(const std::string& name, const std::vector<std::uint32_t>& words, RdnaOpcode opcode, IrOpcode product, std::uint32_t index, std::uint32_t expected) {
