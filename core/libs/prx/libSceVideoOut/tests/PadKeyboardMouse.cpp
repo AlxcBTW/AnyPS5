@@ -596,6 +596,48 @@ void testCaptureHotkeyAndSafety() {
     check(Pad::MouseCaptureHint(both, true) == "Mouse captured, press F8 or press mouse button 4 to release", "the hint lists every capture binding");
 }
 
+void testAnalogTriggers() {
+    const auto r2 = static_cast<std::uint32_t>(Pad::PadButton::R2);
+    const auto l2 = static_cast<std::uint32_t>(Pad::PadButton::L2);
+    const std::vector<TimedEvent> press{At(0.0, PadSimulation::ButtonEvent(SDL_BUTTON_RIGHT, true)), At(50.0, PadSimulation::ButtonEvent(SDL_BUTTON_RIGHT, false))};
+    const auto instant = Simulate(defaults(), press, 1.0, 60.0);
+    check(instant[0].state.analogButtonsR2 == 255 && (instant[0].state.buttons & r2) != 0, "by default a key or button presses a trigger fully at once");
+    check(instant[55].state.analogButtonsR2 == 0 && instant[55].state.buttons == 0, "and lets go at once");
+
+    check(parse("TriggerRampMs = 120\nTriggerWheelStep = 0.25\n").settings.triggerRampMs == 120.0, "TriggerRampMs parsed");
+    check(expectFailure([] { parse("TriggerWheelStep = 2\n"); }).find("between 0 and 1") != std::string::npos, "TriggerWheelStep range");
+
+    const auto ramped = parse("TriggerRampMs = 100\n");
+    const std::vector<TimedEvent> hold{At(0.0, KeyEvent(SDL_SCANCODE_R, true)), At(264.0, KeyEvent(SDL_SCANCODE_R, false))};
+    for (const double poll : Polls) {
+        const auto samples = Simulate(ramped, hold, poll, 528.0);
+        for (const auto& sample : samples) {
+            const auto expectedAt = [](double ms) { return ms < 264.0 ? std::min(1.0, ms / 100.0) : std::max(0.0, 1.0 - (ms - 264.0) / 100.0); };
+            const double value = sample.state.analogButtonsL2 / 255.0;
+            const double low = std::min(expectedAt(sample.ms), expectedAt(std::max(0.0, sample.ms - poll))) - 0.01;
+            const double high = std::max(expectedAt(sample.ms), expectedAt(std::max(0.0, sample.ms - poll))) + 0.01;
+            check(value >= low && value <= high, "L2 ramp at " + std::to_string(poll) + " ms polls is " + std::to_string(value) + " at " + std::to_string(sample.ms) + " ms");
+            check(((sample.state.buttons & l2) != 0) == (sample.state.analogButtonsL2 != 0), "the L2 bit follows the analog value");
+        }
+        check(samples.back().state.analogButtonsL2 == 0, "the ramped trigger returns to zero");
+    }
+
+    const auto stepped = parse("TriggerWheelStep = 0.25\nR2 = WHEEL:Up\nDown = KEY:Down\n");
+    const std::vector<TimedEvent> wheel{
+        At(10.0, PadSimulation::WheelEvent(1)), At(20.0, PadSimulation::WheelEvent(1)),
+        At(500.0, PadSimulation::WheelEvent(-1)),
+        At(600.0, PadSimulation::WheelEvent(-1)), At(610.0, PadSimulation::WheelEvent(-1)), At(620.0, PadSimulation::WheelEvent(-1)),
+        At(700.0, PadSimulation::WheelEvent(1)), At(800.0, PadSimulation::FocusLostEvent())};
+    const auto levels = Simulate(stepped, wheel, 1.0, 900.0);
+    check(levels[14].state.analogButtonsR2 == 64, "one notch up holds a quarter of R2");
+    check(levels[400].state.analogButtonsR2 == 128 && (levels[400].state.buttons & r2) != 0, "two notches hold half of R2 like a throttle");
+    check(levels[550].state.analogButtonsR2 == 64, "a notch down lowers it");
+    check((levels[550].state.buttons & static_cast<std::uint32_t>(Pad::PadButton::Down)) == 0, "the rebound wheel no longer presses the D-pad");
+    check(levels[650].state.analogButtonsR2 == 0 && (levels[650].state.buttons & r2) == 0, "it stops at zero");
+    check(levels[750].state.analogButtonsR2 == 64, "and climbs again from zero");
+    check(levels[850].state.analogButtonsR2 == 0, "losing focus drops the throttle");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -717,6 +759,7 @@ int main(int argc, char** argv) {
             {"describe bindings", testDescribeBindings},
             {"mouse capture hint", testMouseCaptureHint},
             {"capture hotkey and safety", testCaptureHotkeyAndSafety},
+            {"analog triggers", testAnalogTriggers},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };

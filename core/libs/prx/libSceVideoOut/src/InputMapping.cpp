@@ -72,7 +72,9 @@ constexpr auto settings = std::array{
     InputSetting{"MouseSmoothingMs", &Pad::InputSettings::mouseSmoothingMs, 0.0, 500.0},
     InputSetting{"MouseDecayMs", &Pad::InputSettings::mouseDecayMs, 1.0, 1000.0},
     InputSetting{"StickModifierScale", &Pad::InputSettings::stickModifierScale, 0.05, 1.0},
-    InputSetting{"KeyboardRampMs", &Pad::InputSettings::keyboardRampMs, 0.0, 2000.0}
+    InputSetting{"KeyboardRampMs", &Pad::InputSettings::keyboardRampMs, 0.0, 2000.0},
+    InputSetting{"TriggerRampMs", &Pad::InputSettings::triggerRampMs, 0.0, 2000.0},
+    InputSetting{"TriggerWheelStep", &Pad::InputSettings::triggerWheelStep, 0.0, 1.0}
 };
 
 std::string upper(std::string_view value) {
