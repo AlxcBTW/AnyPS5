@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <exception>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -113,24 +114,47 @@ void requireDominatedMerges(const ControlFlowGraph& graph, const char* name) {
     }
 }
 
-std::uint32_t originalBlock(const ControlFlowGraph& graph, std::uint32_t blockId) {
+using Routes = std::map<std::uint32_t, bool>;
+
+std::uint32_t originalBlock(const ControlFlowGraph& graph, std::uint32_t blockId, Routes& routes) {
     for (std::size_t step = 0; step <= graph.blocks.size(); ++step) {
         const auto& block = graph.FindBlock(blockId);
-        if (block.instructionBegin != block.instructionEnd) return block.instructionBegin / 2;
-        if (block.terminator.kind != TerminatorKind::Branch || block.terminator.gotoVariable != InvalidControlFlowId) break;
-        blockId = block.terminator.trueBlock;
+        const auto& terminator = block.terminator;
+        if (block.instructionBegin != block.instructionEnd) return blockId;
+        if (terminator.gotoValue >= 0) routes[terminator.gotoVariable] = terminator.gotoValue != 0;
+        if (terminator.kind == TerminatorKind::Branch) {
+            blockId = terminator.trueBlock;
+        } else if (terminator.kind == TerminatorKind::ConditionalBranch && terminator.condition == BranchCondition::GotoVariable && routes.contains(terminator.gotoVariable)) {
+            blockId = routes.at(terminator.gotoVariable) ? terminator.trueBlock : terminator.falseBlock;
+        } else {
+            break;
+        }
     }
     throw std::runtime_error("block " + std::to_string(blockId) + " does not lead to an original block");
 }
 
 void requireOriginalBranches(const ControlFlowGraph& graph, const std::vector<std::vector<std::uint32_t>>& successors, const char* name) {
     std::vector<bool> seen(successors.size(), false);
-    for (const auto& block : graph.blocks) {
-        if (block.instructionBegin == block.instructionEnd) continue;
+    Routes entryRoutes;
+    std::vector<std::pair<std::uint32_t, Routes>> pending{{originalBlock(graph, graph.entryBlock, entryRoutes), entryRoutes}};
+    std::vector<std::pair<std::uint32_t, Routes>> visited;
+    while (!pending.empty()) {
+        auto state = std::move(pending.back());
+        pending.pop_back();
+        if (std::find(visited.begin(), visited.end(), state) != visited.end()) continue;
+        visited.push_back(state);
+        const auto& block = graph.FindBlock(state.first);
         const auto original = block.instructionBegin / 2;
+        std::vector<std::uint32_t> branchTargets;
+        if (block.terminator.kind == TerminatorKind::Branch) branchTargets = {block.terminator.trueBlock};
+        if (block.terminator.kind == TerminatorKind::ConditionalBranch) branchTargets = {block.terminator.trueBlock, block.terminator.falseBlock};
         std::vector<std::uint32_t> targets;
-        if (block.terminator.kind == TerminatorKind::Branch) targets = {originalBlock(graph, block.terminator.trueBlock)};
-        if (block.terminator.kind == TerminatorKind::ConditionalBranch) targets = {originalBlock(graph, block.terminator.trueBlock), originalBlock(graph, block.terminator.falseBlock)};
+        for (const auto target : branchTargets) {
+            auto routes = state.second;
+            const auto reached = originalBlock(graph, target, routes);
+            targets.push_back(graph.FindBlock(reached).instructionBegin / 2);
+            pending.emplace_back(reached, std::move(routes));
+        }
         if (targets != successors[original]) {
             throw std::runtime_error(std::string(name) + ": block " + std::to_string(original) + " no longer branches to its original targets");
         }
@@ -287,6 +311,11 @@ int main() {
         requireStructuredLoop({{1}, {2, 4}, {3, 4}, {4, 5}, {1, 6}, {1}, {}}, "nested selections in a loop with two latches");
         requireStructuredLoop({{1}, {5, 2}, {5, 3}, {6, 4}, {7, 5}, {8, 1}, {1}, {1}, {}}, "nested selections on the false side in a loop with three latches");
         requireStructuredLoop({{1}, {2, 5}, {3, 4}, {5, 6}, {5}, {1, 7}, {1}, {}}, "an if-else in a loop whose one arm continues");
+        requireStructuredLoop({{1}, {2}, {3, 4}, {2, 5}, {}, {1}}, "an inner loop that returns or continues its outer loop");
+        requireStructuredLoop({{1}, {2, 3}, {4, 5}, {}, {3, 6}, {1}, {2}}, "an inner loop that leaves both loops or continues its outer loop");
+        requireStructuredLoop({{1, 3}, {2, 4}, {3, 1}, {4}, {}}, "a loop whose latch exits into a block the branch before the loop also reaches");
+        requireStructuredLoop({{1, 2}, {3, 2}, {4}, {4, 1}, {}}, "a loop whose header exits into a block the branch before the loop also reaches");
+        requireStructuredLoop({{1, 2}, {4}, {3, 1}, {4, 2}, {}}, "a loop whose header exits into a block the branch before the loop reaches first");
         auto earlyReturn = makeGraph({{2, 1}, {4, 2}, {3, 5}, {5}, {}, {}});
         Structurizer{}.Structurize(earlyReturn);
         requireExactPostDominators(earlyReturn, "an early return inside a selection that joins its parent's merge");
