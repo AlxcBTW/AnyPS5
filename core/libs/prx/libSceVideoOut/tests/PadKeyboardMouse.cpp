@@ -318,10 +318,10 @@ void testKeyboardSettingsParse() {
 
 void testStickModifier() {
     const std::vector<TimedEvent> events{
-        At(0.0, KeyEvent(SDL_SCANCODE_Z, true)),
+        At(0.0, KeyEvent(SDL_SCANCODE_LALT, true)),
         At(0.0, KeyEvent(SDL_SCANCODE_W, true)),
         At(10.0, KeyEvent(SDL_SCANCODE_D, true)),
-        At(20.0, KeyEvent(SDL_SCANCODE_Z, false)),
+        At(20.0, KeyEvent(SDL_SCANCODE_LALT, false)),
         At(30.0, KeyEvent(SDL_SCANCODE_T, true))};
     const auto samples = Simulate(defaults(), events, 1.0, 40.0);
     check(samples[4].state.sticks[1] == Pad::StickByte(-0.5), "the modifier halves an up tilt");
@@ -367,7 +367,7 @@ void testRampWithModifierAndRelease() {
     Pad::KeyboardMouse keyboardMouse(configuration);
     const auto origin = Pad::KeyboardMouse::Clock::time_point{} + std::chrono::hours(1);
     keyboardMouse.Advance(origin);
-    keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_Z, true), origin);
+    keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_LALT, true), origin);
     keyboardMouse.HandleEvent(KeyEvent(SDL_SCANCODE_S, true), origin);
     keyboardMouse.Advance(origin + std::chrono::milliseconds(50));
     check(std::abs(axis(keyboardMouse.Compose({}).sticks[1]) - 0.25) < 0.01, "the ramp climbs toward the modifier tilt");
@@ -498,6 +498,45 @@ void testReplayRelease() {
     check(samples[12].state.sticks[1] == 128, "a release line lets go of every key");
 }
 
+void testDefaultBindings() {
+    struct Expectation {
+        SDL_Event event;
+        Pad::PadButton button;
+        const char* name;
+    };
+    const std::vector<Expectation> expectations{
+        {KeyEvent(SDL_SCANCODE_ESCAPE, true), Pad::PadButton::Options, "Escape pauses with Options"},
+        {KeyEvent(SDL_SCANCODE_SPACE, true), Pad::PadButton::Cross, "Space is Cross"},
+        {KeyEvent(SDL_SCANCODE_X, true), Pad::PadButton::Cross, "X is Cross"},
+        {KeyEvent(SDL_SCANCODE_C, true), Pad::PadButton::Circle, "C is Circle"},
+        {KeyEvent(SDL_SCANCODE_Z, true), Pad::PadButton::Square, "Z is Square"},
+        {KeyEvent(SDL_SCANCODE_V, true), Pad::PadButton::Triangle, "V is Triangle"},
+        {KeyEvent(SDL_SCANCODE_I, true), Pad::PadButton::Triangle, "I stays Triangle"},
+        {KeyEvent(SDL_SCANCODE_Q, true), Pad::PadButton::L1, "Q is L1"},
+        {KeyEvent(SDL_SCANCODE_E, true), Pad::PadButton::R1, "E is R1"},
+        {KeyEvent(SDL_SCANCODE_R, true), Pad::PadButton::L2, "R is L2"},
+        {KeyEvent(SDL_SCANCODE_LSHIFT, true), Pad::PadButton::L3, "Left Shift is L3"},
+        {KeyEvent(SDL_SCANCODE_LCTRL, true), Pad::PadButton::R3, "Left Ctrl is R3"},
+        {KeyEvent(SDL_SCANCODE_UP, true), Pad::PadButton::Up, "the arrow keys are the D-pad"},
+        {PadSimulation::ButtonEvent(SDL_BUTTON_LEFT, true), Pad::PadButton::Square, "left click is Square"},
+        {PadSimulation::ButtonEvent(SDL_BUTTON_RIGHT, true), Pad::PadButton::R2, "right click is R2"},
+        {PadSimulation::ButtonEvent(SDL_BUTTON_X1, true), Pad::PadButton::L2, "mouse button 4 is L2"},
+        {PadSimulation::ButtonEvent(SDL_BUTTON_X2, true), Pad::PadButton::L1, "mouse button 5 is L1"},
+        {PadSimulation::WheelEvent(1), Pad::PadButton::Up, "wheel up is D-pad up"},
+    };
+    for (const auto& expectation : expectations) {
+        const auto samples = Simulate(defaults(), {At(0.0, expectation.event)}, 1.0, 2.0);
+        check(samples.back().state.buttons == static_cast<std::uint32_t>(expectation.button), expectation.name);
+    }
+    const auto touch = Simulate(defaults(), {At(0.0, KeyEvent(SDL_SCANCODE_TAB, true))}, 1.0, 2.0);
+    check(touch.back().state.touchRight, "Tab touches the touch pad");
+    const auto walk = Simulate(defaults(), {At(0.0, KeyEvent(SDL_SCANCODE_LALT, true)), At(0.0, KeyEvent(SDL_SCANCODE_W, true))}, 1.0, 2.0);
+    check(walk.back().state.buttons == 0 && walk.back().state.sticks[1] == Pad::StickByte(-0.5), "Left Alt walks at half tilt and presses nothing");
+    const auto overridden = Simulate(parse("L2 = KEY:F1\nStickModifier = KEY:CapsLock\n"), {At(0.0, KeyEvent(SDL_SCANCODE_R, true)), At(0.0, KeyEvent(SDL_SCANCODE_LALT, true)),
+        At(0.0, KeyEvent(SDL_SCANCODE_W, true))}, 1.0, 2.0);
+    check(overridden.back().state.buttons == 0 && overridden.back().state.sticks[1] == 0, "new defaults can be replaced in the ini file");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -587,6 +626,7 @@ int main(int argc, char** argv) {
             {"opposite keys with alternates", testOppositeKeysWithAlternates},
             {"slow reporting mouse", testSlowReportingMouse},
             {"replay release", testReplayRelease},
+            {"default bindings", testDefaultBindings},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };

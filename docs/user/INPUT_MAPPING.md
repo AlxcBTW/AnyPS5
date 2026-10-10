@@ -4,12 +4,49 @@ AnyPS5 accepts SDL-mapped game controllers as well as its built-in keyboard and 
 
 For an Xbox-layout controller, A/B/X/Y map to Cross/Circle/Square/Triangle, LB/RB map to L1/R1, and LT/RT map to analog L2/R2. Start maps to Options. D-pad and stick-click buttons are supported. On a PlayStation controller, the touchpad click button is forwarded; finger touch coordinates are not implemented.
 
+## Default keyboard and mouse bindings
+
+The built-in bindings follow PC habits: the left hand covers movement and the face buttons, so the right hand can stay on the mouse.
+
+| Pad input | Keys and mouse |
+| --- | --- |
+| Left stick | `W` `A` `S` `D` |
+| Right stick | `T` `F` `G` `H`, or the mouse after a middle click |
+| Cross | `Space`, `Return`, `X` |
+| Circle | `C` |
+| Square | Left click, `Z` |
+| Triangle | `V`, `I` |
+| L1 | `Q`, mouse button 5 (forward) |
+| R1 | `E`, `Right Alt` |
+| L2 | `R`, mouse button 4 (back) |
+| R2 | Right click |
+| L3 / R3 | `Shift` / `Ctrl` |
+| Options | `Escape` |
+| Touch pad | `Backspace` (left half), `Tab` (right half) |
+| D-pad | Arrow keys; the wheel presses up and down |
+| Walk (`StickModifier`) | `Left Alt` |
+| Mouse on the right stick (`ToggleMouse`) | Middle click |
+| Fullscreen | `F11` |
+
+These defaults differ from earlier versions:
+
+| Input | Before | Now | Why |
+| --- | --- | --- | --- |
+| L2 | unbound | `R`, mouse button 4 | Games aim, brake or drop on L2, and it could not be pressed without a configuration file. |
+| L1 | `Q` | `Q`, mouse button 5 | The thumb reaches it while the mouse steers the camera. |
+| Cross, Square, Triangle | `Space` and `Return`; left click; `I` | adds `X`, `Z`, `V` | `Z` `X` `C` `V` form a row of face buttons for the left hand, as in RPCS3; `I` needs the right hand. |
+| `Left Alt` | R1 | walk at reduced tilt | PC games walk on Alt. R1 stays on `E` and `Right Alt`. |
+
+Every default can be replaced in `anyps5-input.ini`.
+
+## Configuration file
+
 Each non-empty line has the form `Action = Type:Value`, or `Setting = number` for the [keyboard stick](#analog-keyboard-sticks) and [mouse](#mouse-as-the-right-stick) settings. Action names are case-insensitive. A `#` or `;` starts a comment. The first line for an action replaces its built-in bindings; later lines for the same action add alternate inputs. Duplicate entries for the same action are ignored. Actions omitted from the file keep their built-in bindings. UTF-8 files with or without a byte-order mark are supported.
 
 Supported input sources are:
 
 - `KEY:Return`, `KEY:Space`, or another key name accepted by SDL.
-- `MOUSE:Left`, `MOUSE:Middle`, `MOUSE:Right`, `MOUSE:X1`, or `MOUSE:X2`.
+- `MOUSE:Left`, `MOUSE:Middle`, `MOUSE:Right`, `MOUSE:X1` (button 4, back), or `MOUSE:X2` (button 5, forward).
 - `WHEEL:Up` or `WHEEL:Down` for pad buttons.
 
 Game-controller bindings are enabled automatically and are not affected by keyboard or mouse overrides in this file.
@@ -38,7 +75,7 @@ To change bindings or settings for one game only, create `anyps5-input.<TITLE ID
 
 ## Analog keyboard sticks
 
-A stick key tilts its stick fully. Hold `StickModifier` (Z by default) to tilt only part of the way, for walking or for fine flight control. Each stick axis is independent, so holding two neighbouring keys tilts both axes fully. Holding opposite keys centers that axis, and releasing one of them tilts toward the other.
+A stick key tilts its stick fully. Hold `StickModifier` (`Left Alt` by default) to tilt only part of the way, for walking or for fine flight control. Each stick axis is independent, so holding two neighbouring keys tilts both axes fully. Holding opposite keys centers that axis, and releasing one of them tilts toward the other.
 
 Settings go in the same file as the bindings, one `Setting = number` per line. Setting names are case-insensitive, and each may appear once in a file.
 
