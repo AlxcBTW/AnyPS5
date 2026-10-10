@@ -36,6 +36,10 @@ namespace AgcDriver::Graphics {
         info.maxLod = descriptor.maxLod;
         info.borderColor = descriptor.borderColor;
         info.unnormalizedCoordinates = descriptor.unnormalizedCoordinates ? VK_TRUE : VK_FALSE;
+        if (descriptor.nonSeamlessCube) {
+            if (context.nonSeamlessCubeMap) info.flags |= VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT;
+            else requiresNonSeamlessCube = true;
+        }
         Check(context.Function<PFN_vkCreateSampler>("vkCreateSampler")(context.device, &info, nullptr, &sampler), "vkCreateSampler");
     }
 
@@ -99,9 +103,20 @@ namespace AgcDriver::Graphics {
         return forcesDegamma;
     }
 
+    bool Sampler::RequiresNonSeamlessCube() const {
+        return requiresNonSeamlessCube;
+    }
+
     void RequireDegammaFormat(std::uint32_t guestFormat, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
             if (((samplerMask >> element) & 1u) != 0u && samplers[element]->ForcesDegamma() && !IsSrgbTextureFormat(guestFormat)) Require(false, "a texture of guest format " + std::to_string(guestFormat) + ", which is not sRGB, is sampled through a sampler that forces sRGB decoding, which is not implemented");
+        }
+    }
+
+    void RequireNonSeamlessCube(bool cube, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+        if (!cube) return;
+        for (std::uint32_t element = 0; element < 32u && element < samplers.size(); ++element) {
+            if (((samplerMask >> element) & 1u) != 0u && samplers[element]->RequiresNonSeamlessCube()) Require(false, "a cube texture is sampled through a sampler that disables seamless cube filtering, which needs VK_EXT_non_seamless_cube_map");
         }
     }
 
