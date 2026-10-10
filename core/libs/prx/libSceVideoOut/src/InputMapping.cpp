@@ -86,6 +86,9 @@ struct InputChoice {
 constexpr auto choices = std::array{
     InputChoice{"KeyboardMouseTarget", {"both", "pad", "native"}, [](Pad::InputSettings& settings, std::size_t value) {
         settings.keyboardMouseTarget = static_cast<Pad::KeyboardMouseTarget>(value);
+    }},
+    InputChoice{"MouseStick", {"right", "left", ""}, [](Pad::InputSettings& settings, std::size_t value) {
+        settings.mouseStick = static_cast<Pad::MouseStickSide>(value);
     }}
 };
 
@@ -346,7 +349,8 @@ std::vector<std::string> Pad::DescribeBindings(const InputConfiguration& configu
     std::string sticks = "Sticks: left " + stick(InputControl::LeftStickUp, InputControl::LeftStickLeft, InputControl::LeftStickDown, InputControl::LeftStickRight) +
         ", right " + stick(InputControl::RightStickUp, InputControl::RightStickLeft, InputControl::RightStickDown, InputControl::RightStickRight);
     const auto toggle = sources(InputControl::ToggleMouse, PadButton::None);
-    if (!toggle.empty()) sticks += "; " + toggle + " puts the mouse on the right stick";
+    const char* mouseSide = configuration.settings.mouseStick == MouseStickSide::Left ? "left" : "right";
+    if (!toggle.empty()) sticks += "; " + toggle + " puts the mouse on the " + mouseSide + " stick";
     const auto modifier = sources(InputControl::StickModifier, PadButton::None);
     if (!modifier.empty()) sticks += "; hold " + modifier + " for " + std::to_string(std::lround(configuration.settings.stickModifierScale * 100.0)) + "% tilt";
 

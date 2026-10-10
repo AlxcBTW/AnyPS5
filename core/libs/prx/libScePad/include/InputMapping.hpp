@@ -24,6 +24,11 @@ enum class KeyboardMouseTarget : std::uint8_t {
     Native
 };
 
+enum class MouseStickSide : std::uint8_t {
+    Right,
+    Left
+};
+
 struct InputSettings {
     double mouseSensitivity = 1.0;
     double mouseVerticalScale = 1.0;
@@ -37,6 +42,7 @@ struct InputSettings {
     double triggerRampMs = 0.0;
     double triggerWheelStep = 0.0;
     KeyboardMouseTarget keyboardMouseTarget = KeyboardMouseTarget::Both;
+    MouseStickSide mouseStick = MouseStickSide::Right;
 };
 
 struct InputConfiguration {

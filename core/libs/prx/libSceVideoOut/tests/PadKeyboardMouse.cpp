@@ -677,6 +677,23 @@ void testKeyboardMouseTarget() {
     check(Pad::DescribeBindings(defaults()).size() == 3, "the default summary has no target line");
 }
 
+void testMouseOnLeftStick() {
+    check(defaults().settings.mouseStick == Pad::MouseStickSide::Right, "right by default");
+    const auto left = parse("MouseStick = Left\nMouseDeadzoneOffset = 0\n");
+    check(left.settings.mouseStick == Pad::MouseStickSide::Left, "left parsed");
+    check(expectFailure([] { parse("MouseStick = both\n"); }).find("MouseStick must be right or left") != std::string::npos, "unknown side");
+    std::vector<TimedEvent> events{PadSimulation::MouseModeAt(0.0, true), At(0.0, KeyEvent(SDL_SCANCODE_T, true))};
+    PadSimulation::AppendMotion(events, 0.0, 300.0, 0.5 * Pad::MouseFullTiltCountsPerSecond, -0.5 * Pad::MouseFullTiltCountsPerSecond);
+    const auto samples = Simulate(left, events, 8.0, 300.0);
+    const auto& state = samples.back().state;
+    check(std::abs(axis(state.sticks[0]) - 0.5) < 0.02 && std::abs(axis(state.sticks[1]) + 0.5) < 0.02, "the mouse drives the left stick");
+    check(state.sticks[2] == 128 && state.sticks[3] == 0, "the right stick keys keep working");
+    std::vector<TimedEvent> walk{PadSimulation::MouseModeAt(0.0, true), At(0.0, KeyEvent(SDL_SCANCODE_W, true))};
+    check(Simulate(left, walk, 8.0, 50.0).back().state.sticks[1] == 128, "while captured the mouse owns the left stick, as it owns the right one by default");
+    check(Simulate(left, {At(0.0, KeyEvent(SDL_SCANCODE_W, true))}, 8.0, 50.0).back().state.sticks[1] == 0, "without capture the left stick keys work");
+    check(Pad::DescribeBindings(left)[0].find("puts the mouse on the left stick") != std::string::npos, "the summary names the left stick");
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -800,6 +817,7 @@ int main(int argc, char** argv) {
             {"capture hotkey and safety", testCaptureHotkeyAndSafety},
             {"analog triggers", testAnalogTriggers},
             {"keyboard and mouse target", testKeyboardMouseTarget},
+            {"mouse on the left stick", testMouseOnLeftStick},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };
