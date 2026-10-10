@@ -29,6 +29,11 @@ static_assert(offsetof(CommandBufferObject, numCommands) == 0x08);
 static_assert(offsetof(CommandBufferObject, offset) == 0x04);
 static_assert(offsetof(CommandBufferObject, size) == 0x0c);
 static_assert(offsetof(CommandBufferObject, base) == 0x10);
+struct SubmitResult {
+    std::int32_t result;
+    std::uint32_t errorOffset;
+};
+static_assert(sizeof(SubmitResult) == 8);
 
 inline constexpr std::uint16_t ScatterGatherValid = 1;
 inline constexpr std::uint16_t MapActive = 2;
