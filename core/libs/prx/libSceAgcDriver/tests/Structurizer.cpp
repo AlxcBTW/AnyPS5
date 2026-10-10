@@ -280,6 +280,13 @@ void requireOriginalDominanceSets(ControlFlowGraph graph, const char* name) {
 
 int main() {
     try {
+        auto largeBlocks = makeGraph({{1}, {2, 3}, {1, 4}, {5, 6}, {1, 7}, {8, 7}, {9, 4}, {10}, {6, 10}, {10}, {}});
+        for (auto& block : largeBlocks.blocks) block.estimatedSpirvWords = 1000u;
+        Structurizer{}.Structurize(largeBlocks);
+        requireStructuredBranches(largeBlocks, "large loop exit blocks retain the baseline result");
+        auto exitJunction = makeGraph({{1}, {2, 3}, {9}, {4, 6}, {5, 9}, {1}, {7, 8}, {9}, {1}, {}});
+        Structurizer{}.Structurize(exitJunction);
+        requireStructuredBranches(exitJunction, "shared loop exit junctions retain structured branches");
         auto nested = makeGraph({{1}, {2}, {5, 3}, {5, 4}, {7}, {6, 7}, {}, {1}});
         Structurizer{}.Structurize(nested);
         requireExactPostDominators(nested, "nested selections");
