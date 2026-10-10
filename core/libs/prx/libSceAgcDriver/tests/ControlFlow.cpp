@@ -542,6 +542,47 @@ latch:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          Store({0xbe880380u, 0x7e020280u, 0xbf820002u, 0x4a020282u, 0x80089008u, 0xbf060208u, 0xbf850004u, 0x7d880088u, 0xbf860002u, 0x7d880084u, 0xbf87fff8u, 0x4a020281u, 0x80089008u, 0xbf0ac008u, 0xbf85fff6u}), Split::None},
+        {"an inner loop that ends the program or continues its outer loop", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s8, 0
+outer:
+  v_add_nc_u32 v1, 2, v1
+inner:
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccz done
+  v_add_nc_u32 v1, 1, v1
+  s_add_u32 s8, s8, 16
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc1 inner
+  s_mov_b32 s8, 0
+  s_branch outer
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe880380u, 0x4a020282u, 0x7d880088u, 0xbf860006u, 0x4a020281u, 0x80089008u, 0xbf0ac008u, 0xbf85fffau, 0xbe880380u, 0xbf82fff7u}), Split::Route, 0},
+        {"an inner loop whose body leaves both loops", R"(
+  v_mov_b32 v1, 0
+  s_mov_b32 s8, 0
+outer:
+  s_cmp_lt_u32 s8, 64
+  s_cbranch_scc0 done
+inner:
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccz latch
+  v_add_nc_u32 v1, 1, v1
+  s_add_u32 s8, s8, 16
+  s_cmp_eq_u32 s8, s2
+  s_cbranch_scc1 done
+  s_branch inner
+latch:
+  v_add_nc_u32 v1, 2, v1
+  s_add_u32 s8, s8, 16
+  s_branch outer
+done:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm)",
+         Store({0x7e020280u, 0xbe880380u, 0xbf0ac008u, 0xbf84000au, 0x7d880088u, 0xbf860005u, 0x4a020281u, 0x80089008u, 0xbf060208u, 0xbf850004u,
+                0xbf82fff9u, 0x4a020282u, 0x80089008u, 0xbf82fff4u}), Split::Route, 0},
         {"loop exit to the end of the program beside a kill exit", R"(
   v_mov_b32 v1, 0
   s_mov_b64 s[20:21], exec
