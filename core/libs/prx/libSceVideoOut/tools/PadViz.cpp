@@ -828,6 +828,9 @@ private:
         const bool captured = keyboardMouse->MouseMode();
         settingRow(inner, rowY, innerWidth, "Mouse speed", captured ? format("%.0f counts/s", mouseSpeed()) : std::string("not captured"));
         settingRow(inner, rowY += Row, innerWidth, "Tracked speed", captured ? format("%.2f × full tilt", keyboardMouse->MouseSpeed()) : std::string("not captured"));
+        const double rate = keyboardMouse->MouseReportRate();
+        settingRow(inner, rowY += Row, innerWidth, "Mouse reports", rate > 0.0 ? format("%.0f per second", rate) : std::string("not measured yet"));
+        settingRow(inner, rowY += Row, innerWidth, "Smoothing in use", format("%.0f ms", keyboardMouse->MouseSmoothingMs()));
 
         double footerY = y + height - PanelPadding - 2.0 * 20.0;
         if (!reloadError.empty()) {

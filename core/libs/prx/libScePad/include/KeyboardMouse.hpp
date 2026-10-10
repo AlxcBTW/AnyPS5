@@ -13,6 +13,10 @@ namespace Pad {
 
 inline constexpr double MouseFullTiltCountsPerSecond = 3000.0;
 inline constexpr double MouseMinimumStepSeconds = 0.0005;
+inline constexpr double MouseRateWindowSeconds = 0.25;
+inline constexpr double MouseRateGapSeconds = 0.05;
+inline constexpr double MouseSmoothingReports = 3.0;
+inline constexpr double MouseSmoothingLimitMs = 30.0;
 
 class MouseStick {
 public:
@@ -21,16 +25,26 @@ public:
     void Advance(double seconds);
     void Reset();
     double Speed() const;
+    double ReportRate() const;
+    double SmoothingMs() const;
     std::array<double, 2> Deflection() const;
 
 private:
+    void measureReportRate(double step, bool moved);
+
     InputSettings settings;
     double pendingX = 0.0;
     double pendingY = 0.0;
     double pendingSeconds = 0.0;
+    double pendingCounts = 0.0;
+    int pendingReports = 0;
     double speedX = 0.0;
     double speedY = 0.0;
     double idleSeconds = 0.0;
+    double rateSeconds = 0.0;
+    double rateCounts = 0.0;
+    int rateReports = 0;
+    double reportRate = 0.0;
 };
 
 struct InputRequests {
@@ -50,6 +64,8 @@ public:
     void Release();
     bool MouseMode() const;
     double MouseSpeed() const;
+    double MouseReportRate() const;
+    double MouseSmoothingMs() const;
     PadInputState Compose(const PadInputState& controller) const;
     const InputConfiguration& Configuration() const;
 

@@ -9,6 +9,32 @@ Pad::MouseStick::MouseStick(const InputSettings& settings) : settings(settings) 
 void Pad::MouseStick::Move(int deltaX, int deltaY) {
     pendingX += deltaX;
     pendingY += deltaY;
+    pendingCounts += std::hypot(deltaX, deltaY);
+    ++pendingReports;
+}
+
+void Pad::MouseStick::measureReportRate(double step, bool moved) {
+    if (moved) {
+        rateSeconds += std::min(idleSeconds + step, MouseRateGapSeconds);
+        rateCounts += pendingCounts;
+        rateReports += pendingReports;
+    }
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    if (rateSeconds < MouseRateWindowSeconds) return;
+    if (rateReports >= 10 && rateCounts >= 2.0 * rateReports) reportRate = rateReports / rateSeconds;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
+}
+
+double Pad::MouseStick::ReportRate() const {
+    return reportRate;
+}
+
+double Pad::MouseStick::SmoothingMs() const {
+    const double reports = reportRate > 0.0 ? std::min(MouseSmoothingReports * 1000.0 / reportRate, MouseSmoothingLimitMs) : 0.0;
+    return settings.mouseSmoothingMs > 0.0 ? std::max(settings.mouseSmoothingMs, reports) : 0.0;
 }
 
 void Pad::MouseStick::Advance(double seconds) {
@@ -23,13 +49,15 @@ void Pad::MouseStick::Advance(double seconds) {
     const double targetY = pendingY * scale * settings.mouseVerticalScale;
     pendingX = 0.0;
     pendingY = 0.0;
+    measureReportRate(step, moved);
     idleSeconds = moved ? 0.0 : idleSeconds + step;
     if (idleSeconds * 1000.0 >= settings.mouseDecayMs) {
         speedX = 0.0;
         speedY = 0.0;
         return;
     }
-    const double keep = settings.mouseSmoothingMs > 0.0 ? std::exp(-step * 1000.0 / settings.mouseSmoothingMs) : 0.0;
+    const double smoothing = SmoothingMs();
+    const double keep = smoothing > 0.0 ? std::exp(-step * 1000.0 / smoothing) : 0.0;
     speedX = targetX + (speedX - targetX) * keep;
     speedY = targetY + (speedY - targetY) * keep;
     const double speed = std::hypot(speedX, speedY);
@@ -43,6 +71,11 @@ void Pad::MouseStick::Reset() {
     pendingX = 0.0;
     pendingY = 0.0;
     pendingSeconds = 0.0;
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
     speedX = 0.0;
     speedY = 0.0;
     idleSeconds = 0.0;
@@ -81,6 +114,14 @@ bool Pad::KeyboardMouse::MouseMode() const {
 
 double Pad::KeyboardMouse::MouseSpeed() const {
     return mouseMode ? mouse.Speed() : 0.0;
+}
+
+double Pad::KeyboardMouse::MouseReportRate() const {
+    return mouse.ReportRate();
+}
+
+double Pad::KeyboardMouse::MouseSmoothingMs() const {
+    return mouse.SmoothingMs();
 }
 
 std::array<double, 4> Pad::KeyboardMouse::keyTargets() const {
