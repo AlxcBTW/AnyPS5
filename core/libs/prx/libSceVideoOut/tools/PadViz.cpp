@@ -363,23 +363,9 @@ std::string signedValue(double value) {
     return rounded < 0.0 ? format("%.3f", rounded) : " " + format("%.3f", std::abs(rounded));
 }
 
-std::string sourceName(const Pad::InputBinding& binding) {
-    if (binding.key != SDL_SCANCODE_UNKNOWN) return SDL_GetScancodeName(binding.key);
-    switch (binding.mouseButton) {
-        case Pad::MouseButton::Left: return "Left click";
-        case Pad::MouseButton::Middle: return "Middle click";
-        case Pad::MouseButton::Right: return "Right click";
-        case Pad::MouseButton::X1: return "Mouse X1";
-        case Pad::MouseButton::X2: return "Mouse X2";
-        case Pad::MouseButton::None: break;
-    }
-    if (binding.wheelDirection != 0) return binding.wheelDirection > 0 ? "Wheel up" : "Wheel down";
-    return "unbound";
-}
-
 std::string boundTo(const Pad::InputConfiguration& configuration, Pad::InputControl control) {
     for (const auto& binding : configuration.bindings) {
-        if (binding.control == control) return sourceName(binding);
+        if (binding.control == control) return Pad::SourceName(binding);
     }
     return "unbound";
 }
@@ -632,8 +618,8 @@ private:
     void drawHeader(const Pad::InputConfiguration& configuration) {
         fonts->title.Draw(*canvas, Margin, 22.0, "Pad visualiser", Palette::TextPrimary);
         const bool captured = keyboardMouse->MouseMode();
-        const std::string toggle = boundTo(configuration, Pad::InputControl::ToggleMouse);
-        const std::string text = captured ? "Mouse drives the right stick. " + toggle + " releases it." : toggle + " captures the mouse for the right stick.";
+        const std::string text = Pad::MouseCaptureHint(configuration, captured);
+        if (text.empty()) return;
         const double textX = WindowWidth - Margin - fonts->body.Width(text);
         canvas->Disc(textX - 8.0 - 4.0, 22.0 + fonts->title.LineHeight() / 2.0, 4.0, captured ? Palette::Accent : Palette::Gate);
         fonts->body.Draw(*canvas, textX, 22.0 + (fonts->title.LineHeight() - fonts->body.LineHeight()) / 2.0, text, captured ? Palette::TextPrimary : Palette::TextSecondary);
@@ -914,12 +900,18 @@ private:
             return condition;
         };
         bool passed = true;
-        if (frame == 1) passed = expect(state.sticks == std::array<std::uint8_t, 4>{128, 128, 128, 128}, "sticks start centered");
+        if (frame == 1) {
+            passed = expect(state.sticks == std::array<std::uint8_t, 4>{128, 128, 128, 128}, "sticks start centered") &&
+                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), false) == "Middle-click to capture the mouse", "the capture hint names the middle click");
+        }
         if (frame == 2) passed = expect(state.sticks[1] == 0, "W tilts the left stick up") && expect(canvas->Count(Palette::Accent) > 50, "the stick point is drawn");
         if (frame == 3) passed = expect(state.sticks[1] == Pad::StickByte(-0.5), "the stick modifier halves the tilt");
         if (frame == 4) passed = expect((state.buttons & static_cast<std::uint32_t>(Pad::PadButton::Cross)) != 0, "Space presses Cross");
         if (frame == 5) passed = expect(state.sticks[1] == 128 && state.buttons == 0, "released keys center the stick");
-        if (frame == 6) passed = expect(keyboardMouse->MouseMode(), "middle click captures the mouse");
+        if (frame == 6) {
+            passed = expect(keyboardMouse->MouseMode(), "middle click captures the mouse") &&
+                expect(Pad::MouseCaptureHint(keyboardMouse->Configuration(), true) == "Mouse captured, middle-click to release", "the captured hint names the release");
+        }
         if (frame == SelftestFrames) {
             passed = expect(state.sticks[2] >= Pad::StickByte(0.2) && state.sticks[3] < 128, "mouse motion tilts the right stick right and up") &&
                 expect(state.sticks[0] == Pad::StickByte(0.5) && state.sticks[1] == Pad::StickByte(-0.5), "keys and modifier still drive the left stick");

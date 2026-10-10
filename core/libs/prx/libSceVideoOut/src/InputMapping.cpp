@@ -257,6 +257,97 @@ Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const
     return configuration;
 }
 
+std::string Pad::SourceName(const InputBinding& binding) {
+    if (binding.key != SDL_SCANCODE_UNKNOWN) {
+        const char* name = SDL_GetScancodeName(binding.key);
+        return name != nullptr && name[0] != '\0' ? std::string(name) : "key " + std::to_string(static_cast<int>(binding.key));
+    }
+    switch (binding.mouseButton) {
+        case MouseButton::Left: return "Left click";
+        case MouseButton::Middle: return "Middle click";
+        case MouseButton::Right: return "Right click";
+        case MouseButton::X1: return "Mouse 4";
+        case MouseButton::X2: return "Mouse 5";
+        case MouseButton::None: break;
+    }
+    if (binding.wheelDirection > 0) return "Wheel up";
+    if (binding.wheelDirection < 0) return "Wheel down";
+    return "nothing";
+}
+
+std::vector<std::string> Pad::DescribeBindings(const InputConfiguration& configuration) {
+    const auto sources = [&configuration](InputControl control, PadButton button) {
+        std::string text;
+        for (const auto& binding : configuration.bindings) {
+            if (binding.control != control || (control == InputControl::Button && binding.button != button)) continue;
+            if (!text.empty()) text += "/";
+            text += SourceName(binding);
+        }
+        return text;
+    };
+    const auto stick = [&sources](InputControl up, InputControl left, InputControl down, InputControl right) {
+        std::string text;
+        for (const auto control : {up, left, down, right}) {
+            auto source = sources(control, PadButton::None);
+            const auto separator = source.find('/');
+            if (separator != std::string::npos) source.resize(separator);
+            text += (text.empty() ? "" : " ") + (source.empty() ? std::string("-") : source);
+        }
+        return text;
+    };
+    std::string sticks = "Sticks: left " + stick(InputControl::LeftStickUp, InputControl::LeftStickLeft, InputControl::LeftStickDown, InputControl::LeftStickRight) +
+        ", right " + stick(InputControl::RightStickUp, InputControl::RightStickLeft, InputControl::RightStickDown, InputControl::RightStickRight);
+    const auto toggle = sources(InputControl::ToggleMouse, PadButton::None);
+    if (!toggle.empty()) sticks += "; " + toggle + " puts the mouse on the right stick";
+    const auto modifier = sources(InputControl::StickModifier, PadButton::None);
+    if (!modifier.empty()) sticks += "; hold " + modifier + " for " + std::to_string(std::lround(configuration.settings.stickModifierScale * 100.0)) + "% tilt";
+
+    struct Named {
+        const char* name;
+        PadButton button;
+    };
+    std::string buttons = "Buttons:";
+    for (const auto& [name, button] : {Named{"Cross", PadButton::Cross}, Named{"Circle", PadButton::Circle}, Named{"Square", PadButton::Square},
+             Named{"Triangle", PadButton::Triangle}, Named{"L1", PadButton::L1}, Named{"R1", PadButton::R1}, Named{"L2", PadButton::L2},
+             Named{"R2", PadButton::R2}, Named{"L3", PadButton::L3}, Named{"R3", PadButton::R3}, Named{"Options", PadButton::Options}}) {
+        const auto source = sources(InputControl::Button, button);
+        if (!source.empty()) buttons += std::string(buttons.back() == ':' ? " " : ", ") + name + " " + source;
+    }
+
+    std::string other = "D-pad:";
+    for (const auto& [name, button] : {Named{"up", PadButton::Up}, Named{"right", PadButton::Right}, Named{"down", PadButton::Down}, Named{"left", PadButton::Left}}) {
+        const auto source = sources(InputControl::Button, button);
+        other += std::string(other.back() == ':' ? " " : ", ") + name + " " + (source.empty() ? std::string("-") : source);
+    }
+    const auto touchLeft = sources(InputControl::TouchLeft, PadButton::None);
+    const auto touchRight = sources(InputControl::TouchRight, PadButton::None);
+    if (!touchLeft.empty() || !touchRight.empty()) {
+        other += "; touch pad: left " + (touchLeft.empty() ? std::string("-") : touchLeft) + ", right " + (touchRight.empty() ? std::string("-") : touchRight);
+    }
+    const auto fullscreen = sources(InputControl::ToggleFullscreen, PadButton::None);
+    if (!fullscreen.empty()) other += "; fullscreen " + fullscreen;
+    return {sticks, buttons, other};
+}
+
+std::string Pad::MouseCaptureHint(const InputConfiguration& configuration, bool captured) {
+    const auto found = std::find_if(configuration.bindings.begin(), configuration.bindings.end(), [](const InputBinding& binding) {
+        return binding.control == InputControl::ToggleMouse;
+    });
+    if (found == configuration.bindings.end()) return {};
+    std::string action;
+    switch (found->mouseButton) {
+        case MouseButton::Left: action = "left-click"; break;
+        case MouseButton::Middle: action = "middle-click"; break;
+        case MouseButton::Right: action = "right-click"; break;
+        case MouseButton::X1: action = "press mouse button 4"; break;
+        case MouseButton::X2: action = "press mouse button 5"; break;
+        case MouseButton::None: action = "press " + SourceName(*found); break;
+    }
+    if (captured) return "Mouse captured, " + action + " to release";
+    action[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(action[0])));
+    return action + " to capture the mouse";
+}
+
 Pad::InputConfiguration Pad::LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId) {
     auto configuration = DefaultInputConfiguration();
     const char* configuredPath = std::getenv("ANYPS5_INPUT_CONFIG");
