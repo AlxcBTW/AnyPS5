@@ -20,6 +20,7 @@ public:
     void Move(int deltaX, int deltaY);
     void Advance(double seconds);
     void Reset();
+    double Speed() const;
     std::array<double, 2> Deflection() const;
 
 private:
@@ -47,6 +48,7 @@ public:
     void SetMouseMode(bool enabled);
     void Release();
     bool MouseMode() const;
+    double MouseSpeed() const;
     PadInputState Compose(const PadInputState& controller) const;
     const InputConfiguration& Configuration() const;
 

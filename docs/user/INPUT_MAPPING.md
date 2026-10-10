@@ -81,3 +81,21 @@ MouseCurve = 1.3
 ```
 
 Earlier versions sampled the mouse every 33 ms and tilted the stick at least halfway for any movement. `MouseDeadzoneOffset = 0.5`, `MouseSensitivity = 0.9`, `MouseSmoothingMs = 0` and `MouseDecayMs = 33` come close to that behaviour.
+
+## Tuning without a game
+
+Builds configured with `-DBUILD_TESTING=ON` include `pad_viz` in `build/tests`. It opens a window that draws the two sticks, the triggers and the buttons as AnyPS5 reports them to a game, computed by the same code, so the keyboard and mouse settings can be tuned by hand. Point it at the game's directory to read the same files a game run reads:
+
+```sh
+pad_viz --dir <game directory> --title <TITLE ID> --deadzone 0.12
+```
+
+Middle-click captures the mouse, as in a game. Saving one of the `.ini` files updates the window. The shaded disc marks the game's deadzone, given with `--deadzone` (default 0.1), and the dashed ring marks `MouseDeadzoneOffset`. The settings panel lists the files in effect and every setting, shows the mouse speed in counts per second next to the speed the stick tracks as a fraction of full tilt, and names the line of an `.ini` file that has an error.
+
+`--record <file>` writes the input events to a text trace. The `pad_keyboard_mouse_tests` program replays a trace through the same code and prints the pad state as CSV, so settings and frame rates can be compared offline:
+
+```sh
+pad_keyboard_mouse_tests --replay <file> --poll 16 --dir <game directory> --title <TITLE ID>
+```
+
+`--poll` sets how often, in milliseconds, the replay samples the pad, like a game's frame time. Both programs take `--config <ini>` to read a single file instead of a directory.
