@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <string>
 #include <vector>
 
 namespace {
@@ -25,6 +26,11 @@ std::atomic<KernelSocketPoll::Poller> g_socketPoller{nullptr};
 
 bool DescriptorSet(const void* set, int descriptor) {
     return set != nullptr && ((static_cast<const std::uint64_t*>(set)[descriptor / 64] >> (descriptor % 64)) & 1u) != 0;
+}
+
+void UnknownDescriptor(int descriptor, bool polled) {
+    const auto what = "select on descriptor " + std::to_string(descriptor) + (polled ? " (not a libSceNet socket)" : " (libSceNet is not loaded)");
+    NotImplemented_nid_no_patch(what.c_str());
 }
 
 void ClearDescriptor(void* set, int descriptor) {
@@ -84,7 +90,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         if (devicesReady) waitMilliseconds = 0;
         if (sockets != 0) {
             const auto poller = g_socketPoller.load();
-            if (poller == nullptr) NotImplemented_nid_no_patch("select on descriptors that are not libSceNet sockets");
+            if (poller == nullptr) UnknownDescriptor(entries.front().descriptor, false);
             for (std::size_t index = 0; index < sockets; ++index) entries[index].revents = 0;
             const int result = poller(entries.data(), static_cast<int>(sockets), waitMilliseconds);
             if (result < 0) {
@@ -96,7 +102,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
         }
         int ready = 0;
         for (const auto& entry : entries) {
-            if ((entry.revents & KernelSocketPoll::Unknown) != 0) NotImplemented_nid_no_patch("select on descriptors that are not libSceNet sockets");
+            if ((entry.revents & KernelSocketPoll::Unknown) != 0) UnknownDescriptor(entry.descriptor, true);
             const bool readable = (entry.events & KernelSocketPoll::Readable) != 0 && (entry.revents & (KernelSocketPoll::Readable | KernelSocketPoll::HangUp | KernelSocketPoll::Error)) != 0;
             const bool writable = (entry.events & KernelSocketPoll::Writable) != 0 && (entry.revents & (KernelSocketPoll::Writable | KernelSocketPoll::Error)) != 0;
             const bool urgent = (entry.events & KernelSocketPoll::Urgent) != 0 && (entry.revents & KernelSocketPoll::Urgent) != 0;
