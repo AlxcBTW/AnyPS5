@@ -96,7 +96,10 @@ inline constexpr std::array InputMapping{
 
 InputConfiguration DefaultInputConfiguration();
 InputConfiguration ParseInputConfiguration(std::istream& stream, const std::filesystem::path& source, InputConfiguration base = DefaultInputConfiguration());
+std::filesystem::path PathFromUtf8(std::string_view text);
+std::string PathToUtf8(const std::filesystem::path& path);
 std::filesystem::path DefaultInputDirectory();
+std::filesystem::path ConfiguredInputPath();
 std::string InputProfileName(std::string_view titleId);
 InputConfiguration LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId);
 std::string SourceName(const InputBinding& binding);

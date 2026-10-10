@@ -397,11 +397,12 @@ public:
     const std::filesystem::path path;
 };
 
-void setConfigEnvironment(const std::string& value) {
+void setConfigEnvironment(const std::filesystem::path& value) {
 #ifdef _WIN32
-    check(_putenv_s("ANYPS5_INPUT_CONFIG", value.c_str()) == 0, "cannot set ANYPS5_INPUT_CONFIG");
+    check(_wputenv_s(L"ANYPS5_INPUT_CONFIG", value.c_str()) == 0, "cannot set ANYPS5_INPUT_CONFIG");
 #else
-    check((value.empty() ? unsetenv("ANYPS5_INPUT_CONFIG") : setenv("ANYPS5_INPUT_CONFIG", value.c_str(), 1)) == 0, "cannot set ANYPS5_INPUT_CONFIG");
+    const auto text = Pad::PathToUtf8(value);
+    check((text.empty() ? unsetenv("ANYPS5_INPUT_CONFIG") : setenv("ANYPS5_INPUT_CONFIG", text.c_str(), 1)) == 0, "cannot set ANYPS5_INPUT_CONFIG");
 #endif
 }
 
@@ -412,7 +413,7 @@ bool binds(const Pad::InputConfiguration& configuration, SDL_Scancode key, Pad::
 }
 
 void testProfiles() {
-    setConfigEnvironment("");
+    setConfigEnvironment({});
     check(Pad::InputProfileName("TEST00001") == "anyps5-input.TEST00001.ini", "profile name");
     check(Pad::InputProfileName("").empty() && Pad::InputProfileName("../TEST").empty() && Pad::InputProfileName("A B").empty(), "unsafe title IDs have no profile");
 
@@ -442,14 +443,14 @@ void testProfiles() {
 
     directory.Write("anyps5-input.TEST00001.ini", "KeyboardRampMs = 80\n");
     directory.Write("custom.ini", "MouseSensitivity = 3\n");
-    setConfigEnvironment((directory.path / "custom.ini").string());
+    setConfigEnvironment(directory.path / "custom.ini");
     configuration = Pad::LoadInputConfiguration(directory.path, "TEST00001");
     check(configuration.settings.mouseSensitivity == 3.0 && configuration.settings.mouseCurve == 1.0, "ANYPS5_INPUT_CONFIG replaces the shared file");
     check(configuration.settings.keyboardRampMs == 80.0, "the profile still applies with ANYPS5_INPUT_CONFIG");
-    setConfigEnvironment((directory.path / "missing.ini").string());
+    setConfigEnvironment(directory.path / "missing.ini");
     check(expectFailure([&directory] { Pad::LoadInputConfiguration(directory.path, "TEST00001"); }).find("cannot read input mapping") != std::string::npos,
         "a missing ANYPS5_INPUT_CONFIG file is an error");
-    setConfigEnvironment("");
+    setConfigEnvironment({});
 }
 
 void testOppositeKeysWithAlternates() {
@@ -694,6 +695,38 @@ void testMouseOnLeftStick() {
     check(Pad::DescribeBindings(left)[0].find("puts the mouse on the left stick") != std::string::npos, "the summary names the left stick");
 }
 
+void testNonAsciiPaths() {
+    const std::string name = "anyps5-pad-\xC3\xBC-\xE6\x97\xA5\xE6\x9C\xAC-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto directory = std::filesystem::temp_directory_path() / Pad::PathFromUtf8(name);
+    std::filesystem::create_directories(directory);
+    const auto write = [&directory](const char* file, const char* text) {
+        std::ofstream stream(directory / file, std::ios::binary);
+        stream << text;
+        check(static_cast<bool>(stream), std::string("cannot write ") + file);
+    };
+    write("anyps5-input.ini", "MouseCurve = 1.5\n");
+    write("custom.ini", "MouseSensitivity = 3\n");
+    const auto utf8 = Pad::PathToUtf8(directory);
+    check(utf8.find(name) != std::string::npos, "the directory converts back to the same UTF-8 bytes");
+    check(std::filesystem::exists(Pad::PathFromUtf8(utf8) / "anyps5-input.ini"), "UTF-8 bytes, as SDL_GetBasePath returns them, find the directory");
+
+    setConfigEnvironment({});
+    auto configuration = Pad::LoadInputConfiguration(Pad::PathFromUtf8(utf8), "TEST00001");
+    check(configuration.sources.size() == 1 && configuration.settings.mouseCurve == 1.5, "the ini in a non-ASCII directory is read");
+    check(Pad::PathToUtf8(configuration.sources[0]).find(name) != std::string::npos, "the source path keeps its characters");
+
+    setConfigEnvironment(directory / "custom.ini");
+    configuration = Pad::LoadInputConfiguration(std::filesystem::temp_directory_path(), "");
+    check(configuration.settings.mouseSensitivity == 3.0, "ANYPS5_INPUT_CONFIG may name a non-ASCII path");
+    setConfigEnvironment({});
+
+    write("anyps5-input.TEST00001.ini", "MouseCurve = 9\n");
+    const auto message = expectFailure([&utf8] { Pad::LoadInputConfiguration(Pad::PathFromUtf8(utf8), "TEST00001"); });
+    check(message.find(name) != std::string::npos && message.find("anyps5-input.TEST00001.ini:1: MouseCurve") != std::string::npos, "errors name the non-ASCII path in UTF-8: " + message);
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+}
+
 void testWheelPress() {
     const auto samples = Simulate(defaults(), {At(0.0, PadSimulation::WheelEvent(1))}, 1.0, 200.0);
     const auto up = static_cast<std::uint32_t>(Pad::PadButton::Up);
@@ -738,7 +771,7 @@ int printBindings(int argc, char** argv) {
     } else if (!directory.empty()) {
         configuration = Pad::LoadInputConfiguration(directory, title);
     }
-    for (const auto& source : configuration.sources) std::printf("Pad: input configuration %s\n", source.string().c_str());
+    for (const auto& source : configuration.sources) std::printf("Pad: input configuration %s\n", Pad::PathToUtf8(source).c_str());
     for (const auto& line : Pad::DescribeBindings(configuration)) std::printf("Pad: %s\n", line.c_str());
     std::printf("Title: %s\n", Pad::MouseCaptureHint(configuration, false).c_str());
     std::printf("Title while captured: %s\n", Pad::MouseCaptureHint(configuration, true).c_str());
@@ -770,7 +803,7 @@ int replay(int argc, char** argv) {
     } else if (!directory.empty()) {
         configuration = Pad::LoadInputConfiguration(directory, title);
     }
-    for (const auto& source : configuration.sources) std::fprintf(stderr, "input configuration %s\n", source.string().c_str());
+    for (const auto& source : configuration.sources) std::fprintf(stderr, "input configuration %s\n", Pad::PathToUtf8(source).c_str());
     std::ifstream trace(tracePath);
     if (!trace) throw std::runtime_error("cannot read " + tracePath);
     const auto events = PadSimulation::ReadTrace(trace);
@@ -818,6 +851,7 @@ int main(int argc, char** argv) {
             {"analog triggers", testAnalogTriggers},
             {"keyboard and mouse target", testKeyboardMouseTarget},
             {"mouse on the left stick", testMouseOnLeftStick},
+            {"non-ASCII paths", testNonAsciiPaths},
             {"wheel press", testWheelPress},
             {"trace round trip", testTraceRoundTrip},
         };

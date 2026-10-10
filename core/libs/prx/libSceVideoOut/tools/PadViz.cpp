@@ -478,8 +478,8 @@ private:
 
     std::vector<std::filesystem::path> watchedPaths() const {
         if (!options.config.empty()) return {options.config};
-        const char* configured = std::getenv("ANYPS5_INPUT_CONFIG");
-        std::vector<std::filesystem::path> paths{configured != nullptr && configured[0] != '\0' ? std::filesystem::path(configured) : options.directory / "anyps5-input.ini"};
+        const auto configured = Pad::ConfiguredInputPath();
+        std::vector<std::filesystem::path> paths{!configured.empty() ? configured : options.directory / "anyps5-input.ini"};
         const auto profile = Pad::InputProfileName(options.title);
         if (!profile.empty()) paths.push_back(options.directory / profile);
         return paths;
@@ -491,7 +491,7 @@ private:
             std::error_code error;
             const auto time = std::filesystem::last_write_time(path, error);
             const auto size = error ? 0 : std::filesystem::file_size(path, error);
-            result += path.string() + (error ? "|missing;" : "|" + std::to_string(time.time_since_epoch().count()) + "|" + std::to_string(size) + ";");
+            result += Pad::PathToUtf8(path) + (error ? "|missing;" : "|" + std::to_string(time.time_since_epoch().count()) + "|" + std::to_string(size) + ";");
         }
         return result;
     }
@@ -792,7 +792,7 @@ private:
             rowY += 20.0;
         }
         for (const auto& source : configuration.sources) {
-            fonts->body.Draw(*canvas, inner, rowY, source.filename().string(), Palette::TextSecondary);
+            fonts->body.Draw(*canvas, inner, rowY, Pad::PathToUtf8(source.filename()), Palette::TextSecondary);
             rowY += 20.0;
         }
 
@@ -873,8 +873,8 @@ private:
         constexpr std::string_view Prefix = "Pad: invalid input mapping ";
         if (message.starts_with(Prefix)) message.erase(0, Prefix.size());
         for (const auto& path : watchedPaths()) {
-            const auto full = path.string();
-            for (auto found = message.find(full); found != std::string::npos; found = message.find(full)) message.replace(found, full.size(), path.filename().string());
+            const auto full = Pad::PathToUtf8(path);
+            for (auto found = message.find(full); found != std::string::npos; found = message.find(full)) message.replace(found, full.size(), Pad::PathToUtf8(path.filename()));
         }
         reloadError = message;
         std::fprintf(stderr, "pad_viz: %s\n", error.what());
