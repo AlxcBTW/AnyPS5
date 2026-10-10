@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -10,7 +11,7 @@ namespace {
 
 struct Module {
     std::vector<std::uint32_t> capabilities;
-    std::vector<std::string_view> extensions;
+    std::vector<std::string> extensions;
     bool layerOutput = false;
     std::uint32_t version = 0;
 };
@@ -38,8 +39,8 @@ bool has(const std::vector<std::uint32_t>& values, std::uint32_t value) {
     return false;
 }
 
-bool named(const std::vector<std::string_view>& values, std::string_view value) {
-    for (const auto entry : values) {
+bool named(const std::vector<std::string>& values, std::string_view value) {
+    for (const auto& entry : values) {
         if (entry == value) return true;
     }
     return false;
