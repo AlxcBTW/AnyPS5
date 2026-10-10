@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -62,6 +63,7 @@ public:
     void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType);
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
+    static std::optional<DrawMiss> MatchDrawEntry(const DrawEntry& entry, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, bool fixedSlots, const std::function<EntryOutcome(std::size_t, const DispatchVariant&)>& validate, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::size_t>& ranks, std::uint64_t& stageValidations, std::uint64_t& stageEqual);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
 
 private:

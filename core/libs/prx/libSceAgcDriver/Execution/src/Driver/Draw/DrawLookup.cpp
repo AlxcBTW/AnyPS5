@@ -4,8 +4,39 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
+std::optional<DrawMiss> Driver::MatchDrawEntry(const DrawEntry& entry, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, bool fixedSlots, const std::function<EntryOutcome(std::size_t, const DispatchVariant&)>& validate, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::size_t>& ranks, std::uint64_t& stageValidations, std::uint64_t& stageEqual) {
     using Role = ShaderRecompiler::ProgramRole;
+    if (entry.stages.size() != programs.size()) return DrawMiss::Stages;
+    std::uint32_t cursor = 0;
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        if (roles[i] == Role::GeometryBack) continue;
+        cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, fixedSlots);
+        ++stageValidations;
+        const auto& variants = entry.stages[i];
+        auto outcome = EntryOutcome::Differing;
+        bool anyLayout = false;
+        for (std::size_t rank = 0; rank < variants.size(); ++rank) {
+            const auto& variant = variants[rank];
+            if (variant->pushOffset != cursor) continue;
+            const auto result = validate(i, *variant);
+            if (!anyLayout) outcome = result;
+            anyLayout = true;
+            if (result != EntryOutcome::Equal) continue;
+            matched[i] = variant;
+            ranks[i] = rank;
+            ++stageEqual;
+            cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
+            break;
+        }
+        if (matched[i] != nullptr) continue;
+        if (!anyLayout) return DrawMiss::Layout;
+        if (outcome != EntryOutcome::Differing) return DrawMiss::Gate;
+        return roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
+    }
+    return std::nullopt;
+}
+
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
     if (useDrawEntries) {
         if (!registerKey) {
             drawKey = 0xcbf29ce484222325ull;
@@ -79,43 +110,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::optional<DrawMiss> miss;
             std::vector<std::size_t> ranks(programs.size(), 0);
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0;
-            if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
-
-            std::uint32_t cursor = 0;
             {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
 
                 std::optional<SampledReadScope> sampling;
-                for (std::size_t i = 0; !miss && i < programs.size(); ++i) {
-                    if (roles[i] == Role::GeometryBack) continue;
-                    ++stageValidations;
-                    cursor = Graphics::StagePushOffset(cursor, programs[i].binary.stage, localDevice->GraphicsPipelineLibraries());
-                    const auto& variants = entry->stages[i];
-                    auto outcome = EntryOutcome::Differing;
-                    bool anyLayout = false;
-                    for (std::size_t rank = 0; rank < variants.size(); ++rank) {
-                        const auto& variant = variants[rank];
-                        if (variant->pushOffset != cursor) continue;
-                        auto& regions = matchedRegions[i];
-                        regions.clear();
-                        appendEntryRegions(*variant, regions);
-                        ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                        if (!anyLayout) outcome = result;
-                        anyLayout = true;
-                        if (result != EntryOutcome::Equal) continue;
-                        matched[i] = variant;
-                        ranks[i] = rank;
-                        ++stageEqual;
-                        cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
-                        break;
-                    }
-                    if (matched[i] != nullptr) continue;
-                    if (!anyLayout) miss = DrawMiss::Layout;
-                    else if (outcome != EntryOutcome::Differing) miss = DrawMiss::Gate;
-                    else miss = roles[i] == Role::Fragment ? DrawMiss::FragmentDiffering : i == 0 ? DrawMiss::FrontDiffering : DrawMiss::OtherDiffering;
-                }
+                miss = MatchDrawEntry(*entry, programs, roles, localDevice->GraphicsPipelineLibraries(), [&](std::size_t i, const DispatchVariant& variant) {
+                    auto& regions = matchedRegions[i];
+                    regions.clear();
+                    appendEntryRegions(variant, regions);
+                    ++compared;
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, variant, regions, imagesFlushed, runsSynced, sampling);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, variant, regions, imagesFlushed, runsSynced, sampling);
+                    return result;
+                }, matched, ranks, stageValidations, stageEqual);
             }
             drawHit = !miss;
             std::lock_guard cacheLock(drawCacheMutex);
