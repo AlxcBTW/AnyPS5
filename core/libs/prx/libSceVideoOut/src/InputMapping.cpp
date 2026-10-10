@@ -174,16 +174,39 @@ Pad::InputBinding parseBinding(const InputAction& action, std::string_view sourc
     throw std::runtime_error("Pad: invalid input mapping " + path.string() + ":" + std::to_string(line) + ": " + reason);
 }
 
-std::filesystem::path defaultConfigPath() {
+void loadLayer(Pad::InputConfiguration& configuration, const std::filesystem::path& path, bool required) {
+    std::ifstream file(path);
+    if (!file) {
+        if (required || std::filesystem::exists(path)) {
+            throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
+        }
+        return;
+    }
+    configuration = Pad::ParseInputConfiguration(file, path, std::move(configuration));
+}
+
+}
+
+Pad::InputConfiguration Pad::DefaultInputConfiguration() {
+    return InputConfiguration{{InputMapping.begin(), InputMapping.end()}, {}, {}};
+}
+
+std::filesystem::path Pad::DefaultInputDirectory() {
     std::unique_ptr<char, decltype(&SDL_free)> basePath(SDL_GetBasePath(), SDL_free);
-    if (basePath) return std::filesystem::path(basePath.get()) / "anyps5-input.ini";
-    return "anyps5-input.ini";
+    if (basePath) return std::filesystem::path(basePath.get());
+    return {};
 }
 
+std::string Pad::InputProfileName(std::string_view titleId) {
+    const bool valid = !titleId.empty() && titleId.size() <= 32 && std::all_of(titleId.begin(), titleId.end(), [](char character) {
+        return std::isalnum(static_cast<unsigned char>(character)) != 0 || character == '_' || character == '-';
+    });
+    return valid ? "anyps5-input." + std::string(titleId) + ".ini" : std::string();
 }
 
-Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const std::filesystem::path& path) {
-    InputConfiguration configuration{{InputMapping.begin(), InputMapping.end()}, {}, path};
+Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const std::filesystem::path& path, InputConfiguration base) {
+    InputConfiguration configuration = std::move(base);
+    configuration.sources.push_back(path);
     auto& bindings = configuration.bindings;
     std::unordered_set<std::string> overriddenActions;
     std::unordered_set<std::string> givenSettings;
@@ -234,16 +257,12 @@ Pad::InputConfiguration Pad::ParseInputConfiguration(std::istream& stream, const
     return configuration;
 }
 
-Pad::InputConfiguration Pad::LoadInputConfiguration() {
+Pad::InputConfiguration Pad::LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId) {
+    auto configuration = DefaultInputConfiguration();
     const char* configuredPath = std::getenv("ANYPS5_INPUT_CONFIG");
     const bool explicitPath = configuredPath != nullptr && configuredPath[0] != '\0';
-    const std::filesystem::path path = explicitPath ? configuredPath : defaultConfigPath();
-    std::ifstream file(path);
-    if (!file) {
-        if (explicitPath || std::filesystem::exists(path)) {
-            throw std::runtime_error("Pad: cannot read input mapping '" + path.string() + "'");
-        }
-        return InputConfiguration{{InputMapping.begin(), InputMapping.end()}, {}, {}};
-    }
-    return ParseInputConfiguration(file, path);
+    loadLayer(configuration, explicitPath ? std::filesystem::path(configuredPath) : directory / "anyps5-input.ini", explicitPath);
+    const auto profile = InputProfileName(titleId);
+    if (!profile.empty()) loadLayer(configuration, directory / profile, false);
+    return configuration;
 }

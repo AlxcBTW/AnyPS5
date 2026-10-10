@@ -32,6 +32,10 @@ ToggleMouse = MOUSE:Middle
 
 An invalid line reports the file and line number and stops input initialization. If the configured file does not exist or cannot be read, AnyPS5 reports an error. With no `anyps5-input.ini` and no `ANYPS5_INPUT_CONFIG`, the built-in mapping is used.
 
+## Per-game profiles
+
+To change bindings or settings for one game only, create `anyps5-input.<TITLE ID>.ini` beside the game executable, named after the title ID in the game's `sce_sys/param.json`, for example `anyps5-input.PPSA01234.ini`. AnyPS5 reads `anyps5-input.ini`, or the `ANYPS5_INPUT_CONFIG` file, first and the profile after it, so the profile only needs the lines that differ. The profile's first line for an action replaces that action's bindings, and its settings replace the shared ones. The log lists every input file it read.
+
 ## Analog keyboard sticks
 
 A stick key tilts its stick fully. Hold `StickModifier` (Z by default) to tilt only part of the way, for walking or for fine flight control. Each stick axis is independent, so holding two neighbouring keys tilts both axes fully. Holding opposite keys centers that axis, and releasing one of them tilts toward the other.

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <istream>
+#include <string>
+#include <string_view>
 #include <vector>
 #include "SDL_scancode.h"
 #include "SDL_mouse.h"
@@ -30,7 +32,7 @@ struct InputSettings {
 struct InputConfiguration {
     std::vector<InputBinding> bindings;
     InputSettings settings;
-    std::filesystem::path source;
+    std::vector<std::filesystem::path> sources;
 };
 
 inline constexpr std::array InputMapping{
@@ -70,8 +72,11 @@ inline constexpr std::array InputMapping{
     InputBinding{SDL_SCANCODE_UNKNOWN, MouseButton::None, InputControl::Button, PadButton::Down, -1}
 };
 
-InputConfiguration ParseInputConfiguration(std::istream& stream, const std::filesystem::path& source);
-InputConfiguration LoadInputConfiguration();
+InputConfiguration DefaultInputConfiguration();
+InputConfiguration ParseInputConfiguration(std::istream& stream, const std::filesystem::path& source, InputConfiguration base = DefaultInputConfiguration());
+std::filesystem::path DefaultInputDirectory();
+std::string InputProfileName(std::string_view titleId);
+InputConfiguration LoadInputConfiguration(const std::filesystem::path& directory, std::string_view titleId);
 
 }
 

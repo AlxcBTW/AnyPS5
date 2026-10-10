@@ -12,10 +12,10 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
-PadInput::PadInput() : keyboardMouse(Pad::LoadInputConfiguration()) {
-    const auto& configuration = keyboardMouse.Configuration();
-    if (!configuration.source.empty()) APS5_LOG_OUT("Pad: input configuration %s", configuration.source.string().c_str());
+PadInput::PadInput() : keyboardMouse(Pad::LoadInputConfiguration(Pad::DefaultInputDirectory(), GetAppTitleId_nid_postfix().value)) {
+    for (const auto& source : keyboardMouse.Configuration().sources) APS5_LOG_OUT("Pad: input configuration %s", source.string().c_str());
     openFirstAvailableController();
 }
 
