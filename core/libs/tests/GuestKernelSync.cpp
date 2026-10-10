@@ -21,6 +21,7 @@ int APS5_VABI sceKernelRename(const char*, const char*);
 int APS5_VABI sceKernelUnlink(const char*);
 int APS5_VABI sceKernelChmod_nid_postfix(const char*, std::uint16_t);
 void APS5_VABI sceKernelSync();
+void APS5_VABI sync_nid_postfix();
 void* APS5_VABI fopen_nid_postfix(const char*, const char*);
 int APS5_VABI fclose_nid_postfix(void*);
 }
@@ -57,6 +58,12 @@ int main() {
     sceKernelSync();
     Require(!Recorded("kernel_sync_probe/data.bin") && !Recorded("kernel_sync_probe/moved.bin"));
     sceKernelSync();
+    const int posix = sceKernelOpen("kernel_sync_probe/posix.bin", 0x1 | 0x200, 0644);
+    Require(posix >= 0 && sceKernelWrite(posix, "data", 4) == 4 && sceKernelClose(posix) == 0);
+    Require(sceKernelUnlink("kernel_sync_probe/posix.bin") == 0);
+    Require(Recorded("kernel_sync_probe/posix.bin"));
+    sync_nid_postfix();
+    Require(!Recorded("kernel_sync_probe/posix.bin"));
     const int locked = sceKernelOpen("kernel_sync_probe/read_only.bin", 0x1 | 0x200, 0644);
     Require(locked >= 0 && sceKernelWrite(locked, "data", 4) == 4 && sceKernelClose(locked) == 0);
     Require(sceKernelChmod_nid_postfix("kernel_sync_probe/read_only.bin", 0444) == 0);

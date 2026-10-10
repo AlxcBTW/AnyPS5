@@ -293,6 +293,10 @@ void APS5_VABI sceKernelSync(void) {
     SyncWrittenPaths_nid_no_patch();
 }
 
+void APS5_VABI sync_nid_postfix(void) {
+    sceKernelSync();
+}
+
 int APS5_VABI sched_get_priority_max_nid_postfix(int policy) {
     validateSchedulingPolicy(policy);
     return 256;

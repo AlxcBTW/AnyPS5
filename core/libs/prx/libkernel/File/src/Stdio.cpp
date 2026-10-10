@@ -237,6 +237,10 @@ static int PosixResult(int result) {
     return result < 0 ? PosixFailure(result & 0xffff) : result;
 }
 
+static std::int64_t PosixResult(std::int64_t result) {
+    return result < 0 ? PosixFailure(static_cast<int>(result & 0xffff)) : result;
+}
+
 extern "C" int APS5_VABI pipe_nid_postfix(int* descriptors) {
     if (!descriptors) return PosixFailure(GUEST_EFAULT);
     const GuestArena::HostWrite destination(descriptors, 2 * sizeof(int));
@@ -698,6 +702,14 @@ int64_t APS5_VABI sceKernelPwritev(int d, const KernelIovec* iov, int iovcnt, in
 }
 
 #endif
+
+int64_t APS5_VABI preadv_nid_postfix(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+    return PosixResult(sceKernelPreadv(d, iov, iovcnt, offset));
+}
+
+int64_t APS5_VABI pwritev_nid_postfix(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+    return PosixResult(sceKernelPwritev(d, iov, iovcnt, offset));
+}
 
 int APS5_VABI sceKernelRename(const char* from, const char* to) {
     if (from == nullptr || to == nullptr) throw std::invalid_argument("sceKernelRename: path is null");
