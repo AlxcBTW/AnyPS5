@@ -108,6 +108,17 @@ std::array<double, 4> Pad::KeyboardMouse::keyTargets() const {
     return targets;
 }
 
+std::array<double, 2> Pad::KeyboardMouse::triggerTargets() const {
+    std::array<double, 2> targets{};
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        const auto& binding = configuration.bindings[index];
+        if (!pressed[index] || binding.control != InputControl::Button) continue;
+        if (binding.button == PadButton::L2) targets[0] = 1.0;
+        if (binding.button == PadButton::R2) targets[1] = 1.0;
+    }
+    return targets;
+}
+
 void Pad::KeyboardMouse::advanceKeys(Clock::time_point now) {
     const double seconds = keysAdvanced && now > lastKeyAdvance ? std::chrono::duration<double>(now - lastKeyAdvance).count() : 0.0;
     if (!keysAdvanced || now > lastKeyAdvance) lastKeyAdvance = now;
@@ -121,6 +132,16 @@ void Pad::KeyboardMouse::advanceKeys(Clock::time_point now) {
         }
         const double step = seconds * 1000.0 / ramp;
         keyAxes[axis] = targets[axis] > keyAxes[axis] ? std::min(targets[axis], keyAxes[axis] + step) : std::max(targets[axis], keyAxes[axis] - step);
+    }
+    const auto triggers = triggerTargets();
+    const double triggerRamp = configuration.settings.triggerRampMs;
+    for (std::size_t trigger = 0; trigger < triggerAxes.size(); ++trigger) {
+        if (triggerRamp <= 0.0) {
+            triggerAxes[trigger] = triggers[trigger];
+            continue;
+        }
+        const double step = seconds * 1000.0 / triggerRamp;
+        triggerAxes[trigger] = triggers[trigger] > triggerAxes[trigger] ? std::min(triggers[trigger], triggerAxes[trigger] + step) : std::max(triggers[trigger], triggerAxes[trigger] - step);
     }
 }
 
@@ -140,6 +161,7 @@ void Pad::KeyboardMouse::Advance(Clock::time_point now) {
         pressed[index] = false;
         wheelReleaseTimes[index] = {};
     }
+    if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
 }
 
 void Pad::KeyboardMouse::SetMouseMode(bool enabled) {
@@ -151,6 +173,8 @@ void Pad::KeyboardMouse::Release() {
     std::fill(pressed.begin(), pressed.end(), false);
     std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), Clock::time_point{});
     keyAxes = {};
+    triggerAxes = {};
+    wheelTriggers = {};
 }
 
 Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock::time_point now) {
@@ -170,12 +194,21 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
         if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) direction = -direction;
         if (direction == 0) return requests;
         const auto releaseTime = now + std::chrono::milliseconds(WheelPressDurationMs);
+        const double step = configuration.settings.triggerWheelStep;
+        advanceKeys(now);
         for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
             const auto& binding = configuration.bindings[index];
             if (binding.wheelDirection == 0) continue;
+            const bool trigger = binding.control == InputControl::Button && (binding.button == PadButton::L2 || binding.button == PadButton::R2);
+            if (step > 0.0 && trigger) {
+                auto& level = wheelTriggers[binding.button == PadButton::L2 ? 0 : 1];
+                level = std::clamp(level + (binding.wheelDirection == direction ? step : -step), 0.0, 1.0);
+                continue;
+            }
             pressed[index] = binding.wheelDirection == direction;
             wheelReleaseTimes[index] = pressed[index] ? releaseTime : Clock::time_point{};
         }
+        if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
         return requests;
     }
     const bool keyboard = event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
@@ -200,6 +233,7 @@ Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock
         pressed[index] = down;
     }
     if (configuration.settings.keyboardRampMs <= 0.0) keyAxes = keyTargets();
+    if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
     return requests;
 }
 
@@ -213,9 +247,7 @@ PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const
         const auto& binding = configuration.bindings[index];
         switch (binding.control) {
             case InputControl::Button:
-                state.buttons |= static_cast<std::uint32_t>(binding.button);
-                if (binding.button == PadButton::L2) state.analogButtonsL2 = 255;
-                if (binding.button == PadButton::R2) state.analogButtonsR2 = 255;
+                if (binding.button != PadButton::L2 && binding.button != PadButton::R2) state.buttons |= static_cast<std::uint32_t>(binding.button);
                 break;
             case InputControl::LeftStickLeft:
             case InputControl::LeftStickRight: held[0] = true; break;
@@ -240,6 +272,9 @@ PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const
         state.sticks[2] = StickByte(deflection[0]);
         state.sticks[3] = StickByte(deflection[1]);
     }
+    const auto triggerByte = [](double value) { return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0)); };
+    state.analogButtonsL2 = std::max(state.analogButtonsL2, triggerByte(std::max(triggerAxes[0], wheelTriggers[0])));
+    state.analogButtonsR2 = std::max(state.analogButtonsR2, triggerByte(std::max(triggerAxes[1], wheelTriggers[1])));
     if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::L2);
     if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::R2);
     return state;

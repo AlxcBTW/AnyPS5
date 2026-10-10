@@ -102,6 +102,26 @@ KeyboardRampMs = 150
 StickModifierScale = 0.35
 ```
 
+## Analog triggers
+
+A key or mouse button bound to L2 or R2 presses the trigger fully at once, as a button does. Two settings make the triggers analog:
+
+| Setting | Default | Range | Effect |
+| --- | --- | --- | --- |
+| `TriggerRampMs` | `0` | 0 to 2000 | Milliseconds a trigger key takes to press the trigger fully, and to let it go. 0 presses at once. |
+| `TriggerWheelStep` | `0` | 0 to 1 | With a value above 0, a wheel binding on L2 or R2 becomes a throttle: each notch in the bound direction raises the trigger by this fraction and holds it there, and each notch the other way lowers it. 0 keeps the wheel as a short button press. |
+
+A trigger key and the wheel level combine; the higher one wins. Losing focus drops a wheel-held trigger to zero. For example, a throttle on the wheel for a driving or flight game, keeping the right button for a full press and taking wheel-down away from the D-pad:
+
+```ini
+TriggerWheelStep = 0.1
+R2 = WHEEL:Up
+R2 = MOUSE:Right
+Down = KEY:Down
+```
+
+Partial trigger values, from a controller or from these settings, reach the game as they are. Earlier versions reported any pressed trigger as fully pressed.
+
 ## Mouse as the right stick
 
 `ToggleMouse` (the middle mouse button or `F7` by default) captures the mouse and drives the right stick from how fast the mouse moves. Capture uses raw relative input, so the pointer speed and acceleration set in the operating system don't apply. Press it again to release the mouse. Capture also ends, and every held key is let go, when the window loses focus, including through Alt+Tab, so the pointer is never stuck in the game window.

@@ -812,6 +812,8 @@ private:
         rowY += 22.0;
         settingRow(inner, rowY, innerWidth, "Modifier (" + boundTo(configuration, Pad::InputControl::StickModifier) + ")", format("%.2f", settings.stickModifierScale));
         settingRow(inner, rowY += Row, innerWidth, "Ramp", format("%.0f ms", settings.keyboardRampMs));
+        settingRow(inner, rowY += Row, innerWidth, "Trigger ramp", format("%.0f ms", settings.triggerRampMs));
+        settingRow(inner, rowY += Row, innerWidth, "Trigger wheel step", settings.triggerWheelStep > 0.0 ? format("%.2f", settings.triggerWheelStep) : std::string("off"));
 
         rowY += Row + 14.0;
         groupLabel(inner, rowY, "LIVE");

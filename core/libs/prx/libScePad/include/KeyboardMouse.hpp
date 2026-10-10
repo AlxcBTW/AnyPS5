@@ -55,6 +55,7 @@ public:
 
 private:
     std::array<double, 4> keyTargets() const;
+    std::array<double, 2> triggerTargets() const;
     void advanceKeys(Clock::time_point now);
 
     InputConfiguration configuration;
@@ -62,6 +63,8 @@ private:
     std::vector<Clock::time_point> wheelReleaseTimes;
     MouseStick mouse;
     std::array<double, 4> keyAxes{};
+    std::array<double, 2> triggerAxes{};
+    std::array<double, 2> wheelTriggers{};
     Clock::time_point lastAdvance{};
     Clock::time_point lastKeyAdvance{};
     bool advanced = false;
