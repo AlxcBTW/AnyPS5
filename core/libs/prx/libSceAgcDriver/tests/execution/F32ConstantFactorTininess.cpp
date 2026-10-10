@@ -76,6 +76,10 @@ constexpr std::array<Pinned, 6> TinyProducts{{
     {31u, 6u, 0x00000000u},
 }};
 
+constexpr std::array<Pinned, 1> RoundedProducts{{
+    {2u, 2u, 0x00800000u},
+}};
+
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
@@ -136,6 +140,10 @@ void CheckTinyProducts(const char* mode) {
     for (const Pinned& pinned : TinyProducts) {
         const std::uint32_t actual = Output[pinned.tid * Results + pinned.pair * 2u];
         Require(actual == pinned.value, std::string("f32 constant factor: lane ") + std::to_string(pinned.tid) + " " + mode + " " + Names[pinned.pair] + " is " + Hex(actual) + ", expected the flushed tiny product " + Hex(pinned.value));
+    }
+    for (const Pinned& pinned : RoundedProducts) {
+        const std::uint32_t actual = Output[pinned.tid * Results + pinned.pair * 2u];
+        Require(actual == pinned.value, std::string("f32 constant factor: lane ") + std::to_string(pinned.tid) + " " + mode + " " + Names[pinned.pair] + " is " + Hex(actual) + ", expected the product that rounds to 24 bits at 2^-126 " + Hex(pinned.value));
     }
 }
 
