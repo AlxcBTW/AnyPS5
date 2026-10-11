@@ -5,6 +5,7 @@
 #include <random>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 
 namespace {
 
@@ -17,7 +18,8 @@ extern "C" {
 
 int APS5_VABI sceRandomGetRandomNumber(void* buf, size_t size) {
     if (!buf || size > SCE_RANDOM_MAX_SIZE) return SCE_RANDOM_ERROR_INVALID;
-    static thread_local std::random_device device;
+    struct DeviceTag {};
+    auto& device = HostThreadLocal<std::random_device, DeviceTag>();
     auto* bytes = static_cast<unsigned char*>(buf);
     for (std::size_t offset = 0; offset < size; offset += sizeof(unsigned int)) {
         const unsigned int value = device();

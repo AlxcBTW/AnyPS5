@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -24,7 +25,8 @@ char* APS5_VABI strcasestr_nid_postfix(const char* text, const char* needle) {
 }
 
 void APS5_VABI arc4random_buf_nid_postfix(void* buffer, std::size_t size) {
-    static thread_local std::random_device device;
+    struct DeviceTag {};
+    auto& device = HostThreadLocal<std::random_device, DeviceTag>();
     auto* bytes = static_cast<unsigned char*>(buffer);
     for (std::size_t offset = 0; offset < size; offset += sizeof(unsigned int)) {
         const unsigned int value = device();

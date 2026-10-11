@@ -12,6 +12,7 @@
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
@@ -329,7 +330,8 @@ void* APS5_VABI sceKernelGetProcParam(void) {
 
 int APS5_VABI sceKernelUuidCreate(std::uint32_t* uuid) {
     if (!uuid) return sceInvalidArgument;
-    static thread_local std::random_device device;
+    struct DeviceTag {};
+    auto& device = HostThreadLocal<std::random_device, DeviceTag>();
     std::uniform_int_distribution<std::uint32_t> distribution;
     std::array<std::uint32_t, 4> value;
     for (auto& word : value)
