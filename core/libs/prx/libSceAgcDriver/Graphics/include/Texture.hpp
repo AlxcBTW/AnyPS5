@@ -409,6 +409,8 @@ private:
     bool refreshProved();
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
+    // exp (APS5_EXP_SNAPSHOT_NOWAIT): a read of the surface now would wait for the GPU.
+    bool snapshotWouldWait() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -544,6 +546,11 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    // exp (APS5_EXP_SNAPSHOT_NOWAIT_VERIFY): `original` / `generationBaseline` were read although
+    // APS5_EXP_SNAPSHOT_NOWAIT would have left them out (a recorded GPU write to the surface was
+    // pending); the decisions made with them are counted against the ones the skip would make.
+    bool originalWouldSkip = false;
+    bool baselineWouldSkip = false;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
