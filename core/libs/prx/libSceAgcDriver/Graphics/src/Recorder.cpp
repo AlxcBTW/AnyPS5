@@ -1747,6 +1747,9 @@ std::atomic<std::uint64_t> timingDropped{0};
 struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
+std::atomic<bool> timedCallsCollected{false};
+std::vector<Recorder::TimedCall> timedCalls;
+std::uint64_t timedCallsDropped = 0;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
 
@@ -1898,6 +1901,26 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
+std::uint32_t Recorder::beginDetailedTiming(std::uint64_t key, const TimingDetail& detail) {
+    Commands();
+    const auto index = beginTiming(key);
+    if (index != NoTiming) open->timedDetails[index] = detail;
+    return index;
+}
+
+void Recorder::CollectTimedCalls(bool collect) {
+    timedCallsCollected.store(collect, std::memory_order_relaxed);
+}
+
+const char* Recorder::ClassName(std::uint64_t key) {
+    return key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : nullptr;
+}
+
+Recorder::TimedCalls Recorder::TakeTimedCalls() {
+    std::lock_guard lock(timingMutex);
+    return {std::exchange(timedCalls, {}), std::exchange(timedCallsDropped, 0)};
+}
+
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
@@ -1920,11 +1943,16 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     }
     if (open->timedKeys.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
+        if (timedCallsCollected.load(std::memory_order_relaxed)) {
+            std::lock_guard lock(timingMutex);
+            ++timedCallsDropped;
+        }
         return NoTiming;
     }
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedDetails.emplace_back();
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2375,6 +2403,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
         const auto key = batch.timedKeys[i];
         auto& totals = timingByKey[key];
+        if (timedCallsCollected.load(std::memory_order_relaxed)) timedCalls.push_back({key, batch.timedDetails[i], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period});
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];

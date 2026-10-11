@@ -1,11 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Journal/include/Recording.hpp"
 #include <mutex>
 
 namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
-    DriverDetail::Driver::Get().Submit(packet, queue);
+    if (Journal::Armed()) Journal::Submit(packet, queue);
+    else DriverDetail::Driver::Get().Submit(packet, queue);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -19,19 +21,23 @@ void Shutdown() {
 }
 
 void RegisterShader(const Shader* shader) {
-    DriverDetail::Driver::Get().RegisterShader(shader);
+    if (Journal::Armed()) Journal::RegisterShader(shader);
+    else DriverDetail::Driver::Get().RegisterShader(shader);
 }
 
 void SuspendPoint() {
-    DriverDetail::Driver::Get().SuspendPoint();
+    if (Journal::Armed()) Journal::SuspendPoint();
+    else DriverDetail::Driver::Get().SuspendPoint();
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
-    DriverDetail::Driver::Get().RegisterVideoOutput(handle, output);
+    if (Journal::Armed()) Journal::RegisterVideoOutput(handle, output);
+    else DriverDetail::Driver::Get().RegisterVideoOutput(handle, output);
 }
 
 void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
-    DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
+    if (Journal::Armed()) Journal::UnregisterVideoOutput(handle, output);
+    else DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
 }
 
 void AttachWindow(const PresentationWindow& window) {
@@ -124,12 +130,15 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 }
 
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
+    if (AgcDriver::Journal::Armed()) AgcDriver::Journal::ResolveShaderAbi(shader, context, primitive);
+    else AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    if (AgcDriver::Journal::Armed()) AgcDriver::Journal::ResolveGraphicsAbi(vertex, pixel, primitiveType);
+    else AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 }
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
+    if (AgcDriver::Journal::Armed()) AgcDriver::Journal::ResolveGraphicsStagesAbi(stages, context, primitive);
+    else AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 }

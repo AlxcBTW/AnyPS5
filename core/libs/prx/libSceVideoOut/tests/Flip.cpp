@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libSceAgcDriver/Journal/include/Format.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "tests/VideoOutTestEnvironment.hpp"
 #include <algorithm>
@@ -15,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <string>
 #include <limits>
@@ -661,6 +664,50 @@ void testOneDevice() {
     check(next.Serial() == 2, "the GPU work and the flip used more than one device");
 }
 
+void testJournal() {
+    AgcDriver::Journal::Arm();
+    const int handle = sceVideoOutOpen(255, 0, 0, nullptr);
+    auto cfg = VideoOutDriver::Get().GetConfig(handle);
+    std::vector<std::byte> allocation(2 * 65536 + 65535);
+    const auto storage = alignedBuffer(allocation);
+    const auto plain = storage.subspan(0, 65536);
+    const auto compressed = storage.subspan(65536, 65536);
+    fillBuffer(plain, 64, 64);
+    fillBuffer(compressed, 64, 64);
+    std::vector<std::uint8_t> keys(4096, 0x20);
+    VideoOutBuffers plainBuffer{plain.data(), nullptr, {nullptr, nullptr}};
+    VideoOutBuffers compressedBuffer{compressed.data(), keys.data(), {nullptr, nullptr}};
+    VideoOutBufferAttribute2 attribute{};
+    sceVideoOutSetBufferAttribute2(&attribute, 0x8000000000000000ull, 0, 64, 64, 0, 0, 0);
+    check(sceVideoOutRegisterBuffers2(handle, 0, 0, &plainBuffer, 1, &attribute, 0, nullptr) == 0, "buffer registration failed");
+    VideoOutBufferAttribute2 compressedAttribute{};
+    sceVideoOutSetBufferAttribute2(&compressedAttribute, 0x8000000000000000ull, 0, 64, 64, 0, 0x208, 0xff102030);
+    check(sceVideoOutRegisterBuffers2(handle, 1, 1, &compressedBuffer, 1, &compressedAttribute, VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED, nullptr) == 0, "compressed buffer registration failed");
+    const auto directory = std::filesystem::temp_directory_path() / ("video-out-journal-" + std::to_string(handle) + "-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    AgcDriver::Journal::Open(directory);
+    for (int index : {0, 1}) {
+        check(sceVideoOutSubmitFlip(handle, index, 1, index + 1) == 0, "the flip was not accepted");
+        std::unique_lock lock(cfg->mutex);
+        const bool done = cfg->vblankCond.wait_for(lock, std::chrono::seconds(30), [&] { return cfg->failure || cfg->flipStatus.count == static_cast<std::uint64_t>(index + 1); });
+        if (cfg->failure) std::rethrow_exception(cfg->failure);
+        check(done, "the flip did not complete");
+    }
+    AgcDriver::Journal::Close();
+    const auto journal = AgcDriver::Journal::ReadJournal(directory);
+    std::filesystem::remove_all(directory);
+    const AgcDriver::DisplayBuffer plainDisplay{reinterpret_cast<std::uint64_t>(plain.data()), 0x8000000000000000ull, 64, 64, 0, 0, 0, 0};
+    const AgcDriver::DisplayBuffer compressedDisplay{reinterpret_cast<std::uint64_t>(compressed.data()), 0x8000000000000000ull, 64, 64, 0, 0, reinterpret_cast<std::uint64_t>(keys.data()), 0xff102030};
+    check(journal.references.size() == 2 && journal.references[0].bgra == AgcDriver::ReadDisplayBuffer(plainDisplay), "the journal did not read back the display buffer VideoOut registered for the flip");
+    const auto clear = AgcDriver::DisplayBufferClearPixel(compressedDisplay, AgcDriver::Graphics::DccKeys::ClearRegister);
+    bool uniform = journal.references[1].bgra.size() == 64u * 64u * clear.size();
+    for (std::size_t offset = 0; uniform && offset < journal.references[1].bgra.size(); offset += clear.size()) uniform = std::equal(clear.begin(), clear.end(), journal.references[1].bgra.begin() + static_cast<std::ptrdiff_t>(offset));
+    check(uniform, "the reference frame of a DCC buffer whose keys clear to the register color is not that color");
+    sceVideoOutUnregisterBuffers(handle, 0);
+    sceVideoOutUnregisterBuffers(handle, 1);
+    sceVideoOutClose(handle);
+    LibcRunShutdown_nid_postfix();
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -678,6 +725,7 @@ int main(int argc, char** argv) {
         else if (argc == 2 && std::string(argv[1]) == "overlay") testOverlay();
         else if (argc == 2 && std::string(argv[1]) == "deferred") testDeferredBuffer();
         else if (argc == 2 && std::string(argv[1]) == "unregistered") testUnregisteredBuffer();
+        else if (argc == 2 && std::string(argv[1]) == "journal") testJournal();
         else testLifetime(argc == 2 && std::string(argv[1]) == "reopen");
         std::puts("VideoOut flip tests passed");
         return 0;

@@ -1,13 +1,17 @@
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Journal/include/Journal.hpp"
 
 AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, const BufferAttributeGroup& group) {
     const auto& attribute = group.attribute;
@@ -87,10 +91,11 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     group.category = category;
     group.occupied = true;
     std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX> registered{};
+    std::array<AgcDriver::DisplayBuffer, VIDEO_OUT_BUFFER_NUM_MAX> displays{};
     for (int i = 0; i < bufferNum; ++i) {
         registered[i] = {setIndex, reinterpret_cast<uint64_t>(buffers[i].data), reinterpret_cast<uint64_t>(buffers[i].metadata)};
-        const auto display = DescribeVideoOutBuffer(registered[i], group);
-        AgcDriverCheckGuestMemory_nid_postfix(buffers[i].data, AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
+        displays[i] = DescribeVideoOutBuffer(registered[i], group);
+        AgcDriverCheckGuestMemory_nid_postfix(buffers[i].data, AgcDriverDisplayBufferSize_nid_postfix(displays[i]), 65536);
     }
     cfg->groups[setIndex] = group;
     cfg->width = attribute->width;
@@ -98,6 +103,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     for (int i = 0; i < bufferNum; i++) {
         cfg->buffers[bufferIndexStart + i] = registered[i];
     }
+    lock.unlock();
+    for (int i = 0; i < bufferNum; ++i) AgcDriverJournalDisplayBuffer_nid_postfix(static_cast<std::uint32_t>(handle), bufferIndexStart + i, displays[i]);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -125,13 +132,17 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     auto group = cfg->groups[setIndex];
     group.attribute = *attribute;
+    std::vector<std::pair<int, AgcDriver::DisplayBuffer>> displays;
     for (int i = 0; i < VIDEO_OUT_BUFFER_NUM_MAX; ++i) {
         if (cfg->buffers[i].groupIndex != setIndex) continue;
         if (cfg->bufferPending[i] != 0) throw std::runtime_error("VideoOut: buffer attributes are in use by a pending flip");
         const auto display = DescribeVideoOutBuffer(cfg->buffers[i], group);
         AgcDriverCheckGuestMemory_nid_postfix(reinterpret_cast<const void*>(display.address), AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
+        displays.emplace_back(i, display);
     }
     cfg->groups[setIndex] = group;
+    lock.unlock();
+    for (const auto& [index, display] : displays) AgcDriverJournalDisplayBuffer_nid_postfix(static_cast<std::uint32_t>(handle), index, display);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
