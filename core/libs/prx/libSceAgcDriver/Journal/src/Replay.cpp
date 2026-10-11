@@ -293,21 +293,28 @@ private:
         AgcDriverSuspendPoint_nid_postfix();
     }
 
+    const Shader* header(const ShaderHeader& header) {
+        if (header.address == 0) return nullptr;
+        const auto* recorded = reinterpret_cast<const Shader*>(header.address);
+        if (placed(header.address, header.bytes.size()) && std::memcmp(recorded, header.bytes.data(), header.bytes.size()) == 0) return recorded;
+        return reinterpret_cast<const Shader*>(headerCopies.emplace_back(header.bytes).data());
+    }
+
     void perform(const RegisterShaderCall& call) {
-        AgcDriverRegisterShader_nid_postfix(reinterpret_cast<const Shader*>(call.shader));
+        AgcDriverRegisterShader_nid_postfix(header(call.shader));
     }
 
     void perform(const ResolveShaderAbiCall& call) {
-        AgcDriverResolveShaderAbi_nid_postfix(reinterpret_cast<const Shader*>(call.shader), call.context, call.primitive);
+        AgcDriverResolveShaderAbi_nid_postfix(header(call.shader), call.context, call.primitive);
     }
 
     void perform(const ResolveGraphicsAbiCall& call) {
-        AgcDriverResolveGraphicsAbi_nid_postfix(reinterpret_cast<const Shader*>(call.vertex), reinterpret_cast<const Shader*>(call.pixel), call.primitiveType);
+        AgcDriverResolveGraphicsAbi_nid_postfix(header(call.vertex), header(call.pixel), call.primitiveType);
     }
 
     void perform(const ResolveGraphicsStagesAbiCall& call) {
         std::vector<const Shader*> stages;
-        for (const auto stage : call.stages) stages.push_back(reinterpret_cast<const Shader*>(stage));
+        for (const auto& stage : call.stages) stages.push_back(header(stage));
         AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, call.context, call.primitive);
     }
 
@@ -333,6 +340,7 @@ private:
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
     std::map<std::pair<std::uint32_t, std::int32_t>, DisplayBuffer> displayBuffers;
     std::deque<std::vector<std::uint32_t>> commandCopies;
+    std::deque<std::vector<std::byte>> headerCopies;
 };
 
 std::vector<GpuRange> gpuRanges(const Graphics::Recorder::TimedCalls& timed) {

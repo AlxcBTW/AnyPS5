@@ -59,6 +59,12 @@ std::vector<ShaderRegister> copied(std::span<const ShaderRegister> registers) {
     return {registers.begin(), registers.end()};
 }
 
+ShaderHeader copied(const Shader* shader, std::size_t bytes) {
+    if (shader == nullptr) return {};
+    const auto* first = reinterpret_cast<const std::byte*>(shader);
+    return {pointer(shader), std::vector<std::byte>(first, first + bytes)};
+}
+
 std::vector<std::pair<std::string, std::string>> journaledEnvironment() {
     std::vector<std::pair<std::string, std::string>> result;
     const auto add = [&](std::string_view entry) {
@@ -423,12 +429,13 @@ private:
         return address - range.address <= range.bytes && bytes <= range.bytes - (address - range.address);
     }
 
-    void requireShader(std::uint64_t address) const {
-        if (address == 0) return;
-        require(journaled(address, sizeof(Shader)), "shader header " + hex(address) + " lies outside the journaled guest memory");
-        const auto* shader = reinterpret_cast<const Shader*>(address);
-        const auto code = pointer(const_cast<const void*>(shader->code));
-        require(journaled(code, shader->shader_size), "the code " + hex(code) + "+" + hex(shader->shader_size) + " of shader " + hex(address) + " lies outside the journaled guest memory");
+    void requireShader(const ShaderHeader& header) const {
+        if (header.address == 0) return;
+        require(header.bytes.size() >= sizeof(Shader), "the journal holds " + std::to_string(header.bytes.size()) + " bytes of shader header " + hex(header.address) + ", fewer than a header");
+        Shader shader;
+        std::memcpy(&shader, header.bytes.data(), sizeof(Shader));
+        const auto code = pointer(const_cast<const void*>(shader.code));
+        require(journaled(code, shader.shader_size), "the code " + hex(code) + "+" + hex(shader.shader_size) + " of shader " + hex(header.address) + " lies outside the journaled guest memory");
     }
 
     void requireJournaled(const Call& call) const {
@@ -440,7 +447,7 @@ private:
             requireShader(item->vertex);
             requireShader(item->pixel);
         } else if (const auto* item = std::get_if<ResolveGraphicsStagesAbiCall>(&call)) {
-            for (const auto stage : item->stages) requireShader(stage);
+            for (const auto& stage : item->stages) requireShader(stage);
         }
     }
 
@@ -548,24 +555,24 @@ void SuspendPoint() {
 }
 
 void RegisterShader(const Shader* shader) {
-    Recording::Get().NoteRegistration([&] { return RegisterShaderCall{pointer(shader)}; }, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
+    Recording::Get().NoteRegistration([&] { return RegisterShaderCall{copied(shader, shader->header_size)}; }, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
 }
 
 void ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    Recording::Get().NoteRegistration([&] { return ResolveShaderAbiCall{pointer(shader), copied(context), copied(primitive)}; }, [&] { DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
+    Recording::Get().NoteRegistration([&] { return ResolveShaderAbiCall{copied(shader, sizeof(Shader)), copied(context), copied(primitive)}; }, [&] { DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
 }
 
 void ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
     const auto make = [&] {
         ResolveGraphicsStagesAbiCall call{{}, copied(context), copied(primitive)};
-        for (const auto* stage : stages) call.stages.push_back(pointer(stage));
+        for (const auto* stage : stages) call.stages.push_back(copied(stage, sizeof(Shader)));
         return call;
     };
     Recording::Get().NoteRegistration(make, [&] { DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
 }
 
 void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
-    Recording::Get().NoteRegistration([&] { return ResolveGraphicsAbiCall{pointer(vertex), pointer(pixel), primitiveType}; }, [&] { DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
+    Recording::Get().NoteRegistration([&] { return ResolveGraphicsAbiCall{copied(vertex, sizeof(Shader)), copied(pixel, sizeof(Shader)), primitiveType}; }, [&] { DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {

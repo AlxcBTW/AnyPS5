@@ -182,25 +182,38 @@ void encode(Encoder& out, const SubmitCall& call) {
 
 void encode(Encoder&, const SuspendCall&) {}
 
+void encode(Encoder& out, const ShaderHeader& header) {
+    out.Value(header.address);
+    out.Bytes(header.bytes);
+}
+
+ShaderHeader decodeHeader(Decoder& in) {
+    ShaderHeader header;
+    header.address = in.Value<std::uint64_t>();
+    const auto bytes = in.Bytes();
+    header.bytes.assign(bytes.begin(), bytes.end());
+    return header;
+}
+
 void encode(Encoder& out, const RegisterShaderCall& call) {
-    out.Value(call.shader);
+    encode(out, call.shader);
 }
 
 void encode(Encoder& out, const ResolveShaderAbiCall& call) {
-    out.Value(call.shader);
+    encode(out, call.shader);
     encode(out, call.context);
     encode(out, call.primitive);
 }
 
 void encode(Encoder& out, const ResolveGraphicsAbiCall& call) {
-    out.Value(call.vertex);
-    out.Value(call.pixel);
+    encode(out, call.vertex);
+    encode(out, call.pixel);
     out.Value(call.primitiveType);
 }
 
 void encode(Encoder& out, const ResolveGraphicsStagesAbiCall& call) {
     out.Count(call.stages.size());
-    for (const auto stage : call.stages) out.Value(stage);
+    for (const auto& stage : call.stages) encode(out, stage);
     encode(out, call.context);
     encode(out, call.primitive);
 }
@@ -235,25 +248,25 @@ Call decodeCall(Decoder& in) {
             return call;
         }
         case 1: return SuspendCall{};
-        case 2: return RegisterShaderCall{in.Value<std::uint64_t>()};
+        case 2: return RegisterShaderCall{decodeHeader(in)};
         case 3: {
             ResolveShaderAbiCall call;
-            call.shader = in.Value<std::uint64_t>();
+            call.shader = decodeHeader(in);
             decode(in, call.context);
             decode(in, call.primitive);
             return call;
         }
         case 4: {
             ResolveGraphicsAbiCall call;
-            call.vertex = in.Value<std::uint64_t>();
-            call.pixel = in.Value<std::uint64_t>();
+            call.vertex = decodeHeader(in);
+            call.pixel = decodeHeader(in);
             call.primitiveType = in.Value<std::uint32_t>();
             return call;
         }
         case 5: {
             ResolveGraphicsStagesAbiCall call;
             call.stages.resize(in.Count(8));
-            for (auto& stage : call.stages) stage = in.Value<std::uint64_t>();
+            for (auto& stage : call.stages) stage = decodeHeader(in);
             decode(in, call.context);
             decode(in, call.primitive);
             return call;

@@ -20,7 +20,7 @@
 
 namespace AgcDriver::Journal {
 
-inline constexpr std::uint32_t FormatVersion = 1;
+inline constexpr std::uint32_t FormatVersion = 2;
 inline constexpr std::size_t ImageBlockBytes = 65536;
 
 struct SubmitCall {
@@ -32,24 +32,29 @@ struct SubmitCall {
 
 struct SuspendCall {};
 
+struct ShaderHeader {
+    std::uint64_t address = 0;
+    std::vector<std::byte> bytes;
+};
+
 struct RegisterShaderCall {
-    std::uint64_t shader = 0;
+    ShaderHeader shader;
 };
 
 struct ResolveShaderAbiCall {
-    std::uint64_t shader = 0;
+    ShaderHeader shader;
     std::vector<ShaderRegister> context;
     std::vector<ShaderRegister> primitive;
 };
 
 struct ResolveGraphicsAbiCall {
-    std::uint64_t vertex = 0;
-    std::uint64_t pixel = 0;
+    ShaderHeader vertex;
+    ShaderHeader pixel;
     std::uint32_t primitiveType = 0;
 };
 
 struct ResolveGraphicsStagesAbiCall {
-    std::vector<std::uint64_t> stages;
+    std::vector<ShaderHeader> stages;
     std::vector<ShaderRegister> context;
     std::vector<ShaderRegister> primitive;
 };
