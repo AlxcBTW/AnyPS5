@@ -2,7 +2,11 @@
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -529,12 +533,134 @@ private:
     std::uint32_t epoch = 0;
 };
 
+// The proofs as they stood before the walk crossed loops and exec phis (main c757e8eaa): every use
+// outside loops, implications through LogicalAnd, ballots and BitwiseAnd only, eight levels deep,
+// and no image reads, writes, gathers or size queries.
+namespace legacy {
+
+constexpr std::size_t VisitLimit = 4096;
+
+bool laneLocal(const IrProgram& program, const IrValue& user) {
+    if (user.Opcode() == IrOpcode::ImageQueryDimensions || user.Opcode() == IrOpcode::ImageGatherRaw) return false;
+    return isLaneLocal(user.Opcode()) || isExplicitLodSample(program, user);
+}
+
+bool implies(const IrValue* condition, const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth = 0);
+
+bool wordsImply(const IrValue* low, const IrValue* high, const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth) {
+    if (depth > DepthLimit) return false;
+    if (isImmediate(low, 0u) && (waveSize == 32u || isImmediate(high, 0u))) return true;
+    if (low->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(low->Argument(1)->Resolve(), 0u)) {
+        const IrValue* ballot = low->Argument(0)->Resolve();
+        const bool sameBallot = waveSize == 32u || (high->Opcode() == IrOpcode::CompositeExtractU32x4 && high->Argument(0)->Resolve() == ballot && isImmediate(high->Argument(1)->Resolve(), 1u));
+        if (ballot->Opcode() == IrOpcode::Ballot && sameBallot && implies(ballot->Argument(0), mask, waveSize, depth + 1u)) return true;
+    }
+    if (low->Opcode() != IrOpcode::BitwiseAnd32) return false;
+    if (waveSize == 32u) return wordsImply(low->Argument(0)->Resolve(), high, mask, waveSize, depth + 1u) || wordsImply(low->Argument(1)->Resolve(), high, mask, waveSize, depth + 1u);
+    if (high->Opcode() != IrOpcode::BitwiseAnd32) return false;
+    for (std::size_t lowIndex = 0; lowIndex < 2u; ++lowIndex) {
+        for (std::size_t highIndex = 0; highIndex < 2u; ++highIndex) {
+            if (wordsImply(low->Argument(lowIndex)->Resolve(), high->Argument(highIndex)->Resolve(), mask, waveSize, depth + 1u)) return true;
+        }
+    }
+    return false;
+}
+
+bool implies(const IrValue* condition, const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth) {
+    condition = condition->Resolve();
+    if (condition == mask || alwaysTrue(mask, waveSize)) return true;
+    if (condition->HasImmediate()) return condition->Type() == IrType::Bool && !condition->ImmediateBool();
+    if (depth > DepthLimit) return false;
+    if (condition->Opcode() == IrOpcode::LogicalAnd) return implies(condition->Argument(0), mask, waveSize, depth + 1u) || implies(condition->Argument(1), mask, waveSize, depth + 1u);
+    const auto bit = threadBit(condition, waveSize);
+    return bit && wordsImply(bit->low, bit->high, mask, waveSize, depth + 1u);
+}
+
+bool unobservedWhereMasked(const IrProgram& program, const std::vector<Region>& regions, const IrValue& select, const IrValue* mask) {
+    const auto waveSize = program.WaveSize();
+    std::vector<const IrValue*> pending{&select};
+    std::unordered_set<const IrValue*> visited{&select};
+    while (!pending.empty()) {
+        const IrValue* value = pending.back();
+        pending.pop_back();
+        for (const IrUse& use : value->OperandUses()) {
+            const IrValue* user = use.user;
+            if (regionOf(regions, user->Parent()) != Region::Once) return false;
+            if (isSelect(user->Opcode()) && use.operand == 1u && implies(user->Argument(0), mask, waveSize)) continue;
+            if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implies(user->Argument(1u - use.operand), mask, waveSize)) continue;
+            const bool gated = user->Opcode() != IrOpcode::ImageRead && user->Opcode() != IrOpcode::ImageWrite && readsOnlyWhereActive(user->Opcode());
+            if (gated && use.operand + 1u < user->ArgumentCount() && implies(user->Argument(user->ArgumentCount() - 1u), mask, waveSize)) continue;
+            if (!user->IsPhi() && !laneLocal(program, *user)) return false;
+            if (visited.insert(user).second) {
+                if (visited.size() > VisitLimit) return false;
+                pending.push_back(user);
+            }
+        }
+    }
+    return true;
+}
+
+}
+
+// Debug aids, read once. APS5_MASKED_LANES_LEGACY=<hex code addresses, comma separated, "all", and
+// "!<address>" to leave a program out of "all"> proves those programs with the legacy rules above, to
+// split a regression between the two sets of proofs. It is not part of the shader cache key, so run
+// with ANYPS5_NO_SHADER_CACHE=1 or a cleared cache. APS5_MASKED_LANES_TRACE=1 prints, per program, how
+// many selects went and how many of those the legacy rules would have kept.
+struct Switches {
+    std::vector<std::string> legacy;
+    std::vector<std::string> excluded;
+    bool legacyAll = false;
+    bool trace = false;
+};
+
+const Switches& switches() {
+    static const Switches value = [] {
+        Switches result;
+        result.trace = std::getenv("APS5_MASKED_LANES_TRACE") != nullptr;
+        const char* text = std::getenv("APS5_MASKED_LANES_LEGACY");
+        if (text == nullptr) return result;
+        const std::string list(text);
+        for (std::size_t start = 0; start <= list.size();) {
+            const std::size_t end = std::min(list.find(',', start), list.size());
+            std::string item = list.substr(start, end - start);
+            start = end + 1u;
+            const bool exclude = !item.empty() && item.front() == '!';
+            if (exclude) item.erase(0, 1);
+            if (item.rfind("0x", 0) == 0 || item.rfind("0X", 0) == 0) item.erase(0, 2);
+            std::transform(item.begin(), item.end(), item.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (item.empty()) continue;
+            if (item == "all") result.legacyAll = true;
+            else (exclude ? result.excluded : result.legacy).push_back(item);
+        }
+        return result;
+    }();
+    return value;
+}
+
+std::string codeAddress(const IrProgram& program) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(program.Resources().shaderHash));
+    return text;
+}
+
+bool legacyFor(const IrProgram& program) {
+    const auto& active = switches();
+    if (!active.legacyAll && active.legacy.empty()) return false;
+    const auto address = codeAddress(program);
+    const auto listed = [&](const std::vector<std::string>& list) { return std::find(list.begin(), list.end(), address) != list.end(); };
+    return (active.legacyAll || listed(active.legacy)) && !listed(active.excluded);
+}
+
 }
 
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {
     MaskedSelectEliminationStats stats;
     const auto regions = blockRegions(program);
     MaskedLaneWalk walk(program, regions);
+    const bool legacyRules = legacyFor(program);
+    const bool trace = switches().trace;
+    std::uint32_t beyondLegacy = 0;
     bool changed = true;
     while (changed) {
         changed = false;
@@ -547,7 +673,15 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
                 IrValue* inst = *it;
                 if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
                 const IrValue* mask = inst->Argument(0)->Resolve();
-                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !walk.UnobservedWhereMasked(*inst, mask))) continue;
+                if (!alwaysTrue(mask, program.WaveSize())) {
+                    if (!single) continue;
+                    if (legacyRules) {
+                        if (!legacy::unobservedWhereMasked(program, regions, *inst, mask)) continue;
+                    } else {
+                        if (!walk.UnobservedWhereMasked(*inst, mask)) continue;
+                        if (trace && !legacy::unobservedWhereMasked(program, regions, *inst, mask)) ++beyondLegacy;
+                    }
+                }
                 inst->ReplaceAllUsesWith(inst->Argument(1));
                 inst->Invalidate();
                 inst->SetParent(nullptr);
@@ -557,6 +691,9 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
             }
         }
         if (changed) DeadCodeEliminator{}.Eliminate(program);
+    }
+    if (trace && stats.removedSelects != 0u) {
+        std::fprintf(stderr, "[masked-lanes] %s: %u selects removed, %u of them beyond the legacy proofs%s\n", codeAddress(program).c_str(), stats.removedSelects, beyondLegacy, legacyRules ? " (legacy rules)" : "");
     }
     return stats;
 }
