@@ -281,9 +281,10 @@ constexpr std::size_t ImageMemoSlots = 1024;
 struct ImageMemoTag {};
 
 ImageMemoEntry& imageMemoSlot(std::span<const std::uint32_t> words) {
-    auto& imageMemo = HostThreadLocal<std::array<ImageMemoEntry, ImageMemoSlots>, ImageMemoTag>();
+    auto& imageMemo = HostThreadLocal<std::unique_ptr<std::array<ImageMemoEntry, ImageMemoSlots>>, ImageMemoTag>();
+    if (imageMemo == nullptr) imageMemo = std::make_unique<std::array<ImageMemoEntry, ImageMemoSlots>>();
     const auto hash = hashWords(14695981039346656037ull, words.data(), words.size());
-    return imageMemo[(hash ^ (hash >> 29u)) % ImageMemoSlots];
+    return (*imageMemo)[(hash ^ (hash >> 29u)) % ImageMemoSlots];
 }
 
 const ImageMemoEntry& decodedImage(VkDevice device, std::span<const std::uint32_t> words) {
