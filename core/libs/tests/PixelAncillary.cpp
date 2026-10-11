@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -310,12 +311,15 @@ static HelperProgram HelperOnly(IrProgram& program, HelperRead read, std::uint32
     return HelperProgram {&written, &layer, &value};
 }
 static void LowerMasked(IrProgram& program, bool compose = false) {
+    const bool traced = AncillaryTraceEnabled() && ReadsPackedAncillary(program);
     ConstantFolder().Fold(program);
     DeadCodeEliminator().RemoveIdentities(program);
     DeadCodeEliminator().Eliminate(program);
-    static_cast<void>(MaskedSelectEliminator().Eliminate(program));
+    const auto stats = MaskedSelectEliminator().Eliminate(program);
     DeadCodeEliminator().Eliminate(program);
-    if (compose && ConstantFolder().ComposePackedAncillary(program)) DeadCodeEliminator().Eliminate(program);
+    const bool composed = compose && ConstantFolder().ComposePackedAncillary(program);
+    if (composed) DeadCodeEliminator().Eliminate(program);
+    if (traced) std::fprintf(stderr, "%s\n", AncillarySummaryLine(program, stats, composed).c_str());
     const ShaderPixelInputInfo pixel {};
     ShaderInfoCollector().Collect(program, ShaderStageInputInfo {nullptr, &pixel, nullptr});
 }
@@ -468,6 +472,12 @@ static bool AncillaryRemains(const IrProgram& program) {
     }
     return false;
 }
+static void FieldsOnly() {
+    IrProgram program;
+    static_cast<void>(Build(program, IrOpcode::BitFieldUExtract, 16u, 13u));
+    LowerMasked(program, true);
+    Require(!AncillaryRemains(program));
+}
 static void ExportedWholeWord() {
     IrProgram program;
     auto& entry = Begin(program);
@@ -518,6 +528,9 @@ static void WholeWordReplacesRefusal(HelperRead read) {
 }
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--trace") {
+        FieldsOnly();
+        HelperLanesOnly();
+        WholeWordReplacesRefusal(HelperRead::FullWaveExport);
         HelperLanesRefused(HelperRead::FullWaveExport);
         return 0;
     }

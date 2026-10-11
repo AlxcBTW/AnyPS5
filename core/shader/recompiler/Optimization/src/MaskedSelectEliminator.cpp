@@ -837,7 +837,7 @@ std::vector<bool> ancillaryCarriers(const IrProgram& program) {
         pending.pop_back();
         for (const IrUse& use : value->OperandUses()) {
             const IrOpcode opcode = use.user->Opcode();
-            if (opcode == IrOpcode::Identity || use.user->IsPhi() || (isSelect(opcode) && use.operand != 0u)) mark(*use.user);
+            if (opcode == IrOpcode::Identity || use.user->IsPhi() || (isSelect(opcode) && use.operand == 1u)) mark(*use.user);
         }
     }
     return carries;
@@ -848,10 +848,19 @@ bool keepsAncillary(const std::vector<bool>& carries, const IrValue& select) {
     return inactive->Id() < carries.size() && carries[inactive->Id()];
 }
 
-std::string refusalLine(const IrProgram& program, const IrValue& select, Reason reason, const std::string& detail) {
+std::string tracePrefix(const IrProgram& program) {
     char shader[32];
     std::snprintf(shader, sizeof(shader), "0x%llx", static_cast<unsigned long long>(program.Resources().shaderHash));
-    return std::string("[ancillary] shader ") + shader + " select #" + std::to_string(select.Id()) + " kept, " + std::string(MaskedSelectRefusalCode(reason)) + ": " + detail + "; mask " + describeCondition(select.Argument(0), program.WaveSize());
+    return std::string("[ancillary] shader ") + shader;
+}
+
+std::string refusalLine(const IrProgram& program, const IrValue& select, Reason reason, const std::string& detail) {
+    return tracePrefix(program) + " select #" + std::to_string(select.Id()) + " kept, " + std::string(MaskedSelectRefusalCode(reason)) + ": " + detail + "; mask " + describeCondition(select.Argument(0), program.WaveSize());
+}
+
+std::string dropLine(const IrProgram& program, const IrValue& select, bool everyLane) {
+    const char* why = everyLane ? "the mask holds in every lane" : "every use reads it only where the mask holds";
+    return tracePrefix(program) + " select #" + std::to_string(select.Id()) + " dropped: " + why + "; mask " + describeCondition(select.Argument(0), program.WaveSize());
 }
 
 }
@@ -878,8 +887,23 @@ bool AncillaryTraceEnabled() {
     return enabled;
 }
 
+bool ReadsPackedAncillary(const IrProgram& program) {
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->HasUses() && isBuiltin(inst, StageInputKind::PackedAncillary)) return true;
+        }
+    }
+    return false;
+}
+
+std::string AncillarySummaryLine(const IrProgram& program, const MaskedSelectEliminationStats& stats, bool composed) {
+    const std::size_t dropped = stats.drops.size();
+    return tracePrefix(program) + " summary: " + std::to_string(dropped) + (dropped == 1u ? " select" : " selects") + " dropped, " + std::to_string(stats.refusals.size()) + " kept, whole word " + (composed ? "composed" : "not composed");
+}
+
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {
     auto stats = Eliminate(program, AncillaryTraceEnabled());
+    for (const auto& drop : stats.drops) std::fprintf(stderr, "%s\n", drop.line.c_str());
     for (const auto& refusal : stats.refusals) std::fprintf(stderr, "%s\n", refusal.line.c_str());
     return stats;
 }
@@ -906,7 +930,8 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
                 IrValue* inst = *it;
                 if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
                 const IrValue* mask = inst->Argument(0)->Resolve();
-                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !walk.UnobservedWhereMasked(*inst, mask))) {
+                const bool everyLane = alwaysTrue(mask, program.WaveSize());
+                if (!everyLane && (!single || !walk.UnobservedWhereMasked(*inst, mask))) {
                     if (explain && keepsAncillary(carries, *inst)) {
                         auto [reason, detail] = single ? walk.Describe(*inst, mask)
                                                        : std::pair{region == Region::Loop ? Reason::LoopSelect : Reason::Unreached, std::string(region == Region::Loop ? "the select is inside a loop" : "the select is in a block the entry does not reach")};
@@ -914,6 +939,7 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
                     }
                     continue;
                 }
+                if (explain && keepsAncillary(carries, *inst)) stats.drops.push_back(MaskedSelectDrop{inst->Id(), dropLine(program, *inst, everyLane)});
                 inst->ReplaceAllUsesWith(inst->Argument(1));
                 inst->Invalidate();
                 inst->SetParent(nullptr);

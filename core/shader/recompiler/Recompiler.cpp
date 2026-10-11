@@ -194,6 +194,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         dumpIr("translate");
         ssaBuilder.Rewrite(program);
         dumpIr("ssa");
+        const bool traceAncillary = AncillaryTraceEnabled() && ReadsPackedAncillary(program);
 
         constantFolder.Fold(program);
         ResolveControlFlowIdentities(program);
@@ -209,11 +210,16 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
             deadCodeEliminator.Eliminate(program);
         }
 
-        if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
+        const auto maskedSelectStats = maskedSelectEliminator.Eliminate(program);
+        if (maskedSelectStats.removedSelects != 0u) {
             deadCodeEliminator.Eliminate(program);
         }
-        if (constantFolder.ComposePackedAncillary(program)) {
+        const bool composed = constantFolder.ComposePackedAncillary(program);
+        if (composed) {
             deadCodeEliminator.Eliminate(program);
+        }
+        if (traceAncillary) {
+            std::fprintf(stderr, "%s\n", AncillarySummaryLine(program, maskedSelectStats, composed).c_str());
         }
     };
     simplify();
