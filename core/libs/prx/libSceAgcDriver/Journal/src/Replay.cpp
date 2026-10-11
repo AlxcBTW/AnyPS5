@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -319,25 +320,29 @@ private:
 #endif
     }
 
-    const Shader* stage(const ShaderHeader& header, std::vector<StagedHeader>& staged) {
-        if (header.address == 0) return nullptr;
-        auto* recorded = reinterpret_cast<std::byte*>(header.address);
-        const auto bytes = header.bytes.size();
-        const auto pages = header.address & ~(PageBytes - 1);
-        const auto pageBytes = ((header.address + bytes + PageBytes - 1) & ~(PageBytes - 1)) - pages;
-        const auto covered = std::any_of(staged.begin(), staged.end(), [&](const StagedHeader& entry) { return entry.mapping != nullptr && header.address >= entry.pages && header.address + bytes <= entry.pages + entry.pageBytes; });
-        if (placed(header.address, bytes)) {
-            if (std::memcmp(recorded, header.bytes.data(), bytes) == 0) return reinterpret_cast<const Shader*>(recorded);
-            StagedHeader entry{header.address, std::vector<std::byte>(recorded, recorded + bytes), rangeAt(header.address), pages, pageBytes, nullptr};
+    bool stageAt(std::uint64_t address, std::span<const std::byte> bytes, std::vector<StagedHeader>& staged) {
+        auto* recorded = reinterpret_cast<std::byte*>(address);
+        const auto pages = address & ~(PageBytes - 1);
+        const auto pageBytes = ((address + bytes.size() + PageBytes - 1) & ~(PageBytes - 1)) - pages;
+        const auto covered = std::any_of(staged.begin(), staged.end(), [&](const StagedHeader& entry) { return entry.mapping != nullptr && address >= entry.pages && address + bytes.size() <= entry.pages + entry.pageBytes; });
+        if (placed(address, bytes.size())) {
+            if (std::memcmp(recorded, bytes.data(), bytes.size()) == 0) return true;
+            StagedHeader entry{address, std::vector<std::byte>(recorded, recorded + bytes.size()), rangeAt(address), pages, pageBytes, nullptr};
             if (!entry.range->writable) setPagesWritable(*entry.range, pages, pageBytes, true);
             staged.push_back(std::move(entry));
         } else if (!covered) {
             auto* mapping = mapAt(pages, pageBytes);
-            if (mapping == nullptr) return reinterpret_cast<const Shader*>(headerCopies.emplace_back(header.bytes).data());
-            staged.push_back({header.address, {}, nullptr, pages, pageBytes, mapping});
+            if (mapping == nullptr) return false;
+            staged.push_back({address, {}, nullptr, pages, pageBytes, mapping});
         }
-        std::memcpy(recorded, header.bytes.data(), bytes);
-        return reinterpret_cast<const Shader*>(recorded);
+        std::memcpy(recorded, bytes.data(), bytes.size());
+        return true;
+    }
+
+    const Shader* stage(const ShaderHeader& header, std::vector<StagedHeader>& staged) {
+        if (header.address == 0) return nullptr;
+        if (stageAt(header.address, header.bytes, staged)) return reinterpret_cast<const Shader*>(header.address);
+        return reinterpret_cast<const Shader*>(headerCopies.emplace_back(header.bytes).data());
     }
 
     static void unstage(std::vector<StagedHeader>& staged) {
@@ -390,7 +395,14 @@ private:
     }
 
     void perform(const RegisterShaderCall& call) {
-        withHeaders([&](std::vector<StagedHeader>& staged) { AgcDriverRegisterShader_nid_postfix(stage(call.shader, staged)); });
+        withHeaders([&](std::vector<StagedHeader>& staged) {
+            const auto* header = stage(call.shader, staged);
+            Shader fields;
+            std::memcpy(&fields, call.shader.bytes.data(), sizeof(Shader));
+            const auto code = reinterpret_cast<std::uint64_t>(const_cast<const void*>(fields.code));
+            require(stageAt(code, call.code, staged), "cannot place the code " + hex(code) + " of shader " + hex(call.shader.address) + " for its registration");
+            AgcDriverRegisterShader_nid_postfix(header);
+        });
     }
 
     void perform(const ResolveShaderAbiCall& call) {

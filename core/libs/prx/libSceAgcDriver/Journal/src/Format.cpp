@@ -197,6 +197,7 @@ ShaderHeader decodeHeader(Decoder& in) {
 
 void encode(Encoder& out, const RegisterShaderCall& call) {
     encode(out, call.shader);
+    out.Bytes(call.code);
 }
 
 void encode(Encoder& out, const ResolveShaderAbiCall& call) {
@@ -248,7 +249,13 @@ Call decodeCall(Decoder& in) {
             return call;
         }
         case 1: return SuspendCall{};
-        case 2: return RegisterShaderCall{decodeHeader(in)};
+        case 2: {
+            RegisterShaderCall call;
+            call.shader = decodeHeader(in);
+            const auto code = in.Bytes();
+            call.code.assign(code.begin(), code.end());
+            return call;
+        }
         case 3: {
             ResolveShaderAbiCall call;
             call.shader = decodeHeader(in);

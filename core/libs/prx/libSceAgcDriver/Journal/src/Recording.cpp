@@ -59,6 +59,11 @@ std::vector<ShaderRegister> copied(std::span<const ShaderRegister> registers) {
     return {registers.begin(), registers.end()};
 }
 
+std::vector<std::byte> codeOf(const Shader* shader) {
+    const auto* first = reinterpret_cast<const std::byte*>(const_cast<const void*>(shader->code));
+    return {first, first + shader->shader_size};
+}
+
 ShaderHeader copied(const Shader* shader, std::size_t bytes) {
     if (shader == nullptr) return {};
     const auto* first = reinterpret_cast<const std::byte*>(shader);
@@ -568,7 +573,7 @@ void SuspendPoint() {
 }
 
 void RegisterShader(const Shader* shader) {
-    Recording::Get().NoteRegistration([&] { return RegisterShaderCall{copied(shader, shader->header_size)}; }, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
+    Recording::Get().NoteRegistration([&] { return RegisterShaderCall{copied(shader, shader->header_size), codeOf(shader)}; }, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
 }
 
 void ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {

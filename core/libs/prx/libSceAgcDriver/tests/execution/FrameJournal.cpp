@@ -78,10 +78,11 @@ struct Header {
     ShaderUserData userData{};
 };
 
-struct ContextHeader {
+struct ComputeHeader {
     Shader shader{};
     ShaderUserData userData{};
-    std::array<ShaderRegister, 1> context{};
+    std::array<ShaderRegister, 6> registers{};
+    ShaderSpecialRegs specials{};
 };
 
 struct alignas(256) HostShader {
@@ -286,19 +287,24 @@ Live Record(const std::filesystem::path& journal) {
     RegisterDuringPreparation([&] { Register(vertexHeader, vertexCode, sizeof(VertexCode), 2); }, [&] { Register(pixelHeader, pixelCode, sizeof(PixelCode), 1); }, "before the journal opened");
     const auto pixelCopy = std::make_unique<Header>(pixelHeader);
     AgcDriverRegisterShader_nid_postfix(&pixelCopy->shader);
-    auto& reused = *std::construct_at(reinterpret_cast<ContextHeader*>(code.Address(ReusedHeaderOffset)));
-    reused.context[0] = {0x1b6, 0};
+    const auto* reusedCode = code.Store(ReusedCodeOffset, FillCode);
+    const auto reusedProgram = reinterpret_cast<std::uintptr_t>(reusedCode);
+    auto& reused = *std::construct_at(reinterpret_cast<ComputeHeader*>(code.Address(ReusedHeaderOffset)));
+    reused.registers = {{{0x207, 64}, {0x208, 1}, {0x209, 1}, {0x20c, static_cast<std::uint32_t>(reusedProgram >> 8u)}, {0x20d, static_cast<std::uint32_t>(reusedProgram >> 40u)}, {0x213, (10u << 1u) | (1u << 7u)}}};
     reused.shader.file_header = 0x34333231u;
     reused.shader.version = 0x18u;
-    reused.shader.header_size = sizeof(ContextHeader);
-    reused.shader.shader_size = sizeof(VertexCode);
-    reused.shader.code = code.Store(ReusedCodeOffset, VertexCode);
-    reused.shader.type = 2;
+    reused.shader.header_size = sizeof(ComputeHeader);
+    reused.shader.shader_size = sizeof(FillCode);
+    reused.shader.code = reusedCode;
+    reused.shader.type = 0;
     reused.shader.user_data = &reused.userData;
-    reused.shader.num_cx_registers = 1;
-    reused.shader.cx_registers = reused.context.data();
+    reused.shader.num_sh_registers = static_cast<std::uint8_t>(reused.registers.size());
+    reused.shader.sh_registers = reused.registers.data();
+    reused.shader.specials = &reused.specials;
+    reused.shader.special_sizes_bytes = sizeof(ShaderSpecialRegs);
     AgcDriverRegisterShader_nid_postfix(&reused.shader);
-    std::memset(static_cast<void*>(&reused), 0, sizeof(ContextHeader));
+    std::memset(static_cast<void*>(&reused), 0, sizeof(ComputeHeader));
+    code.Store(ReusedCodeOffset, std::array<std::uint32_t, 1>{0x2e000000u});
     const auto hostShader = std::make_unique<HostShader>();
     hostShader->code = VertexCode;
     Register(hostShader->header, hostShader->code.data(), sizeof(VertexCode), 2);

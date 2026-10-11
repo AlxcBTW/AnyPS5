@@ -20,7 +20,7 @@
 
 namespace AgcDriver::Journal {
 
-inline constexpr std::uint32_t FormatVersion = 2;
+inline constexpr std::uint32_t FormatVersion = 3;
 inline constexpr std::size_t ImageBlockBytes = 65536;
 
 struct SubmitCall {
@@ -39,6 +39,7 @@ struct ShaderHeader {
 
 struct RegisterShaderCall {
     ShaderHeader shader;
+    std::vector<std::byte> code;
 };
 
 struct ResolveShaderAbiCall {
