@@ -4104,7 +4104,8 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     context.nullDescriptors = true;
     TextureCache cache(context);
     context.textureCache = &cache;
-    const DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    const std::uint64_t htile = address + bytes;
+    const DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, htile};
     Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth surface has no view");
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
@@ -4130,10 +4131,16 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     bool reusable = false;
     std::array<bool, 2> proved{};
     std::array<ShaderResources::ProofReport, 2> reports{};
+    std::array<bool, 2> clearedProved{};
+    std::array<ShaderResources::ProofReport, 2> clearedReports{};
     {
         ShaderResources resources(context, compute);
         reusable = resources.Reusable();
         for (std::size_t use = 0; reusable && use < reports.size(); ++use) proved[use] = resources.Revalidate(compute, &reports[use]);
+        if (reusable) {
+            NoteHtileDepthClear(htile);
+            for (std::size_t use = 0; use < clearedReports.size(); ++use) clearedProved[use] = resources.Revalidate(compute, &clearedReports[use]);
+        }
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
@@ -4144,6 +4151,8 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
         Require(proved[use], "a set sampling an unchanged depth surface failed its proof on use " + name);
         Require(reports[use].path == ShaderResources::ProofPath::Fast, "a set sampling an unchanged depth surface left the fast proof for the full walk on use " + name);
     }
+    Require(clearedProved[0] && clearedReports[0].path == ShaderResources::ProofPath::Full, "a set sampling a depth surface with a pending fast clear took the fast proof, which skips the clear");
+    Require(clearedProved[1] && clearedReports[1].path == ShaderResources::ProofPath::Fast, "a set sampling a depth surface whose fast clear was applied left the fast proof");
     const auto resource = DecodeTextureResource(binding.guestDescriptor);
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     const auto texture = DepthSurfaceTexture(context, binding.guestDescriptor, resource, identity);
