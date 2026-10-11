@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -277,12 +278,12 @@ struct ImageMemoEntry {
 };
 
 constexpr std::size_t ImageMemoSlots = 1024;
-thread_local std::unique_ptr<std::array<ImageMemoEntry, ImageMemoSlots>> imageMemo;
+struct ImageMemoTag {};
 
 ImageMemoEntry& imageMemoSlot(std::span<const std::uint32_t> words) {
-    if (imageMemo == nullptr) imageMemo = std::make_unique<std::array<ImageMemoEntry, ImageMemoSlots>>();
+    auto& imageMemo = HostThreadLocal<std::array<ImageMemoEntry, ImageMemoSlots>, ImageMemoTag>();
     const auto hash = hashWords(14695981039346656037ull, words.data(), words.size());
-    return (*imageMemo)[(hash ^ (hash >> 29u)) % ImageMemoSlots];
+    return imageMemo[(hash ^ (hash >> 29u)) % ImageMemoSlots];
 }
 
 const ImageMemoEntry& decodedImage(VkDevice device, std::span<const std::uint32_t> words) {
