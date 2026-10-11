@@ -382,7 +382,9 @@ private:
         next.checkpoint.gds.resize(Pm4::GdsBytes);
         std::memcpy(next.checkpoint.gds.data(), reinterpret_cast<const void*>(gds), Pm4::GdsBytes);
         journal = std::move(next);
-        for (const auto& call : journal.prelude) requireJournaled(call);
+        const auto registered = journal.prelude.size();
+        std::erase_if(journal.prelude, [&](const Call& call) { return !unjournaled(call).empty(); });
+        if (journal.prelude.size() != registered) std::fprintf(stderr, "[journal] %zu of %zu registrations made before the journal opened refer to shader code outside the journaled guest memory and are left out of the prelude\n", registered - journal.prelude.size(), registered);
         std::filesystem::create_directories(directory);
         BlockWriter blocks(directory);
         shadow.Load(journal.ranges, [&](std::uint64_t address, std::span<const std::byte> block) {
@@ -429,26 +431,37 @@ private:
         return address - range.address <= range.bytes && bytes <= range.bytes - (address - range.address);
     }
 
-    void requireShader(const ShaderHeader& header) const {
-        if (header.address == 0) return;
-        require(header.bytes.size() >= sizeof(Shader), "the journal holds " + std::to_string(header.bytes.size()) + " bytes of shader header " + hex(header.address) + ", fewer than a header");
+    std::string unjournaledShader(const ShaderHeader& header) const {
+        if (header.address == 0) return {};
+        if (header.bytes.size() < sizeof(Shader)) return "the journal holds " + std::to_string(header.bytes.size()) + " bytes of shader header " + hex(header.address) + ", fewer than a header";
         Shader shader;
         std::memcpy(&shader, header.bytes.data(), sizeof(Shader));
         const auto code = pointer(const_cast<const void*>(shader.code));
-        require(journaled(code, shader.shader_size), "the code " + hex(code) + "+" + hex(shader.shader_size) + " of shader " + hex(header.address) + " lies outside the journaled guest memory");
+        if (journaled(code, shader.shader_size)) return {};
+        return "the code " + hex(code) + "+" + hex(shader.shader_size) + " of shader " + hex(header.address) + " lies outside the journaled guest memory";
+    }
+
+    std::string unjournaled(const Call& call) const {
+        std::string reason;
+        const auto check = [&](const ShaderHeader& header) {
+            if (reason.empty()) reason = unjournaledShader(header);
+        };
+        if (const auto* item = std::get_if<RegisterShaderCall>(&call)) {
+            check(item->shader);
+        } else if (const auto* item = std::get_if<ResolveShaderAbiCall>(&call)) {
+            check(item->shader);
+        } else if (const auto* item = std::get_if<ResolveGraphicsAbiCall>(&call)) {
+            check(item->vertex);
+            check(item->pixel);
+        } else if (const auto* item = std::get_if<ResolveGraphicsStagesAbiCall>(&call)) {
+            for (const auto& stage : item->stages) check(stage);
+        }
+        return reason;
     }
 
     void requireJournaled(const Call& call) const {
-        if (const auto* item = std::get_if<RegisterShaderCall>(&call)) {
-            requireShader(item->shader);
-        } else if (const auto* item = std::get_if<ResolveShaderAbiCall>(&call)) {
-            requireShader(item->shader);
-        } else if (const auto* item = std::get_if<ResolveGraphicsAbiCall>(&call)) {
-            requireShader(item->vertex);
-            requireShader(item->pixel);
-        } else if (const auto* item = std::get_if<ResolveGraphicsStagesAbiCall>(&call)) {
-            for (const auto& stage : item->stages) requireShader(stage);
-        }
+        const auto reason = unjournaled(call);
+        require(reason.empty(), reason);
     }
 
     Frame reference(const FlipInfo& flip) {

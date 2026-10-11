@@ -78,6 +78,11 @@ struct Header {
     ShaderUserData userData{};
 };
 
+struct alignas(256) HostShader {
+    std::array<std::uint32_t, 8> code{};
+    Header header;
+};
+
 constexpr std::size_t VertexHeaderOffset = 0x0;
 constexpr std::size_t PixelHeaderOffset = 0x100;
 constexpr std::size_t VertexCodeOffset = 0x1000;
@@ -254,6 +259,7 @@ struct Live {
     std::uint64_t label = 0;
     std::uint64_t fill = 0;
     std::uint64_t copiedHeader = 0;
+    std::uint64_t hostHeader = 0;
 };
 
 Live Record(const std::filesystem::path& journal) {
@@ -272,6 +278,9 @@ Live Record(const std::filesystem::path& journal) {
     RegisterDuringPreparation([&] { Register(vertexHeader, vertexCode, sizeof(VertexCode), 2); }, [&] { Register(pixelHeader, pixelCode, sizeof(PixelCode), 1); }, "before the journal opened");
     const auto pixelCopy = std::make_unique<Header>(pixelHeader);
     AgcDriverRegisterShader_nid_postfix(&pixelCopy->shader);
+    const auto hostShader = std::make_unique<HostShader>();
+    hostShader->code = VertexCode;
+    Register(hostShader->header, hostShader->code.data(), sizeof(VertexCode), 2);
     std::vector<std::uint32_t> setup;
     Context(setup, target.Address());
     GdsWrite(setup);
@@ -301,17 +310,22 @@ Live Record(const std::filesystem::path& journal) {
     code.Release(LabelOffset);
     present();
     AgcDriver::Journal::Close();
-    return {frames, code.Address(LabelOffset), code.Address(FillCodeOffset), reinterpret_cast<std::uintptr_t>(&pixelCopy->shader)};
+    return {frames, code.Address(LabelOffset), code.Address(FillCodeOffset), reinterpret_cast<std::uintptr_t>(&pixelCopy->shader), reinterpret_cast<std::uintptr_t>(&hostShader->header.shader)};
 }
 
-void RequireJournal(const std::filesystem::path& directory, std::uint64_t label, std::uint64_t copiedHeader) {
+void RequireJournal(const std::filesystem::path& directory, const Live& recorded) {
     const auto journal = AgcDriver::Journal::ReadJournal(directory);
     const auto shaders = std::count_if(journal.prelude.begin(), journal.prelude.end(), [](const AgcDriver::Journal::Call& call) { return std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(call); });
     Require(shaders == 3, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 3 made before the journal opened");
     Require(std::any_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
         const auto* registration = std::get_if<AgcDriver::Journal::RegisterShaderCall>(&call);
-        return registration != nullptr && registration->shader.address == copiedHeader && registration->shader.bytes.size() == sizeof(Header);
+        return registration != nullptr && registration->shader.address == recorded.copiedHeader && registration->shader.bytes.size() == sizeof(Header);
     }), "the prelude does not hold the registration from a shader header outside guest memory with the header's bytes");
+    Require(std::none_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
+        const auto* registration = std::get_if<AgcDriver::Journal::RegisterShaderCall>(&call);
+        return registration != nullptr && registration->shader.address == recorded.hostHeader;
+    }), "the prelude holds the registration of a shader whose code lies outside guest memory");
+    const auto label = recorded.label;
     Require(journal.calls.size() == 7, "the journal holds " + std::to_string(journal.calls.size()) + " calls, expected 2 shader registrations, 2 frame submissions, 2 flips and a suspend point");
     Require(std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[0].call) && std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[1].call), "the shader registrations made while the journal was open are not its first calls");
     Require(std::holds_alternative<AgcDriver::Journal::SubmitCall>(journal.calls[2].call), "the first frame submission does not follow the shader registrations");
@@ -410,7 +424,7 @@ int main(int argc, char** argv) {
         const auto recorded = Record(directory / "journal");
         const auto& live = recorded.frames;
         AgcDriverShutdown_nid_postfix();
-        RequireJournal(directory / "journal", recorded.label, recorded.copiedHeader);
+        RequireJournal(directory / "journal", recorded);
         RequireWorkload(live);
         const auto first = Replay(argv[1], directory / "journal", directory / "first");
         const auto second = Replay(argv[1], directory / "journal", directory / "second", " --repeat 2 --gpu-times " + Quoted(directory / "gpu-times.json"));
