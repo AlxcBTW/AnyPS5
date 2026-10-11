@@ -45,6 +45,7 @@ private:
 };
 
 std::string ProgramToString(const IrProgram& program);
+std::string ValueReference(const IrValue* value);
 void ValidateProgram(const IrProgram& program, bool requireSsa);
 void ResolveControlFlowIdentities(IrProgram& program);
 bool EquivalentValue(const IrResourcePlan& program, const IrValue* left, const IrValue* right);

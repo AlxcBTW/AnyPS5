@@ -3697,6 +3697,82 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     inPassSampleDumpTests(recorder, context, cover, words, address, target);
 }
 
+void cmaskPassTests(const Device& device, Recorder& recorder) {
+    namespace GuestMemory = AgcDriver::GuestMemory;
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    constexpr std::size_t surfaceBytes = 256 * 256 * 4;
+    constexpr std::size_t bytes = surfaceBytes + 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the CMASK pass block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } release{context, block};
+    Require(HostImportFor(context, address, bytes) == nullptr, "CMASK copy-path test imported its memory");
+    std::memset(block, 0x55, surfaceBytes);
+    std::memset(static_cast<std::byte*>(block) + surfaceBytes, 0, 4096);
+    ColorTarget color{};
+    color.address = address;
+    color.extent = {256, 256};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    color.bytes = surfaceBytes;
+    color.componentMapping = 0xe4u;
+    color.tileMode = ColorTileMode::RenderTarget;
+    color.cmaskAddress = address + surfaceBytes;
+    color.cmaskBytes = CmaskBytes(color.extent.width, color.extent.height);
+    color.clearWords = {0x80402010u, 0};
+    const auto run = [&] { RunColorMetadataPass(context, {ColorMetadataPass::Mode::EliminateFastClear, {color}}); };
+    auto broken = context;
+    broken.deviceProc = nullptr;
+    bool refused = false;
+    try {
+        RunColorMetadataPass(broken, {ColorMetadataPass::Mode::EliminateFastClear, {color}});
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("missing Vulkan device function resolver") != std::string_view::npos;
+        if (!refused) throw;
+    }
+    Require(refused, "CMASK storage creation failure was silently ignored");
+    Require(*static_cast<std::uint8_t*>(block) == 0x55 && ReadDccKeys(color.cmaskAddress, color.cmaskBytes * 256u) == DccKeys::Clear0000, "failed CMASK storage creation changed guest memory");
+    run();
+    Require(StorageTexture::FindPending(address, surfaceBytes) != nullptr && *static_cast<std::uint8_t*>(block) == 0x55, "CMASK clear without host imports did not stay on the GPU");
+    Require(ReadDccKeys(color.cmaskAddress, color.cmaskBytes * 256u) == DccKeys::Uncompressed, "resident CMASK clear left unresolved metadata");
+    color.clearWords[0] = 0x12345678;
+    run();
+    std::vector<std::uint32_t> stored(surfaceBytes / 4);
+    GuestMemory::Read(address, std::as_writable_bytes(std::span(stored)));
+    Require(std::ranges::all_of(stored, [](auto word) { return word == 0x80402010u; }), "expanded CMASK changed a pending clear or copy write-back lost it");
+    const std::vector<std::byte> clearKeys(4096);
+    GuestMemory::Write(color.cmaskAddress, clearKeys);
+    run();
+    GuestMemory::Read(address, std::as_writable_bytes(std::span(stored)));
+    Require(std::ranges::all_of(stored, [](auto word) { return word == 0x12345678u; }), "a second resident CMASK clear retained the first frame");
+    recorder.Sync();
+}
+
 void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -4028,7 +4104,8 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     context.nullDescriptors = true;
     TextureCache cache(context);
     context.textureCache = &cache;
-    const DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    const std::uint64_t htile = address + bytes;
+    const DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0, htile};
     Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth surface has no view");
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
@@ -4054,10 +4131,16 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     bool reusable = false;
     std::array<bool, 2> proved{};
     std::array<ShaderResources::ProofReport, 2> reports{};
+    std::array<bool, 2> clearedProved{};
+    std::array<ShaderResources::ProofReport, 2> clearedReports{};
     {
         ShaderResources resources(context, compute);
         reusable = resources.Reusable();
         for (std::size_t use = 0; reusable && use < reports.size(); ++use) proved[use] = resources.Revalidate(compute, &reports[use]);
+        if (reusable) {
+            NoteHtileDepthClear(htile);
+            for (std::size_t use = 0; use < clearedReports.size(); ++use) clearedProved[use] = resources.Revalidate(compute, &clearedReports[use]);
+        }
         recorder.Submit();
         device.WaitQueue();
         recorder.Sync();
@@ -4068,6 +4151,8 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
         Require(proved[use], "a set sampling an unchanged depth surface failed its proof on use " + name);
         Require(reports[use].path == ShaderResources::ProofPath::Fast, "a set sampling an unchanged depth surface left the fast proof for the full walk on use " + name);
     }
+    Require(clearedProved[0] && clearedReports[0].path == ShaderResources::ProofPath::Full, "a set sampling a depth surface with a pending fast clear took the fast proof, which skips the clear");
+    Require(clearedProved[1] && clearedReports[1].path == ShaderResources::ProofPath::Fast, "a set sampling a depth surface whose fast clear was applied left the fast proof");
     const auto resource = DecodeTextureResource(binding.guestDescriptor);
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     const auto texture = DepthSurfaceTexture(context, binding.guestDescriptor, resource, identity);
@@ -4755,6 +4840,11 @@ int main(int argc, char** argv) {
             unitShadowTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
+            cmaskPassTests(device, recorder);
+            std::cout << "CMASK copied clear, write-back and failure tests passed\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
@@ -4806,6 +4896,7 @@ int main(int argc, char** argv) {
         singleCubeTests(device, recorder);
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
+        cmaskPassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         gpu.unlock();

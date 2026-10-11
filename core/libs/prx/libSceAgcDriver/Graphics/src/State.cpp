@@ -226,8 +226,11 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, State& result)
     }
     depth.format = zFormat == 1 ? (stencil ? VK_FORMAT_D16_UNORM_S8_UINT : VK_FORMAT_D16_UNORM) : (stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT);
     depth.clearDepth = readFloat(cx, 0x00b);
-    if (zFormat != 0 && (read(cx, 0x010) & 0x20000000u) != 0 && find(cx, 0x005) != cx.end()) depth.htileAddress = base(0x005, 0x01e);
     depth.clearStencil = static_cast<std::uint8_t>(read(cx, 0x00a) & 0xffu);
+    if (const auto htile = find(cx, 0x005); zFormat != 0 && htile != cx.end() && htile->second != 0 && (read(cx, 0x010) & (1u << 29u)) != 0) {
+        depth.htileAddress = base(0x005, 0x01e);
+        depth.htileStencil = stencil && (read(cx, 0x011) & (1u << 29u)) == 0;
+    }
     result.depth = depth;
     result.depthTest = (depthControl & 2u) != 0;
     result.depthWrite = result.depthTest && (depthControl & 4u) != 0 && !depthReadOnly;
@@ -780,6 +783,16 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
         if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
     }
     return packings;
+}
+
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
+    if (state.rectList) return ShaderRecompiler::RasterPrimitive::Rectangle;
+    if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
+    switch (state.topology) {
+        case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
+        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return ShaderRecompiler::RasterPrimitive::Line;
+        default: return ShaderRecompiler::RasterPrimitive::Triangle;
+    }
 }
 
 std::array<std::uint8_t, 8> ExportMappings(const State& state) {

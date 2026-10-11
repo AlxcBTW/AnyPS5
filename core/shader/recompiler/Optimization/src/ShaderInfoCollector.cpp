@@ -1,11 +1,14 @@
 #include "Optimization/ShaderInfoCollector.hpp"
+#include "Optimization/MaskedSelectEliminator.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 namespace {
@@ -73,6 +76,15 @@ void ValidateOptions(const IrProgram& program, ShaderStageInputInfo inputInfo) {
     }
 }
 
+std::string DescribeAncillaryUse(const IrValue& user, const IrValue& ancillary) {
+    std::string text = ValueReference(&user) + "(";
+    for (std::size_t index = 0; index < user.ArgumentCount(); ++index) {
+        const IrValue* argument = user.Argument(index)->Resolve();
+        text += (index == 0 ? "" : ", ") + (argument == &ancillary ? std::string("ancillary") : ValueReference(argument));
+    }
+    return text + ")";
+}
+
 void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inputInfo) {
     for (const auto& block : program.Blocks()) {
         for (const IrValue* inst : block->Instructions()) {
@@ -130,19 +142,24 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                     const auto component = componentValue->ImmediateU32();
                     switch (kind) {
                         case StageInputKind::PackedAncillary: {
+                            std::vector<const IrValue*> users;
                             std::string uses;
                             for (const IrValue* user : inst->Uses()) {
-                                uses += uses.empty() ? " (used by " : ", ";
-                                uses += IrOpcodeName(user->Opcode());
-                                for (std::size_t i = 1; i < user->ArgumentCount(); ++i) {
-                                    const IrValue* argument = user->Argument(i)->Resolve();
-                                    uses += argument->HasImmediate() && argument->Type() == IrType::U32 ? " " + std::to_string(argument->ImmediateU32()) : " ?";
+                                if (std::ranges::find(users, user) != users.end()) {
+                                    continue;
+                                }
+                                users.push_back(user);
+                                const std::string use = DescribeAncillaryUse(*user, *inst);
+                                uses += (uses.empty() ? " (used by " : "; ") + use;
+                                if (AncillaryTraceEnabled()) {
+                                    std::fprintf(stderr, "[ancillary] shader 0x%llx live-use: %s\n", static_cast<unsigned long long>(program.Resources().shaderHash), use.c_str());
                                 }
                             }
                             return Fail("packed pixel ancillary input has an unsupported live use" + uses + (uses.empty() ? "" : ")"));
                         }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
+                        case StageInputKind::RasterPrimitive:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
                                 return Fail("typed pixel scalar input is invalid");
                             }
@@ -388,6 +405,7 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::PackedAncillary:
                 case StageInputKind::Parameter:
+                case StageInputKind::RasterPrimitive:
                     break;
             }
         }

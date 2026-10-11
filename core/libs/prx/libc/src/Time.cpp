@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstddef>
+#include <cerrno>
 #include <ctime>
 #include <cstring>
 #include <limits>
@@ -211,6 +212,14 @@ size_t APS5_VABI libc_strftime_nid_postfix(char* str, size_t count, const char* 
 char* APS5_VABI asctime_nid_postfix(const GuestTm* timeptr) {
     const std::tm host = toHostTm(*timeptr);
     return std::asctime(&host);
+}
+
+char* APS5_VABI ctime_nid_postfix(const int64_t* timer) {
+    if (const GuestTm* local = localtime_nid_postfix(timer)) return asctime_nid_postfix(local);
+    static char unknown[26];
+    std::memcpy(unknown, "??? ??? ?? ??:??:?? ????\n", sizeof(unknown));
+    errno = EINVAL;
+    return unknown;
 }
 
 size_t APS5_VABI strftime_nid_postfix(char* str, size_t count, const char* format, const GuestTm* timeptr) {

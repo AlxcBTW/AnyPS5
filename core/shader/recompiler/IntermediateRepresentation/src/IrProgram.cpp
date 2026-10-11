@@ -312,6 +312,18 @@ const std::vector<IrBlock*>& IrProgram::BlockOrder() const {
     return blockOrder;
 }
 
+std::string ValueReference(const IrValue* value) {
+    if (value == nullptr) {
+        return "<null>";
+    }
+    value = value->Resolve();
+    if (value->HasImmediate()) {
+        static const std::map<const IrValue*, std::size_t> noIds;
+        return valueToString(noIds, value);
+    }
+    return "#" + std::to_string(value->Id()) + " " + std::string(IrOpcodeName(value->Opcode()));
+}
+
 std::string ProgramToString(const IrProgram& program) {
     std::map<const IrValue*, std::size_t> ids;
     std::size_t nextId = 1;

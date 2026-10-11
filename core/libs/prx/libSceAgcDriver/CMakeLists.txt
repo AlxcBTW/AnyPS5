@@ -1340,8 +1340,11 @@ if(BUILD_TESTING)
     target_link_libraries(pixel_ancillary_tests PRIVATE shader_recompiler_agc_driver libc)
     configure_windows_unwind(pixel_ancillary_tests)
     add_test(NAME pixel_ancillary COMMAND pixel_ancillary_tests)
+    add_test(NAME pixel_ancillary_trace COMMAND pixel_ancillary_tests --trace)
+    set_tests_properties(pixel_ancillary_trace PROPERTIES ENVIRONMENT "APS5_TRACE_ANCILLARY=1"
+        PASS_REGULAR_EXPRESSION "\\[ancillary\\] shader 0x0 summary: 0 selects dropped, 0 kept, whole word not composed\n\\[ancillary\\] shader 0x0 select #[0-9]+ dropped: every use reads it only where the mask holds; mask #[0-9]+ IEqual32 = not a helper lane\n\\[ancillary\\] shader 0x0 summary: 1 select dropped, 0 kept, whole word not composed\n\\[ancillary\\] shader 0x0 select #[0-9]+ kept, exec-reactivated: #[0-9]+ SetAttribute runs under true[^\n]*mask #[0-9]+ IEqual32 = not a helper lane\n\\[ancillary\\] shader 0x0 whole word for #[0-9]+ SelectU32\n\\[ancillary\\] shader 0x0 summary: 0 selects dropped, 1 kept, whole word composed\n\\[ancillary\\] shader 0x0 select #[0-9]+ kept, exec-reactivated: #[0-9]+ SetAttribute runs under true[^\n]*mask #[0-9]+ IEqual32 = not a helper lane\n\\[ancillary\\] shader 0x0 summary: 0 selects dropped, 1 kept, whole word not composed\n\\[ancillary\\] shader 0x0 live-use: #[0-9]+ SelectU32\\(#[0-9]+ IEqual32, 0x5a3c9e17, ancillary\\)")
     if(WIN32)
-        set_tests_properties(pixel_ancillary PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(pixel_ancillary pixel_ancillary_trace PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_indexed_draw_tests ${LIBS_INCLUDE_DIR}/tests/GuestIndexedDraw.cpp)

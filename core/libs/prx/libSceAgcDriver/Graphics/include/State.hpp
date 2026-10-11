@@ -67,6 +67,7 @@ struct DepthTarget {
     float clearDepth;
     std::uint8_t clearStencil;
     std::uint64_t htileAddress = 0;
+    bool htileStencil = false;
 };
 
 struct State {
@@ -113,6 +114,7 @@ ShaderStages DecodeShaderStages(const QueueState& queue);
 State DecodeState(const QueueState& queue);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);

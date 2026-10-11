@@ -41,8 +41,10 @@ int APS5_VABI __swbuf_nid_postfix(int, FileStream*);
 int APS5_VABI ungetc_nid_postfix(int, FileStream*);
 char* APS5_VABI fgets_nid_postfix(char*, int, FileStream*);
 int APS5_VABI feof_nid_postfix(FileStream*);
+int APS5_VABI ferror_nid_postfix(FileStream*);
 int APS5_VABI fileno_nid_postfix(FileStream*);
 void APS5_VABI clearerr_nid_postfix(FileStream*);
+void APS5_VABI rewind_nid_postfix(FileStream*);
 int APS5_VABI setvbuf_nid_postfix(FileStream*, char*, int, std::size_t);
 void APS5_VABI setbuf_nid_postfix(FileStream*, char*);
 FileStream* APS5_VABI fdopen_nid_postfix(int, const char*);
@@ -91,6 +93,35 @@ static bool CheckFileBytes(const std::string& filename, const std::string& expec
     if (actual == expected) return true;
     std::fprintf(stderr, "%s %s: expected %zu raw bytes, received %zu\n", reopen ? "freopen" : "fopen", mode, expected.size(), actual.size());
     return false;
+}
+
+static void CheckRewind() {
+    FileStream stream(std::tmpfile());
+    Require(fwrite_nid_postfix("ab", 1, 2, &stream) == 2);
+    *__error_nid_postfix() = 7;
+    rewind_nid_postfix(&stream);
+    Require(*__error_nid_postfix() == 7 && ftello_nid_postfix(&stream) == 0);
+    Require(fgetc_nid_postfix(&stream) == 'a' && ungetc_nid_postfix('z', &stream) == 'z');
+    rewind_nid_postfix(&stream);
+    Require(fgetc_nid_postfix(&stream) == 'a' && fgetc_nid_postfix(&stream) == 'b' && fgetc_nid_postfix(&stream) == EOF);
+    Require(feof_nid_postfix(&stream) != 0);
+    stream.SetEncodingError();
+    Require(ferror_nid_postfix(&stream) != 0);
+    rewind_nid_postfix(&stream);
+    Require(feof_nid_postfix(&stream) == 0 && ferror_nid_postfix(&stream) == 0 && fgetc_nid_postfix(&stream) == 'a');
+    stream.Close();
+#ifndef _WIN32
+    int pipeEnds[2];
+    Require(::pipe(pipeEnds) == 0);
+    Require(::write(pipeEnds[1], "p", 1) == 1);
+    ::close(pipeEnds[1]);
+    FileStream pipe(::fdopen(pipeEnds[0], "r"));
+    Require(fgetc_nid_postfix(&pipe) == 'p' && fgetc_nid_postfix(&pipe) == EOF && feof_nid_postfix(&pipe) != 0);
+    *__error_nid_postfix() = 0;
+    rewind_nid_postfix(&pipe);
+    Require(*__error_nid_postfix() == 29 && feof_nid_postfix(&pipe) == 0 && ferror_nid_postfix(&pipe) == 0);
+    pipe.Close();
+#endif
 }
 
 static bool CheckBinaryModes() {
@@ -333,5 +364,6 @@ int main() {
     Require(lockedWrite && fseeko_nid_postfix(&locked, 0, SEEK_SET) == 0);
     Require(fgetc_nid_postfix(&locked) == 'A' && fgetc_nid_postfix(&locked) == 'B');
     locked.Close();
+    CheckRewind();
     return CheckBinaryModes() ? 0 : 1;
 }

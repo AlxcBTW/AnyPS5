@@ -246,6 +246,12 @@ int APS5_VABI fsetpos_nid_postfix(FileStream* stream, const std::int64_t* positi
     return fseeko_nid_postfix(stream, *position, SEEK_SET);
 }
 
+void APS5_VABI rewind_nid_postfix(FileStream* stream) {
+    const int saved = errno;
+    if (fseeko_nid_postfix(stream, 0, SEEK_SET) == 0) errno = saved;
+    stream->ClearError();
+}
+
 int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream) {
     if (!str) throw std::runtime_error("fputs: null string");
     const int result = std::fputs(str, GetNativeStream(stream));

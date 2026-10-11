@@ -361,7 +361,8 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
     } else if (options.stage == ShaderStageKind::Vertex) {
         if (options.userDataBaseRegister >= 8u) {
-            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(options.waveSize | (options.waveSize << 8u)));
+            const std::uint32_t lanes = options.waveSize == 64u && options.inputInfo.vertex->hostSubgroupSize == 32u ? 32u : options.waveSize;
+            entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
         }
         entryIr.SetVectorReg(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
         entryIr.SetVectorReg(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
