@@ -365,7 +365,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
+                const auto flushBeforePipelineWait = [&] {
+                    GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (!recordLabelsForPacket(localDevice.get(), submission.queue)) localDevice->SubmitRecorded(submission.queue == 0);
+                };
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address, flushBeforePipelineWait);
             } catch (const std::exception& error) {
                 if (rethrow(error)) return;
             }
