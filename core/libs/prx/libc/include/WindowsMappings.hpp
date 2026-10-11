@@ -318,15 +318,9 @@ public:
                 }
                 cursor = stop;
             } else {
-                std::uintptr_t stop = 0;
-                if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
-                    stop = std::min(end, allocation->second);
-                } else {
-                    if (profile) collectStats[CollectQueries].fetch_add(1, std::memory_order_relaxed);
-                    const auto memory = query(cursor);
-                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-                    stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                }
+                const auto allocation = findPrivate(cursor);
+                if (allocation == privateAllocations.end()) return false;
+                const auto stop = std::min(end, allocation->second);
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (stop - cursor + 4095) / 4096);
                 if (available == 0) return true;
                 DWORD granularity = 0;
@@ -363,14 +357,9 @@ public:
                     }
                 }
                 if (views.find(cursor & ~(pageBytes - 1)) != views.end()) return false;
-                std::uintptr_t stop = 0;
-                if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
-                    stop = std::min(end, allocation->second);
-                } else {
-                    const auto memory = query(cursor);
-                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-                    stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                }
+                const auto allocation = findPrivate(cursor);
+                if (allocation == privateAllocations.end()) return false;
+                const auto stop = std::min(end, allocation->second);
                 pieces.emplace_back(cursor, stop);
                 cursor = stop;
             }
@@ -422,14 +411,9 @@ private:
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
-                cursor = std::min(end, allocation->second);
-                continue;
-            }
-            if (collectProfiled()) collectStats[CollectQueries].fetch_add(1, std::memory_order_relaxed);
-            const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-            cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            const auto allocation = findPrivate(cursor);
+            if (allocation == privateAllocations.end()) return false;
+            cursor = std::min(end, allocation->second);
         }
         return true;
     }
