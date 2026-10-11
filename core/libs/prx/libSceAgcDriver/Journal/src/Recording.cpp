@@ -351,6 +351,48 @@ private:
         open.store(true, std::memory_order_release);
     }
 
+    static bool within(const std::vector<Range>& ranges, std::uint64_t address, std::uint64_t bytes) {
+        const auto after = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const Range& range) { return value < range.address; });
+        if (after == ranges.begin()) return false;
+        const auto& range = *std::prev(after);
+        return address - range.address <= range.bytes && bytes <= range.bytes - (address - range.address);
+    }
+
+    static bool overlaps(const std::vector<Range>& ranges, std::uint64_t begin, std::uint64_t end) {
+        const auto after = std::upper_bound(ranges.begin(), ranges.end(), end - 1, [](std::uint64_t value, const Range& range) { return value < range.address; });
+        return after != ranges.begin() && std::prev(after)->address + std::prev(after)->bytes > begin;
+    }
+
+    static std::vector<Range> unregisteredCode(const JournalFile& next) {
+        constexpr std::uint64_t PageBytes = 0x1000;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pages;
+        for (const auto& call : next.prelude) {
+            const auto* registration = std::get_if<RegisterShaderCall>(&call);
+            if (registration == nullptr || registration->shader.bytes.size() < sizeof(Shader)) continue;
+            Shader fields;
+            std::memcpy(&fields, registration->shader.bytes.data(), sizeof(Shader));
+            const auto code = pointer(const_cast<const void*>(fields.code));
+            if (fields.shader_size == 0 || within(next.ranges, code, fields.shader_size) || !GuestMemory::Accessible(reinterpret_cast<const void*>(code), fields.shader_size)) continue;
+            const auto begin = code & ~(PageBytes - 1);
+            const auto end = (code + fields.shader_size + PageBytes - 1) & ~(PageBytes - 1);
+            if (!overlaps(next.ranges, begin, end)) pages.emplace_back(begin, end);
+        }
+        std::sort(pages.begin(), pages.end());
+        std::vector<Range> ranges;
+        for (const auto& [begin, end] : pages) {
+            if (!ranges.empty() && begin <= ranges.back().address + ranges.back().bytes) {
+                const auto last = std::max(ranges.back().address + ranges.back().bytes, end);
+                ranges.back().bytes = last - ranges.back().address;
+                ranges.back().allocationBytes = ranges.back().bytes;
+                ranges.back().committed.back().second = last;
+                continue;
+            }
+            ranges.push_back({begin, end - begin, true, false, false, begin, end - begin, 0, 0, {{begin, end}}});
+        }
+        for (auto& range : ranges) range.writable = GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes, true);
+        return ranges;
+    }
+
     void fill(JournalFile& next, const std::filesystem::path& directory) {
         auto& driver = DriverDetail::Driver::Get();
         {
@@ -376,9 +418,15 @@ private:
             if (sharedBacking(range->address, range->bytes)) shared.push_back(entry);
             next.ranges.push_back(std::move(entry));
         }
+        std::sort(next.ranges.begin(), next.ranges.end(), [](const Range& a, const Range& b) { return a.address < b.address; });
+        for (auto& entry : unregisteredCode(next)) {
+            for (const auto& [begin, end] : entry.committed) committedBytes += end - begin;
+            if (sharedBacking(entry.address, entry.bytes)) shared.push_back(entry);
+            next.ranges.push_back(std::move(entry));
+        }
+        std::sort(next.ranges.begin(), next.ranges.end(), [](const Range& a, const Range& b) { return a.address < b.address; });
         requireUnshared(shared);
         requireMemoryFor(committedBytes);
-        std::sort(next.ranges.begin(), next.ranges.end(), [](const Range& a, const Range& b) { return a.address < b.address; });
         Settle(next.ranges);
         GuestMemory::FlushGpuWrites(gds, Pm4::GdsBytes);
         auto queues = driver.Checkpoint();
@@ -389,7 +437,7 @@ private:
         journal = std::move(next);
         const auto registered = journal.prelude.size();
         std::erase_if(journal.prelude, [&](const Call& call) { return !unjournaled(call).empty(); });
-        if (journal.prelude.size() != registered) std::fprintf(stderr, "[journal] %zu of %zu registrations made before the journal opened refer to shader code outside the journaled guest memory and are left out of the prelude\n", registered - journal.prelude.size(), registered);
+        if (journal.prelude.size() != registered) std::fprintf(stderr, "[journal] %zu of %zu registrations made before the journal opened refer to shader code that is no longer readable and are left out of the prelude\n", registered - journal.prelude.size(), registered);
         std::filesystem::create_directories(directory);
         BlockWriter blocks(directory);
         shadow.Load(journal.ranges, [&](std::uint64_t address, std::span<const std::byte> block) {

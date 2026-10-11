@@ -104,7 +104,7 @@ The register layout and instruction contract follow [AMD RDNA2 ISA sections 5.8 
 |---|---|
 | Frame journal (journal) | A directory with everything a replay needs: prelude, memory image, checkpoint, calls and reference frames. |
 | Call | One invocation of a driver entry point (`Submit`, `SuspendPoint`, shader registration and ABI resolution, video output registration) or a display buffer noted for a video output, with the bytes it passes outside guest memory. Registrations and ABI resolutions keep the shader headers' bytes as they were at the call (titles pass header copies on their stacks and reuse header memory), registrations the shader code too. |
-| Prelude | The registrations made after the journal was armed and before it opened, without those whose shader code lies outside the journaled memory by then (freed shaders); `Open` reports how many it left out. |
+| Prelude | The registrations made after the journal was armed and before it opened. Shader code outside the registered guest memory (titles keep some in their heap) is journaled as ranges of its own; registrations whose code is no longer readable (freed) are left out, and `Open` reports how many. |
 | Memory image | The committed bytes of every readable registered guest range when the journal opens. |
 | Checkpoint | Driver state outside guest memory when the journal opens: the registers of every queue and the GDS. |
 | Title write | Guest bytes that differ, in 64-byte lines, from guest memory after the previous call settled. |

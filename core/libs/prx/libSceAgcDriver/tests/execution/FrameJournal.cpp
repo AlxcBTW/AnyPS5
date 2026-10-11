@@ -269,6 +269,7 @@ struct Live {
     std::uint64_t fill = 0;
     std::uint64_t copiedHeader = 0;
     std::uint64_t hostHeader = 0;
+    std::uint64_t hostCode = 0;
 };
 
 Live Record(const std::filesystem::path& journal) {
@@ -337,21 +338,22 @@ Live Record(const std::filesystem::path& journal) {
     code.Release(LabelOffset);
     present();
     AgcDriver::Journal::Close();
-    return {frames, code.Address(LabelOffset), code.Address(FillCodeOffset), reinterpret_cast<std::uintptr_t>(&pixelCopy->shader), reinterpret_cast<std::uintptr_t>(&hostShader->header.shader)};
+    return {frames, code.Address(LabelOffset), code.Address(FillCodeOffset), reinterpret_cast<std::uintptr_t>(&pixelCopy->shader), reinterpret_cast<std::uintptr_t>(&hostShader->header.shader), reinterpret_cast<std::uintptr_t>(hostShader->code.data())};
 }
 
 void RequireJournal(const std::filesystem::path& directory, const Live& recorded) {
     const auto journal = AgcDriver::Journal::ReadJournal(directory);
     const auto shaders = std::count_if(journal.prelude.begin(), journal.prelude.end(), [](const AgcDriver::Journal::Call& call) { return std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(call); });
-    Require(shaders == 4, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 4 of journaled shaders made before the journal opened");
+    Require(shaders == 5, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 5 made before the journal opened");
     Require(std::any_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
         const auto* registration = std::get_if<AgcDriver::Journal::RegisterShaderCall>(&call);
         return registration != nullptr && registration->shader.address == recorded.copiedHeader && registration->shader.bytes.size() == sizeof(Header);
     }), "the prelude does not hold the registration from a shader header outside guest memory with the header's bytes");
-    Require(std::none_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
+    Require(std::any_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
         const auto* registration = std::get_if<AgcDriver::Journal::RegisterShaderCall>(&call);
         return registration != nullptr && registration->shader.address == recorded.hostHeader;
-    }), "the prelude holds the registration of a shader whose code lies outside guest memory");
+    }), "the prelude does not hold the registration of a shader whose code lies outside the registered guest memory");
+    Require(std::any_of(journal.ranges.begin(), journal.ranges.end(), [&](const AgcDriver::Journal::Range& range) { return range.address <= recorded.hostCode && recorded.hostCode - range.address < range.bytes; }), "the journal does not hold the code of the shader registered from outside the registered guest memory");
     const auto label = recorded.label;
     Require(journal.calls.size() == 7, "the journal holds " + std::to_string(journal.calls.size()) + " calls, expected 2 shader registrations, 2 frame submissions, 2 flips and a suspend point");
     Require(std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[0].call) && std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[1].call), "the shader registrations made while the journal was open are not its first calls");
