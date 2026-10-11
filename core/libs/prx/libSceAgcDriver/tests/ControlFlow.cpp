@@ -487,7 +487,7 @@ done:
   buffer_store_dword v1, off, s[0:3], 0
   s_endpgm)",
          Store({0x7e020280u, 0xbe880380u, 0xbf0a8408u, 0xbf84000cu, 0xbf060208u, 0xbf850004u, 0x7d880088u, 0xbf860007u, 0x4a020281u,
-                0xbf820003u, 0x7d880090u, 0xbf860003u, 0x4a020282u, 0x80088108u, 0xbf82fff3u, 0x4a020283u}), Split::Route, 0},
+                0xbf820003u, 0x7d880090u, 0xbf860003u, 0x4a020282u, 0x80088108u, 0xbf82fff3u, 0x4a020283u}), Split::None},
         {"shared tail", R"(
   v_cmp_gt_u32 vcc, 16, v0
   s_cbranch_vccz outer_else
