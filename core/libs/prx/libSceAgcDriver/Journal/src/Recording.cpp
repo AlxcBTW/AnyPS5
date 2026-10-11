@@ -13,6 +13,8 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -112,53 +114,81 @@ std::uint64_t availableMemory() {
 #endif
 }
 
+std::uint64_t mixWord(std::uint64_t lane, std::uint64_t word) {
+    return std::rotl((lane ^ word) * 0x9e3779b97f4a7c15ull, 31) * 0xbf58476d1ce4e5b9ull;
+}
+
+std::uint64_t lineHash(const std::byte* line, std::size_t bytes) {
+    std::array<std::uint64_t, LineBytes / sizeof(std::uint64_t)> words{};
+    static_assert(std::tuple_size_v<decltype(words)> == 8);
+    std::memcpy(words.data(), line, std::min(sizeof(words), bytes));
+    auto a = mixWord(bytes, words[0]);
+    auto b = mixWord(0x9e3779b97f4a7c15ull, words[1]);
+    auto c = mixWord(0xbf58476d1ce4e5b9ull, words[2]);
+    auto d = mixWord(0x94d049bb133111ebull, words[3]);
+    a = mixWord(a, words[4]);
+    b = mixWord(b, words[5]);
+    c = mixWord(c, words[6]);
+    d = mixWord(d, words[7]);
+    return a ^ std::rotl(b, 16) ^ std::rotl(c, 32) ^ std::rotl(d, 48);
+}
+
 class Shadow {
 public:
-    void Load(const std::vector<Range>& ranges) {
-        regions.clear();
-        for (const auto& range : ranges) {
-            for (const auto& [begin, end] : range.committed) {
-                Region region{begin, std::vector<std::byte>(end - begin)};
-                std::memcpy(region.bytes.data(), reinterpret_cast<const void*>(begin), region.bytes.size());
-                regions.push_back(std::move(region));
-            }
-        }
-    }
+    static std::uint64_t BytesFor(std::uint64_t imageBytes) { return (imageBytes + LineBytes - 1) / LineBytes * sizeof(std::uint64_t); }
 
     template <typename TVisit>
-    void ForEach(TVisit&& visit) const {
-        for (const auto& region : regions) visit(region.address, std::span<const std::byte>(region.bytes));
+    void Load(const std::vector<Range>& ranges, TVisit&& visit) {
+        regions.clear();
+        for (const auto& range : ranges) {
+            for (const auto& [begin, end] : range.committed) regions.push_back({begin, end - begin, std::vector<std::uint64_t>((end - begin + LineBytes - 1) / LineBytes)});
+        }
+        for (auto& region : regions) hashRegion(region, visit);
     }
 
     std::vector<TitleWrite> Changes() const {
         std::vector<TitleWrite> writes;
+        std::array<std::byte, LineBytes> line;
         for (const auto& region : regions) {
-            const auto* live = reinterpret_cast<const std::byte*>(region.address);
-            const auto size = region.bytes.size();
-            const auto differs = [&](std::size_t at) { return std::memcmp(live + at, region.bytes.data() + at, std::min(LineBytes, size - at)) != 0; };
-            for (std::size_t at = 0; at < size;) {
-                if (!differs(at)) {
-                    at += std::min(LineBytes, size - at);
+            bool extending = false;
+            for (std::uint64_t at = 0; at < region.bytes; at += LineBytes) {
+                const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(LineBytes, region.bytes - at));
+                std::memcpy(line.data(), reinterpret_cast<const void*>(region.address + at), length);
+                if (lineHash(line.data(), length) == region.lines[at / LineBytes]) {
+                    extending = false;
                     continue;
                 }
-                auto end = at;
-                while (end < size && differs(end)) end += std::min(LineBytes, size - end);
-                writes.push_back({region.address + at, std::vector<std::byte>(live + at, live + end)});
-                at = end;
+                if (!extending) writes.push_back({region.address + at, {}});
+                writes.back().bytes.insert(writes.back().bytes.end(), line.begin(), line.begin() + static_cast<std::ptrdiff_t>(length));
+                extending = true;
             }
         }
         return writes;
     }
 
     void Refresh() {
-        for (auto& region : regions) std::memcpy(region.bytes.data(), reinterpret_cast<const void*>(region.address), region.bytes.size());
+        for (auto& region : regions) hashRegion(region, [](std::uint64_t, std::span<const std::byte>) {});
     }
 
 private:
     struct Region {
         std::uint64_t address;
-        std::vector<std::byte> bytes;
+        std::uint64_t bytes;
+        std::vector<std::uint64_t> lines;
     };
+
+    template <typename TVisit>
+    void hashRegion(Region& region, TVisit&& visit) {
+        std::vector<std::byte> chunk(ImageBlockBytes);
+        for (std::uint64_t at = 0; at < region.bytes;) {
+            const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(region.bytes - at, ImageBlockBytes - (region.address + at) % ImageBlockBytes));
+            std::memcpy(chunk.data(), reinterpret_cast<const void*>(region.address + at), length);
+            for (std::size_t line = 0; line < length; line += LineBytes) region.lines[(at + line) / LineBytes] = lineHash(chunk.data() + line, std::min(LineBytes, length - line));
+            visit(region.address + at, std::span<const std::byte>(chunk.data(), length));
+            at += length;
+        }
+    }
+
     std::vector<Region> regions;
 };
 
@@ -348,15 +378,9 @@ private:
         journal = std::move(next);
         for (const auto& call : journal.prelude) requireJournaled(call);
         std::filesystem::create_directories(directory);
-        shadow.Load(journal.ranges);
         BlockWriter blocks(directory);
-        shadow.ForEach([&](std::uint64_t address, std::span<const std::byte> bytes) {
-            for (std::size_t at = 0; at < bytes.size();) {
-                const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(bytes.size() - at, ImageBlockBytes - (address + at) % ImageBlockBytes));
-                const auto block = bytes.subspan(at, length);
-                if (std::any_of(block.begin(), block.end(), [](std::byte value) { return value != std::byte{0}; })) journal.image.push_back({address + at, blocks.Store(block), static_cast<std::uint32_t>(length)});
-                at += length;
-            }
+        shadow.Load(journal.ranges, [&](std::uint64_t address, std::span<const std::byte> block) {
+            if (std::any_of(block.begin(), block.end(), [](std::byte value) { return value != std::byte{0}; })) journal.image.push_back({address, blocks.Store(block), static_cast<std::uint32_t>(block.size())});
         });
         this->directory = directory;
     }
@@ -387,8 +411,9 @@ private:
 
     static void requireMemoryFor(std::uint64_t imageBytes) {
         constexpr std::uint64_t Headroom = std::uint64_t{3} << 29;
+        const auto needed = Shadow::BytesFor(imageBytes);
         const auto available = availableMemory();
-        require(available >= imageBytes + Headroom, "the memory image needs " + std::to_string(imageBytes >> 20) + " MiB in this process, " + std::to_string(available >> 20) + " MiB are available and " + std::to_string(Headroom >> 20) + " MiB stay free");
+        require(available >= needed + Headroom, "the line hashes of the " + std::to_string(imageBytes >> 20) + " MiB memory image need " + std::to_string(needed >> 20) + " MiB in this process, " + std::to_string(available >> 20) + " MiB are available and " + std::to_string(Headroom >> 20) + " MiB stay free");
     }
 
     bool journaled(std::uint64_t address, std::uint64_t bytes) const {
