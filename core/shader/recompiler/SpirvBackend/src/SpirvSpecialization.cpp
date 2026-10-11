@@ -613,7 +613,6 @@ private:
     std::vector<Instruction> instructions;
     std::vector<Instruction> constants;
     std::map<std::uint32_t, ScalarType> types;
-    std::set<std::uint32_t> vectorTypes;
     std::map<std::uint32_t, std::uint32_t> values;
     std::map<std::uint32_t, std::uint32_t> resultTypes;
     std::set<std::uint32_t> vectorTypes;
