@@ -456,7 +456,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     for (const auto& surface : surfaces()) {
         if (surface->context.device == context.device && sameSurface(surface->target, target)) {
             bound = surface.get();
-            bound->retired = false;
+            if (bound->retired) {
+                bound->retired = false;
+                surfacesSerial.fetch_add(1, std::memory_order_release);
+            }
             bound->clearDepth = target.clearDepth;
             bound->clearStencil = target.clearStencil;
             if (cleared) bound->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -473,7 +476,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         bound->clearStencil = target.clearStencil;
     }
     for (const auto& surface : surfaces()) {
-        if (surface.get() != bound && surface->context.device == context.device && surface->Overlaps(*bound)) surface->retired = true;
+        if (surface.get() != bound && surface->context.device == context.device && !surface->retired && surface->Overlaps(*bound)) {
+            surface->retired = true;
+            surfacesSerial.fetch_add(1, std::memory_order_release);
+        }
     }
     bound->NoteWritten();
     return bound->view;
@@ -501,7 +507,10 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
 void RetireDepthSurfaces(VkDevice device, std::uint64_t address, std::uint64_t bytes) {
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
-        if (surface->context.device == device && surface->Overlaps(address, bytes)) surface->retired = true;
+        if (surface->context.device == device && !surface->retired && surface->Overlaps(address, bytes)) {
+            surface->retired = true;
+            surfacesSerial.fetch_add(1, std::memory_order_release);
+        }
     }
 }
 
@@ -511,7 +520,10 @@ bool RetireDepthSurfacesForStorage(VkDevice device, const GuestTextureResource& 
     const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == device && !surface->retired && surface->target.address == descriptor.baseAddress; });
     if (found == list.rend() || storageFits((*found)->target, descriptor, storageFormat)) return false;
     for (const auto& surface : list) {
-        if (surface->context.device == device && surface->Overlaps(descriptor.baseAddress, bytes)) surface->retired = true;
+        if (surface->context.device == device && !surface->retired && surface->Overlaps(descriptor.baseAddress, bytes)) {
+            surface->retired = true;
+            surfacesSerial.fetch_add(1, std::memory_order_release);
+        }
     }
     return true;
 }
@@ -551,6 +563,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const bool accepted = sampled ? (*found)->SampledAccepts(words, resource) : planesAccepted(base, resource, integer);
     if (!accepted && (*found)->OverwrittenInMemory()) {
         (*found)->retired = true;
+        surfacesSerial.fetch_add(1, std::memory_order_release);
         return nullptr;
     }
     (*found)->ApplyFastClear();
