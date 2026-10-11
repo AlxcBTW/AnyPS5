@@ -113,6 +113,8 @@ extern "C" {
 }
 
 [[noreturn]] void LibcTerminate_nid_no_patch(int code) {
+    // TerminateProcess flushes nothing, and stderr is buffered (libSceAgcDriver's BufferStandardError).
+    std::fflush(nullptr);
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
 #endif
