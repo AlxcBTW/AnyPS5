@@ -9,6 +9,9 @@
 #include <cstddef>
 #include <atomic>
 #include <cstdint>
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <map>
@@ -269,7 +272,10 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+        const bool profile = collectProfiled();
+        const auto requested = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::lock_guard lock(mutex);
+        const CollectTimer timer{*this, profile, requested, profile ? std::chrono::steady_clock::now() : requested};
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -316,6 +322,7 @@ public:
                 if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
                     stop = std::min(end, allocation->second);
                 } else {
+                    if (profile) collectStats[CollectQueries].fetch_add(1, std::memory_order_relaxed);
                     const auto memory = query(cursor);
                     if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                     stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
@@ -323,7 +330,14 @@ public:
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (stop - cursor + 4095) / 4096);
                 if (available == 0) return true;
                 DWORD granularity = 0;
+                const auto watchStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                if (profile) {
+                    collectStats[CollectWatchCalls].fetch_add(1, std::memory_order_relaxed);
+                    collectStats[CollectWatchNs].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - watchStart).count()), std::memory_order_relaxed);
+                    collectStats[CollectWatchBytes].fetch_add(stop - cursor, std::memory_order_relaxed);
+                    collectStats[CollectPagesReported].fetch_add(available, std::memory_order_relaxed);
+                }
                 *count += available;
                 if (*count == capacity) return true;
                 cursor = stop;
@@ -370,11 +384,36 @@ public:
         return true;
     }
 
+    enum CollectStatistic : std::size_t { CollectCalls, CollectLockWaitNs, CollectHeldNs, CollectWatchCalls, CollectWatchNs, CollectWatchBytes, CollectPagesReported, CollectQueries, CollectStatisticCount };
+
+    void CollectStatistics(std::uint64_t* values, std::size_t count) const {
+        for (std::size_t i = 0; i < count && i < CollectStatisticCount; ++i) values[i] = collectStats[i].load(std::memory_order_relaxed);
+    }
+
     std::uint64_t MappingSerial() const {
         return mappingSerial.load(std::memory_order_acquire);
     }
 
 private:
+    static bool collectProfiled() {
+        static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        return profiled;
+    }
+
+    struct CollectTimer {
+        WindowsMappings& owner;
+        bool profile;
+        std::chrono::steady_clock::time_point requested;
+        std::chrono::steady_clock::time_point locked;
+        ~CollectTimer() {
+            if (!profile) return;
+            const auto now = std::chrono::steady_clock::now();
+            owner.collectStats[CollectCalls].fetch_add(1, std::memory_order_relaxed);
+            owner.collectStats[CollectLockWaitNs].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(locked - requested).count()), std::memory_order_relaxed);
+            owner.collectStats[CollectHeldNs].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - locked).count()), std::memory_order_relaxed);
+        }
+    };
+
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
@@ -387,6 +426,7 @@ private:
                 cursor = std::min(end, allocation->second);
                 continue;
             }
+            if (collectProfiled()) collectStats[CollectQueries].fetch_add(1, std::memory_order_relaxed);
             const auto memory = query(cursor);
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
@@ -605,6 +645,7 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     std::atomic<std::uint64_t> mappingSerial{0};
+    std::array<std::atomic<std::uint64_t>, CollectStatisticCount> collectStats{};
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
     UnmapFunction unmap = nullptr;

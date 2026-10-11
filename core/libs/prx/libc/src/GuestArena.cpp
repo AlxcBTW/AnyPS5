@@ -334,6 +334,10 @@ std::uint64_t GuestArenaMappingSerial_nid_postfix() {
     return WindowsMappings::Get().MappingSerial();
 }
 
+void GuestArenaCollectStatistics_nid_postfix(std::uint64_t* values, std::size_t count) {
+    WindowsMappings::Get().CollectStatistics(values, count);
+}
+
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return Arena::Get().OverlapsHostRegion(address, bytes);
 }

@@ -333,6 +333,11 @@ public:
             const auto count = readSiteSamples[site].load(std::memory_order_relaxed);
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
+#ifdef _WIN32
+        std::array<std::uint64_t, 8> mappings{};
+        GuestArena::GuestArenaCollectStatistics_nid_postfix(mappings.data(), mappings.size());
+        AgcDriver::ProfilePrint_nid_no_patch(" | win collects %llu (lock wait %.1f ms, held %.1f ms), GetWriteWatch %llu calls over %.0f MiB in %.1f ms reporting %llu pages, %llu queries", static_cast<unsigned long long>(mappings[0]), mappings[1] / 1e6, mappings[2] / 1e6, static_cast<unsigned long long>(mappings[3]), mappings[5] / 1048576.0, mappings[4] / 1e6, static_cast<unsigned long long>(mappings[6]), static_cast<unsigned long long>(mappings[7]));
+#endif
         AgcDriver::ProfilePrint_nid_no_patch("\n");
     }
 private:
