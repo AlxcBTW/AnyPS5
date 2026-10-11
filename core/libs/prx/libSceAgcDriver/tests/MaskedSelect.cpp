@@ -128,6 +128,18 @@ bool refusedAs(const std::vector<MaskedSelectRefusal>& refusals, const IrValue& 
     return false;
 }
 
+bool droppedAs(const std::vector<MaskedSelectDrop>& drops, const IrValue& select, const std::string& why, const IrValue& mask, const std::string& opcode) {
+    const std::string expected = "[ancillary] shader 0x0 select #" + std::to_string(select.Id()) + " dropped: " + why + "; mask #" + std::to_string(mask.Id()) + " " + opcode;
+    for (const auto& drop : drops) {
+        if (drop.select != select.Id()) continue;
+        const bool ok = drop.line.rfind(expected, 0) == 0;
+        if (!ok) std::fprintf(stderr, "  expected %s, got: %s\n", expected.c_str(), drop.line.c_str());
+        return ok;
+    }
+    std::fprintf(stderr, "  no drop recorded for #%u (%zu recorded)\n", select.Id(), drops.size());
+    return false;
+}
+
 bool expect(const char* name, bool condition) {
     if (!condition) std::fprintf(stderr, "%s\n", name);
     return condition;
@@ -730,8 +742,65 @@ int main() {
         auto& written = ancillary.select(kept, ancillary.add(word, 1u), word);
         auto& next = ancillary.select(kept, ancillary.add(written, 2u), word);
         ancillary.keep(next);
+        const auto plainStats = MaskedSelectEliminator{}.Eliminate(plain.program, true);
         const auto stats = MaskedSelectEliminator{}.Eliminate(ancillary.program, true);
-        return plain.explain().empty() && stats.removedSelects == 1u && removed(written) && stats.refusals.size() == 1u && refusedAs(stats.refusals, next, MaskedSelectRefusalReason::ObservableUse, {"#", "ReferenceU32"});
+        return plainStats.removedSelects == 1u && plainStats.drops.empty() && plainStats.refusals.empty() && stats.removedSelects == 1u && removed(written) && stats.refusals.size() == 1u && refusedAs(stats.refusals, next, MaskedSelectRefusalReason::ObservableUse, {"#", "ReferenceU32"}) &&
+               stats.drops.size() == 1u && droppedAs(stats.drops, written, "every use reads it only where the mask holds", kept, "ULessThan32");
+    });
+
+    passed &= run("a dropped select that kept the ancillary word says why it could go", [] {
+        Builder b;
+        auto& full = b.threadBit(b.constant(0xffffffffu), b.constant(0xffffffffu));
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        auto& everyLane = b.select(full, b.add(old, 1u), old);
+        auto& masked = b.select(exec, b.add(old, 2u), old);
+        b.keep(everyLane);
+        b.keep(b.select(exec, b.add(masked, 3u), b.lane()));
+        const auto stats = MaskedSelectEliminator{}.Eliminate(b.program, true);
+        const std::string line = stats.drops.empty() ? std::string() : stats.drops.front().line;
+        return removed(everyLane) && removed(masked) && stats.refusals.empty() && stats.drops.size() == 2u &&
+               droppedAs(stats.drops, everyLane, "the mask holds in every lane", full, "INotEqual32 = lane bit of 0xffffffff") &&
+               droppedAs(stats.drops, masked, "every use reads it only where the mask holds", exec, "ULessThan32") &&
+               line == "[ancillary] shader 0x0 select #" + std::to_string(masked.Id()) + " dropped: every use reads it only where the mask holds; mask #" + std::to_string(exec.Id()) + " ULessThan32";
+    });
+
+    passed &= run("only a select whose inactive arm reaches the word without another select's inactive arm is explained", [] {
+        Builder b;
+        auto& old = b.ancillary();
+        auto& root = b.select(b.mask(16u), b.add(old, 1u), old);
+        auto& chained = b.select(b.mask(8u), b.add(root, 2u), root);
+        IrBlock& entry = *b.block;
+        IrBlock& next = b.newBlock();
+        entry.AddBranch(&next);
+        b.block = &next;
+        auto& merged = b.phi(IrType::U32, entry, root);
+        auto& afterPhi = b.select(b.mask(6u), b.add(merged, 3u), merged);
+        auto& copied = b.select(b.mask(4u), old, b.lane());
+        auto& throughActive = b.select(b.mask(2u), b.add(copied, 4u), copied);
+        b.keep(chained);
+        b.keep(afterPhi);
+        b.keep(throughActive);
+        const auto stats = MaskedSelectEliminator{}.Eliminate(b.program, true);
+        std::vector<std::uint32_t> explained;
+        for (const auto& refusal : stats.refusals) explained.push_back(refusal.select);
+        return stats.removedSelects == 0u && stats.drops.empty() && explained == std::vector<std::uint32_t>{throughActive.Id(), root.Id()};
+    });
+
+    passed &= run("the ancillary summary counts dropped and kept selects and says whether the whole word was composed", [] {
+        Builder plain;
+        plain.keep(plain.select(plain.mask(16u), plain.add(plain.lane(), 1u), plain.lane()));
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.ancillary();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        b.keep(b.select(exec, b.add(written, 2u), old));
+        const bool reads = ReadsPackedAncillary(b.program);
+        const auto stats = MaskedSelectEliminator{}.Eliminate(b.program, true);
+        MaskedSelectEliminationStats none;
+        none.drops.resize(2u);
+        return reads && !ReadsPackedAncillary(plain.program) && AncillarySummaryLine(b.program, stats, false) == "[ancillary] shader 0x0 summary: 1 select dropped, 1 kept, whole word not composed" &&
+               AncillarySummaryLine(b.program, none, true) == "[ancillary] shader 0x0 summary: 2 selects dropped, 0 kept, whole word composed";
     });
 
     passed &= run("a walk that runs out of steps is reported with its step count and what more steps give", [] {
