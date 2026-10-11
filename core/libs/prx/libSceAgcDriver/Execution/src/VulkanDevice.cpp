@@ -3616,6 +3616,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         for (std::size_t i = 0; i < labelValues.size(); ++i) {
             if (labelValues[i].has_value() && *labelValues[i] != groups[i]) stats.labelDiffers.fetch_add(1, std::memory_order_relaxed);
         }
+        const auto* limit = state->properties.limits.maxComputeWorkGroupCount;
         if (groups[0] > limit[0] || groups[1] > limit[1] || groups[2] > limit[2]) stats.overLimit.fetch_add(1, std::memory_order_relaxed);
     }
     record.x = groups[0];
