@@ -2173,9 +2173,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-            APS5_LOG_CHARS_OUT("StorageTexture upload submit");
+            AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture upload submit\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
             batch.SubmitAndWait();
-            APS5_LOG_CHARS_OUT("StorageTexture upload done");
+            AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture upload done\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
     }
     countStorageUpload(2, guestBytes);
     ++version;
@@ -4260,9 +4260,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
     CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, original.size());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
+    AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture writeback submit\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
     batch.SubmitAndWait();
-    APS5_LOG_CHARS_OUT("StorageTexture writeback done");
+    AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture writeback done\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
     countStorageWriteBack(guestBytes, false);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
