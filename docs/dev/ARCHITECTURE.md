@@ -95,3 +95,27 @@ An immediate MODE write confined to the rounding fields is accepted only when it
 The register layout and instruction contract follow [AMD RDNA2 ISA sections 5.8 and 6.4, Table 24](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf), cross-checked against LLVM 20.1.8's [hardware-register encoding](https://github.com/llvm/llvm-project/blob/87f0227cb60147a26a1eeb4fb06e3b505e9c7261/llvm/lib/Target/AMDGPU/Utils/AMDGPUBaseInfo.h) and [MODE state analysis](https://github.com/llvm/llvm-project/blob/87f0227cb60147a26a1eeb4fb06e3b505e9c7261/llvm/lib/Target/AMDGPU/SIModeRegister.cpp). This contract does not establish arithmetic support for every initial mode or console-specific behavior.
 
 `agc_shader_mode_register` decodes instruction words, builds the control-flow graph and checks production translation without a Vulkan device. It covers rounding subfield reads, masked constant writes, branches, unsupported runtime changes and diagnostics, plus mode propagation through full recompilation. The requirements remain active in Release; CTest bounds execution to 20 seconds.
+
+### Frame journal
+
+[`Journal`](../../core/libs/prx/libSceAgcDriver/Journal/include/Journal.hpp) records what a title passes to the driver and replays it in another process without the title. "Capture", "trace", "snapshot", "recorder" and "dump" already name other things in the driver, so the tool uses these terms:
+
+| Term | Meaning |
+|---|---|
+| Frame journal (journal) | A directory with everything a replay needs: prelude, memory image, checkpoint, calls and reference frames. |
+| Call | One invocation of a driver entry point (`Submit`, `SuspendPoint`, shader registration and ABI resolution, video output registration) or a display buffer noted for a video output, with the bytes it passes outside guest memory. |
+| Prelude | The registrations made after the journal was armed and before it opened. |
+| Memory image | The committed bytes of every readable registered guest range when the journal opens. |
+| Checkpoint | Driver state outside guest memory when the journal opens: the registers of every queue and the GDS. |
+| Title write | Guest bytes that differ, in 64-byte lines, from guest memory after the previous call settled. |
+| Reference frame | The display buffer of a flip, read back in the recording. |
+| Replay | Running a journal in `agc_journal_replay`. |
+| Divergence | A replayed frame that differs from its reference frame or from another replay. |
+
+- `Journal::Arm` routes every driver entry point through the journal; video outputs have to be registered after it. Not armed, an entry point costs one branch on a flag.
+- `Journal::Open(directory)` settles the driver (every accepted submission completes and the pending GPU writes of the registered ranges are stored), then takes the checkpoint and the memory image (`blocks.bin`: 64 KiB blocks, zero blocks skipped, equal blocks stored once). While the journal is open, calls run one at a time: the title writes are taken, the call runs, the driver is settled, the display buffer of each flip is read back as a reference frame, and the settled memory is the base for the next title writes. `Journal::Close` writes `journal.bin`.
+- `Journal::NoteDisplayBuffer` tells the journal the address and format behind a buffer index of a video output.
+- `Journal::ReplayEnvironment(directory)` lists the environment a replay runs in: the recorded `APS5_*` and `ANYPS5_*` variables, `ANYPS5_GPU` as recorded, and `APS5_NO_WRITE_EVIDENCE=1`, `APS5_NO_PIPELINE_LTO=1`, `APS5_GPU_WAIT_TIMEOUT_MS=600000`, `APS5_THREAD_PRIORITY=off`, `APS5_NO_WORKER_AFFINITY=1` and `ANYPS5_NO_SHADER_CACHE=1`. The host process sets it before the first driver call; the driver itself never sets environment variables.
+- `Journal::Replay(directory)` checks that environment, places every range at its recorded address in the guest arena, loads the image, registers the ranges, repeats the prelude, restores the checkpoint and runs the calls, each after its title writes and followed by the same settling and readback as in the recording.
+- `agc_journal_replay <journal> [--frames <directory>]` replays a journal, writes each flip as a PNG and exits with 0 when every flip matches its reference frame, 2 when one diverges and 1 on an error. On Windows it is linked at a fixed base without high-entropy ASLR, so nothing it loads lands on a recorded arena address.
+- A journal holds the title's shaders, textures and heap. Tests journal synthetic workloads: `agc_driver_frame_journal` records two frames of a fill, a draw and a GDS copy and replays them twice, bit-identical to each other and to the live frames.

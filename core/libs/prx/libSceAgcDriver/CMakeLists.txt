@@ -113,6 +113,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Checkpoint.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
@@ -207,6 +208,10 @@ set(agcDriverSources
         ${agcSampleDumpsShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Journal/src/Format.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Journal/src/Readback.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Journal/src/Recording.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Journal/src/Replay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Registration.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/State/src/Configuration.cpp
@@ -957,7 +962,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_shader_bindless agc_shader_frontend_pair agc_shader_frontend_pair_off PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     foreach(agcTest IN ITEMS agc_shared_write_tests agc_driver_tests agc_shader_memory_tests agc_structurizer_tests agc_spirv_module_tests agc_dpp_write_tests agc_masked_select_tests agc_constant_bit_test_tests agc_scalar_select_mask_tests agc_vop1_control_decode_tests agc_validate_program_tests agc_pass_hazards_tests agc_shader_disk_cache_tests agc_shader_device_profile_tests agc_shader_control_flow_tests agc_driver_flip_tests agc_driver_pm4_tests agc_driver_graphics_tests agc_driver_bda_device_tests agc_driver_mesh_tests agc_driver_cmask_fast_clear_tests agc_formatted_buffer_once_tests ${agcExecutionTests})
-        if(agcTest STREQUAL "agc_driver_constant_store_tests" OR agcTest STREQUAL "agc_driver_flat_apertures_tests")
+        if(agcTest STREQUAL "agc_driver_constant_store_tests" OR agcTest STREQUAL "agc_driver_flat_apertures_tests" OR agcTest STREQUAL "agc_driver_frame_journal_tests")
             continue()
         endif()
         string(REGEX REPLACE "_tests$" "" agcTestName "${agcTest}")
@@ -1173,6 +1178,30 @@ if(ANYPS5_ENABLE_SPIRV_TOOLS)
 endif()
 set_target_properties(agc_shader_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_replay)
+
+add_executable(agc_journal_replay EXCLUDE_FROM_ALL
+        tools/JournalReplay.cpp
+)
+target_include_directories(agc_journal_replay PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_journal_replay PRIVATE libSceAgcDriver decoder_png libc)
+if(MINGW)
+    target_link_options(agc_journal_replay PRIVATE -Wl,--disable-dynamicbase,--disable-high-entropy-va)
+endif()
+set_target_properties(agc_journal_replay PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_journal_replay)
+
+if(BUILD_TESTING)
+    set_target_properties(agc_journal_replay agc_driver_frame_journal_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    target_link_libraries(agc_driver_frame_journal_tests PRIVATE decoder_png)
+    add_test(NAME agc_driver_frame_journal COMMAND agc_driver_frame_journal_tests $<TARGET_FILE:agc_journal_replay>)
+    set_tests_properties(agc_driver_frame_journal PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WRITE_EVIDENCE=1;APS5_NO_PIPELINE_LTO=1;APS5_GPU_WAIT_TIMEOUT_MS=600000;APS5_THREAD_PRIORITY=off;APS5_NO_WORKER_AFFINITY=1"
+            SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_frame_journal PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(texture_format_lookup_tests ${LIBS_INCLUDE_DIR}/tests/TextureFormatLookup.cpp)
