@@ -697,5 +697,255 @@ int main() {
         return !guarded(IrOpcode::SharedAtomicIAdd32, true, false);
     });
 
+    // Adversarial shapes for the loop, exec-phi and kill-chain proofs: each one is either a lane the
+    // write masked that reads the value again (the select must stay) or its control (the select goes).
+
+    enum class Restore { Own, SavedWider, OrWider };
+    const auto restoredAfterLoop = [](Restore restore) {
+        Builder b;
+        auto& wide = b.mask(48u);
+        const auto [wideLow, wideHigh] = b.ballotWords(wide);
+        auto& exec = b.logicalAnd(wide, b.mask(40u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [execLow, execHigh] = b.ballotWords(exec);
+        IrBlock& entry = *b.block;
+        IrBlock& header = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        entry.AddBranch(&header);
+        header.AddBranch(&header);
+        header.AddBranch(&exit);
+        b.block = &header;
+        auto& low = b.phi(IrType::U32, entry, *execLow);
+        auto& high = b.phi(IrType::U32, entry, *execHigh);
+        const auto [stayLow, stayHigh] = b.ballotWords(b.mask(24u));
+        low.AddPhiOperand(&header, &b.wordAnd(low, *stayLow));
+        high.AddPhiOperand(&header, &b.wordAnd(high, *stayHigh));
+        b.keep(b.select(b.threadBit(low, high), b.add(written, 3u), old));
+        b.block = &exit;
+        IrValue* after = nullptr;
+        switch (restore) {
+            case Restore::Own: after = &b.threadBit(*execLow, *execHigh); break;
+            case Restore::SavedWider: after = &b.threadBit(*wideLow, *wideHigh); break;
+            case Restore::OrWider:
+                after = &b.threadBit(b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&low, wideLow}), b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&high, wideHigh}));
+                break;
+        }
+        b.keep(b.select(*after, b.add(written, 4u), old));
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a write read after a loop under the exec it was written with loses its select", [&] {
+        const auto [count, gone] = restoredAfterLoop(Restore::Own);
+        return count == 1u && gone;
+    });
+
+    passed &= run("a write read after a loop under an exec saved before the write and wider keeps its select", [&] {
+        const auto [count, gone] = restoredAfterLoop(Restore::SavedWider);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a write read after a loop under an exec ORed with a wider mask keeps its select", [&] {
+        const auto [count, gone] = restoredAfterLoop(Restore::OrWider);
+        return count == 0u && !gone;
+    });
+
+    const auto nestedRevive = [](bool reviveOuter) {
+        Builder b;
+        auto& wide = b.mask(48u);
+        const auto [wideLow, wideHigh] = b.ballotWords(wide);
+        auto& exec = b.logicalAnd(wide, b.mask(40u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [execLow, execHigh] = b.ballotWords(exec);
+        IrBlock& entry = *b.block;
+        IrBlock& outer = b.newBlock();
+        IrBlock& inner = b.newBlock();
+        IrBlock& outerLatch = b.newBlock();
+        IrBlock& exit = b.newBlock();
+        entry.AddBranch(&outer);
+        outer.AddBranch(&inner);
+        inner.AddBranch(&inner);
+        inner.AddBranch(&outerLatch);
+        outerLatch.AddBranch(&outer);
+        outerLatch.AddBranch(&exit);
+        b.block = &outer;
+        auto& outerLow = b.phi(IrType::U32, entry, *execLow);
+        auto& outerHigh = b.phi(IrType::U32, entry, *execHigh);
+        b.block = &inner;
+        auto& innerLow = b.phi(IrType::U32, outer, outerLow);
+        auto& innerHigh = b.phi(IrType::U32, outer, outerHigh);
+        const auto [stayLow, stayHigh] = b.ballotWords(b.mask(24u));
+        innerLow.AddPhiOperand(&inner, &b.wordAnd(innerLow, *stayLow));
+        innerHigh.AddPhiOperand(&inner, &b.wordAnd(innerHigh, *stayHigh));
+        b.keep(b.select(b.threadBit(innerLow, innerHigh), b.add(written, 2u), old));
+        b.block = &outerLatch;
+        outerLow.AddPhiOperand(&outerLatch, reviveOuter ? wideLow : &innerLow);
+        outerHigh.AddPhiOperand(&outerLatch, reviveOuter ? wideHigh : &innerHigh);
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a write read in an inner loop whose exec only narrows the outer loop's exec loses its select", [&] {
+        const auto [count, gone] = nestedRevive(false);
+        return count == 1u && gone;
+    });
+
+    passed &= run("a write read in an inner loop after the outer latch revived wider lanes keeps its select", [&] {
+        const auto [count, gone] = nestedRevive(true);
+        return count == 0u && !gone;
+    });
+
+    passed &= run("a kill chain that restores a wider exec in its middle keeps the select", [] {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(32u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrValue* later = &exec;
+        for (std::uint32_t kill = 0; kill < 8u; ++kill) later = &b.logicalAnd(*later, b.mask(31u - kill));
+        later = &b.ballotBit(b.logicalAnd(wide, b.mask(46u)));
+        for (std::uint32_t kill = 0; kill < 8u; ++kill) later = &b.logicalAnd(*later, b.mask(45u - kill));
+        b.keep(b.select(*later, b.add(written, 2u), old));
+        return b.eliminate() == 0u && !removed(written);
+    });
+
+    passed &= run("a kill chain deeper than the implication limit keeps the select", [] {
+        Builder b;
+        auto& exec = b.mask(32u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        IrValue* later = &exec;
+        for (std::uint32_t kill = 0; kill < 100u; ++kill) later = &b.logicalAnd(*later, b.mask(31u - kill % 16u));
+        b.keep(b.select(*later, b.add(written, 2u), old));
+        return b.eliminate() == 0u && !removed(written);
+    });
+
+    passed &= run("a readlane or writelane of a value derived from the write keeps the select, also through a loop phi", [] {
+        bool ok = true;
+        for (const bool throughLoop : {false, true}) {
+            for (const IrOpcode opcode : {IrOpcode::ReadLane, IrOpcode::WriteLane}) {
+                Builder b;
+                auto& exec = b.mask(16u);
+                auto& old = b.lane();
+                auto& written = b.select(exec, b.add(old, 1u), old);
+                IrValue* value = &b.add(written, 5u);
+                if (throughLoop) {
+                    IrBlock& entry = *b.block;
+                    IrBlock& header = b.newBlock();
+                    entry.AddBranch(&header);
+                    header.AddBranch(&header);
+                    b.block = &header;
+                    auto& carried = b.phi(IrType::U32, entry, *value);
+                    carried.AddPhiOperand(&header, &b.add(carried, 1u));
+                    value = &carried;
+                }
+                if (opcode == IrOpcode::ReadLane) b.keep(b.emit(opcode, IrType::U32, {value, &b.constant(20u)}));
+                else b.keep(b.emit(opcode, IrType::U32, {value, &b.constant(3u), &old}));
+                ok &= b.eliminate() == 0u && !removed(written);
+            }
+        }
+        return ok;
+    });
+
+    passed &= run("a readlane of a lane the write masked reads a value its own exec gated and lets the select go", [] {
+        Builder b;
+        auto& exec = b.mask(16u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& narrow = b.logicalAnd(exec, b.mask(8u));
+        auto& gated = b.select(narrow, b.add(written, 2u), old);
+        b.keep(b.emit(IrOpcode::ReadLane, IrType::U32, {&gated, &b.constant(40u)}));
+        return b.eliminate() == 1u && removed(written);
+    });
+
+    passed &= run("a compare of the write into a mask under a wider exec keeps the select", [] {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(16u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        auto& compare = b.logicalAnd(wide, b.emit(IrOpcode::INotEqual32, IrType::Bool, {&written, &b.constant(0u)}));
+        auto& ballot = b.emit(IrOpcode::Ballot, IrType::U32x4, {&compare});
+        b.keep(b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&ballot, &b.constant(0u)}));
+        return b.eliminate() == 0u && !removed(written);
+    });
+
+    passed &= run("an image resource or sampler built from the write keeps the select even under its exec", [] {
+        bool ok = true;
+        for (const bool sampler : {false, true}) {
+            Builder b;
+            auto& exec = b.mask(16u);
+            auto& old = b.lane();
+            auto& written = b.select(exec, b.add(old, 1u), old);
+            auto& address = b.emit(IrOpcode::MakeImageAddress, IrType::ImageAddress, {&old, &old});
+            if (sampler) {
+                auto& samplerValue = b.emit(IrOpcode::GetSamplerResource, IrType::SamplerResource, {&written, &old, &old, &old});
+                auto& sampled = b.emit(IrOpcode::ImageSampleRaw, IrType::U32x4, {&b.emit(IrOpcode::GetImageResource, IrType::ImageResource, {}), &samplerValue, &address});
+                b.keep(b.select(exec, b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&sampled, &b.constant(0u)}), old));
+            } else {
+                auto& image = b.emit(IrOpcode::GetImageResource, IrType::ImageResource, {&written, &old, &old, &old, &old, &old, &old, &old});
+                auto& read = b.emit(IrOpcode::ImageRead, IrType::U32x4, {&image, &address, &exec});
+                b.keep(b.select(exec, b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&read, &b.constant(0u)}), old));
+            }
+            ok &= b.eliminate() == 0u && !removed(written);
+        }
+        return ok;
+    });
+
+    const auto halves = [](bool sameBallot) {
+        Builder b;
+        auto& wide = b.mask(48u);
+        auto& exec = b.logicalAnd(wide, b.mask(40u));
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [execLow, execHigh] = b.ballotWords(exec);
+        const auto [wideLow, wideHigh] = b.ballotWords(wide);
+        const auto [killLow, killHigh] = b.ballotWords(b.mask(44u));
+        auto& low = b.wordAnd(*killLow, *execLow);
+        auto& high = b.wordAnd(sameBallot ? *execHigh : *wideHigh, *killHigh);
+        b.keep(b.select(b.threadBit(low, high), b.add(written, 2u), old));
+        static_cast<void>(wideLow);
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("a wave64 exec whose halves each narrow the write's exec loses its select", [&] {
+        const auto [count, gone] = halves(true);
+        return count == 1u && gone;
+    });
+
+    passed &= run("a wave64 exec whose high half comes from a wider mask keeps the select", [&] {
+        const auto [count, gone] = halves(false);
+        return count == 0u && !gone;
+    });
+
+    const auto exhausted = [](std::uint32_t depth) {
+        Builder b;
+        auto& exec = b.mask(40u);
+        auto& old = b.lane();
+        auto& written = b.select(exec, b.add(old, 1u), old);
+        const auto [execLow, execHigh] = b.ballotWords(exec);
+        std::uint32_t opaque = 0;
+        const std::function<IrValue&(std::uint32_t, bool, IrValue&)> tree = [&](std::uint32_t level, bool rightmost, IrValue& leaf) -> IrValue& {
+            if (level == 0u) return rightmost ? leaf : b.add(b.lane(), ++opaque);
+            auto& left = tree(level - 1u, false, leaf);
+            auto& right = tree(level - 1u, rightmost, leaf);
+            return b.wordAnd(left, right);
+        };
+        auto& low = tree(depth, true, *execLow);
+        auto& high = tree(depth, true, *execHigh);
+        b.keep(b.select(b.threadBit(low, high), b.add(written, 2u), old));
+        return std::pair{b.eliminate(), removed(written)};
+    };
+
+    passed &= run("an exec proof inside the walk limit lets the select go", [&] {
+        const auto [count, gone] = exhausted(3u);
+        return count == 1u && gone;
+    });
+
+    passed &= run("an exec proof that needs more work than the walk limit keeps the select", [&] {
+        const auto [count, gone] = exhausted(7u);
+        return count == 0u && !gone;
+    });
+
     return passed ? 0 : 1;
 }
