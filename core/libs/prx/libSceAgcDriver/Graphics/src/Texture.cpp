@@ -1512,9 +1512,17 @@ LookupOutcomes& ThreadLookupOutcomes() {
 
 namespace {
 
-// The upload and write-back trace lines go through the async profile writer; they never throw out
-// of an upload or a write-back (the writer stopping at shutdown, or failed for good).
+// The upload and write-back trace lines go through the async profile writer under APS5_PROFILE_DRAW;
+// they never throw out of an upload or a write-back (the writer stopping at shutdown, or failed for
+// good). Without it they stay on stdout as before: the writer is a static of this module that only
+// Driver::Shutdown stops, and a process that never runs the driver (the agc_driver tests) would
+// otherwise hang at exit joining the writer thread from the module's detach.
 void LogStorageStep(const char* step, int line, const char* function) {
+    if (!LookupOutcomes::Profiled()) {
+        std::fprintf(stdout, "[%s:%d %s] StorageTexture %s\n", _APS5_FILE_, line, function, step);
+        std::fflush(stdout);
+        return;
+    }
     try {
         AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture %s\n", _APS5_FILE_, line, function, step);
     } catch (...) {
