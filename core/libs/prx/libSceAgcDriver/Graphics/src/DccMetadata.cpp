@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -148,6 +149,9 @@ struct GpuKeyStore {
     std::uint64_t end;
     DccKeys keys = DccKeys::Uncompressed;
     std::uint64_t note = 0;
+    // exp (APS5_EXP_DCC_KEYS_RECORDED): proved from the recorded fills over the range instead of a
+    // store of its own; under the lock it answers only while `note` is still the newest write there.
+    bool recorded = false;
 };
 
 struct KeyStoreMemo {
@@ -190,7 +194,7 @@ std::optional<DccKeys> MemoizedKeys(std::uint64_t begin, std::uint64_t end) {
                 // The open batch is never signaled (also with APS5_NO_SYNC_THROUGH, where the info
                 // carries the open flag with the newest in-flight batch's fence state).
                 const auto info = recorder->DescribePendingWrite(it->begin, bytes);
-                pending = info.has_value() && !info->signaled;
+                pending = info.has_value() && !info->signaled && (!it->recorded || recorder->NewestWriteNote(it->begin, bytes) == it->note);
             } else {
                 pending = Recorder::SnapshotWriteOverlaps(it->begin, bytes);
             }
@@ -708,6 +712,99 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
 
 }
 
+namespace {
+
+// exp: APS5_EXP_DCC_KEYS_RECORDED=1 proves the keys a key sync would wait for from the recorded
+// writes over them: when every part of the range is written last by a pending fill of a known byte
+// or by nothing pending, and all of it is one byte, that byte is what the sync would read.
+// APS5_EXP_DCC_KEYS_RECORDED_VERIFY=1 still syncs and compares the proof with the keys after it.
+int DccKeysRecordedMode() {
+    static const int mode = std::getenv("APS5_EXP_DCC_KEYS_RECORDED_VERIFY") != nullptr ? 2 : std::getenv("APS5_EXP_DCC_KEYS_RECORDED") != nullptr ? 1 : 0;
+    return mode;
+}
+
+enum class RecordedKeys { Proved, UnknownWriter, Mixed, Unreadable, Count };
+
+// Newest write first, as PendingFillsLeaveUncompressed; a write with no known value (a kernel, a
+// copy, a write-back, a completion store) leaves the keys undecided.
+RecordedKeys ProveRecordedKeys(const Recorder& recorder, std::uint64_t begin, std::size_t count, std::uint8_t& key) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return RecordedKeys::Unreadable;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    int value = -1;
+    for (const auto& write : writes) {
+        if (unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!covered) continue;
+        if (write.value < 0) return RecordedKeys::UnknownWriter;
+        if (value >= 0 && value != write.value) return RecordedKeys::Mixed;
+        value = write.value;
+    }
+    for (const auto& [from, to] : unwritten) {
+        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        if (!AllKeysEqual(keys, static_cast<std::size_t>(to - from), keys[0]) || (value >= 0 && value != keys[0])) return RecordedKeys::Mixed;
+        value = keys[0];
+    }
+    if (value < 0) return RecordedKeys::Unreadable;
+    key = static_cast<std::uint8_t>(value);
+    return RecordedKeys::Proved;
+}
+
+struct RecordedKeyStats {
+    std::atomic<std::uint64_t> syncs{0}, agree{0}, differ{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecordedKeys::Count)> outcomes{};
+    std::atomic<std::int64_t> reported{0};
+};
+
+RecordedKeyStats& RecordedKeyCounts() {
+    static RecordedKeyStats stats;
+    return stats;
+}
+
+void ReportRecordedKeys() {
+    if (!ScanProfileEnabled()) return;
+    auto& stats = RecordedKeyCounts();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.reported.load();
+    if (last == 0) {
+        stats.reported.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !stats.reported.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [&](RecordedKeys outcome) { return static_cast<unsigned long long>(stats.outcomes[static_cast<std::size_t>(outcome)].exchange(0)); };
+    const auto proved = take(RecordedKeys::Proved);
+    const auto unknown = take(RecordedKeys::UnknownWriter);
+    const auto mixed = take(RecordedKeys::Mixed);
+    const auto unreadable = take(RecordedKeys::Unreadable);
+    AgcDriver::ProfilePrint_nid_no_patch("[exp-dcc-keys] (10 s): %llu key syncs reached, %llu proved from recorded fills (%s); undecided: %llu unknown writer, %llu mixed, %llu shadowed or unreadable; verify: %llu agree, %llu differ\n",
+        static_cast<unsigned long long>(stats.syncs.exchange(0)), proved, DccKeysRecordedMode() == 2 ? "synced anyway for the verification" : "not synced", unknown, mixed, unreadable,
+        static_cast<unsigned long long>(stats.agree.exchange(0)), static_cast<unsigned long long>(stats.differ.exchange(0)));
+}
+
+// The proof as a memo entry, so every later reader of the range (upload's key read, the resource
+// builds' proofs) sees the keys the recorded fills leave, as the sync would have made them read.
+void RememberRecordedKeys(Recorder& recorder, std::uint64_t begin, std::size_t count, DccKeys keys) {
+    auto& memo = Memo();
+    std::lock_guard lock(memo.mutex);
+    const auto end = begin + count;
+    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
+    if (MemoRecorder(memo) == &recorder) memo.entries.push_back({begin, end, keys, recorder.NewestWriteNote(begin, count), true});
+}
+
+}
+
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
@@ -715,8 +812,28 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    std::optional<std::uint8_t> predicted;
+    if (const int mode = DccKeysRecordedMode(); mode != 0) {
+        auto& stats = RecordedKeyCounts();
+        stats.syncs.fetch_add(1, std::memory_order_relaxed);
+        std::uint8_t key = 0;
+        const auto outcome = ProveRecordedKeys(*recorder, metaAddress, count, key);
+        stats.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+        ReportRecordedKeys();
+        if (outcome == RecordedKeys::Proved) {
+            if (mode == 1) {
+                RememberRecordedKeys(*recorder, metaAddress, count, ByteKeys(key));
+                return std::nullopt;
+            }
+            predicted = key;
+        }
+    }
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
+    if (predicted.has_value()) {
+        const bool same = AllKeysEqual(reinterpret_cast<const std::uint8_t*>(metaAddress), count, *predicted);
+        (same ? RecordedKeyCounts().agree : RecordedKeyCounts().differ).fetch_add(1, std::memory_order_relaxed);
+    }
     return std::nullopt;
 }
 
