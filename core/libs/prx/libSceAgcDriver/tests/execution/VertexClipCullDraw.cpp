@@ -211,10 +211,12 @@ int main(int argc, char** argv) {
             AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), colors);
             Check(step, colors);
         }
+        AgcDriverShutdown_nid_postfix();
         std::puts(noKey ? "vertex clip and cull distance draws passed without the draw key" : "vertex clip and cull distance draws passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        AgcDriverShutdown_nid_postfix();
         return 1;
     }
 }
