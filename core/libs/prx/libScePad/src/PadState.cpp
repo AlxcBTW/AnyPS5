@@ -8,7 +8,12 @@
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
     std::mutex stateMutex;
@@ -35,6 +40,50 @@ namespace {
     std::uint8_t nextTouchId = 0;
     bool prevTouchActive[2] = {false, false};
     std::uint8_t touchIds[2] = {0, 0};
+
+    // Local test aid (never push): APS5_LOCAL_PAD_SCRIPT="<seconds>:<button>[:<hold ms>],..." makes the
+    // runtime-side pad report the button held from that second of process time on (default 250 ms), so an
+    // unattended run can confirm a menu without OS input. Buttons: cross circle square triangle options
+    // up down left right l1 r1.
+    struct ScriptedPress { std::uint64_t startUs; std::uint64_t endUs; std::uint32_t button; };
+
+    const std::vector<ScriptedPress>& scriptedPresses() {
+        static const std::vector<ScriptedPress> presses = [] {
+            std::vector<ScriptedPress> parsed;
+            const char* text = std::getenv("APS5_LOCAL_PAD_SCRIPT");
+            if (text == nullptr) return parsed;
+            const std::pair<const char*, std::uint32_t> names[] = {{"cross", 0x4000u}, {"circle", 0x2000u}, {"square", 0x8000u}, {"triangle", 0x1000u}, {"options", 0x8u}, {"up", 0x10u}, {"right", 0x20u}, {"down", 0x40u}, {"left", 0x80u}, {"l1", 0x400u}, {"r1", 0x800u}};
+            std::string all(text);
+            std::size_t start = 0;
+            while (start < all.size()) {
+                const auto end = all.find(',', start);
+                const auto item = all.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                start = end == std::string::npos ? all.size() : end + 1;
+                const auto first = item.find(':');
+                if (first == std::string::npos) continue;
+                const auto second = item.find(':', first + 1);
+                const double seconds = std::atof(item.substr(0, first).c_str());
+                const auto name = item.substr(first + 1, second == std::string::npos ? std::string::npos : second - first - 1);
+                const double holdMs = second == std::string::npos ? 250.0 : std::atof(item.substr(second + 1).c_str());
+                for (const auto& [label, bit] : names) {
+                    if (name != label) continue;
+                    const auto from = static_cast<std::uint64_t>(seconds * 1e6);
+                    parsed.push_back({from, from + static_cast<std::uint64_t>(holdMs * 1e3), bit});
+                    std::fprintf(stderr, "[pad] runtime-side script: %s at %.1f s for %.0f ms\n", label, seconds, holdMs);
+                }
+            }
+            return parsed;
+        }();
+        return presses;
+    }
+
+    std::uint32_t scriptedButtons(std::uint64_t nowUs) {
+        std::uint32_t buttons = 0;
+        for (const auto& press : scriptedPresses()) {
+            if (nowUs >= press.startUs && nowUs < press.endUs) buttons |= press.button;
+        }
+        return buttons;
+    }
 
     void normalize(Quat& q) {
         const float n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
@@ -113,7 +162,7 @@ void Pad::Initialize() {
 namespace {
 PadData BuildData(const PadInputState& state, std::uint64_t changeTime, std::uint64_t now, const Pad::InputCommandFile::Input& injected) {
     PadData data{};
-    data.buttons = state.buttons | injected.buttons;
+    data.buttons = state.buttons | injected.buttons | scriptedButtons(now);
     const auto& sticks = injected.hasSticks ? injected.sticks : state.sticks;
     data.left_stick_x = sticks[0];
     data.left_stick_y = sticks[1];
