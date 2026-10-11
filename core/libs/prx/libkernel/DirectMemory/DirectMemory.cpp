@@ -592,7 +592,6 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
         constexpr bool privatePages = false;
         page.backing->Map(address + offset, bytes, page.offset, nativeProt);
 #else
-        static_cast<void>(ShareMappedPages(phys + offset, bytes));
         constexpr bool privatePages = false;
         page.backing->Map(address + offset, bytes, page.offset, nativeProt);
 #endif
