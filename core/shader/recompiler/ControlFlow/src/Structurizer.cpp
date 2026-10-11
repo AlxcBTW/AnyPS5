@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 
 namespace ShaderRecompiler {
 
@@ -1611,7 +1612,9 @@ void Structurizer::recomputeAnalyses(ControlFlowGraph& graph) const {
 
 void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph, bool routeLeavingExits, bool routeSharedExits) const {
     const auto rewriteBudget = graph.blocks.size() * 2u + 16u;
+    auto routedHeader = InvalidControlFlowId;
     for (std::size_t rewrite = 0; rewrite < rewriteBudget; ++rewrite) {
+        const auto previousRoute = std::exchange(routedHeader, InvalidControlFlowId);
         bool changed = false;
         for (const auto& loop : graph.naturalLoops) {
             std::vector<std::uint32_t> latches;
@@ -1670,12 +1673,16 @@ void Structurizer::canonicalizeNaturalLoops(ControlFlowGraph& graph, bool routeL
         if (unmerged == nullptr) {
             return;
         }
+        if (unmerged->headerBlock == previousRoute) {
+            throw std::runtime_error("loop at block " + std::to_string(unmerged->headerBlock) + " still has exits to route after they were routed through block " + std::to_string(unmerged->mergeBlock));
+        }
         std::string refusal;
         auto routed = routeLoopExits(graph, *unmerged, [this](ControlFlowGraph& candidate) { recomputeAnalyses(candidate); }, refusal);
         if (!routed) {
             const auto exits = unmerged->mergeBlock == InvalidControlFlowId ? std::string("with no common post-dominator") : "that leave the loop before its merge block " + std::to_string(unmerged->mergeBlock);
             throw std::runtime_error("loop at block " + std::to_string(unmerged->headerBlock) + " has exits " + exits + ": " + refusal);
         }
+        routedHeader = unmerged->headerBlock;
         graph = std::move(*routed);
     }
 
