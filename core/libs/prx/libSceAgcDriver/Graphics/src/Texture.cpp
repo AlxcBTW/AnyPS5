@@ -1581,9 +1581,9 @@ bool StorageTexture::snapshotWouldWait() const {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     const auto* recorder = Recorder::Active();
-    // Recorded work still running writes the surface, or another image's pending results would be
-    // stored into it first (the read's flush hook stores them, then waits).
-    return (recorder != nullptr && !recorder->PendingWriteSettled(descriptor.baseAddress, bytes)) || otherPendingOverlaps();
+    // Recorded work still running writes the surface. Not when another image's results are pending
+    // there: the read's flush hook would store them first, an order the skipped read must not lose.
+    return recorder != nullptr && !recorder->PendingWriteSettled(descriptor.baseAddress, bytes) && !otherPendingOverlaps();
 }
 
 bool StorageTexture::Refresh() {
