@@ -39,6 +39,7 @@ namespace {
 
 constexpr std::uint32_t ReadOnly = 0x02;
 constexpr std::uint32_t ReadWrite = 0x04;
+constexpr std::uint64_t PageBytes = 0x1000;
 
 constexpr std::array<std::pair<const char*, const char*>, 6> StrictPins{{
     {"APS5_NO_WRITE_EVIDENCE", "1"},
@@ -268,6 +269,101 @@ private:
         return after != journal.ranges.begin() && std::prev(after)->writable && address - std::prev(after)->address < std::prev(after)->bytes;
     }
 
+    struct StagedHeader {
+        std::uint64_t address = 0;
+        std::vector<std::byte> original;
+        const Range* range = nullptr;
+        std::uint64_t pages = 0;
+        std::uint64_t pageBytes = 0;
+        void* mapping = nullptr;
+    };
+
+    const Range* rangeAt(std::uint64_t address) const {
+        const auto after = std::upper_bound(journal.ranges.begin(), journal.ranges.end(), address, [](std::uint64_t value, const Range& range) { return value < range.address; });
+        if (after == journal.ranges.begin() || address - std::prev(after)->address >= std::prev(after)->bytes) return nullptr;
+        return &*std::prev(after);
+    }
+
+    static void setPagesWritable(const Range& range, std::uint64_t pages, std::uint64_t bytes, bool writable) {
+        if (inArena(range)) {
+            GuestArena::GuestArenaSetProtection_nid_postfix(pages, bytes, writable ? ReadWrite : ReadOnly);
+            return;
+        }
+#ifdef _WIN32
+        DWORD previous = 0;
+        require(VirtualProtect(reinterpret_cast<void*>(pages), bytes, writable ? PAGE_READWRITE : PAGE_READONLY, &previous) != 0, "cannot change the protection of " + hex(pages));
+#else
+        require(mprotect(reinterpret_cast<void*>(pages), bytes, writable ? PROT_READ | PROT_WRITE : PROT_READ) == 0, "cannot change the protection of " + hex(pages));
+#endif
+    }
+
+    static void* mapAt(std::uint64_t pages, std::uint64_t bytes) {
+#ifdef _WIN32
+        return VirtualAlloc(reinterpret_cast<void*>(pages), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        void* const wanted = reinterpret_cast<void*>(pages);
+        void* const mapped = mmap(wanted, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapped == MAP_FAILED) return nullptr;
+        if (mapped == wanted) return mapped;
+        munmap(mapped, bytes);
+        return nullptr;
+#endif
+    }
+
+    static void unmap(void* mapping, std::uint64_t bytes) {
+#ifdef _WIN32
+        static_cast<void>(bytes);
+        VirtualFree(mapping, 0, MEM_RELEASE);
+#else
+        munmap(mapping, bytes);
+#endif
+    }
+
+    const Shader* stage(const ShaderHeader& header, std::vector<StagedHeader>& staged) {
+        if (header.address == 0) return nullptr;
+        auto* recorded = reinterpret_cast<std::byte*>(header.address);
+        const auto bytes = header.bytes.size();
+        const auto pages = header.address & ~(PageBytes - 1);
+        const auto pageBytes = ((header.address + bytes + PageBytes - 1) & ~(PageBytes - 1)) - pages;
+        const auto covered = std::any_of(staged.begin(), staged.end(), [&](const StagedHeader& entry) { return entry.mapping != nullptr && header.address >= entry.pages && header.address + bytes <= entry.pages + entry.pageBytes; });
+        if (placed(header.address, bytes)) {
+            if (std::memcmp(recorded, header.bytes.data(), bytes) == 0) return reinterpret_cast<const Shader*>(recorded);
+            StagedHeader entry{header.address, std::vector<std::byte>(recorded, recorded + bytes), rangeAt(header.address), pages, pageBytes, nullptr};
+            if (!entry.range->writable) setPagesWritable(*entry.range, pages, pageBytes, true);
+            staged.push_back(std::move(entry));
+        } else if (!covered) {
+            auto* mapping = mapAt(pages, pageBytes);
+            if (mapping == nullptr) return reinterpret_cast<const Shader*>(headerCopies.emplace_back(header.bytes).data());
+            staged.push_back({header.address, {}, nullptr, pages, pageBytes, mapping});
+        }
+        std::memcpy(recorded, header.bytes.data(), bytes);
+        return reinterpret_cast<const Shader*>(recorded);
+    }
+
+    static void unstage(std::vector<StagedHeader>& staged) {
+        for (auto entry = staged.rbegin(); entry != staged.rend(); ++entry) {
+            if (entry->mapping != nullptr) {
+                unmap(entry->mapping, entry->pageBytes);
+                continue;
+            }
+            std::memcpy(reinterpret_cast<void*>(entry->address), entry->original.data(), entry->original.size());
+            if (!entry->range->writable) setPagesWritable(*entry->range, entry->pages, entry->pageBytes, false);
+        }
+        staged.clear();
+    }
+
+    template <typename TCall>
+    void withHeaders(TCall&& call) {
+        std::vector<StagedHeader> staged;
+        try {
+            call(staged);
+        } catch (...) {
+            unstage(staged);
+            throw;
+        }
+        unstage(staged);
+    }
+
     bool placed(std::uint64_t address, std::uint64_t bytes) const {
         for (const auto& range : journal.ranges) {
             for (const auto& [begin, end] : range.committed) {
@@ -293,29 +389,27 @@ private:
         AgcDriverSuspendPoint_nid_postfix();
     }
 
-    const Shader* header(const ShaderHeader& header) {
-        if (header.address == 0) return nullptr;
-        const auto* recorded = reinterpret_cast<const Shader*>(header.address);
-        if (placed(header.address, header.bytes.size()) && std::memcmp(recorded, header.bytes.data(), header.bytes.size()) == 0) return recorded;
-        return reinterpret_cast<const Shader*>(headerCopies.emplace_back(header.bytes).data());
-    }
-
     void perform(const RegisterShaderCall& call) {
-        AgcDriverRegisterShader_nid_postfix(header(call.shader));
+        withHeaders([&](std::vector<StagedHeader>& staged) { AgcDriverRegisterShader_nid_postfix(stage(call.shader, staged)); });
     }
 
     void perform(const ResolveShaderAbiCall& call) {
-        AgcDriverResolveShaderAbi_nid_postfix(header(call.shader), call.context, call.primitive);
+        withHeaders([&](std::vector<StagedHeader>& staged) { AgcDriverResolveShaderAbi_nid_postfix(stage(call.shader, staged), call.context, call.primitive); });
     }
 
     void perform(const ResolveGraphicsAbiCall& call) {
-        AgcDriverResolveGraphicsAbi_nid_postfix(header(call.vertex), header(call.pixel), call.primitiveType);
+        withHeaders([&](std::vector<StagedHeader>& staged) {
+            const auto* vertex = stage(call.vertex, staged);
+            AgcDriverResolveGraphicsAbi_nid_postfix(vertex, stage(call.pixel, staged), call.primitiveType);
+        });
     }
 
     void perform(const ResolveGraphicsStagesAbiCall& call) {
-        std::vector<const Shader*> stages;
-        for (const auto& stage : call.stages) stages.push_back(header(stage));
-        AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, call.context, call.primitive);
+        withHeaders([&](std::vector<StagedHeader>& staged) {
+            std::vector<const Shader*> stages;
+            for (const auto& header : call.stages) stages.push_back(stage(header, staged));
+            AgcDriverResolveGraphicsStagesAbi_nid_postfix(stages, call.context, call.primitive);
+        });
     }
 
     void perform(const VideoOutputCall& call) {

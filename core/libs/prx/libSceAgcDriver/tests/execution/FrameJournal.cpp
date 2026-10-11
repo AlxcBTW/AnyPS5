@@ -78,6 +78,12 @@ struct Header {
     ShaderUserData userData{};
 };
 
+struct ContextHeader {
+    Shader shader{};
+    ShaderUserData userData{};
+    std::array<ShaderRegister, 1> context{};
+};
+
 struct alignas(256) HostShader {
     std::array<std::uint32_t, 8> code{};
     Header header;
@@ -88,6 +94,8 @@ constexpr std::size_t PixelHeaderOffset = 0x100;
 constexpr std::size_t VertexCodeOffset = 0x1000;
 constexpr std::size_t PixelCodeOffset = 0x1100;
 constexpr std::size_t FillCodeOffset = 0x1200;
+constexpr std::size_t ReusedHeaderOffset = 0x300;
+constexpr std::size_t ReusedCodeOffset = 0x1400;
 constexpr std::size_t LabelOffset = 0xf000;
 constexpr std::size_t SetupOffset = 0x4000;
 constexpr std::size_t FrameOffset = 0x8000;
@@ -278,6 +286,19 @@ Live Record(const std::filesystem::path& journal) {
     RegisterDuringPreparation([&] { Register(vertexHeader, vertexCode, sizeof(VertexCode), 2); }, [&] { Register(pixelHeader, pixelCode, sizeof(PixelCode), 1); }, "before the journal opened");
     const auto pixelCopy = std::make_unique<Header>(pixelHeader);
     AgcDriverRegisterShader_nid_postfix(&pixelCopy->shader);
+    auto& reused = *std::construct_at(reinterpret_cast<ContextHeader*>(code.Address(ReusedHeaderOffset)));
+    reused.context[0] = {0x1b6, 0};
+    reused.shader.file_header = 0x34333231u;
+    reused.shader.version = 0x18u;
+    reused.shader.header_size = sizeof(ContextHeader);
+    reused.shader.shader_size = sizeof(VertexCode);
+    reused.shader.code = code.Store(ReusedCodeOffset, VertexCode);
+    reused.shader.type = 2;
+    reused.shader.user_data = &reused.userData;
+    reused.shader.num_cx_registers = 1;
+    reused.shader.cx_registers = reused.context.data();
+    AgcDriverRegisterShader_nid_postfix(&reused.shader);
+    std::memset(static_cast<void*>(&reused), 0, sizeof(ContextHeader));
     const auto hostShader = std::make_unique<HostShader>();
     hostShader->code = VertexCode;
     Register(hostShader->header, hostShader->code.data(), sizeof(VertexCode), 2);
@@ -316,7 +337,7 @@ Live Record(const std::filesystem::path& journal) {
 void RequireJournal(const std::filesystem::path& directory, const Live& recorded) {
     const auto journal = AgcDriver::Journal::ReadJournal(directory);
     const auto shaders = std::count_if(journal.prelude.begin(), journal.prelude.end(), [](const AgcDriver::Journal::Call& call) { return std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(call); });
-    Require(shaders == 3, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 3 made before the journal opened");
+    Require(shaders == 4, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 4 of journaled shaders made before the journal opened");
     Require(std::any_of(journal.prelude.begin(), journal.prelude.end(), [&](const AgcDriver::Journal::Call& call) {
         const auto* registration = std::get_if<AgcDriver::Journal::RegisterShaderCall>(&call);
         return registration != nullptr && registration->shader.address == recorded.copiedHeader && registration->shader.bytes.size() == sizeof(Header);
