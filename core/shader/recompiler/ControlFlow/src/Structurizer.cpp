@@ -603,9 +603,6 @@ std::uint32_t findSelectionMerge(const ControlFlowGraph& graph, const BasicBlock
                 return merge;
             }
         }
-        if (trueJoins && isInsideLoopConstruct(graph, *loop, globalMerge)) {
-            return joinWithinIteration(graph, *loop, trueTarget, falseTarget, globalMerge);
-        }
     }
     return globalMerge;
 }
