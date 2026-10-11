@@ -124,6 +124,36 @@ void CheckOwnStore() {
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
 
+// The storage write-back's keep rule (StorageTexture::writeBackLayers, unchangedSinceBaseline): a
+// driver store landing after an upload's generation (an aliasing image's write-back, which the
+// upload's snapshot read waited for) reads as written since that generation, as a CPU store does;
+// only the cpu flag tells them apart. The keep rule does not ask for it: it stores the image's
+// results there because the bytes still equal a snapshot read after the store landed. So the
+// snapshot cannot be left out (APS5_EXP_SNAPSHOT_NOWAIT, wfix1: 73% of the checked write-back
+// decisions differed without it).
+void CheckDriverStoreAfterGeneration() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto generation = CollectWrites(base, 2 * Block);
+    Require(generation != 0, "the upload's generation block is not collected");
+
+    std::array<std::byte, 4096> result{};
+    result.fill(std::byte{0x55});
+    Write(base, result);
+    CollectWritesUncached(base, 2 * Block);
+    std::array<std::uint64_t, 2> generations{generation, generation};
+    std::array<std::uint8_t, 2> changed{};
+    std::array<std::uint8_t, 2> cpu{};
+    Require(ChangedBlocks(base, 2 * Block, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 0 && changed[1] == BlockUnchanged,
+        "a driver store after the generation does not read as written by the driver alone");
+
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    Require(ChangedBlocks(base, 2 * Block, generations, changed, cpu) && changed[1] == BlockWritten && cpu[1] != 0 && cpu[0] == 0,
+        "a CPU store after the generation does not read as a CPU write");
+}
+
 void CheckUnwatch() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -361,6 +391,7 @@ int main() {
         }
         CheckSharedBlock();
         CheckOwnStore();
+        CheckDriverStoreAfterGeneration();
         CheckUnwatch();
 #ifdef _WIN32
         CheckPrivateMappingReuse();

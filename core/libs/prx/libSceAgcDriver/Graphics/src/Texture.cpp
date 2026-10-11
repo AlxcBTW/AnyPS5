@@ -4,7 +4,6 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -1513,11 +1512,6 @@ LookupOutcomes& ThreadLookupOutcomes() {
 
 namespace {
 
-// exp: APS5_EXP_SNAPSHOT_NOWAIT=1 lets StorageTexture::upload leave out the snapshots of a watched
-// surface (`original`, `generationBaseline`) when reading them would wait for recorded GPU work, as
-// the direct path already does for `original` and as surfaces over 1 MiB do for the baseline.
-// APS5_EXP_SNAPSHOT_NOWAIT_VERIFY=1 still waits and reads them, and counts the decisions that
-// would have differed without them ([exp-snapshot]).
 // The upload and write-back trace lines go through the async profile writer; they never throw out
 // of an upload or a write-back (the writer stopping at shutdown, or failed for good).
 void LogStorageStep(const char* step, int line, const char* function) {
@@ -1527,82 +1521,6 @@ void LogStorageStep(const char* step, int line, const char* function) {
     }
 }
 
-bool SnapshotNoWait() {
-    static const bool enabled = std::getenv("APS5_EXP_SNAPSHOT_NOWAIT") != nullptr;
-    return enabled;
-}
-
-bool SnapshotNoWaitVerify() {
-    static const bool enabled = std::getenv("APS5_EXP_SNAPSHOT_NOWAIT_VERIFY") != nullptr;
-    return enabled;
-}
-
-struct SnapshotSkipStats {
-    std::atomic<std::uint64_t> originals{0}, originalBytes{0}, baselines{0}, baselineBytes{0};
-    std::atomic<std::uint64_t> rescuesLost{0}, comparesLost{0}, rereads{0}, decisions{0}, decisionsDiffer{0};
-    std::atomic<std::int64_t> reported{0};
-};
-
-SnapshotSkipStats& SnapshotSkips() {
-    static SnapshotSkipStats stats;
-    return stats;
-}
-
-void ReportSnapshotSkips() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return;
-    auto& stats = SnapshotSkips();
-    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    auto last = stats.reported.load();
-    if (last == 0) {
-        stats.reported.compare_exchange_strong(last, nowMs);
-        return;
-    }
-    if (nowMs - last < 10000 || !stats.reported.compare_exchange_strong(last, nowMs)) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[exp-snapshot] (10 s): %s %llu captures (%.0f MiB) and %llu generation baselines (%.0f MiB) with a recorded GPU write pending; verify: %llu refresh rescues lost, %llu untracked compares lost, %llu write-back re-reads, %llu write-back blocks decided differently of %llu checked\n",
-        SnapshotNoWaitVerify() ? "read for the verification" : "left out", static_cast<unsigned long long>(stats.originals.exchange(0)), stats.originalBytes.exchange(0) / 1048576.0,
-        static_cast<unsigned long long>(stats.baselines.exchange(0)), stats.baselineBytes.exchange(0) / 1048576.0, static_cast<unsigned long long>(stats.rescuesLost.exchange(0)),
-        static_cast<unsigned long long>(stats.comparesLost.exchange(0)), static_cast<unsigned long long>(stats.rereads.exchange(0)), static_cast<unsigned long long>(stats.decisionsDiffer.exchange(0)),
-        static_cast<unsigned long long>(stats.decisions.exchange(0)));
-}
-
-void NoteSnapshotSkip(bool baseline, std::uint64_t bytes) {
-    auto& stats = SnapshotSkips();
-    (baseline ? stats.baselines : stats.originals).fetch_add(1, std::memory_order_relaxed);
-    (baseline ? stats.baselineBytes : stats.originalBytes).fetch_add(bytes, std::memory_order_relaxed);
-    ReportSnapshotSkips();
-}
-
-void NoteSnapshotVerify(std::atomic<std::uint64_t> SnapshotSkipStats::*counter) {
-    (SnapshotSkips().*counter).fetch_add(1, std::memory_order_relaxed);
-    ReportSnapshotSkips();
-}
-
-void NoteSnapshotDecision(bool differs) {
-    auto& stats = SnapshotSkips();
-    stats.decisions.fetch_add(1, std::memory_order_relaxed);
-    if (differs) stats.decisionsDiffer.fetch_add(1, std::memory_order_relaxed);
-    ReportSnapshotSkips();
-}
-
-}
-
-bool StorageTexture::snapshotSkippable() const {
-    if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
-    const auto base = descriptor.baseAddress;
-    const auto bytes = static_cast<std::size_t>(guestBytes);
-    const auto* recorder = Recorder::Active();
-    // Recorded work still running writes the surface. Not when another image's results are pending
-    // there: the read's flush hook would store them first, an order the skipped read must not lose.
-    if (recorder == nullptr || recorder->PendingWriteSettled(base, bytes) || otherPendingOverlaps()) return false;
-    // Nor when a completion stores into it as its batch retires (a copied writer's write-back, a
-    // completion label): that store lands after this upload's generation, stamped as written, and
-    // only a snapshot read after the sync would let the write-back tell it from a CPU store.
-    if (recorder->CompletionLabelIn(base, bytes)) return false;
-    const auto copied = [&](const auto& writer) { return writer->CopiedWritesOverlap(base, bytes); };
-    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), copied)) return false;
-    const auto drawWriters = DrawCopiedWriters();
-    return std::none_of(drawWriters->begin(), drawWriters->end(), copied);
 }
 
 bool StorageTexture::Refresh() {
@@ -1741,7 +1659,6 @@ bool StorageTexture::Refresh() {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
         if (!unchanged && !keysChanged && !pendingChanged && originalValid && equalsOriginal()) {
-            if (originalWouldSkip) NoteSnapshotVerify(&SnapshotSkipStats::rescuesLost);
             unchanged = true;
             stamped = false;
         }
@@ -1977,7 +1894,6 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
         GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
     }
     originalValid = originalValid || complete;
-    if (complete) originalWouldSkip = false;
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
@@ -1991,7 +1907,6 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
     GuestMemory::FlushGpuWrites(address, bytes);
     if (!originalValid) return false;
-    if (originalWouldSkip) NoteSnapshotVerify(&SnapshotSkipStats::comparesLost);
     constexpr std::uint64_t blockBytes = 65536;
     const auto end = address + bytes;
     const auto first = address / blockBytes;
@@ -2032,22 +1947,12 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    // exp (APS5_EXP_SNAPSHOT_NOWAIT): the surface's snapshots are left out (or, verifying, marked)
-    // when reading them would wait for the GPU. Watched surfaces only: for the others `original` is
-    // the only change detection.
-    const auto skipSnapshots = [&] {
-        return (SnapshotNoWait() || SnapshotNoWaitVerify()) && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && snapshotSkippable();
-    };
-    const auto stampLayers = [&](bool selectedOnly, bool skipBaseline) {
+    const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (skipBaseline && guestBytes <= GenerationBaselineBytes && guestBytesSettled()) NoteSnapshotSkip(true, guestBytes);
-        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled() || (skipBaseline && !SnapshotNoWaitVerify())) generationBaseline.clear();
+        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
-            baselineWouldSkip = skipBaseline;
-        } else if (skipBaseline) {
-            baselineWouldSkip = true;
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
@@ -2069,21 +1974,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // Watched memory needs no copy unless an import window can stamp it: Refresh then compares
         // the stamped units with the copy (WatchedImportsStampPages).
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        const bool skip = skipSnapshots();
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && !WatchedImportsStampPages(context)) {
-            originalValid = false;
-        } else {
-            if (skip) NoteSnapshotSkip(false, guestBytes);
-            if (skip && !SnapshotNoWaitVerify()) {
-                originalValid = false;
-                comparedGuestBytes = {};
-            } else {
-                captureGuestBytes(nullptr);
-                originalWouldSkip = skip;
-            }
-        }
+        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && !WatchedImportsStampPages(context)) originalValid = false;
+        else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
-        stampLayers(false, skip);
+        stampLayers(false);
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
         auto* recorder = recordClear ? Recorder::Active() : nullptr;
         std::unique_ptr<CommandBatch> batch;
@@ -2129,10 +2023,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        const bool skip = skipSnapshots();
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
         else captureGuestBytes(layers);
-        stampLayers(true, skip);
+        stampLayers(true);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
         // layout yet); a partial one always does.
@@ -2253,9 +2146,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     originalValid = true;
-    originalWouldSkip = false;
     forgetBorrowed(0, trackedLayers);
-    stampLayers(false, false);
+    stampLayers(false);
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -4058,17 +3950,10 @@ bool StorageTexture::guestBytesSettled() const {
 }
 
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
+    const auto& baseline = originalValid ? original : generationBaseline;
+    if (baseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
-    const auto equals = [&](const std::vector<std::byte>* baseline) {
-        return baseline != nullptr && baseline->size() == guestBytes && GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(*baseline).subspan(offset, static_cast<std::size_t>(to - from)));
-    };
-    const bool unchanged = equals(originalValid ? &original : &generationBaseline);
-    // exp (APS5_EXP_SNAPSHOT_NOWAIT_VERIFY): the decision without the snapshots the skip leaves out.
-    if (originalWouldSkip || baselineWouldSkip) {
-        const auto* skipped = originalValid && !originalWouldSkip ? &original : baselineWouldSkip ? nullptr : &generationBaseline;
-        NoteSnapshotDecision(equals(skipped) != unchanged);
-    }
-    return unchanged;
+    return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
@@ -4335,7 +4220,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
     const bool wasValid = originalValid;
-    if (wasValid && originalWouldSkip) NoteSnapshotVerify(&SnapshotSkipStats::rereads);
     if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4421,8 +4305,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The store above is the only write to these pages, so `original` is current at a fresh
     // generation, unless blocks were kept for the CPU: then the image is stale there.
     originalValid = !skippedAny && (wasValid || std::all_of(layers.begin(), layers.end(), [](bool selected) { return selected; }));
-    // Every layer stored: `original` is the same with or without the skipped capture.
-    if (std::all_of(layers.begin(), layers.end(), [](bool selected) { return selected; })) originalWouldSkip = false;
     // As in the GPU-direct path, but the store's memcpy dirtied this surface's pages in the write
     // watch: a memoized collect would leave them for the next walk to stamp newer than this value
     // (the shared edge block included, undoing the advance), so the walk is made here and
