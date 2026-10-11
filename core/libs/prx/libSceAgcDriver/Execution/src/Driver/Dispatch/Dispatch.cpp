@@ -8,10 +8,31 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
+#include <span>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+void noteHtileFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, std::uint32_t groups) {
+    const auto fill = Graphics::HtileFillKernel(code, userData, numThreads, groups);
+    if (!fill) return;
+    auto pattern = fill->pattern;
+    if (fill->patternAddress != 0) GuestMemory::Read(fill->patternAddress, std::as_writable_bytes(std::span(&pattern, 1)), alignof(std::uint32_t));
+    if (!Graphics::NoteDepthMetadataFill(fill->address, static_cast<std::size_t>(fill->bytes), pattern) || pattern == 0) return;
+    static std::mutex mutex;
+    static std::set<std::uint32_t> reported;
+    std::lock_guard lock(mutex);
+    if (reported.insert(pattern).second) std::fprintf(stderr, "[htile] a compute fill stores 0x%08x into the HTILE of a depth surface at 0x%llx; it is not a full fast clear (ZMASK 0x%x, SMEM 0x%x)\n", pattern, static_cast<unsigned long long>(fill->address), pattern & 0xfu, (pattern >> 8u) & 0x3u);
+}
+
+}
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
@@ -75,6 +96,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (indirectArguments == 0 && packet[2] == 1 && packet[3] == 1) noteHtileFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, packet[1]);
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;

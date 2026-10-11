@@ -673,14 +673,35 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
     return address + bytes - htile >= HtileMetadataBytes(extent);
 }
 
-void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
+std::optional<HtileFill> HtileFillKernel(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, std::uint32_t groups) {
+    static constexpr std::array<std::uint32_t, 6> constantStore{0xd7460000u, 0x04010c04u, 0x7e020200u, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    static constexpr std::array<std::uint32_t, 9> loadedStore{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (numThreads[0] != 64 || numThreads[1] != 1 || numThreads[2] != 1 || userData.size() < 4 || ((userData[1] >> 16u) & 0x3fffu) != 4u) return std::nullopt;
+    HtileFill fill;
+    fill.address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    fill.bytes = std::min<std::uint64_t>(userData[2], static_cast<std::uint64_t>(groups) * 64u) * 4u;
+    const auto inlineConstant = code.size() >= constantStore.size() ? code[2] & 0xffu : 0u;
+    const bool constant = code.size() >= constantStore.size() && (code[2] & 0xffffff00u) == constantStore[2] && inlineConstant >= 0x80u && inlineConstant <= 0xd0u && std::equal(constantStore.begin(), constantStore.begin() + 2, code.begin()) && std::equal(constantStore.begin() + 3, constantStore.end(), code.begin() + 3);
+    if (constant) {
+        fill.pattern = inlineConstant <= 0xc0u ? inlineConstant - 0x80u : 0xc0u - inlineConstant;
+        return fill;
+    }
+    if (userData.size() < 6 || code.size() < loadedStore.size() || !std::equal(loadedStore.begin(), loadedStore.end(), code.begin())) return std::nullopt;
+    fill.patternAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+    return fill;
+}
+
+bool NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
+    bool covered = false;
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
         if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;
+        covered = true;
         const VkImageAspectFlags written = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         surface->pendingClear = (surface->pendingClear & ~written) | HtileFillClears(pattern, target.htileStencil);
     }
+    return covered;
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
