@@ -8,6 +8,14 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -117,19 +125,13 @@ public:
     explicit Host(const JournalFile& journal) : journal(journal) {}
 
     void Place(BlockReader& blocks) {
+        std::vector<const Range*> outside;
         for (const auto& range : journal.ranges) {
-            auto* pointer = reinterpret_cast<void*>(range.address);
-            require(GuestArena::GuestArenaContains_nid_postfix(pointer, range.bytes), "range " + hex(range.address) + "+" + hex(range.bytes) + " lies outside the guest arena; placing image ranges is not implemented");
             require(range.backing == 0, "range " + hex(range.address) + " belongs to an alias group; alias groups are not implemented");
-            auto cursor = range.address;
-            for (const auto& [begin, end] : range.committed) {
-                if (cursor < begin) GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(cursor), begin - cursor);
-                GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(begin), end - begin);
-                GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(begin), end - begin, ReadWrite, end - begin);
-                cursor = end;
-            }
-            if (cursor < range.address + range.bytes) GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(cursor), range.address + range.bytes - cursor);
+            if (inArena(range)) placeInArena(range);
+            else outside.push_back(&range);
         }
+        placeOutsideArena(outside);
         for (const auto& block : journal.image) {
             require(placed(block.address, block.bytes), "image block " + hex(block.address) + " lies outside the journaled ranges");
             blocks.Read(block, {reinterpret_cast<std::byte*>(block.address), block.bytes});
@@ -137,6 +139,10 @@ public:
         GuestAllocations::Mutation mutation;
         for (const auto& range : journal.ranges) {
             for (const auto& [begin, end] : range.committed) {
+                if (!inArena(range)) {
+                    if (!range.writable) protectOutsideArena(begin, end - begin);
+                    continue;
+                }
                 if (!range.writable) GuestArena::GuestArenaSetProtection_nid_postfix(begin, end - begin, ReadOnly);
 #ifndef _WIN32
                 GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(begin), end - begin);
@@ -182,6 +188,61 @@ public:
     }
 
 private:
+    static bool inArena(const Range& range) {
+        return GuestArena::GuestArenaContains_nid_postfix(reinterpret_cast<const void*>(range.address), range.bytes);
+    }
+
+    static void placeInArena(const Range& range) {
+        auto cursor = range.address;
+        for (const auto& [begin, end] : range.committed) {
+            if (cursor < begin) GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(cursor), begin - cursor);
+            GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(begin), end - begin);
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(begin), end - begin, ReadWrite, end - begin);
+            cursor = end;
+        }
+        if (cursor < range.address + range.bytes) GuestArena::GuestArenaMarkUsed_nid_postfix(reinterpret_cast<void*>(cursor), range.address + range.bytes - cursor);
+    }
+
+    static void placeOutsideArena(const std::vector<const Range*>& ranges) {
+#ifdef _WIN32
+        constexpr std::uint64_t Granule = 0x10000;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+        for (const auto* range : ranges) spans.emplace_back(range->address & ~(Granule - 1), (range->address + range->bytes + Granule - 1) & ~(Granule - 1));
+        std::sort(spans.begin(), spans.end());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+        for (const auto& span : spans) {
+            if (!merged.empty() && span.first <= merged.back().second) merged.back().second = std::max(merged.back().second, span.second);
+            else merged.push_back(span);
+        }
+        for (const auto& [begin, end] : merged) {
+            require(VirtualAlloc(reinterpret_cast<void*>(begin), end - begin, MEM_RESERVE, PAGE_NOACCESS) == reinterpret_cast<void*>(begin), "cannot reserve " + hex(begin) + "+" + hex(end - begin) + " outside the guest arena at its recorded address (error " + std::to_string(GetLastError()) + ")");
+        }
+        for (const auto* range : ranges) {
+            for (const auto& [begin, end] : range->committed) {
+                require(VirtualAlloc(reinterpret_cast<void*>(begin), end - begin, MEM_COMMIT, PAGE_READWRITE) == reinterpret_cast<void*>(begin), "cannot commit " + hex(begin) + "+" + hex(end - begin) + " outside the guest arena (error " + std::to_string(GetLastError()) + ")");
+            }
+        }
+#else
+        for (const auto* range : ranges) {
+            for (const auto& [begin, end] : range->committed) {
+                void* const wanted = reinterpret_cast<void*>(begin);
+                void* const mapped = mmap(wanted, end - begin, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                if (mapped != MAP_FAILED && mapped != wanted) munmap(mapped, end - begin);
+                require(mapped == wanted, "cannot map " + hex(begin) + "+" + hex(end - begin) + " outside the guest arena at its recorded address");
+            }
+        }
+#endif
+    }
+
+    static void protectOutsideArena(std::uint64_t address, std::uint64_t bytes) {
+#ifdef _WIN32
+        DWORD previous = 0;
+        require(VirtualProtect(reinterpret_cast<void*>(address), bytes, PAGE_READONLY, &previous) != 0, "cannot protect " + hex(address) + " read-only");
+#else
+        require(mprotect(reinterpret_cast<void*>(address), bytes, PROT_READ) == 0, "cannot protect " + hex(address) + " read-only");
+#endif
+    }
+
     bool placed(std::uint64_t address, std::uint64_t bytes) const {
         for (const auto& range : journal.ranges) {
             for (const auto& [begin, end] : range.committed) {

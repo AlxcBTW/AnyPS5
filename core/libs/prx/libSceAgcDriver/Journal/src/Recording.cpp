@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -88,6 +89,24 @@ bool sharedBacking(std::uint64_t address, std::uint64_t bytes) {
     int file = -1;
     std::uint64_t offset = 0;
     return GuestArena::GuestArenaSharedBacking_nid_postfix(address, bytes, &file, &offset);
+#endif
+}
+
+std::uint64_t availableMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    require(GlobalMemoryStatusEx(&status) != 0, "cannot query the available memory");
+    return status.ullAvailPhys;
+#else
+    std::ifstream meminfo("/proc/meminfo");
+    std::string name;
+    std::uint64_t kib = 0;
+    std::string unit;
+    while (meminfo >> name >> kib >> unit) {
+        if (name == "MemAvailable:") return kib << 10u;
+    }
+    throw std::runtime_error("frame journal: /proc/meminfo has no MemAvailable line");
 #endif
 }
 
@@ -191,9 +210,20 @@ public:
 
     void Open(const std::filesystem::path& directory) {
         std::lock_guard lock(mutex);
+        openLocked(directory);
+    }
+
+    void Close() {
+        std::lock_guard lock(mutex);
+        closeLocked();
+    }
+
+private:
+    void openLocked(const std::filesystem::path& directory) {
         require(!open.load(std::memory_order_relaxed), "a journal is already open");
         auto& driver = DriverDetail::Driver::Get();
         for (const auto handle : driver.VideoOutputHandles()) require(outputs.contains(handle), "video output " + std::to_string(handle) + " was registered before the journal was armed");
+        require(driver.WaitQuiescent(), "a submission waits for a title write; the journal opens only when every accepted submission has completed");
         const auto gds = Pm4::GdsAddress();
         JournalFile next;
         next.prelude = journal.prelude;
@@ -205,11 +235,17 @@ public:
         next.arenaBytes = arenaBytes;
         next.arenaWriteWatched = GuestArena::GuestArenaWriteWatched_nid_postfix();
         registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        std::vector<Range> shared;
+        std::uint64_t committedBytes = 0;
         for (const auto& range : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
             if (!range->readable) continue;
-            require(!sharedBacking(range->address, range->bytes), "guest range " + hex(range->address) + "+" + hex(range->bytes) + " is mapped from shared backing; journaling alias groups is not implemented");
-            next.ranges.push_back({range->address, range->bytes, range->readable, range->writable, range->gpu, range->allocationAddress, range->allocationBytes, 0, 0, GuestMemory::CommittedRanges(range->address, range->bytes)});
+            Range entry{range->address, range->bytes, range->readable, range->writable, range->gpu, range->allocationAddress, range->allocationBytes, 0, 0, GuestMemory::CommittedRanges(range->address, range->bytes)};
+            for (const auto& [begin, end] : entry.committed) committedBytes += end - begin;
+            if (sharedBacking(range->address, range->bytes)) shared.push_back(entry);
+            next.ranges.push_back(std::move(entry));
         }
+        requireUnshared(shared);
+        requireMemoryFor(committedBytes);
         std::sort(next.ranges.begin(), next.ranges.end(), [](const Range& a, const Range& b) { return a.address < b.address; });
         Settle(next.ranges);
         GuestMemory::FlushGpuWrites(gds, Pm4::GdsBytes);
@@ -235,8 +271,7 @@ public:
         open.store(true, std::memory_order_release);
     }
 
-    void Close() {
-        std::lock_guard lock(mutex);
+    void closeLocked() {
         require(open.load(std::memory_order_relaxed), "no journal is open");
         open.store(false, std::memory_order_release);
         WriteJournal(directory, journal);
@@ -246,7 +281,21 @@ public:
         shadow = {};
     }
 
-private:
+    static void requireUnshared(const std::vector<Range>& shared) {
+        if (shared.empty()) return;
+        std::uint64_t bytes = 0;
+        for (const auto& range : shared) bytes += range.bytes;
+        std::string first;
+        for (std::size_t index = 0; index < shared.size() && index < 4; ++index) first += (index == 0 ? "" : ", ") + hex(shared[index].address) + "+" + hex(shared[index].bytes);
+        throw std::runtime_error("frame journal: " + std::to_string(shared.size()) + " registered ranges (" + std::to_string(bytes >> 20) + " MiB, first " + first + ") are mapped from shared backing that other addresses can alias; journaling alias groups is not implemented");
+    }
+
+    static void requireMemoryFor(std::uint64_t imageBytes) {
+        constexpr std::uint64_t Headroom = std::uint64_t{4} << 30;
+        const auto available = availableMemory();
+        require(available >= imageBytes + Headroom, "the memory image needs " + std::to_string(imageBytes >> 20) + " MiB in this process, " + std::to_string(available >> 20) + " MiB are available and " + std::to_string(Headroom >> 20) + " MiB stay free");
+    }
+
     bool journaled(std::uint64_t address, std::uint64_t bytes) const {
         const auto after = std::upper_bound(journal.ranges.begin(), journal.ranges.end(), address, [](std::uint64_t value, const Range& range) { return value < range.address; });
         if (after == journal.ranges.begin()) return false;
@@ -394,4 +443,8 @@ void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOut
     Recording::Get().UnregisterVideoOutput(handle, output);
 }
 
+}
+
+extern "C" void AgcDriverJournalDisplayBuffer_nid_postfix(std::uint32_t handle, std::int32_t index, const AgcDriver::DisplayBuffer& buffer) {
+    AgcDriver::Journal::NoteDisplayBuffer(handle, index, buffer);
 }

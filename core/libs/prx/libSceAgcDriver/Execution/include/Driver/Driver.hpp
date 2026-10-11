@@ -71,6 +71,7 @@ public:
     QueueCheckpoint Checkpoint();
     void Restore(QueueCheckpoint checkpoint);
     std::vector<std::uint32_t> VideoOutputHandles();
+    bool WaitQuiescent();
 
 private:
     friend class SampledReadScope;

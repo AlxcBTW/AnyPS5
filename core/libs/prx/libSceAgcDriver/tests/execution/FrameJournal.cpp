@@ -11,12 +11,18 @@
 #include "Decoder/Png.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <process.h>
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -40,6 +46,7 @@ using AgcDriver::Graphics::Require;
 using AgcDriver::Journal::Frame;
 
 constexpr std::uintptr_t TitleBase = 0x1580000000ull;
+constexpr std::uintptr_t OutsideArena = 0x600000000000ull;
 constexpr std::size_t RegionBytes = 0x10000;
 constexpr std::uint32_t PageReadWrite = 0x04;
 constexpr std::uint32_t Handle = 7;
@@ -71,6 +78,7 @@ constexpr std::size_t PixelHeaderOffset = 0x100;
 constexpr std::size_t VertexCodeOffset = 0x1000;
 constexpr std::size_t PixelCodeOffset = 0x1100;
 constexpr std::size_t FillCodeOffset = 0x1200;
+constexpr std::size_t LabelOffset = 0xf000;
 constexpr std::size_t SetupOffset = 0x4000;
 constexpr std::size_t FrameOffset = 0x8000;
 
@@ -84,7 +92,17 @@ public:
         GuestAllocations::Mutation mutation;
         mutation.Add(data, RegionBytes, true, true, true);
     }
+    explicit Region(std::uintptr_t fixed) : data(reinterpret_cast<std::byte*>(fixed)) {
+#ifdef _WIN32
+        Require(VirtualAlloc(data, RegionBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) == data, "cannot map the command region outside the guest arena");
+#else
+        Require(mmap(data, RegionBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == data, "cannot map the command region outside the guest arena");
+#endif
+        GuestAllocations::Mutation mutation;
+        mutation.Add(data, RegionBytes, true, true, false);
+    }
     std::uint64_t Address(std::size_t offset = 0) const { return reinterpret_cast<std::uintptr_t>(data) + offset; }
+    void Release(std::size_t offset) { std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(data + offset)).store(1, std::memory_order_release); }
     template <typename TValue, std::size_t Count>
     const TValue* Store(std::size_t offset, const std::array<TValue, Count>& values) {
         std::memcpy(data + offset, values.data(), sizeof(values));
@@ -185,6 +203,10 @@ void GdsCopy(std::vector<std::uint32_t>& commands, std::uint64_t target) {
     Append(commands, 0x50, {0x20000000u, 0, 0, static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u), GdsBytes});
 }
 
+void WaitForTitle(std::vector<std::uint32_t>& commands, std::uint64_t label) {
+    Append(commands, 0x3c, {0x13, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1, 0xffffffffu, 0x19});
+}
+
 void Flip() {
     std::array<std::uint32_t, 6> words{AgcDriver::FlipPacketHeader, Handle, 0, 1, 0, 0};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -199,10 +221,16 @@ AgcDriver::DisplayBuffer Scanout(const Region& target) {
     return {target.Address(), 0x8000000022000000ull, Width, Height, 1, 0, 0, 0};
 }
 
-std::vector<Frame> Record(const std::filesystem::path& journal) {
+struct Live {
+    std::vector<Frame> frames;
+    std::uint64_t label = 0;
+};
+
+Live Record(const std::filesystem::path& journal) {
     AgcDriver::Journal::Arm();
     Region code;
     Region target;
+    Region commands(OutsideArena);
     const auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
     AgcDriver::Journal::NoteDisplayBuffer(Handle, 0, Scanout(target));
@@ -214,7 +242,7 @@ std::vector<Frame> Record(const std::filesystem::path& journal) {
     std::vector<std::uint32_t> setup;
     Context(setup, target.Address());
     GdsWrite(setup);
-    Submit(code.Commands(SetupOffset, setup));
+    Submit(commands.Commands(SetupOffset, setup));
     AgcDriverWaitIdle_nid_postfix();
     AgcDriver::Journal::Open(journal);
     std::vector<Frame> frames;
@@ -227,26 +255,29 @@ std::vector<Frame> Record(const std::filesystem::path& journal) {
     Fill(first, code.Address(FillCodeOffset), target.Address(), {0xff0000ffu, 0xff00ff00u, 0xffff0000u, 0xff808080u});
     Draw(first, code.Address(VertexCodeOffset), code.Address(PixelCodeOffset), 1.0f);
     GdsCopy(first, target.Address());
-    Submit(code.Commands(FrameOffset, first));
+    Submit(commands.Commands(FrameOffset, first));
     present();
     AgcDriverSuspendPoint_nid_postfix();
     std::vector<std::uint32_t> second;
+    WaitForTitle(second, code.Address(LabelOffset));
     Context(second, target.Address());
     Fill(second, code.Address(FillCodeOffset), target.Address(), {0xff204060u, 0xff604020u, 0xff000000u, 0xffffffffu});
     Draw(second, code.Address(VertexCodeOffset), code.Address(PixelCodeOffset), 0.5f);
-    Submit(code.Commands(FrameOffset, second));
+    Submit(commands.Commands(FrameOffset, second));
+    code.Release(LabelOffset);
     present();
     AgcDriver::Journal::Close();
-    return frames;
+    return {frames, code.Address(LabelOffset)};
 }
 
-void RequireJournal(const std::filesystem::path& directory) {
+void RequireJournal(const std::filesystem::path& directory, std::uint64_t label) {
     const auto journal = AgcDriver::Journal::ReadJournal(directory);
     const auto shaders = std::count_if(journal.prelude.begin(), journal.prelude.end(), [](const AgcDriver::Journal::Call& call) { return std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(call); });
     Require(shaders == 2, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 2 made before the journal opened");
     Require(journal.calls.size() == 5, "the journal holds " + std::to_string(journal.calls.size()) + " calls, expected 2 frame submissions, 2 flips and a suspend point");
-    const auto written = std::count_if(journal.calls.begin(), journal.calls.end(), [](const AgcDriver::Journal::JournaledCall& call) { return !call.writes.empty(); });
-    Require(written == 2, "title writes precede " + std::to_string(written) + " calls, expected the 2 frame submissions whose commands the title stored");
+    Require(!journal.calls[0].writes.empty() && !journal.calls[3].writes.empty(), "no title writes precede the frame submissions whose commands the title stored");
+    Require(std::any_of(journal.calls[4].writes.begin(), journal.calls[4].writes.end(), [&](const AgcDriver::Journal::TitleWrite& write) { return write.address <= label && label < write.address + write.bytes.size(); }), "the label the title stored after the second submission is not a title write of the next call");
+    Require(std::any_of(journal.ranges.begin(), journal.ranges.end(), [](const AgcDriver::Journal::Range& range) { return range.address == OutsideArena; }), "the command region outside the guest arena is not in the journal");
     const auto queue = journal.checkpoint.queues.find(0);
     Require(queue != journal.checkpoint.queues.end() && queue->second.context.contains(0x318), "the checkpoint lost the colour target register set before the journal opened");
     std::uint32_t gds = 0;
@@ -320,9 +351,9 @@ int main(int argc, char** argv) {
 #endif
         const auto directory = std::filesystem::temp_directory_path() / ("agc-frame-journal-" + std::to_string(process));
         std::filesystem::remove_all(directory);
-        const auto live = Record(directory / "journal");
+        const auto [live, label] = Record(directory / "journal");
         AgcDriverShutdown_nid_postfix();
-        RequireJournal(directory / "journal");
+        RequireJournal(directory / "journal", label);
         RequireWorkload(live);
         const auto first = Replay(argv[1], directory / "journal", directory / "first");
         const auto second = Replay(argv[1], directory / "journal", directory / "second");
@@ -330,7 +361,7 @@ int main(int argc, char** argv) {
         Require(first == second, "two replays of one journal are not bit-identical");
         Require(first == live, "the replay differs from the live run's frames");
         std::filesystem::remove_all(directory);
-        std::cout << "A journaled fill, draw and GDS copy over two frames replayed twice bit-identical to the live run\n";
+        std::cout << "A journaled fill, draw and GDS copy over two frames, the second waiting for a title write, replayed twice bit-identical to the live run\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -39,4 +39,6 @@ Report Replay(const std::filesystem::path& directory);
 
 }
 
+extern "C" void AgcDriverJournalDisplayBuffer_nid_postfix(std::uint32_t handle, std::int32_t index, const AgcDriver::DisplayBuffer& buffer);
+
 #endif
