@@ -105,7 +105,15 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
     std::lock_guard cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
-    const bool seen = drawKeySightings->SeenBefore(key);
+    bool seen = drawKeySightings->SeenBefore(key);
+    const auto& pending = drawRelocationPending;
+    if (pending.key == key && pending.identity != 0) {
+        if (pending.alias != 0) {
+            if (drawKeySightings->SeenBefore(pending.alias ^ 0x9e3779b97f4a7c15ull)) seen = true;
+        } else if (!drawRelocations.contains(pending.identity)) {
+            if (drawKeySightings->SeenBefore(pending.identity ^ 0xc2b2ae3d27d4eb4full)) seen = true;
+        }
+    }
     if (seen || shape == 0 || drawShapes.contains(shape)) return seen;
     if (!drawShapeSightings) drawShapeSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     return drawShapeSightings->SeenBefore(shape);
