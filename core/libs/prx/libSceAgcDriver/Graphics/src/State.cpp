@@ -782,6 +782,16 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
     return packings;
 }
 
+ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
+    if (state.rectList) return ShaderRecompiler::RasterPrimitive::Rectangle;
+    if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
+    switch (state.topology) {
+        case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
+        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return ShaderRecompiler::RasterPrimitive::Line;
+        default: return ShaderRecompiler::RasterPrimitive::Triangle;
+    }
+}
+
 std::array<std::uint8_t, 8> ExportMappings(const State& state) {
     std::array<std::uint8_t, 8> mappings{};
     mappings.fill(0xe4u);

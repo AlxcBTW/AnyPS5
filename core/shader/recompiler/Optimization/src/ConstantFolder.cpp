@@ -1,11 +1,14 @@
 #include "Optimization/ConstantFolder.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "Optimization/MaskedSelectEliminator.hpp"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -753,6 +756,46 @@ void ConstantFolder::Fold(IrProgram& program, std::span<IrBlock* const> blocks) 
 
 void ConstantFolder::Fold(IrProgram& program) const {
     Fold(program, program.BlockOrder());
+}
+
+bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
+    std::vector<IrValue*> words;
+    for (IrBlock* block : program.BlockOrder()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() != IrOpcode::GetBuiltin || !inst->HasUses()) continue;
+            auto& kind = resolveArg(*inst, 0);
+            if (isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::PackedAncillary) words.push_back(inst);
+        }
+    }
+    IrBuilder builder(program);
+    for (IrValue* word : words) {
+        if (AncillaryTraceEnabled()) {
+            std::vector<const IrValue*> users;
+            std::string uses;
+            for (const IrValue* user : word->Uses()) {
+                if (std::ranges::find(users, user) != users.end()) continue;
+                users.push_back(user);
+                uses += (uses.empty() ? "" : ", ") + ValueReference(user);
+            }
+            std::fprintf(stderr, "[ancillary] shader 0x%llx whole word for %s\n", static_cast<unsigned long long>(program.Resources().shaderHash), uses.c_str());
+        }
+        const auto emit = [&](IrOpcode opcode, IrValue& lhs, IrValue& rhs) -> IrValue& {
+            IrValue& created = program.CreateValue(opcode, IrType::U32);
+            created.AddArgument(&lhs);
+            created.AddArgument(&rhs);
+            word->Parent()->InsertInstructionBefore(word, &created);
+            return created;
+        };
+        const auto builtin = [&](StageInputKind kind) -> IrValue& {
+            return emit(IrOpcode::GetBuiltin, builder.Constant(static_cast<std::uint32_t>(kind)), builder.Constant(0u));
+        };
+        IrValue& primitive = builtin(StageInputKind::RasterPrimitive);
+        IrValue& sample = emit(IrOpcode::ShiftLeftLogical32, builtin(StageInputKind::SampleId), builder.Constant(8u));
+        IrValue& layer = emit(IrOpcode::ShiftLeftLogical32, builtin(StageInputKind::Layer), builder.Constant(16u));
+        IrValue& packed = emit(IrOpcode::BitwiseOr32, emit(IrOpcode::BitwiseOr32, primitive, sample), layer);
+        word->ReplaceAllUsesWith(&packed);
+    }
+    return !words.empty();
 }
 
 }
