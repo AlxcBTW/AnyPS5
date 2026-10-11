@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -169,8 +170,22 @@ public:
 
     template <typename TCall, typename TForward>
     void Note(TCall&& make, bool prelude, TForward&& forward) {
+        {
+            std::shared_lock gateLock(gate);
+            if (!open.load(std::memory_order_acquire)) {
+                if (!prelude) {
+                    forward();
+                    return;
+                }
+                std::lock_guard preludeLock(preludeMutex);
+                forward();
+                journal.prelude.push_back(make());
+                return;
+            }
+        }
         std::lock_guard lock(mutex);
         if (!open.load(std::memory_order_relaxed)) {
+            std::lock_guard preludeLock(preludeMutex);
             forward();
             if (prelude) journal.prelude.push_back(make());
             return;
@@ -220,6 +235,8 @@ public:
 
 private:
     void openLocked(const std::filesystem::path& directory) {
+        std::unique_lock gateLock(gate);
+        std::lock_guard preludeLock(preludeMutex);
         require(!open.load(std::memory_order_relaxed), "a journal is already open");
         auto& driver = DriverDetail::Driver::Get();
         for (const auto handle : driver.VideoOutputHandles()) require(outputs.contains(handle), "video output " + std::to_string(handle) + " was registered before the journal was armed");
@@ -272,6 +289,8 @@ private:
     }
 
     void closeLocked() {
+        std::unique_lock gateLock(gate);
+        std::lock_guard preludeLock(preludeMutex);
         require(open.load(std::memory_order_relaxed), "no journal is open");
         open.store(false, std::memory_order_release);
         WriteJournal(directory, journal);
@@ -291,7 +310,7 @@ private:
     }
 
     static void requireMemoryFor(std::uint64_t imageBytes) {
-        constexpr std::uint64_t Headroom = std::uint64_t{4} << 30;
+        constexpr std::uint64_t Headroom = std::uint64_t{3} << 29;
         const auto available = availableMemory();
         require(available >= imageBytes + Headroom, "the memory image needs " + std::to_string(imageBytes >> 20) + " MiB in this process, " + std::to_string(available >> 20) + " MiB are available and " + std::to_string(Headroom >> 20) + " MiB stay free");
     }
@@ -332,6 +351,8 @@ private:
     }
 
     std::mutex mutex;
+    std::shared_mutex gate;
+    std::mutex preludeMutex;
     std::atomic<bool> open{false};
     std::filesystem::path directory;
     JournalFile journal;
