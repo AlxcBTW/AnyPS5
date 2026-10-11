@@ -1262,6 +1262,32 @@ void htileDepthClearTests() {
     Require(address(std::span(kernel).first(16), {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0, "a truncated kernel was taken for RADV's HTILE update");
 }
 
+void htileFillKernelTests() {
+    const std::array<std::uint32_t, 6> constantStore{0xd7460000u, 0x04010c04u, 0x7e020280u, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    const std::array<std::uint32_t, 9> loadedStore{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    const std::array<std::uint32_t, 3> wave{64, 1, 1};
+    const std::array<std::uint32_t, 4> buffer{0xb23e0000u, 0x00040030u, 0x0000c000u, 0x00014204u};
+    const std::array<std::uint32_t, 8> loadedUserData{0xb23e0000u, 0x00040030u, 0x0000c000u, 0x00014204u, 0xbbb5cfe0u, 0x00100031u, 1u, 0x0004dfacu};
+    const auto zero = AgcDriver::Graphics::HtileFillKernel(constantStore, buffer, wave, 768);
+    Require(zero && zero->address == 0x30b23e0000ull && zero->bytes == 0x30000u && zero->pattern == 0 && zero->patternAddress == 0, "a compute store of an inline 0 to every HTILE dword was not recognized as an HTILE fill");
+    const auto loaded = AgcDriver::Graphics::HtileFillKernel(loadedStore, loadedUserData, wave, 768);
+    Require(loaded && loaded->address == 0x30b23e0000ull && loaded->bytes == 0x30000u && loaded->patternAddress == 0x31bbb5cfe0ull, "a compute store of a dword loaded through a user-data pointer to every HTILE dword was not recognized as an HTILE fill");
+    auto fifteen = constantStore;
+    fifteen[2] = 0x7e02028fu;
+    const auto expanded = AgcDriver::Graphics::HtileFillKernel(fifteen, buffer, wave, 768);
+    Require(expanded && expanded->pattern == 15u && (AgcDriver::Graphics::HtileFillClears(expanded->pattern, true) & VK_IMAGE_ASPECT_DEPTH_BIT) == 0, "an HTILE fill of ZMASK 0xf was taken for a depth clear");
+    Require(AgcDriver::Graphics::HtileFillClears(zero->pattern, true) == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT), "an HTILE fill of 0 does not clear depth and stencil");
+    const auto partial = AgcDriver::Graphics::HtileFillKernel(constantStore, buffer, wave, 100);
+    Require(partial && partial->bytes == 100u * 64u * 4u, "an HTILE fill with fewer threads than buffer records claims the whole buffer");
+    Require(!AgcDriver::Graphics::HtileFillKernel(constantStore, buffer, {32, 1, 1}, 768), "the HTILE fill kernel matched with another group size");
+    Require(!AgcDriver::Graphics::HtileFillKernel(constantStore, std::array<std::uint32_t, 4>{0xb23e0000u, 0x00080030u, 0x0000c000u, 0x00014204u}, wave, 768), "an HTILE fill matched a buffer with an 8-byte stride");
+    Require(!AgcDriver::Graphics::HtileFillKernel(loadedStore, buffer, wave, 768), "the loaded-pattern HTILE fill matched without its pattern pointer");
+    auto other = loadedStore;
+    other[6] ^= 1u;
+    Require(!AgcDriver::Graphics::HtileFillKernel(other, loadedUserData, wave, 768), "a different kernel was taken for an HTILE fill");
+    Require(!AgcDriver::Graphics::HtileFillKernel(std::span(constantStore).first(5), buffer, wave, 768), "a truncated kernel was taken for an HTILE fill");
+}
+
 void depthMaintenanceTests() {
     for (const auto mode : {0x4u, 0x8u, 0x80u, 0x100u, 0x1000u, 0x4000u}) {
         for (const auto clear : {0u, 1u, 2u, 3u}) {
@@ -4586,6 +4612,7 @@ int main(int argc, char** argv) {
         DepthStencilTests();
         OneDimensionalColorTests();
         htileDepthClearTests();
+        htileFillKernelTests();
         ZExportTests();
         unorm10_11_11TargetTests();
         DepthBoundsBiasTests();
