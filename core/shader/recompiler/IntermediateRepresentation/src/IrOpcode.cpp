@@ -181,6 +181,7 @@ constexpr std::array<OpcodeMeta, static_cast<std::size_t>(IrOpcode::Count)> Meta
     makeMeta("CompositeExtractU32x3", U32, U32x3, U32),
     makeMeta("CompositeExtractU32x4", U32, U32x4, U32),
     makeMeta("PackHalf2x16", U32, F32x2),
+    makeMeta("PackHalf2x16AnyNan", U32, F32x2),
     makeMeta("PackFloat2x16Rtz", U32, F32, F32),
     makeMeta("FPAbs32", F32, F32),
     makeMeta("FPNeg32", F32, F32),

@@ -1345,7 +1345,7 @@ static bool NativeF16Rte(const SpirvEmitterState& state) {
     return supported(spv::CapabilityFloat16) && supported(spv::CapabilityRoundingModeRTE) && supported(spv::CapabilityDenormPreserve);
 }
 
-static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
+static void EmitNativeF16Modes(SpirvEmitterState& state) {
     state.module.EmitCapability(spv::CapabilityFloat16);
     state.module.EmitCapability(spv::CapabilityRoundingModeRTE);
     state.module.EmitCapability(spv::CapabilityDenormPreserve);
@@ -1355,6 +1355,10 @@ static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::ui
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSignedZeroInfNanPreserve, 16u);
         state.nativeF16ModesEmitted = true;
     }
+}
+
+static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {
+    EmitNativeF16Modes(state);
     const auto u32 = TypeU32(state);
     const auto f16 = state.module.Type(spv::OpTypeFloat, 16u);
     const auto half = Unary(state, spv::OpFConvert, f16, value);
@@ -1409,6 +1413,23 @@ std::uint32_t EmitPackHalf2x16(SpirvEmitterState& state, std::uint32_t arg0) {
     };
     const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component(1u), ConstantU32(state, 16u));
     return Binary(state, spv::OpBitwiseOr, TypeU32(state), component(0u), high);
+}
+
+std::uint32_t EmitPackHalf2x16AnyNan(SpirvEmitterState& state, std::uint32_t arg0) {
+    if (!NativeF16Rte(state)) return EmitPackHalf2x16(state, arg0);
+    EmitNativeF16Modes(state);
+    const auto u32 = TypeU32(state);
+    const auto halves = Unary(state, spv::OpFConvert, state.module.Type(spv::OpTypeVector, state.module.Type(spv::OpTypeFloat, 16u), 2u), arg0);
+    const auto magnitudes = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpBitcast, u32, halves), ConstantU32(state, 0x7fff7fffu));
+    const auto sources = Unary(state, spv::OpBitcast, state.module.Type(spv::OpTypeVector, u32, 2u), arg0);
+    const auto extract = [&](std::uint32_t index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, u32, value, sources, index);
+        return value;
+    };
+    const auto lowSign = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, extract(0u), ConstantU32(state, 16u)), ConstantU32(state, 0x8000u));
+    const auto highSign = Binary(state, spv::OpBitwiseAnd, u32, extract(1u), ConstantU32(state, 0x80000000u));
+    return Binary(state, spv::OpBitwiseOr, u32, magnitudes, Binary(state, spv::OpBitwiseOr, u32, lowSign, highSign));
 }
 
 std::uint32_t EmitFPFma32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
