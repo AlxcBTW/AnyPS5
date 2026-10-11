@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Journal/include/Format.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -24,6 +25,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -31,12 +33,15 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <iterator>
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -152,6 +157,29 @@ void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std:
     AgcDriverRegisterShader_nid_postfix(&header.shader);
 }
 
+void RegisterDuringPreparation(const std::function<void()>& outside, const std::function<void()>& inside, const std::string& phase) {
+    std::promise<void> holding;
+    std::promise<void> proceed;
+    auto preparing = std::async(std::launch::async, [&, go = proceed.get_future()] {
+        AgcDriver::ShaderPreparationScope transaction;
+        holding.set_value();
+        go.wait();
+        inside();
+        transaction.Commit();
+    });
+    holding.get_future().wait();
+    auto registering = std::async(std::launch::async, outside);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    proceed.set_value();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    if (preparing.wait_until(deadline) != std::future_status::ready || registering.wait_until(deadline) != std::future_status::ready) {
+        std::cerr << "a shader registration " << phase << " deadlocked against a shader preparation transaction that another thread held while it registered a shader" << std::endl;
+        std::_Exit(1);
+    }
+    preparing.get();
+    registering.get();
+}
+
 void Context(std::vector<std::uint32_t>& commands, std::uint64_t color) {
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
@@ -238,14 +266,16 @@ Live Record(const std::filesystem::path& journal) {
     const auto* vertexCode = code.Store(VertexCodeOffset, VertexCode);
     const auto* pixelCode = code.Store(PixelCodeOffset, PixelCode);
     code.Store(FillCodeOffset, FillCode);
-    Register(code.HeaderAt(VertexHeaderOffset), vertexCode, sizeof(VertexCode), 2);
-    Register(code.HeaderAt(PixelHeaderOffset), pixelCode, sizeof(PixelCode), 1);
+    auto& vertexHeader = code.HeaderAt(VertexHeaderOffset);
+    auto& pixelHeader = code.HeaderAt(PixelHeaderOffset);
+    RegisterDuringPreparation([&] { Register(vertexHeader, vertexCode, sizeof(VertexCode), 2); }, [&] { Register(pixelHeader, pixelCode, sizeof(PixelCode), 1); }, "before the journal opened");
     std::vector<std::uint32_t> setup;
     Context(setup, target.Address());
     GdsWrite(setup);
     Submit(commands.Commands(SetupOffset, setup));
     AgcDriverWaitIdle_nid_postfix();
     AgcDriver::Journal::Open(journal);
+    RegisterDuringPreparation([&] { AgcDriverRegisterShader_nid_postfix(&vertexHeader.shader); }, [&] { AgcDriverRegisterShader_nid_postfix(&pixelHeader.shader); }, "while the journal was open");
     std::vector<Frame> frames;
     const auto present = [&] {
         Flip();
@@ -275,9 +305,12 @@ void RequireJournal(const std::filesystem::path& directory, std::uint64_t label)
     const auto journal = AgcDriver::Journal::ReadJournal(directory);
     const auto shaders = std::count_if(journal.prelude.begin(), journal.prelude.end(), [](const AgcDriver::Journal::Call& call) { return std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(call); });
     Require(shaders == 2, "the prelude holds " + std::to_string(shaders) + " shader registrations, expected the 2 made before the journal opened");
-    Require(journal.calls.size() == 5, "the journal holds " + std::to_string(journal.calls.size()) + " calls, expected 2 frame submissions, 2 flips and a suspend point");
-    Require(!journal.calls[0].writes.empty() && !journal.calls[3].writes.empty(), "no title writes precede the frame submissions whose commands the title stored");
-    Require(std::any_of(journal.calls[4].writes.begin(), journal.calls[4].writes.end(), [&](const AgcDriver::Journal::TitleWrite& write) { return write.address <= label && label < write.address + write.bytes.size(); }), "the label the title stored after the second submission is not a title write of the next call");
+    Require(journal.calls.size() == 7, "the journal holds " + std::to_string(journal.calls.size()) + " calls, expected 2 shader registrations, 2 frame submissions, 2 flips and a suspend point");
+    Require(std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[0].call) && std::holds_alternative<AgcDriver::Journal::RegisterShaderCall>(journal.calls[1].call), "the shader registrations made while the journal was open are not its first calls");
+    Require(std::holds_alternative<AgcDriver::Journal::SubmitCall>(journal.calls[2].call), "the first frame submission does not follow the shader registrations");
+    const auto writes = [&](std::size_t index) { return !journal.calls[index].writes.empty(); };
+    Require((writes(0) || writes(1) || writes(2)) && writes(5), "no title writes precede the frame submissions whose commands the title stored");
+    Require(std::any_of(journal.calls[6].writes.begin(), journal.calls[6].writes.end(), [&](const AgcDriver::Journal::TitleWrite& write) { return write.address <= label && label < write.address + write.bytes.size(); }), "the label the title stored after the second submission is not a title write of the next call");
     Require(std::any_of(journal.ranges.begin(), journal.ranges.end(), [](const AgcDriver::Journal::Range& range) { return range.address == OutsideArena; }), "the command region outside the guest arena is not in the journal");
     const auto queue = journal.checkpoint.queues.find(0);
     Require(queue != journal.checkpoint.queues.end() && queue->second.context.contains(0x318), "the checkpoint lost the colour target register set before the journal opened");

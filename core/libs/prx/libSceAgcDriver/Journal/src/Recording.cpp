@@ -13,16 +13,17 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -169,45 +170,25 @@ public:
     }
 
     template <typename TCall, typename TForward>
-    void Note(TCall&& make, bool prelude, TForward&& forward) {
-        {
-            std::shared_lock gateLock(gate);
-            if (!open.load(std::memory_order_acquire)) {
-                if (!prelude) {
-                    forward();
-                    return;
-                }
-                std::lock_guard preludeLock(preludeMutex);
+    void NoteSubmission(TCall&& make, TForward&& forward) {
+        for (;;) {
+            if (admit()) {
+                const Admitted admitted{admission};
                 forward();
-                journal.prelude.push_back(make());
                 return;
             }
-        }
-        std::lock_guard lock(mutex);
-        if (!open.load(std::memory_order_relaxed)) {
-            std::lock_guard preludeLock(preludeMutex);
-            forward();
-            if (prelude) journal.prelude.push_back(make());
+            std::lock_guard lock(mutex);
+            if (!open.load(std::memory_order_relaxed)) continue;
+            journalLocked(make(), forward);
             return;
         }
-        JournaledCall entry{make(), {}, {}};
-        requireJournaled(entry.call);
-        require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() == registryGeneration, "the registered guest memory changed while the journal was open; journaling memory registration is not implemented");
-        entry.writes = shadow.Changes();
-        {
-            std::lock_guard flipLock(flipMutex);
-            flips.clear();
-        }
+    }
+
+    template <typename TCall, typename TForward>
+    void NoteRegistration(TCall&& make, TForward&& forward) {
         forward();
-        Settle(journal.ranges);
-        {
-            std::lock_guard flipLock(flipMutex);
-            entry.flips = std::exchange(flips, {});
-        }
-        for (const auto& flip : entry.flips) journal.references.push_back(reference(flip));
-        shadow.Refresh();
-        if (prelude) journal.prelude.push_back(entry.call);
-        journal.calls.push_back(std::move(entry));
+        std::lock_guard preludeLock(preludeMutex);
+        registeredLocked(make());
     }
 
     void NoteFlip(const FlipInfo& info) {
@@ -220,7 +201,9 @@ public:
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
 
     void NoteDisplayBuffer(std::uint32_t handle, std::int32_t index, const DisplayBuffer& buffer) {
-        Note([&] { return DisplayBufferCall{handle, index, buffer}; }, true, [&] { displayBuffers[{handle, index}] = buffer; });
+        std::lock_guard preludeLock(preludeMutex);
+        displayBuffers[{handle, index}] = buffer;
+        registeredLocked(DisplayBufferCall{handle, index, buffer});
     }
 
     void Open(const std::filesystem::path& directory) {
@@ -234,16 +217,107 @@ public:
     }
 
 private:
-    void openLocked(const std::filesystem::path& directory) {
-        std::unique_lock gateLock(gate);
+    static constexpr std::uint64_t Claimed = std::uint64_t{1} << 63u;
+
+    struct Admitted {
+        std::atomic<std::uint64_t>& admission;
+        ~Admitted() { admission.fetch_sub(1, std::memory_order_acq_rel); }
+    };
+
+    bool admit() {
+        auto current = admission.load(std::memory_order_acquire);
+        while ((current & Claimed) == 0) {
+            if (admission.compare_exchange_weak(current, current + 1, std::memory_order_acq_rel)) return true;
+        }
+        return false;
+    }
+
+    static bool registration(const Call& call) {
+        return !std::holds_alternative<SubmitCall>(call) && !std::holds_alternative<SuspendCall>(call);
+    }
+
+    void registeredLocked(Call call) {
+        if ((admission.load(std::memory_order_acquire) & Claimed) != 0) pending.push_back(std::move(call));
+        else prelude.push_back(std::move(call));
+    }
+
+    template <typename TForward>
+    void journalLocked(Call call, TForward& forward) {
+        std::vector<JournaledCall> entries;
+        {
+            std::lock_guard preludeLock(preludeMutex);
+            for (auto& item : std::exchange(pending, {})) entries.push_back({std::move(item), {}, {}});
+        }
+        entries.push_back({std::move(call), {}, {}});
+        for (const auto& entry : entries) requireJournaled(entry.call);
+        require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() == registryGeneration, "the registered guest memory changed while the journal was open; journaling memory registration is not implemented");
+        entries.front().writes = shadow.Changes();
+        {
+            std::lock_guard flipLock(flipMutex);
+            flips.clear();
+        }
+        forward();
+        Settle(journal.ranges);
+        {
+            std::lock_guard flipLock(flipMutex);
+            entries.back().flips = std::exchange(flips, {});
+        }
+        for (const auto& flip : entries.back().flips) journal.references.push_back(reference(flip));
+        shadow.Refresh();
+        for (auto& entry : entries) journal.calls.push_back(std::move(entry));
+    }
+
+    std::vector<Call> claim() {
+        std::vector<Call> registered;
+        {
+            std::lock_guard preludeLock(preludeMutex);
+            admission.fetch_or(Claimed, std::memory_order_acq_rel);
+            registered = prelude;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((admission.load(std::memory_order_acquire) & ~Claimed) != 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                const auto inFlight = admission.load(std::memory_order_acquire) & ~Claimed;
+                release();
+                throw std::runtime_error("frame journal: " + std::to_string(inFlight) + " driver submissions stayed in flight for 5 s; the journal opens only between submissions");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return registered;
+    }
+
+    void release() {
         std::lock_guard preludeLock(preludeMutex);
+        for (const auto& call : journal.calls) {
+            if (registration(call.call)) prelude.push_back(call.call);
+        }
+        for (auto& call : std::exchange(pending, {})) prelude.push_back(std::move(call));
+        admission.fetch_and(~Claimed, std::memory_order_acq_rel);
+    }
+
+    void openLocked(const std::filesystem::path& directory) {
         require(!open.load(std::memory_order_relaxed), "a journal is already open");
+        JournalFile next;
+        next.prelude = claim();
+        try {
+            fill(next, directory);
+        } catch (...) {
+            journal = {};
+            shadow = {};
+            release();
+            throw;
+        }
+        open.store(true, std::memory_order_release);
+    }
+
+    void fill(JournalFile& next, const std::filesystem::path& directory) {
         auto& driver = DriverDetail::Driver::Get();
-        for (const auto handle : driver.VideoOutputHandles()) require(outputs.contains(handle), "video output " + std::to_string(handle) + " was registered before the journal was armed");
+        {
+            std::lock_guard preludeLock(preludeMutex);
+            for (const auto handle : driver.VideoOutputHandles()) require(outputs.contains(handle), "video output " + std::to_string(handle) + " was registered before the journal was armed");
+        }
         require(driver.WaitQuiescent(), "a submission waits for a title write; the journal opens only when every accepted submission has completed");
         const auto gds = Pm4::GdsAddress();
-        JournalFile next;
-        next.prelude = journal.prelude;
         next.environment = journaledEnvironment();
         std::uintptr_t arenaBase = 0;
         std::size_t arenaBytes = 0;
@@ -285,19 +359,21 @@ private:
             }
         });
         this->directory = directory;
-        open.store(true, std::memory_order_release);
     }
 
     void closeLocked() {
-        std::unique_lock gateLock(gate);
-        std::lock_guard preludeLock(preludeMutex);
         require(open.load(std::memory_order_relaxed), "no journal is open");
         open.store(false, std::memory_order_release);
-        WriteJournal(directory, journal);
-        auto prelude = std::move(journal.prelude);
+        std::exception_ptr failure;
+        try {
+            WriteJournal(directory, journal);
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        release();
         journal = {};
-        journal.prelude = std::move(prelude);
         shadow = {};
+        if (failure) std::rethrow_exception(failure);
     }
 
     static void requireUnshared(const std::vector<Range>& shared) {
@@ -345,15 +421,22 @@ private:
 
     Frame reference(const FlipInfo& flip) {
         if (flip.index < 0) return {};
-        const auto buffer = displayBuffers.find({flip.handle, flip.index});
-        require(buffer != displayBuffers.end(), "a flip shows display buffer " + std::to_string(flip.index) + " of video output " + std::to_string(flip.handle) + ", which the journal has no display buffer for");
-        return ReadFrame(buffer->second);
+        DisplayBuffer buffer;
+        {
+            std::lock_guard preludeLock(preludeMutex);
+            const auto found = displayBuffers.find({flip.handle, flip.index});
+            require(found != displayBuffers.end(), "a flip shows display buffer " + std::to_string(flip.index) + " of video output " + std::to_string(flip.handle) + ", which the journal has no display buffer for");
+            buffer = found->second;
+        }
+        return ReadFrame(buffer);
     }
 
     std::mutex mutex;
-    std::shared_mutex gate;
     std::mutex preludeMutex;
+    std::atomic<std::uint64_t> admission{0};
     std::atomic<bool> open{false};
+    std::vector<Call> prelude;
+    std::vector<Call> pending;
     std::filesystem::path directory;
     JournalFile journal;
     Shadow shadow;
@@ -382,19 +465,23 @@ private:
 
 void Recording::RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
     const std::shared_ptr<IVideoOutput> journaled = output == nullptr ? nullptr : std::make_shared<JournaledOutput>(output);
-    Note([&] { return VideoOutputCall{handle, true}; }, true, [&] {
-        DriverDetail::Driver::Get().RegisterVideoOutput(handle, journaled);
-        outputs[handle] = {output, journaled};
-    });
+    DriverDetail::Driver::Get().RegisterVideoOutput(handle, journaled);
+    std::lock_guard preludeLock(preludeMutex);
+    outputs[handle] = {output, journaled};
+    registeredLocked(VideoOutputCall{handle, true});
 }
 
 void Recording::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
-    Note([&] { return VideoOutputCall{handle, false}; }, true, [&] {
+    std::shared_ptr<IVideoOutput> journaled;
+    {
+        std::lock_guard preludeLock(preludeMutex);
         const auto found = outputs.find(handle);
-        const bool wrapped = found != outputs.end() && found->second.first == output;
-        DriverDetail::Driver::Get().UnregisterVideoOutput(handle, wrapped ? found->second.second : output);
-        if (wrapped) outputs.erase(found);
-    });
+        if (found != outputs.end() && found->second.first == output) journaled = found->second.second;
+    }
+    DriverDetail::Driver::Get().UnregisterVideoOutput(handle, journaled != nullptr ? journaled : output);
+    std::lock_guard preludeLock(preludeMutex);
+    if (journaled != nullptr) outputs.erase(handle);
+    registeredLocked(VideoOutputCall{handle, false});
 }
 
 SubmitCall submitted(const Packet* packet, std::uint32_t queue) {
@@ -428,19 +515,19 @@ void NoteDisplayBuffer(std::uint32_t handle, std::int32_t index, const DisplayBu
 }
 
 void Submit(const Packet* packet, std::uint32_t queue) {
-    Recording::Get().Note([&] { return submitted(packet, queue); }, false, [&] { DriverDetail::Driver::Get().Submit(packet, queue); });
+    Recording::Get().NoteSubmission([&] { return submitted(packet, queue); }, [&] { DriverDetail::Driver::Get().Submit(packet, queue); });
 }
 
 void SuspendPoint() {
-    Recording::Get().Note([] { return SuspendCall{}; }, false, [] { DriverDetail::Driver::Get().SuspendPoint(); });
+    Recording::Get().NoteSubmission([] { return SuspendCall{}; }, [] { DriverDetail::Driver::Get().SuspendPoint(); });
 }
 
 void RegisterShader(const Shader* shader) {
-    Recording::Get().Note([&] { return RegisterShaderCall{pointer(shader)}; }, true, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
+    Recording::Get().NoteRegistration([&] { return RegisterShaderCall{pointer(shader)}; }, [&] { DriverDetail::Driver::Get().RegisterShader(shader); });
 }
 
 void ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
-    Recording::Get().Note([&] { return ResolveShaderAbiCall{pointer(shader), copied(context), copied(primitive)}; }, true, [&] { DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
+    Recording::Get().NoteRegistration([&] { return ResolveShaderAbiCall{pointer(shader), copied(context), copied(primitive)}; }, [&] { DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive); });
 }
 
 void ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
@@ -449,11 +536,11 @@ void ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<c
         for (const auto* stage : stages) call.stages.push_back(pointer(stage));
         return call;
     };
-    Recording::Get().Note(make, true, [&] { DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
+    Recording::Get().NoteRegistration(make, [&] { DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive); });
 }
 
 void ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) {
-    Recording::Get().Note([&] { return ResolveGraphicsAbiCall{pointer(vertex), pointer(pixel), primitiveType}; }, true, [&] { DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
+    Recording::Get().NoteRegistration([&] { return ResolveGraphicsAbiCall{pointer(vertex), pointer(pixel), primitiveType}; }, [&] { DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType); });
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
