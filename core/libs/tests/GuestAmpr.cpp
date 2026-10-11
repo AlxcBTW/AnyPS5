@@ -893,7 +893,7 @@ void TestGatherScatter() {
     Require(sceAmprAprCommandBufferReadFileGather(&compact.buffer, &compact.gatherState, &compact.scatterState, 8, 108) == 0);
     Require(sceAmprAprCommandBufferReadFileGather(&compact.buffer, &compact.gatherState, &compact.scatterState, 8, 116) == 0);
     Require(compact.Offset() == 64);
-    Require(sceKernelAprSubmitCommandBuffer(&compact.buffer, 0) == 0);
+    SubmitAndWait(compact);
     Require(MatchesFile(compactData.data(), 100, compactData.size()));
 
     Recorder recorder;
