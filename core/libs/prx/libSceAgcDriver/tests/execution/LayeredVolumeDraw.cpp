@@ -109,7 +109,7 @@ public:
         block = static_cast<std::byte*>(std::aligned_alloc(65536, bytes));
 #endif
         Require(block != nullptr, "cannot allocate the volume");
-        GuestAllocations::Mutation().Add(block, bytes, true, true);
+        GuestAllocations::Mutation().Add(block, bytes, true, true, true);
         std::memset(block, Kept, bytes);
     }
 
