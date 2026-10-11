@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -15,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -503,6 +505,28 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
     if (code.size() < htileMaskKernel.size() || !std::equal(htileMaskKernel.begin(), htileMaskKernel.end(), code.begin())) return 0;
     if ((userData[5] & 0xfu) != 0 || (userData[4] & 0xfu) != 0) return 0;
     return userData[2] | (static_cast<std::uint64_t>(userData[3]) << 32u);
+}
+
+std::optional<MemoryValueFill> MatchMemoryValueFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 9> kernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (userData.size() < 6 || numThreads != std::array<std::uint32_t, 3>{64u, 1u, 1u} || groups[1] != 1u || groups[2] != 1u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    const auto type = userData[3] >> 30u;
+    if (type != 0 || stride != 4 || swizzled || addTid) return std::nullopt;
+    const auto dwords = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, userData[2]);
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    const auto valueAddress = userData[4] | (static_cast<std::uint64_t>(userData[5] & 0xffffu) << 32u);
+    if (dwords == 0 || valueAddress == 0 || (valueAddress & 3u) != 0) return std::nullopt;
+    return MemoryValueFill{address, static_cast<std::size_t>(dwords * 4u), valueAddress};
+}
+
+void NoteMemoryValueFill(const MemoryValueFill& fill) {
+    std::uint32_t value = 0;
+    GuestMemory::Read(fill.valueAddress, std::as_writable_bytes(std::span(&value, 1)), 4);
+    NoteDepthMetadataFill(fill.address, fill.bytes, value);
 }
 
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
