@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_JOURNAL_INCLUDE_JOURNAL_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -18,11 +19,32 @@ struct Frame {
     bool operator==(const Frame&) const = default;
 };
 
-struct Report {
+struct GpuRange {
+    std::string kind;
+    std::uint32_t queue = 0;
+    std::uint64_t program = 0;
+    std::uint64_t vertexProgram = 0;
+    std::array<std::uint32_t, 3> shape{};
+    double beginNs = 0;
+    double endNs = 0;
+};
+
+struct Iteration {
     std::vector<Frame> frames;
+    double milliseconds = 0;
+    std::vector<GpuRange> gpuRanges;
+    std::uint64_t droppedRanges = 0;
+};
+
+struct ReplayOptions {
+    std::size_t iterations = 1;
+    bool gpuTimes = false;
+};
+
+struct Report {
     std::vector<Frame> references;
     std::size_t calls = 0;
-    double milliseconds = 0;
+    std::vector<Iteration> iterations;
 };
 
 struct EnvironmentVariable {
@@ -35,7 +57,7 @@ void Open(const std::filesystem::path& directory);
 void Close();
 void NoteDisplayBuffer(std::uint32_t handle, std::int32_t index, const DisplayBuffer& buffer);
 std::vector<EnvironmentVariable> ReplayEnvironment(const std::filesystem::path& directory);
-Report Replay(const std::filesystem::path& directory);
+Report Replay(const std::filesystem::path& directory, const ReplayOptions& options = {});
 
 }
 

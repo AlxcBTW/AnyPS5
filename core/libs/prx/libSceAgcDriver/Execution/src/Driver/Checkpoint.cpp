@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -39,6 +40,14 @@ bool Driver::WaitQuiescent() {
         seen = now;
     }
     return false;
+}
+
+void Driver::DrainGpu() {
+    const auto current = device.Load();
+    if (current == nullptr) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    current->WaitIdle();
 }
 
 std::vector<std::uint32_t> Driver::VideoOutputHandles() {

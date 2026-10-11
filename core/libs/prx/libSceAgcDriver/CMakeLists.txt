@@ -1195,7 +1195,7 @@ if(BUILD_TESTING)
     target_link_libraries(agc_driver_frame_journal_tests PRIVATE decoder_png)
     add_test(NAME agc_driver_frame_journal COMMAND agc_driver_frame_journal_tests $<TARGET_FILE:agc_journal_replay>)
     set_tests_properties(agc_driver_frame_journal PROPERTIES
-            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WRITE_EVIDENCE=1;APS5_NO_PIPELINE_LTO=1;APS5_GPU_WAIT_TIMEOUT_MS=600000;APS5_THREAD_PRIORITY=off;APS5_NO_WORKER_AFFINITY=1"
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_WRITE_EVIDENCE=1;APS5_NO_PIPELINE_LTO=1;APS5_GPU_WAIT_TIMEOUT_MS=600000;APS5_THREAD_PRIORITY=off;APS5_NO_WORKER_AFFINITY=1;APS5_NO_FILL_HLE=1"
             SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_driver_frame_journal PROPERTIES ENVIRONMENT_MODIFICATION

@@ -72,6 +72,7 @@ public:
     void Restore(QueueCheckpoint checkpoint);
     std::vector<std::uint32_t> VideoOutputHandles();
     bool WaitQuiescent();
+    void DrainGpu();
 
 private:
     friend class SampledReadScope;

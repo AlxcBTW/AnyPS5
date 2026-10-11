@@ -435,7 +435,31 @@ public:
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
-    // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
+    struct TimingDetail {
+        std::uint32_t queue = 0;
+        std::uint64_t program = 0;
+        std::uint64_t vertexProgram = 0;
+        std::array<std::uint32_t, 3> shape{};
+    };
+    struct TimedCall {
+        std::uint64_t key = 0;
+        std::optional<TimingDetail> detail;
+        double beginNs = 0;
+        double endNs = 0;
+    };
+    struct TimedCalls {
+        std::vector<TimedCall> calls;
+        std::uint64_t dropped = 0;
+    };
+    template <typename TDetail>
+    std::uint32_t BeginGpuTiming(std::uint64_t key, TDetail&& detail) {
+        if (!GpuTimingEnabled()) return NoTiming;
+        return beginDetailedTiming(key, detail());
+    }
+    static void CollectTimedCalls(bool collect);
+    static TimedCalls TakeTimedCalls();
+    static const char* ClassName(std::uint64_t key);
+    static inline thread_local std::array<std::uint64_t, 2> drawPrograms{};
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
@@ -547,6 +571,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::optional<TimingDetail>> timedDetails;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -683,6 +708,7 @@ private:
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);
+    std::uint32_t beginDetailedTiming(std::uint64_t key, const TimingDetail& detail);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline

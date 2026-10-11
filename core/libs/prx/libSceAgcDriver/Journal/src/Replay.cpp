@@ -3,8 +3,10 @@
 #include "prx/libSceAgcDriver/Journal/include/Readback.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -163,6 +165,24 @@ public:
         std::visit([&](const auto& item) { perform(item); }, call);
     }
 
+    void Reload(BlockReader& blocks) {
+        constexpr std::size_t Chunk = std::size_t{1} << 20u;
+        const std::vector<std::byte> zeros(Chunk);
+        for (const auto& range : journal.ranges) {
+            if (!range.writable) continue;
+            for (const auto& [begin, end] : range.committed) {
+                for (auto at = begin; at < end; at += Chunk) GuestMemory::Write(at, std::span(zeros).first(static_cast<std::size_t>(std::min<std::uint64_t>(Chunk, end - at))));
+            }
+        }
+        std::vector<std::byte> bytes;
+        for (const auto& block : journal.image) {
+            if (!writable(block.address)) continue;
+            bytes.resize(block.bytes);
+            blocks.Read(block, bytes);
+            GuestMemory::Write(block.address, bytes);
+        }
+    }
+
     void Apply(const std::vector<TitleWrite>& writes) {
         for (const auto& write : writes) {
             require(placed(write.address, write.bytes.size()), "title write " + hex(write.address) + " lies outside the journaled ranges");
@@ -243,6 +263,11 @@ private:
 #endif
     }
 
+    bool writable(std::uint64_t address) const {
+        const auto after = std::upper_bound(journal.ranges.begin(), journal.ranges.end(), address, [](std::uint64_t value, const Range& range) { return value < range.address; });
+        return after != journal.ranges.begin() && std::prev(after)->writable && address - std::prev(after)->address < std::prev(after)->bytes;
+    }
+
     bool placed(std::uint64_t address, std::uint64_t bytes) const {
         for (const auto& range : journal.ranges) {
             for (const auto& [begin, end] : range.committed) {
@@ -310,32 +335,72 @@ private:
     std::deque<std::vector<std::uint32_t>> commandCopies;
 };
 
+std::vector<GpuRange> gpuRanges(const Graphics::Recorder::TimedCalls& timed) {
+    std::vector<GpuRange> ranges;
+    ranges.reserve(timed.calls.size());
+    for (const auto& call : timed.calls) {
+        GpuRange range;
+        range.beginNs = call.beginNs;
+        range.endNs = call.endNs;
+        const char* name = Graphics::Recorder::ClassName(call.key);
+        if (call.detail) {
+            range.kind = name != nullptr ? name : (call.detail->shape == std::array<std::uint32_t, 3>{} ? "dispatch-indirect" : "dispatch");
+            range.queue = call.detail->queue;
+            range.program = call.detail->program != 0 ? call.detail->program : call.key;
+            range.vertexProgram = call.detail->vertexProgram;
+            range.shape = call.detail->shape;
+        } else {
+            range.kind = name != nullptr ? name : "program";
+            range.queue = 0xffffffffu;
+            range.program = name != nullptr ? 0 : call.key;
+        }
+        ranges.push_back(std::move(range));
+    }
+    return ranges;
+}
+
 }
 
 std::vector<EnvironmentVariable> ReplayEnvironment(const std::filesystem::path& directory) {
     return environmentOf(ReadJournal(directory));
 }
 
-Report Replay(const std::filesystem::path& directory) {
+Report Replay(const std::filesystem::path& directory, const ReplayOptions& options) {
+    require(options.iterations >= 1, "a replay needs at least one iteration");
+    require(!options.gpuTimes || Graphics::Recorder::GpuTimingEnabled(), "GPU times need APS5_PROFILE_GPU=1 in the replay's environment");
     const auto journal = ReadJournal(directory);
     requireEnvironment(journal);
     BlockReader blocks(directory);
     Host host(journal);
     host.Place(blocks);
     for (const auto& call : journal.prelude) host.Perform(call);
-    host.Restore();
     Report report;
     report.references = journal.references;
     report.calls = journal.calls.size();
-    const auto started = std::chrono::steady_clock::now();
-    for (std::size_t index = 0; index < journal.calls.size(); ++index) {
-        const auto& call = journal.calls[index];
-        host.Apply(call.writes);
-        host.Perform(call.call);
-        Settle(journal.ranges);
-        for (auto& frame : host.Frames(index, call.flips)) report.frames.push_back(std::move(frame));
+    Graphics::Recorder::CollectTimedCalls(options.gpuTimes);
+    for (std::size_t iteration = 0; iteration < options.iterations; ++iteration) {
+        if (iteration != 0) host.Reload(blocks);
+        host.Restore();
+        if (options.gpuTimes) static_cast<void>(Graphics::Recorder::TakeTimedCalls());
+        Iteration result;
+        const auto started = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < journal.calls.size(); ++index) {
+            const auto& call = journal.calls[index];
+            host.Apply(call.writes);
+            host.Perform(call.call);
+            Settle(journal.ranges);
+            for (auto& frame : host.Frames(index, call.flips)) result.frames.push_back(std::move(frame));
+        }
+        result.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        if (options.gpuTimes) {
+            DriverDetail::Driver::Get().DrainGpu();
+            const auto timed = Graphics::Recorder::TakeTimedCalls();
+            result.gpuRanges = gpuRanges(timed);
+            result.droppedRanges = timed.dropped;
+        }
+        report.iterations.push_back(std::move(result));
     }
-    report.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    Graphics::Recorder::CollectTimedCalls(false);
     return report;
 }
 

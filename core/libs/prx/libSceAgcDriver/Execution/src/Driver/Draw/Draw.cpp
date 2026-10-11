@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -348,6 +349,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
+            Graphics::Recorder::drawPrograms = {programs.front().binary.codeAddress, programs.back().binary.codeAddress};
             phaseTiming.Phase(DrawRowVectors);
             localDevice->Draw(graphics, direct, stages, snapshots);
             phaseTiming.Phase(DrawRowGraphics);
@@ -375,6 +377,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
+    Graphics::Recorder::drawPrograms = {programs.front().binary.codeAddress, programs.back().binary.codeAddress};
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {

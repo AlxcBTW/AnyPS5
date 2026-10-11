@@ -224,6 +224,7 @@ AgcDriver::DisplayBuffer Scanout(const Region& target) {
 struct Live {
     std::vector<Frame> frames;
     std::uint64_t label = 0;
+    std::uint64_t fill = 0;
 };
 
 Live Record(const std::filesystem::path& journal) {
@@ -267,7 +268,7 @@ Live Record(const std::filesystem::path& journal) {
     code.Release(LabelOffset);
     present();
     AgcDriver::Journal::Close();
-    return {frames, code.Address(LabelOffset)};
+    return {frames, code.Address(LabelOffset), code.Address(FillCodeOffset)};
 }
 
 void RequireJournal(const std::filesystem::path& directory, std::uint64_t label) {
@@ -290,8 +291,8 @@ std::string Quoted(const std::filesystem::path& path) {
     return "\"" + path.string() + "\"";
 }
 
-std::vector<Frame> Replay(const std::filesystem::path& replayer, const std::filesystem::path& journal, const std::filesystem::path& frames) {
-    std::string command = Quoted(replayer) + " " + Quoted(journal) + " --frames " + Quoted(frames);
+std::vector<Frame> Replay(const std::filesystem::path& replayer, const std::filesystem::path& journal, const std::filesystem::path& frames, const std::string& options = {}) {
+    std::string command = Quoted(replayer) + " " + Quoted(journal) + " --frames " + Quoted(frames) + options;
 #ifdef _WIN32
     command = "\"" + command + "\"";
 #endif
@@ -313,6 +314,21 @@ std::vector<Frame> Replay(const std::filesystem::path& replayer, const std::file
         result.push_back(std::move(frame));
     }
     return result;
+}
+
+std::string Hex(std::uint64_t value) {
+    char text[24];
+    std::snprintf(text, sizeof(text), "0x%llx", static_cast<unsigned long long>(value));
+    return text;
+}
+
+void RequireGpuTimes(const std::filesystem::path& path, const Live& recorded) {
+    std::ifstream file(path);
+    Require(file.is_open(), "the replay wrote no GPU times");
+    const std::string json{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    Require(json.find("\"iterations\": 2") != std::string::npos, "the GPU times do not cover both iterations");
+    Require(json.find("\"kind\": \"dispatch\", \"queue\": 0, \"program\": \"" + Hex(recorded.fill) + "\"") != std::string::npos, "the GPU times have no entry for the pattern-fill dispatch on queue 0");
+    Require(json.find("\"frameMicroseconds\": 0,") == std::string::npos, "the replayed frame took no GPU time");
 }
 
 std::uint32_t Pixel(const Frame& frame, std::uint32_t x, std::uint32_t y) {
@@ -351,12 +367,14 @@ int main(int argc, char** argv) {
 #endif
         const auto directory = std::filesystem::temp_directory_path() / ("agc-frame-journal-" + std::to_string(process));
         std::filesystem::remove_all(directory);
-        const auto [live, label] = Record(directory / "journal");
+        const auto recorded = Record(directory / "journal");
+        const auto& live = recorded.frames;
         AgcDriverShutdown_nid_postfix();
-        RequireJournal(directory / "journal", label);
+        RequireJournal(directory / "journal", recorded.label);
         RequireWorkload(live);
         const auto first = Replay(argv[1], directory / "journal", directory / "first");
-        const auto second = Replay(argv[1], directory / "journal", directory / "second");
+        const auto second = Replay(argv[1], directory / "journal", directory / "second", " --repeat 2 --gpu-times " + Quoted(directory / "gpu-times.json"));
+        RequireGpuTimes(directory / "gpu-times.json", recorded);
         Require(first.size() == live.size() && second.size() == live.size(), "a replay presented " + std::to_string(first.size()) + " and " + std::to_string(second.size()) + " frames, the live run " + std::to_string(live.size()));
         Require(first == second, "two replays of one journal are not bit-identical");
         Require(first == live, "the replay differs from the live run's frames");
