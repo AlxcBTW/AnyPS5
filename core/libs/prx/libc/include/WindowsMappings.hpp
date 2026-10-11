@@ -349,9 +349,14 @@ public:
                     }
                 }
                 if (views.find(cursor & ~(pageBytes - 1)) != views.end()) return false;
-                const auto memory = query(cursor);
-                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-                const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                std::uintptr_t stop = 0;
+                if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
+                    stop = std::min(end, allocation->second);
+                } else {
+                    const auto memory = query(cursor);
+                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                    stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                }
                 pieces.emplace_back(cursor, stop);
                 cursor = stop;
             }
@@ -376,6 +381,10 @@ private:
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
                 cursor = std::min(end, base + pageBytes);
+                continue;
+            }
+            if (const auto allocation = findPrivate(cursor); allocation != privateAllocations.end()) {
+                cursor = std::min(end, allocation->second);
                 continue;
             }
             const auto memory = query(cursor);
