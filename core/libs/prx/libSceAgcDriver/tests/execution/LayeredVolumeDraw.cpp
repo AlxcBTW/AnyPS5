@@ -203,7 +203,7 @@ void Run(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget
     if (mesh) {
         Require(DeclaresLayer(geometryResult.spirv), "the mesh program declares no Layer output");
         VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
-        subgroup.subgroupSize = 64;
+        subgroup.subgroupSize = target.subgroupSize;
         subgroup.supportedStages = VK_SHADER_STAGE_ALL;
         subgroup.supportedOperations = 0xffu;
         subgroup.quadOperationsInAllStages = VK_TRUE;
