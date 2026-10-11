@@ -409,8 +409,9 @@ private:
     bool refreshProved();
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
-    // exp (APS5_EXP_SNAPSHOT_NOWAIT): a read of the surface now would wait for the GPU.
-    bool snapshotWouldWait() const;
+    // exp (APS5_EXP_SNAPSHOT_NOWAIT): a read of the surface now would only wait for recorded GPU
+    // writes landing in place, so its snapshots may be left out.
+    bool snapshotSkippable() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);

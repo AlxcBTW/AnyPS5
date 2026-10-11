@@ -4,6 +4,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -1517,6 +1518,15 @@ namespace {
 // the direct path already does for `original` and as surfaces over 1 MiB do for the baseline.
 // APS5_EXP_SNAPSHOT_NOWAIT_VERIFY=1 still waits and reads them, and counts the decisions that
 // would have differed without them ([exp-snapshot]).
+// The upload and write-back trace lines go through the async profile writer; they never throw out
+// of an upload or a write-back (the writer stopping at shutdown, or failed for good).
+void LogStorageStep(const char* step, int line, const char* function) {
+    try {
+        AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture %s\n", _APS5_FILE_, line, function, step);
+    } catch (...) {
+    }
+}
+
 bool SnapshotNoWait() {
     static const bool enabled = std::getenv("APS5_EXP_SNAPSHOT_NOWAIT") != nullptr;
     return enabled;
@@ -1577,13 +1587,22 @@ void NoteSnapshotDecision(bool differs) {
 
 }
 
-bool StorageTexture::snapshotWouldWait() const {
+bool StorageTexture::snapshotSkippable() const {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto base = descriptor.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     const auto* recorder = Recorder::Active();
     // Recorded work still running writes the surface. Not when another image's results are pending
     // there: the read's flush hook would store them first, an order the skipped read must not lose.
-    return recorder != nullptr && !recorder->PendingWriteSettled(descriptor.baseAddress, bytes) && !otherPendingOverlaps();
+    if (recorder == nullptr || recorder->PendingWriteSettled(base, bytes) || otherPendingOverlaps()) return false;
+    // Nor when a completion stores into it as its batch retires (a copied writer's write-back, a
+    // completion label): that store lands after this upload's generation, stamped as written, and
+    // only a snapshot read after the sync would let the write-back tell it from a CPU store.
+    if (recorder->CompletionLabelIn(base, bytes)) return false;
+    const auto copied = [&](const auto& writer) { return writer->CopiedWritesOverlap(base, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), copied)) return false;
+    const auto drawWriters = DrawCopiedWriters();
+    return std::none_of(drawWriters->begin(), drawWriters->end(), copied);
 }
 
 bool StorageTexture::Refresh() {
@@ -1958,7 +1977,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
         GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
     }
     originalValid = originalValid || complete;
-    originalWouldSkip = false;
+    if (complete) originalWouldSkip = false;
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
@@ -2017,7 +2036,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // when reading them would wait for the GPU. Watched surfaces only: for the others `original` is
     // the only change detection.
     const auto skipSnapshots = [&] {
-        return (SnapshotNoWait() || SnapshotNoWaitVerify()) && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && snapshotWouldWait();
+        return (SnapshotNoWait() || SnapshotNoWaitVerify()) && GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && snapshotSkippable();
     };
     const auto stampLayers = [&](bool selectedOnly, bool skipBaseline) {
         const bool whole = !selectedOnly || layers == nullptr;
@@ -2275,9 +2294,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-            AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture upload submit\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
+            LogStorageStep("upload submit", __LINE__, TrimNidPostfix(__func__));
             batch.SubmitAndWait();
-            AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture upload done\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
+            LogStorageStep("upload done", __LINE__, TrimNidPostfix(__func__));
     }
     countStorageUpload(2, guestBytes);
     ++version;
@@ -4370,9 +4389,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
     CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, original.size());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture writeback submit\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
+    LogStorageStep("writeback submit", __LINE__, TrimNidPostfix(__func__));
     batch.SubmitAndWait();
-    AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture writeback done\n", _APS5_FILE_, __LINE__, TrimNidPostfix(__func__));
+    LogStorageStep("writeback done", __LINE__, TrimNidPostfix(__func__));
     countStorageWriteBack(guestBytes, false);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {

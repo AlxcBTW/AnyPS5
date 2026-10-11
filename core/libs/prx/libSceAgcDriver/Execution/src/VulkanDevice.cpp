@@ -3569,8 +3569,12 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
             } else if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), copied) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), copied)) {
                 stats.copied.fetch_add(1, std::memory_order_relaxed);
             } else if (IndirectGpuMode() == 2) {
-                stats.eligible.fetch_add(1, std::memory_order_relaxed);
-                verifyEligible = true;
+                if (Graphics::HostImportFor(context, arguments, 12) == nullptr) {
+                    stats.notImported.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    stats.eligible.fetch_add(1, std::memory_order_relaxed);
+                    verifyEligible = true;
+                }
             } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
                 stats.notImported.fetch_add(1, std::memory_order_relaxed);
                 outcome.cpuReason = 3;

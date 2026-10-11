@@ -723,7 +723,7 @@ int DccKeysRecordedMode() {
     return mode;
 }
 
-enum class RecordedKeys { Proved, UnknownWriter, Mixed, Unreadable, Count };
+enum class RecordedKeys { Proved, UnknownWriter, Mixed, Unwritten, Unreadable, Count };
 
 // Newest write first, as PendingFillsLeaveUncompressed; a write with no known value (a kernel, a
 // copy, a write-back, a completion store) leaves the keys undecided.
@@ -752,11 +752,9 @@ RecordedKeys ProveRecordedKeys(const Recorder& recorder, std::uint64_t begin, st
         if (value >= 0 && value != write.value) return RecordedKeys::Mixed;
         value = write.value;
     }
-    for (const auto& [from, to] : unwritten) {
-        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
-        if (!AllKeysEqual(keys, static_cast<std::size_t>(to - from), keys[0]) || (value >= 0 && value != keys[0])) return RecordedKeys::Mixed;
-        value = keys[0];
-    }
+    // Key bytes no pending write covers could take a CPU store before the fills' batch signals,
+    // which a memo entry would not see: only a range the pending fills cover whole is proved.
+    if (!unwritten.empty()) return RecordedKeys::Unwritten;
     if (value < 0) return RecordedKeys::Unreadable;
     key = static_cast<std::uint8_t>(value);
     return RecordedKeys::Proved;
@@ -787,9 +785,10 @@ void ReportRecordedKeys() {
     const auto proved = take(RecordedKeys::Proved);
     const auto unknown = take(RecordedKeys::UnknownWriter);
     const auto mixed = take(RecordedKeys::Mixed);
+    const auto unwritten = take(RecordedKeys::Unwritten);
     const auto unreadable = take(RecordedKeys::Unreadable);
-    AgcDriver::ProfilePrint_nid_no_patch("[exp-dcc-keys] (10 s): %llu key syncs reached, %llu proved from recorded fills (%s); undecided: %llu unknown writer, %llu mixed, %llu shadowed or unreadable; verify: %llu agree, %llu differ\n",
-        static_cast<unsigned long long>(stats.syncs.exchange(0)), proved, DccKeysRecordedMode() == 2 ? "synced anyway for the verification" : "not synced", unknown, mixed, unreadable,
+    AgcDriver::ProfilePrint_nid_no_patch("[exp-dcc-keys] (10 s): %llu key syncs reached, %llu proved from recorded fills (%s); undecided: %llu unknown writer, %llu mixed, %llu partly not covered by a pending fill, %llu shadowed or unreadable; verify: %llu agree, %llu differ\n",
+        static_cast<unsigned long long>(stats.syncs.exchange(0)), proved, DccKeysRecordedMode() == 2 ? "synced anyway for the verification" : "not synced", unknown, mixed, unwritten, unreadable,
         static_cast<unsigned long long>(stats.agree.exchange(0)), static_cast<unsigned long long>(stats.differ.exchange(0)));
 }
 
@@ -799,8 +798,8 @@ void RememberRecordedKeys(Recorder& recorder, std::uint64_t begin, std::size_t c
     auto& memo = Memo();
     std::lock_guard lock(memo.mutex);
     const auto end = begin + count;
-    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
-    if (MemoRecorder(memo) == &recorder) memo.entries.push_back({begin, end, keys, recorder.NewestWriteNote(begin, count), true});
+    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin <= store.begin && store.end <= end; });
+    if (MemoRecorder(memo) == &recorder) memo.entries.insert(memo.entries.begin(), {begin, end, keys, recorder.NewestWriteNote(begin, count), true});
 }
 
 }
