@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -51,6 +52,8 @@ PacketTimer::~PacketTimer() {
     profile.submissions = 0;
     profile.flushMs = 0;
     profile.dispatchOutcomes = {};
+    // The 10 s window boundary: what was printed to the (buffered) stderr directly reaches the log.
+    if (queue == 0) FlushStandardStreams();
 }
 
 }
