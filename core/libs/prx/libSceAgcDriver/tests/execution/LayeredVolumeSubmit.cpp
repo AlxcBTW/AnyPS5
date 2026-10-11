@@ -10,6 +10,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -276,10 +277,14 @@ int main() {
         Run("layered volume draw through the driver", std::nullopt);
         Run("layered volume draw through the driver under uncompressed DCC keys", std::uint8_t{0xff});
         Run("layered volume draw through the driver under 0000 fast-clear DCC keys", std::uint8_t{0x00});
+        // The driver's worker threads stop only in the libc shutdown (as in the clip and cull draw
+        // test); without it the device is torn down under them after main and the process crashes.
+        LibcRunShutdown_nid_postfix();
         std::puts("layered volume draws through the driver passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        try { LibcRunShutdown_nid_postfix(); } catch (...) {}
         return 1;
     }
 }
