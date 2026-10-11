@@ -184,11 +184,70 @@ void requireCmaskCodes(std::uint32_t codes) {
     Require(false, "CMASK codes " + listed + " were recorded, which are not a single-sample fast-clear code (0 cleared, 15 expanded)");
 }
 
+// APS5_EXP_CMASK_* (see Draw.hpp): counters for the [cmask-exp] line, colour targets by CMASK address.
+struct CmaskExperiment {
+    std::mutex mutex;
+    std::map<std::uint64_t, ColorTarget> targets;
+    std::map<std::string, std::uint64_t> counts;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+CmaskExperiment& TheCmaskExperiment() {
+    static CmaskExperiment experiment;
+    return experiment;
+}
+
+bool CmaskSyncRead() {
+    static const bool sync = std::getenv("APS5_EXP_CMASK_SYNC_READ") != nullptr;
+    return sync;
+}
+
+void countCmaskExperiment(const std::string& what) {
+    auto& experiment = TheCmaskExperiment();
+    std::lock_guard lock(experiment.mutex);
+    ++experiment.counts[what];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - experiment.lastReport < std::chrono::seconds(10)) return;
+    experiment.lastReport = now;
+    for (const auto& [name, count] : experiment.counts) std::fprintf(stderr, "[cmask-exp] 10 s: %s %llu\n", name.c_str(), static_cast<unsigned long long>(count));
+    experiment.counts.clear();
+}
+
+std::string targetName(const ColorTarget& color) {
+    char text[160];
+    std::snprintf(text, sizeof(text), "0x%llx %ux%u vk%d cmask 0x%llx dcc 0x%llx clear %08x %08x", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), static_cast<unsigned long long>(color.cmaskAddress), static_cast<unsigned long long>(color.dccAddress), color.clearWords[0], color.clearWords[1]);
+    return text;
+}
+
+void noteCmask(const ColorTarget& color, const char* outcome) {
+    static const bool trace = std::getenv("APS5_EXP_TRACE_CMASK") != nullptr;
+    if (!trace) return;
+    static std::mutex mutex;
+    static std::map<std::string, std::uint64_t> counts;
+    static auto lastReport = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[targetName(color) + " " + outcome];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    for (const auto& [what, count] : counts) std::fprintf(stderr, "[cmask-trace] 10 s: %s %llu\n", what.c_str(), static_cast<unsigned long long>(count));
+    counts.clear();
+}
+
 CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::vector<std::uint32_t>& cleared) {
     const auto address = color.cmaskAddress;
     const auto bytes = layout.Bytes();
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
     auto* recorder = Recorder::Active();
+    // APS5_EXP_CMASK_SYNC_READ: every recorded GPU write over the CMASK lands first, whatever the snapshot says.
+    if (CmaskSyncRead()) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+        if (locked && recorder != nullptr) {
+            Recorder::CountSync(2);
+            recorder->SyncThrough(address, bytes);
+        }
+        countCmaskExperiment(locked && recorder != nullptr ? "sync read: synced" : "sync read: no recorder or lock, flushed only");
+    }
     if (locked && recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) {
         Recorder::CountSync(2);
         recorder->SyncThrough(address, bytes);
@@ -259,13 +318,17 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const CmaskLayout layout(color.extent.width, color.extent.height);
     const auto bytes = layout.Bytes();
     Require(color.cmaskBytes == bytes, "CMASK size differs from the color target's CMASK layout");
-    if (cmaskProved(color.cmaskAddress, bytes)) return false;
+    if (cmaskProved(color.cmaskAddress, bytes)) {
+        noteCmask(color, "unchanged (proved)");
+        return false;
+    }
     auto* recorder = Recorder::Active();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
         const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
         const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
         if (view != VK_NULL_HANDLE) {
             recordCmaskClear(context, *recorder, *import, color, layout, resident, view);
+            noteCmask(color, "GPU CMASK clear recorded");
             return true;
         }
     }
@@ -274,6 +337,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const auto state = readCmask(color, layout, cleared);
     if (state == CmaskState::Expanded) {
         proveCmask(color.cmaskAddress, bytes, collected);
+        noteCmask(color, "read on the CPU: expanded");
         return false;
     }
     Require(color.dccAddress == 0, "CMASK fast clear of a DCC color target, whose clear belongs in its DCC keys");
@@ -287,6 +351,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     const std::vector<std::byte> expanded(bytes, std::byte{0xff});
     GuestMemory::Write(color.cmaskAddress, expanded, CmaskLayout::Alignment);
     proveCmask(color.cmaskAddress, bytes, GuestMemory::CollectWrites(color.cmaskAddress, bytes));
+    noteCmask(color, filled ? "read on the CPU: cleared, image filled" : state == CmaskState::Cleared ? "read on the CPU: cleared, texels stored" : "read on the CPU: partly cleared, texels stored");
     return filled;
 }
 
@@ -1780,6 +1845,14 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    // APS5_EXP_CMASK_DISPATCH_CLEAR: colour targets by CMASK address, for a later zero fill of it.
+    if (CmaskDispatchClearEnabled()) {
+        auto& experiment = TheCmaskExperiment();
+        std::lock_guard lock(experiment.mutex);
+        for (const auto& color : state.colors) {
+            if (color.cmaskAddress != 0 && color.mipCount == 1 && color.depth == 1) experiment.targets[color.cmaskAddress] = color;
+        }
+    }
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     PerformanceTimer timing("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -2443,6 +2516,66 @@ std::shared_ptr<StorageTexture> metadataPassResident(const Context& context, con
     return resident != nullptr && resident->GuestBytes() == color.bytes ? resident : nullptr;
 }
 
+}
+
+bool CmaskDispatchClearEnabled() {
+    static const bool enabled = std::getenv("APS5_EXP_CMASK_DISPATCH_CLEAR") != nullptr;
+    return enabled;
+}
+
+std::optional<std::pair<std::uint64_t, std::uint64_t>> MatchZeroFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups) {
+    static constexpr std::array<std::uint32_t, 6> kernel{0xd7460000u, 0x04010c04u, 0x7e020280u, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    if (userData.size() < 4 || numThreads != std::array<std::uint32_t, 3>{64u, 1u, 1u} || groups[1] != 1u || groups[2] != 1u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    if ((userData[3] >> 30u) != 0 || stride != 4 || swizzled || addTid) return std::nullopt;
+    const auto dwords = std::min<std::uint64_t>(static_cast<std::uint64_t>(groups[0]) * 64u, userData[2]);
+    const auto address = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    if (dwords == 0 || address == 0) return std::nullopt;
+    return std::pair<std::uint64_t, std::uint64_t>{address, dwords * 4u};
+}
+
+void ApplyCmaskZeroFill(const Context& context, std::uint64_t address, std::uint64_t bytes) {
+    std::vector<ColorTarget> covered;
+    {
+        auto& experiment = TheCmaskExperiment();
+        std::lock_guard lock(experiment.mutex);
+        for (const auto& [cmask, color] : experiment.targets) {
+            const auto cmaskBytes = CmaskLayout(color.extent.width, color.extent.height).Bytes();
+            if (cmask >= address && cmask + cmaskBytes <= address + bytes) covered.push_back(color);
+        }
+    }
+    if (covered.empty()) {
+        countCmaskExperiment("zero fill over no known CMASK");
+        return;
+    }
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    for (const auto& color : covered) {
+        const auto name = targetName(color);
+        if (recorder == nullptr || context.detiler == nullptr) {
+            countCmaskExperiment("zero fill of " + name + ": no recorder");
+            continue;
+        }
+        std::shared_ptr<StorageTexture> resident;
+        try {
+            resident = CachedStorageSurface(context, SurfaceForTarget(color));
+        } catch (const std::exception&) {
+            resident = nullptr;
+        }
+        const CmaskLayout layout(color.extent.width, color.extent.height);
+        const auto* import = HostImportFor(context, color.cmaskAddress, layout.Bytes());
+        const auto view = resident != nullptr && import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
+        if (view == VK_NULL_HANDLE) {
+            countCmaskExperiment("zero fill of " + name + (resident == nullptr ? ": no resident image" : import == nullptr ? ": CMASK not imported" : ": no element view"));
+            continue;
+        }
+        recordCmaskClear(context, *recorder, *import, color, layout, resident, view);
+        resident->MarkDirty();
+        countCmaskExperiment("zero fill of " + name + ": CMASK clear recorded");
+    }
 }
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass) {

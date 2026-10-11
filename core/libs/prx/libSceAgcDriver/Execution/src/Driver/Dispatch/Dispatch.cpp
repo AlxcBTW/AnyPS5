@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <cstdio>
+#include <memory>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -70,11 +72,31 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         partialGroups = Pm4::PartialGroupThreads({packet[1], packet[2], packet[3]}, {readRegister(queue.shader, 0x207), readRegister(queue.shader, 0x208), readRegister(queue.shader, 0x209)});
     }
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
+    // APS5_EXP_CMASK_DISPATCH_CLEAR: released when this function returns, after the dispatch is recorded.
+    std::shared_ptr<void> cmaskZeroFill;
     if (resolving) {
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        // APS5_EXP_CMASK_DISPATCH_CLEAR: a zero fill of a target's whole CMASK records that target's CMASK fast clear
+        // once this dispatch (or its fill HLE) is recorded, so the clear reads the zeros in queue order.
+        if (Graphics::CmaskDispatchClearEnabled() && indirectArguments == 0 && localDevice != nullptr) {
+            if (const auto fill = Graphics::MatchZeroFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) {
+                struct ApplyAfter {
+                    std::shared_ptr<VulkanDevice> device;
+                    std::pair<std::uint64_t, std::uint64_t> range;
+                    ~ApplyAfter() {
+                        try {
+                            device->ApplyCmaskZeroFill(range.first, range.second);
+                        } catch (const std::exception& error) {
+                            std::fprintf(stderr, "[cmask-exp] zero fill 0x%llx+0x%llx: %s\n", static_cast<unsigned long long>(range.first), static_cast<unsigned long long>(range.second), error.what());
+                        }
+                    }
+                };
+                cmaskZeroFill = std::make_shared<ApplyAfter>(ApplyAfter{localDevice, *fill});
+            }
+        }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;

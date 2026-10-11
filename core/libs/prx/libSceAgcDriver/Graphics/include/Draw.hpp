@@ -1,3 +1,7 @@
+#include <cstdint>
+#include <utility>
+#include <span>
+#include <array>
 #include <string>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -112,6 +116,17 @@ void CountDrawSkip(DrawSkip kind, double us);
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
+
+// Experiment switches for the SotS black specks (sots/menu-boot-cmask-exp, not for main), off by default:
+// APS5_EXP_CMASK_DISPATCH_CLEAR=1: a dispatch of the 6-word zero-fill kernel (d7460000 04010c04 7e020280
+// e0102000 80000100 bf810000) whose range covers the whole CMASK of a colour target drawn before records
+// that target's CMASK fast clear right behind it, as a draw binding the target would (recordCmaskClear).
+// APS5_EXP_CMASK_SYNC_READ=1: readCmask waits for every recorded GPU write over the CMASK before reading it.
+// APS5_EXP_TRACE_CMASK=1: what materializeCmaskClear did per colour target. All three print on
+// [cmask-exp] / [cmask-trace] lines every 10 s.
+bool CmaskDispatchClearEnabled();
+std::optional<std::pair<std::uint64_t, std::uint64_t>> MatchZeroFill(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const std::array<std::uint32_t, 3>& numThreads, const std::array<std::uint32_t, 3>& groups);
+void ApplyCmaskZeroFill(const Context& context, std::uint64_t address, std::uint64_t bytes);
 
 }
 

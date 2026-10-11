@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -1628,6 +1629,10 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
     return true;
+}
+
+void VulkanDevice::ApplyCmaskZeroFill(std::uint64_t address, std::uint64_t bytes) {
+    Graphics::ApplyCmaskZeroFill(graphicsContext(), address, bytes);
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
