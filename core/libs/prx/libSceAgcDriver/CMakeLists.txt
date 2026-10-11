@@ -1581,7 +1581,6 @@ if(BUILD_TESTING)
     endif()
 endif()
 
-<<<<<<< HEAD
 add_test_executable(agc_embedded_vertex_fetch_aliasing_tests EXCLUDE_FROM_ALL tests/EmbeddedVertexFetchAliasing.cpp)
 target_link_libraries(agc_embedded_vertex_fetch_aliasing_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_embedded_vertex_fetch_aliasing_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -1591,7 +1590,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_embedded_vertex_fetch_aliasing COMMAND agc_embedded_vertex_fetch_aliasing_tests)
     if(WIN32)
         set_tests_properties(agc_embedded_vertex_fetch_aliasing PROPERTIES ENVIRONMENT_MODIFICATION
-=======
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_constant_phi_tests EXCLUDE_FROM_ALL tests/ConstantPhi.cpp)
 target_link_libraries(agc_constant_phi_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_constant_phi_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -1601,7 +1603,6 @@ if(BUILD_TESTING)
     add_test(NAME agc_constant_phi COMMAND agc_constant_phi_tests)
     if(WIN32)
         set_tests_properties(agc_constant_phi PROPERTIES ENVIRONMENT_MODIFICATION
->>>>>>> 4454f83e (fix(shader): preserve distinct definitions while folding phi inputs)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
