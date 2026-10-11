@@ -342,6 +342,50 @@ void verifyLargeLoopExitFallback() {
     static_cast<void>(recompile(name, code, 64u));
 }
 
+void verifyNestedExitForwarders() {
+    constexpr auto none = InvalidControlFlowId;
+    constexpr std::array<std::array<std::uint32_t, 2>, 21> targets{{
+        {1, none}, {2, none}, {2, 3}, {2, 4}, {5, 6}, {1, 7}, {8, 9}, {10, none},
+        {11, 12}, {13, 14}, {1, 15}, {16, none}, {9, none}, {17, 18}, {19, none},
+        {16, none}, {none, none}, {16, none}, {15, 20}, {10, none}, {19, none},
+    }};
+    constexpr std::array<std::uint32_t, 21> order{0, 1, 2, 3, 4, 6, 9, 14, 19, 10, 15, 13, 18, 20, 17, 8, 12, 11, 5, 7, 16};
+    std::vector<std::uint32_t> code;
+    std::array<std::size_t, targets.size()> starts{};
+    std::vector<std::pair<std::size_t, std::uint32_t>> patches;
+    for (std::size_t at = 0; at < order.size(); ++at) {
+        const auto block = order[at];
+        starts[block] = code.size();
+        code.insert(code.end(), {0x060202ffu, 0x3f800000u + block * 0x10000u});
+        for (std::uint32_t padding = 0; padding < 17; ++padding) code.insert(code.end(), {0x060202ffu, 0x3f000000u + padding * 0x1000u + block * 0x10u});
+        const auto next = at + 1 < order.size() ? order[at + 1] : none;
+        const auto [first, second] = targets[block];
+        if (first == none) {
+            code.insert(code.end(), {0xe0700000u, 0x80010100u, 0xbf810000u});
+            continue;
+        }
+        if (second != none) {
+            code.push_back(0x7d880080u + block + 3u);
+            patches.emplace_back(code.size(), first);
+            code.push_back(0xbf870000u);
+        }
+        const auto branch = second != none ? second : first;
+        if (branch != next) {
+            patches.emplace_back(code.size(), branch);
+            code.push_back(0xbf820000u);
+        }
+    }
+    for (const auto& [instruction, target] : patches) {
+        const auto displacement = static_cast<std::int64_t>(starts[target]) - static_cast<std::int64_t>(instruction) - 1;
+        require(displacement >= -32768 && displacement <= 32767, "nested exit forwarder test branch is out of range");
+        code[instruction] |= static_cast<std::uint32_t>(displacement) & 0xffffu;
+    }
+    const std::string name("nested exit forwarders keep conditional selections structured");
+    static_cast<void>(verifyGraph(name, code));
+    static_cast<void>(recompile(name, code, 32u));
+    static_cast<void>(recompile(name, code, 64u));
+}
+
 void verifyProgram(const Program& program) {
     const std::string name(program.name);
     const auto result = verifyGraph(name, program.code);
@@ -1203,6 +1247,7 @@ done:
     try {
         verifyNullSwappc();
         verifyLargeLoopExitFallback();
+        verifyNestedExitForwarders();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         ++failures;

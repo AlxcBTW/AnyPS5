@@ -1444,10 +1444,12 @@ void Structurizer::Structurize(ControlFlowGraph& graph) const {
     const auto original = graph;
     try {
         structurize(graph, false, false, false);
+        if (!hasStructuredConstructs(graph)) throw std::runtime_error("CFG does not have structured constructs");
     } catch (const std::runtime_error&) {
         graph = original;
         try {
             structurize(graph, true, false, false);
+            if (!hasStructuredConstructs(graph)) throw std::runtime_error("CFG does not have structured constructs");
         } catch (const std::runtime_error&) {
             const auto error = std::current_exception();
             graph = original;
@@ -1850,6 +1852,15 @@ void Structurizer::verifyReducibility(const ControlFlowGraph& graph) const {
 }
 
 bool Structurizer::hasStructuredConstructs(const ControlFlowGraph& graph) const {
+    for (const auto& block : graph.blocks) {
+        const auto& terminator = block.terminator;
+        if (terminator.kind != TerminatorKind::ConditionalBranch || terminator.loopHeader || terminator.mergeBlock != InvalidControlFlowId || terminator.trueBlock == terminator.falseBlock) continue;
+        const BasicBlock* loop = nullptr;
+        for (const auto& header : graph.blocks) {
+            if (header.terminator.loopHeader && graph.Dominates(header.id, block.id) && !graph.Dominates(header.terminator.mergeBlock, block.id) && (loop == nullptr || graph.Dominates(loop->id, header.id))) loop = &header;
+        }
+        if (loop == nullptr || (terminator.trueBlock != loop->terminator.mergeBlock && terminator.trueBlock != loop->terminator.continueBlock && terminator.falseBlock != loop->terminator.mergeBlock && terminator.falseBlock != loop->terminator.continueBlock)) return false;
+    }
     auto structural = graph;
     for (auto& block : structural.blocks) {
         if (block.terminator.mergeBlock != InvalidControlFlowId) {
