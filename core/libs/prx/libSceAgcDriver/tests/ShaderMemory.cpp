@@ -2499,6 +2499,49 @@ void verifyRobustBufferAccess2() {
     require(robust.loads == guarded.loads && robust.stores == guarded.stores, "robust buffer access 2: the loads or stores changed");
 }
 
+void verifyPackedF16ConvertsOnce() {
+    using namespace ShaderRecompiler;
+    static std::array<std::uint32_t, 16> output{};
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 5> userData{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), 64u, 0xfacu, 0x3c00bc00u};
+    const std::array<std::uint32_t, 4> capabilities{spv::CapabilityShader, spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve};
+    const std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
+    const std::vector<std::uint32_t> code{0xcc0f4001u, 0x1a000900u, 0xe0700000u, 0x80000100u, 0xbf810000u};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
+    request.context.waveSize = 32;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00403000u;
+    request.target.spirvVersion = 0x00010600u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.layout.pushConstantSizeBytes = 128;
+    request.useCache = false;
+    AgcDriver::ShaderMemory memory({});
+    static_cast<void>(memory.Capture(request));
+    request.context.memory = memory.Regions();
+    const auto words = Recompile(request).spirv;
+    std::uint32_t half = 0;
+    std::uint32_t halfPair = 0;
+    std::size_t scalarConverts = 0;
+    std::size_t pairConverts = 0;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        require(count != 0 && count <= words.size() - cursor, "packed f16 conversion: truncated SPIR-V instruction");
+        const auto op = words[cursor] & 0xffffu;
+        if (op == spv::OpTypeFloat && words[cursor + 2] == 16u) half = words[cursor + 1];
+        if (op == spv::OpTypeVector && half != 0u && words[cursor + 2] == half && words[cursor + 3] == 2u) halfPair = words[cursor + 1];
+        if (op == spv::OpFConvert) {
+            scalarConverts += words[cursor + 1] == half;
+            pairConverts += words[cursor + 1] == halfPair;
+        }
+        cursor += count;
+    }
+    require(pairConverts == 1u && scalarConverts == 0u, "packed f16 conversion: v_pk_add_f16 does not convert both lanes with one OpFConvert");
+}
 void verifyInt64AtomicCapabilities() {
     using namespace ShaderRecompiler;
     constexpr std::uint32_t Format32_32UInt = 62;
@@ -3540,6 +3583,7 @@ int main(int argc, char** argv) {
         verifyComputedTexelOffsets();
         verifyShaderClockScopes();
         verifyRobustBufferAccess2();
+        verifyPackedF16ConvertsOnce();
         verifyInt64AtomicCapabilities();
         verifyCoherentBufferAccesses();
         verifyUnnormalizedSamplers();

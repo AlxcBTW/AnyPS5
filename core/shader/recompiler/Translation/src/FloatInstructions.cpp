@@ -40,8 +40,14 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return bits;
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, laneBits(sourceAt(inst, 0u), high), laneBits(sourceAt(inst, 1u), high)); };
-    IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : packHalf2x16(translateLane(false), translateLane(true));
-    if (!inst.destination.clamp || !dx10Clamp() || quietSnan) {
+    const bool lanesRewritten = !inst.destination.clamp || !dx10Clamp() || quietSnan;
+    const auto converted = [&] {
+        if (!lanesRewritten) return packHalf2x16(translateLane(false), translateLane(true));
+        IrValue& pair = ir.Emit(IrOpcode::CompositeConstructF32x2, IrType::F32x2, {&translateLane(false).Value(), &translateLane(true).Value()});
+        return IrU32(ir.Emit(IrOpcode::PackHalf2x16AnyNan, IrType::U32, {&pair}));
+    };
+    IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : converted();
+    if (lanesRewritten) {
         const auto isNan = [&](const IrU32& bits) {
             return IrU1(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffu)), ir.Constant(0x7c00u)));
         };
