@@ -31,12 +31,20 @@ struct MaskedSelectRefusal {
     std::string line;
 };
 
+struct MaskedSelectDrop {
+    std::uint32_t select = 0;
+    std::string line;
+};
+
 struct MaskedSelectEliminationStats {
     std::uint32_t removedSelects = 0;
+    std::vector<MaskedSelectDrop> drops;
     std::vector<MaskedSelectRefusal> refusals;
 };
 
 [[nodiscard]] bool AncillaryTraceEnabled();
+[[nodiscard]] bool ReadsPackedAncillary(const IrProgram& program);
+[[nodiscard]] std::string AncillarySummaryLine(const IrProgram& program, const MaskedSelectEliminationStats& stats, bool composed);
 
 class MaskedSelectEliminator {
 public:
