@@ -243,9 +243,25 @@ std::optional<std::size_t> packedField(std::uint32_t offset, std::uint32_t count
     return static_cast<std::size_t>(field - packedFields.begin());
 }
 
+bool isPackedAncillary(const IrValue& builtin) {
+    auto& kind = resolveArg(builtin, 0);
+    return isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::PackedAncillary;
+}
+
+IrValue& insertBefore(IrProgram& program, IrValue& next, IrOpcode opcode, IrValue& lhs, IrValue& rhs) {
+    IrValue& created = program.CreateValue(opcode, IrType::U32);
+    created.AddArgument(&lhs);
+    created.AddArgument(&rhs);
+    next.Parent()->InsertInstructionBefore(&next, &created);
+    return created;
+}
+
+IrValue& insertBuiltin(IrProgram& program, IrBuilder& builder, IrValue& next, StageInputKind kind) {
+    return insertBefore(program, next, IrOpcode::GetBuiltin, builder.Constant(static_cast<std::uint32_t>(kind)), builder.Constant(0u));
+}
+
 void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancillary) {
-    auto& kind = resolveArg(ancillary, 0);
-    if (!isImmediate(kind, IrType::U32) || static_cast<StageInputKind>(kind.ImmediateU32()) != StageInputKind::PackedAncillary) {
+    if (!isPackedAncillary(ancillary)) {
         return;
     }
     const std::vector<IrUse> uses = ancillary.OperandUses();
@@ -291,21 +307,12 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
     std::array<IrValue*, 2> fields {};
     const auto field = [&](std::size_t index) -> IrValue& {
         if (fields[index] == nullptr) {
-            const auto builtin = index == 0u ? StageInputKind::SampleId : StageInputKind::Layer;
-            IrValue& created = program.CreateValue(IrOpcode::GetBuiltin, IrType::U32);
-            created.AddArgument(&builder.Constant(static_cast<std::uint32_t>(builtin)));
-            created.AddArgument(&builder.Constant(0u));
-            ancillary.Parent()->InsertInstructionBefore(&ancillary, &created);
-            fields[index] = &created;
+            fields[index] = &insertBuiltin(program, builder, ancillary, index == 0u ? StageInputKind::SampleId : StageInputKind::Layer);
         }
         return *fields[index];
     };
     const auto emit = [&](IrOpcode opcode, IrValue& lhs, IrValue& rhs) -> IrValue& {
-        IrValue& created = program.CreateValue(opcode, IrType::U32);
-        created.AddArgument(&lhs);
-        created.AddArgument(&rhs);
-        ancillary.Parent()->InsertInstructionBefore(&ancillary, &created);
-        return created;
+        return insertBefore(program, ancillary, opcode, lhs, rhs);
     };
     if (!forwarded.empty()) {
         IrValue& sample = emit(IrOpcode::ShiftLeftLogical32, field(0u), builder.Constant(8u));
@@ -753,6 +760,26 @@ void ConstantFolder::Fold(IrProgram& program, std::span<IrBlock* const> blocks) 
 
 void ConstantFolder::Fold(IrProgram& program) const {
     Fold(program, program.BlockOrder());
+}
+
+bool ConstantFolder::ComposePackedAncillary(IrProgram& program) const {
+    std::vector<IrValue*> words;
+    for (IrBlock* block : program.BlockOrder()) {
+        for (IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::GetBuiltin && inst->HasUses() && isPackedAncillary(*inst)) {
+                words.push_back(inst);
+            }
+        }
+    }
+    IrBuilder builder(program);
+    for (IrValue* word : words) {
+        IrValue& primitive = insertBuiltin(program, builder, *word, StageInputKind::RasterPrimitive);
+        IrValue& sample = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, insertBuiltin(program, builder, *word, StageInputKind::SampleId), builder.Constant(8u));
+        IrValue& layer = insertBefore(program, *word, IrOpcode::ShiftLeftLogical32, insertBuiltin(program, builder, *word, StageInputKind::Layer), builder.Constant(16u));
+        IrValue& low = insertBefore(program, *word, IrOpcode::BitwiseOr32, primitive, sample);
+        word->ReplaceAllUsesWith(&insertBefore(program, *word, IrOpcode::BitwiseOr32, low, layer));
+    }
+    return !words.empty();
 }
 
 }
