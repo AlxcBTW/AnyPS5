@@ -1165,6 +1165,8 @@ bool hasSharedExitSelection(const ControlFlowGraph& graph, const NaturalLoop& lo
         const auto globalMerge = graph.FindNearestCommonPostDominator(block.terminator.trueBlock, block.terminator.falseBlock);
         if (globalMerge != InvalidControlFlowId && isInsideLoopConstruct(graph, loop, globalMerge)) continue;
         for (const auto exit : loop.exitBlocks) {
+            const auto& forwarder = graph.FindBlock(exit);
+            if (forwarder.instructionBegin == forwarder.instructionEnd && forwarder.terminator.kind == TerminatorKind::Branch && forwarder.terminator.gotoVariable != InvalidControlFlowId && forwarder.terminator.trueBlock == loop.mergeBlock) continue;
             if (exit != loop.mergeBlock && graph.Dominates(block.id, exit) && reachesWithinIteration(graph, loop, block.terminator.trueBlock, exit) && reachesWithinIteration(graph, loop, block.terminator.falseBlock, exit)) return true;
         }
     }
