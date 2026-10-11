@@ -85,19 +85,21 @@ struct Options {
     std::filesystem::path journal;
     std::optional<std::filesystem::path> frames;
     std::optional<std::filesystem::path> gpuTimes;
+    std::optional<std::filesystem::path> dumpTargets;
     std::size_t repeat = 1;
 };
 
 Options parse(int argc, char** argv) {
-    require(argc >= 2, "usage: agc_journal_replay <journal directory> [--frames <directory>] [--repeat <count>] [--gpu-times <json file>]");
+    require(argc >= 2, "usage: agc_journal_replay <journal directory> [--frames <directory>] [--repeat <count>] [--gpu-times <json file>] [--dump-targets <directory>]");
     Options options;
-    options.journal = argv[1];
+    options.journal = std::filesystem::absolute(argv[1]);
     for (int index = 2; index < argc; ++index) {
         const std::string option = argv[index];
         require(index + 1 < argc, option + " needs a value");
         const char* value = argv[++index];
-        if (option == "--frames") options.frames = value;
-        else if (option == "--gpu-times") options.gpuTimes = value;
+        if (option == "--frames") options.frames = std::filesystem::absolute(value);
+        else if (option == "--gpu-times") options.gpuTimes = std::filesystem::absolute(value);
+        else if (option == "--dump-targets") options.dumpTargets = std::filesystem::absolute(value);
         else if (option == "--repeat") options.repeat = static_cast<std::size_t>(std::stoul(value));
         else throw std::runtime_error("unknown option " + option);
     }
@@ -231,6 +233,11 @@ int main(int argc, char** argv) {
         const auto options = parse(argc, argv);
         applyEnvironment(options.journal);
         if (options.gpuTimes) setVariable("APS5_PROFILE_GPU", "1");
+        if (options.dumpTargets) {
+            setVariable("APS5_DUMP_TARGETS", "1000000");
+            std::filesystem::create_directories(*options.dumpTargets);
+            std::filesystem::current_path(*options.dumpTargets);
+        }
         const auto report = AgcDriver::Journal::Replay(options.journal, {options.repeat, options.gpuTimes.has_value()});
         AgcDriverShutdown_nid_postfix();
         const auto& first = report.iterations.front();
