@@ -235,6 +235,7 @@ CompiledVariant sampleVariant() {
     info.info.hasBitwiseXor = true;
     info.info.usesDma = true;
     info.info.usesFaultBuffer = true;
+    info.info.rasterPrimitive = true;
     info.bindings.pushDataStartDword = 2;
     info.bindings.memoryOffsetDword = 1;
     info.bindings.memoryOffsetCount = 5;
