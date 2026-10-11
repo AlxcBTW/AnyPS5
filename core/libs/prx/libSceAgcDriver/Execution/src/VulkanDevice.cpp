@@ -3484,6 +3484,48 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
     return dispatch(shader, 0, 0, 0, arguments, snapshots, programAddress, std::move(prepared), recipe);
 }
 
+namespace {
+
+// exp: APS5_EXP_INDIRECT_GPU=1 keeps an indirect dispatch on the GPU when its arguments have a
+// pending label or a listed writer over them but every such write is already recorded on the
+// device's one queue: labels stored by the GPU (none queued, none landing by a completion's CPU
+// store) and no copied region the CPU stores back when the writer retires. The dispatch's barrier
+// (ALL_COMMANDS to DRAW_INDIRECT) then orders those writes before the GPU reads the arguments.
+// APS5_EXP_INDIRECT_GPU_VERIFY=1 keeps the CPU read and counts what the switch would change.
+int IndirectGpuMode() {
+    static const int mode = std::getenv("APS5_EXP_INDIRECT_GPU_VERIFY") != nullptr ? 2 : std::getenv("APS5_EXP_INDIRECT_GPU") != nullptr ? 1 : 0;
+    return mode;
+}
+
+struct IndirectGpuStats {
+    std::atomic<std::uint64_t> pending{0}, eligible{0}, labels{0}, copied{0}, notImported{0}, readUs{0}, labelDiffers{0}, overLimit{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+IndirectGpuStats& IndirectGpu() {
+    static IndirectGpuStats stats;
+    return stats;
+}
+
+void ReportIndirectGpu() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = IndirectGpu();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.reported.load();
+    if (last == 0) {
+        stats.reported.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !stats.reported.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[exp-indirect] (10 s): %llu indirect dispatches with a pending label or listed writer over the arguments: %llu %s, kept on the CPU: %llu queued or completion label, %llu copied write, %llu not imported; verify: CPU reads of the eligible %.1f ms, %llu label values differ from the bytes read, %llu over the workgroup limit\n",
+        static_cast<unsigned long long>(stats.pending.exchange(0)), static_cast<unsigned long long>(stats.eligible.exchange(0)), IndirectGpuMode() == 1 ? "recorded on the GPU" : "eligible (read on the CPU for the verification)",
+        static_cast<unsigned long long>(stats.labels.exchange(0)), static_cast<unsigned long long>(stats.copied.exchange(0)), static_cast<unsigned long long>(stats.notImported.exchange(0)),
+        stats.readUs.exchange(0) / 1000.0, static_cast<unsigned long long>(stats.labelDiffers.exchange(0)), static_cast<unsigned long long>(stats.overLimit.exchange(0)));
+}
+
+}
+
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -3506,6 +3548,7 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         }
         return false;
     };
+    bool verifyEligible = false;
     if (Graphics::StorageTexture::FlushPending(arguments, 12, nullptr, "indirect dispatch arguments")) {
         // As the flush hook does: the stores were only recorded and the CPU is about to read them.
         outcome.cpuReason = 1;
@@ -3516,6 +3559,27 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     } else if (labelPending() || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })
                || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
         outcome.cpuReason = 2;
+        // exp (APS5_EXP_INDIRECT_GPU): see IndirectGpuMode.
+        if (IndirectGpuMode() != 0) {
+            auto& stats = IndirectGpu();
+            stats.pending.fetch_add(1, std::memory_order_relaxed);
+            const auto copied = [&](const auto& writer) { return writer->CopiedWritesOverlap(arguments, 12); };
+            if (!recorder.LabelsRecordedOnGpu(arguments, 12)) {
+                stats.labels.fetch_add(1, std::memory_order_relaxed);
+            } else if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), copied) || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), copied)) {
+                stats.copied.fetch_add(1, std::memory_order_relaxed);
+            } else if (IndirectGpuMode() == 2) {
+                stats.eligible.fetch_add(1, std::memory_order_relaxed);
+                verifyEligible = true;
+            } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
+                stats.notImported.fetch_add(1, std::memory_order_relaxed);
+                outcome.cpuReason = 3;
+            } else {
+                stats.eligible.fetch_add(1, std::memory_order_relaxed);
+                outcome.cpuReason = 0;
+            }
+            ReportIndirectGpu();
+        }
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held
         // here, by every Dispatch caller) and Keeps a retired VkBuffer while the recorder is busy.
@@ -3531,10 +3595,25 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     if (outcome.cpuReason == 0) return;
     // The read waits for the producing batch through the flush hook, as the driver's resolve
     // did for every indirect dispatch before; the counts then go through the direct checks.
+    // exp (APS5_EXP_INDIRECT_GPU_VERIFY): the label values the GPU stores, to compare with the read.
+    std::array<std::optional<std::uint32_t>, 3> labelValues;
+    if (verifyEligible) {
+        for (std::size_t i = 0; i < labelValues.size(); ++i) {
+            if (const auto hit = recorder.PendingLabel(arguments + 4 * i, 4, 0)) labelValues[i] = static_cast<std::uint32_t>(hit->value);
+        }
+    }
     const auto readStart = std::chrono::steady_clock::now();
     std::array<std::uint32_t, 3> groups{};
     GuestMemory::Read(arguments, std::as_writable_bytes(std::span(groups)), 4);
     outcome.argumentReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+    if (verifyEligible) {
+        auto& stats = IndirectGpu();
+        stats.readUs.fetch_add(static_cast<std::uint64_t>(outcome.argumentReadMs * 1000.0), std::memory_order_relaxed);
+        for (std::size_t i = 0; i < labelValues.size(); ++i) {
+            if (labelValues[i].has_value() && *labelValues[i] != groups[i]) stats.labelDiffers.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (groups[0] > limit[0] || groups[1] > limit[1] || groups[2] > limit[2]) stats.overLimit.fetch_add(1, std::memory_order_relaxed);
+    }
     record.x = groups[0];
     record.y = groups[1];
     record.z = groups[2];

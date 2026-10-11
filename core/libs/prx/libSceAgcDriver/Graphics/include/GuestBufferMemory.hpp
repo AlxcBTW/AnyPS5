@@ -238,6 +238,10 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    // exp (APS5_EXP_INDIRECT_GPU): whether a written range over [address, address + bytes) lies in a
+    // region the CPU stores back when the work retires (HasCopiedWrites' rule, per range); a range
+    // without a region of its own, or running past it, counts as one.
+    bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.

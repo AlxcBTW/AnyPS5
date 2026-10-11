@@ -2906,6 +2906,17 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     return false;
 }
 
+bool Recorder::LabelsRecordedOnGpu(std::uint64_t address, std::size_t bytes) const {
+    std::lock_guard tableLock(labelTableMutex);
+    if (bytes == 0) return true;
+    const auto end = address + bytes;
+    for (auto it = labels.lower_bound(address); it != labels.end() && it->first < end; ++it) {
+        if (it->second.batch == nullptr || it->second.behindCompletion) return false;
+    }
+    if (const auto first = queuedLabels.lower_bound(address); first != queuedLabels.end() && first->first < end) return false;
+    return !wideLabelInLocked(address, bytes);
+}
+
 bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const {
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;

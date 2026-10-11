@@ -303,6 +303,10 @@ public:
     // where a per-dword lookup would not do.
     bool PendingLabelIn(std::uint64_t address, std::size_t bytes) const;
     bool CompletionLabelIn(std::uint64_t address, std::size_t bytes) const;
+    // exp (APS5_EXP_INDIRECT_GPU): whether every label over [address, address + bytes) is stored by
+    // the GPU in a recorded batch: none queued (any queue), none landing only by a completion's CPU
+    // store, no wide label. A GPU read recorded later in the queue then sees their values.
+    bool LabelsRecordedOnGpu(std::uint64_t address, std::size_t bytes) const;
     // PendingLabel of the active recorder WITHOUT GuestMemory::GpuMutex: the table has a small mutex
     // of its own (every mutation holds both), so a WAIT_REG_MEM consults it without queueing behind
     // device work. Nothing is done under the table mutex but the lookup (it never takes the GPU mutex).

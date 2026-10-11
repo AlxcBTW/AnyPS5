@@ -805,6 +805,34 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
     return *writers;
 }
 
+namespace {
+
+// exp: APS5_EXP_INDIRECT_GPU=1 for indirect draws (see the decide lambda in Draw).
+bool IndirectGpuDraws() {
+    static const bool enabled = std::getenv("APS5_EXP_INDIRECT_GPU") != nullptr && std::getenv("APS5_EXP_INDIRECT_GPU_VERIFY") == nullptr;
+    return enabled;
+}
+
+void NoteIndirectGpuDraw(bool recorded) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> pending{0}, kept{0};
+    static std::atomic<std::int64_t> reported{0};
+    if (!profile) return;
+    pending.fetch_add(1, std::memory_order_relaxed);
+    if (recorded) kept.fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = reported.load();
+    if (last == 0) {
+        reported.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !reported.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[exp-indirect-draw] (10 s): %llu indirect draw argument ranges with a pending label or listed writer over them, %llu kept on the GPU (APS5_EXP_INDIRECT_GPU%s)\n",
+        static_cast<unsigned long long>(pending.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), IndirectGpuDraws() ? "=1" : " off");
+}
+
+}
+
 const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
@@ -1930,10 +1958,18 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 }
                 return IndirectDrawPath::PendingImage;
             }
-            if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
             const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+            if ((recorder != nullptr && recorder->PendingLabelIn(address, bytes)) || (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps))
+                || std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) {
+                // exp (APS5_EXP_INDIRECT_GPU=1): as for indirect dispatches (VulkanDevice::decideIndirect),
+                // the draw stays on the GPU when every pending write over its arguments is recorded on
+                // the device queue; recordIndirectArguments' barrier orders them before the read.
+                const auto copied = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
+                const bool recorded = IndirectGpuDraws() && recorder != nullptr && recorder->LabelsRecordedOnGpu(address, bytes) && !(context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), copied))
+                                      && !std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), copied);
+                NoteIndirectGpuDraw(recorded);
+                if (!recorded) return IndirectDrawPath::PendingLabelOrCopy;
+            }
             if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
             return IndirectDrawPath::Gpu;
         };
