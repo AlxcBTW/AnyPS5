@@ -172,6 +172,13 @@ struct HostImports {
     // writtenAtImport): its import window then stamps a range the import leaves watched.
     bool importsStampPages = true;
     bool dmaBufImportsStampPages = true;
+    // exp (APS5_EXP_IMPORT_MEMO=1): the import HostImportFor's fast path last found per 64 KiB slot
+    // of address, with the epoch it was found at (see HostImportFor).
+    struct LookupMemo {
+        std::uint64_t epoch = 0;
+        const HostImport* entry = nullptr;
+    };
+    std::array<LookupMemo, 256> lookupMemo{};
 };
 
 HostImports& Imports() {
@@ -1993,13 +2000,33 @@ void SetHostImportWindow(std::uint64_t bytes) {
 
 namespace {
 
+// exp (APS5_EXP_IMPORT_MEMO=1): the fast path remembers the import it found per 64 KiB slot of
+// address. A later lookup inside that import takes it without walking the map while no import was
+// dropped since (HostImports::epoch, which every drop bumps): imports never overlap, so the import
+// findImport would return for a range inside it is that one.
+std::atomic<int> importMemoMode{-1};
+std::atomic<int> sharedLeaseMode{-1};
+
+bool importMemo() {
+    auto enabled = importMemoMode.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        enabled = std::getenv("APS5_EXP_IMPORT_MEMO") != nullptr ? 1 : 0;
+        importMemoMode.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
+}
+
 // exp (APS5_EXP_SHARED_LEASE=1): the lookups that go through the registry (an address without an
 // import, or the registry moved since the imports were reconciled) take the registry's shared lease
 // (GuestAllocationsAcquireShared, built once per registry generation) instead of copying every range
 // per call. The same ranges either way; APS5_VERIFY_SHARED_LEASE=1 compares them with a copy.
 bool sharedLease() {
-    static const bool enabled = std::getenv("APS5_EXP_SHARED_LEASE") != nullptr;
-    return enabled;
+    auto enabled = sharedLeaseMode.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        enabled = std::getenv("APS5_EXP_SHARED_LEASE") != nullptr ? 1 : 0;
+        sharedLeaseMode.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
 }
 
 void verifySharedLease(const GuestAllocations::Lease& shared) {
@@ -2017,6 +2044,11 @@ void verifySharedLease(const GuestAllocations::Lease& shared) {
 
 }
 
+void SetImportLookupExperiments(bool shared, bool memo) {
+    sharedLeaseMode.store(shared ? 1 : 0, std::memory_order_relaxed);
+    importMemoMode.store(memo ? 1 : 0, std::memory_order_relaxed);
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
@@ -2024,7 +2056,12 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     std::lock_guard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
-        if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+        auto* memo = importMemo() ? &state.lookupMemo[(address >> 16u) & (state.lookupMemo.size() - 1u)] : nullptr;
+        if (memo != nullptr && memo->entry != nullptr && memo->epoch == state.epoch && address >= memo->entry->base && address + bytes <= memo->entry->base + memo->entry->bytes) return memo->entry;
+        if (const auto* entry = findImport(state, address, address + bytes)) {
+            if (memo != nullptr) *memo = {state.epoch, entry};
+            return entry;
+        }
     }
     const auto resolve = [&](const GuestAllocations::Lease& lease) -> const HostImport* {
         refreshImports(context, state, lease);

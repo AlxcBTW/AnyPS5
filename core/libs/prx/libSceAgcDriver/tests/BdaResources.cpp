@@ -89,6 +89,38 @@ void importCrossingTests(const Context& context, const BdaTestAccess& access) {
     ::operator delete(block, std::align_val_t{half});
 }
 
+// APS5_EXP_IMPORT_MEMO: repeated lookups inside an import return it, a lookup past its end does
+// not, and once its range left the registry no lookup returns it (or anything) again.
+void importMemoTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(2 * piece, std::align_val_t{piece});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](std::uint8_t* range, bool add, bool writable) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, writable, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(guest, true, false);
+    change(guest + piece, true, true);
+    const auto* readOnly = HostImportFor(importing, first + 64, 64);
+    Require(readOnly != nullptr && readOnly->base == first && readOnly->bytes == piece, "the read-only range was not imported alone");
+    for (std::uint64_t offset = 0; offset < piece; offset += 4096) Require(HostImportFor(importing, first + offset, 64) == readOnly, "a remembered import was not returned inside its range");
+    const auto* writable = HostImportFor(importing, first + piece - 16, 32);
+    Require(writable == nullptr, "a view crossing ranges of different access was imported");
+    const auto* second = HostImportFor(importing, first + piece, 64);
+    Require(second != nullptr && second != readOnly && second->base == first + piece, "the writable range was served by the read-only range's import");
+    change(guest, false, false);
+    Require(HostImportFor(importing, first + 64, 64) == nullptr, "a removed range's import was served from the memo");
+    Require(HostImportFor(importing, first + piece, 64) == second, "the writable range's import changed with its neighbour's removal");
+    change(guest + piece, false, false);
+    Require(HostImportFor(importing, first + piece, 64) == nullptr, "the last removed range's import was served from the memo");
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importSpanTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     void* block = ::operator new(3 * piece, std::align_val_t{piece});
@@ -1139,6 +1171,13 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
+    // The same lookups through the registry's shared lease and the remembered imports: a removed
+    // range's import is never served from the memo (its drop moved the epoch).
+    SetImportLookupExperiments(true, true);
+    importCrossingTests(context, access);
+    importSpanTests(context);
+    importMemoTests(context);
+    SetImportLookupExperiments(false, false);
     importWindowTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);

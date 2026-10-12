@@ -65,6 +65,8 @@ bool WatchedImportsStampPages();
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
+// Overrides APS5_EXP_SHARED_LEASE and APS5_EXP_IMPORT_MEMO (tests).
+void SetImportLookupExperiments(bool sharedLease, bool memo);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
