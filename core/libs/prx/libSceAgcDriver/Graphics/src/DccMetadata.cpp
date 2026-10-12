@@ -719,6 +719,7 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
     return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
 }
 
+
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
