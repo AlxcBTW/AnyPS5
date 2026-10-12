@@ -1542,7 +1542,22 @@ void LogStorageStep(const char* step, int line, const char* function) {
 
 }
 
+void StorageTexture::ensureOriginal() {
+    if (original.size() == guestBytes) return;
+    CountHostCopy(HostCopyKind::StorageOriginal, static_cast<std::int64_t>(guestBytes) - static_cast<std::int64_t>(original.size()));
+    original.resize(static_cast<std::size_t>(guestBytes));
+}
+
+void StorageTexture::dropInvalidOriginal() noexcept {
+    static const bool enabled = std::getenv("APS5_EXP_DROP_ORIGINALS") != nullptr;
+    if (!enabled || originalValid || original.empty()) return;
+    CountHostCopy(HostCopyKind::StorageOriginal, -static_cast<std::int64_t>(original.size()));
+    std::vector<std::byte>().swap(original);
+    comparedGuestBytes = {};
+}
+
 bool StorageTexture::Refresh() {
+    const DropInvalidOriginal dropOnReturn{this};
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (refreshProved()) {
@@ -1905,6 +1920,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+    ensureOriginal();
     comparedGuestBytes = {};
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -3980,6 +3996,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const DropInvalidOriginal dropOnReturn{this};
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -4243,6 +4260,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
     const bool wasValid = originalValid;
+    ensureOriginal();
     if (!wasValid) GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);

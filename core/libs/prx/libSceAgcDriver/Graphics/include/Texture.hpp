@@ -347,6 +347,15 @@ private:
     // upload everything).
     void upload(const std::vector<bool>* layers = nullptr);
     void captureGuestBytes(const std::vector<bool>* layers);
+    // exp (APS5_EXP_DROP_ORIGINALS=1): `original` is freed while it does not vouch for the guest bytes
+    // (!originalValid: every use re-reads them first), when Refresh or a store returns; ensureOriginal
+    // sizes it again before a read into it.
+    void ensureOriginal();
+    void dropInvalidOriginal() noexcept;
+    struct DropInvalidOriginal {
+        StorageTexture* texture;
+        ~DropInvalidOriginal() { texture->dropInvalidOriginal(); }
+    };
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block

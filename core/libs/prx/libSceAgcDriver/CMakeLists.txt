@@ -780,6 +780,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_storage_baseline_settled PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # The storage-image cases again with the invalid CPU copies freed (exp APS5_EXP_DROP_ORIGINALS).
+    add_test(NAME agc_storage_baseline_settled_drop_originals COMMAND agc_driver_recorder_tests --settled-baseline-only)
+    add_test(NAME agc_unchanged_cpu_stamps_drop_originals COMMAND agc_driver_recorder_tests --unchanged-cpu-stamps-only)
+    set_tests_properties(agc_storage_baseline_settled_drop_originals agc_unchanged_cpu_stamps_drop_originals PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_EXP_DROP_ORIGINALS=1")
+    if(WIN32)
+        set_tests_properties(agc_storage_baseline_settled_drop_originals agc_unchanged_cpu_stamps_drop_originals PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_host_import_unmap COMMAND agc_driver_recorder_tests --host-import-unmap-only)
     set_tests_properties(agc_host_import_unmap PROPERTIES SKIP_RETURN_CODE 77)
     add_test(NAME agc_unit_shadow COMMAND agc_driver_recorder_tests --unit-shadow-only)
