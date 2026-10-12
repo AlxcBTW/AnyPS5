@@ -724,6 +724,40 @@ enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow, Fresh };
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation);
 #endif
 
+#ifdef _WIN32
+// Tables over the whole guest arena (~992 GiB in 64 KiB blocks: 62 MiB each) come from VirtualAlloc,
+// whose pages are zero until touched, and the vector default-initializes its elements instead of
+// writing zeros: only the parts covering guest memory in use take RAM. exp (APS5_EXP_LAZY_TABLES=1);
+// without it the tables are zeroed at once, touching every page as before.
+template <typename T>
+struct ZeroPageAllocator {
+    using value_type = T;
+    ZeroPageAllocator() = default;
+    template <typename U>
+    ZeroPageAllocator(const ZeroPageAllocator<U>&) noexcept {}
+    T* allocate(std::size_t count) {
+        void* memory = VirtualAlloc(nullptr, count * sizeof(T), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (memory == nullptr) throw std::bad_alloc();
+        return static_cast<T*>(memory);
+    }
+    void deallocate(T* pointer, std::size_t) noexcept { VirtualFree(pointer, 0, MEM_RELEASE); }
+    template <typename U>
+    void construct(U* pointer) noexcept { ::new (static_cast<void*>(pointer)) U; }
+    template <typename U, typename... Arguments>
+    void construct(U* pointer, Arguments&&... arguments) { ::new (static_cast<void*>(pointer)) U(std::forward<Arguments>(arguments)...); }
+    template <typename U>
+    bool operator==(const ZeroPageAllocator<U>&) const noexcept { return true; }
+};
+
+using BlockTable = std::vector<std::uint32_t, ZeroPageAllocator<std::uint32_t>>;
+
+void sizeBlockTable(BlockTable& table, std::size_t count) {
+    static const bool lazy = std::getenv("APS5_EXP_LAZY_TABLES") != nullptr;
+    table.resize(count);
+    if (!lazy) std::fill(table.begin(), table.end(), 0u);
+}
+#endif
+
 struct WriteTracker {
     std::mutex mutex;
     bool initialized = false;
@@ -732,13 +766,13 @@ struct WriteTracker {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     // Generation of the last collected write per 64 KiB block of the arena.
-    std::vector<std::uint32_t> blocks;
+    BlockTable blocks;
     // The same, stamped by collects only (dirty pages = CPU stores), never by MarkWritten: the
     // late label rule asks whether the CPU touched a label's block, and the driver's own GPU label
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
-    std::vector<std::uint32_t> cpuBlocks;
-    std::vector<std::uint32_t> writtenBlocks;
-    std::vector<std::uint32_t> walkedBlocks;
+    BlockTable cpuBlocks;
+    BlockTable writtenBlocks;
+    BlockTable walkedBlocks;
     WriteWatchCoverage coverage;
 #else
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
@@ -780,10 +814,10 @@ struct WriteTracker {
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
-        blocks.assign(size / WriteBlockBytes + 1, 0);
-        cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
-        writtenBlocks.assign(size / WriteBlockBytes + 1, 0);
-        walkedBlocks.assign(size / WriteBlockBytes + 1, 0);
+        sizeBlockTable(blocks, size / WriteBlockBytes + 1);
+        sizeBlockTable(cpuBlocks, size / WriteBlockBytes + 1);
+        sizeBlockTable(writtenBlocks, size / WriteBlockBytes + 1);
+        sizeBlockTable(walkedBlocks, size / WriteBlockBytes + 1);
         coverage.Initialize(base, size);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
