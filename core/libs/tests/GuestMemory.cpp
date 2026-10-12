@@ -284,6 +284,34 @@ static void CheckDirectMemoryFollowsPhysicalPages() {
     Require(sceKernelReleaseDirectMemory(again, page * 2) == 0);
 }
 
+static void CheckSparseDirectMemoryBacking() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t size = 256u * 1024u * 1024u;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, size, 0, 0, &physical) == 0);
+    void* first = nullptr;
+    void* last = nullptr;
+    Require(sceKernelMapDirectMemory(&first, page, 3, 0, physical, 0) == 0);
+    Require(sceKernelMapDirectMemory(&last, page, 3, 0, physical + size - page, 0) == 0);
+    auto* firstBytes = static_cast<unsigned char*>(first);
+    auto* lastBytes = static_cast<unsigned char*>(last);
+    Require(firstBytes[0] == 0 && firstBytes[page - 1] == 0 && lastBytes[0] == 0 && lastBytes[page - 1] == 0);
+    firstBytes[0] = 17;
+    lastBytes[page - 1] = 29;
+    void* alias = nullptr;
+    Require(sceKernelMapDirectMemory(&alias, page, 3, 0, physical + size - page, 0) == 0);
+    auto* aliasBytes = static_cast<unsigned char*>(alias);
+    Require(aliasBytes[page - 1] == 29 && aliasBytes[0] == 0);
+    aliasBytes[page - 1] = 41;
+    Require(lastBytes[page - 1] == 41 && firstBytes[0] == 17);
+    Require(sceKernelMunmap(last, page) == 0 && sceKernelMunmap(alias, page) == 0);
+    last = nullptr;
+    Require(sceKernelMapDirectMemory(&last, page, 3, 0, physical + size - page, 0) == 0);
+    Require(static_cast<unsigned char*>(last)[page - 1] == 41);
+    Require(sceKernelMunmap(first, page) == 0 && sceKernelMunmap(last, page) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, size) == 0);
+}
+
 static void CheckReleaseDirectMemoryClearsMappings() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -1852,6 +1880,7 @@ int main() {
     CheckCheckedReleaseDirectMemory();
     CheckAudioCoprocessorProtection();
     CheckDirectMemoryFollowsPhysicalPages();
+    CheckSparseDirectMemoryBacking();
     CheckReleaseDirectMemoryClearsMappings();
     CheckReleaseDirectMemoryRejectsInvalidRanges();
     CheckFixedMappingReplacesPartialOverlap();
