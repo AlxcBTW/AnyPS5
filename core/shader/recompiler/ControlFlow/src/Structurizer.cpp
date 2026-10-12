@@ -1400,6 +1400,7 @@ struct TarjanState {
     std::vector<StronglyConnectedComponent> components;
 };
 
+
 void tarjanVisit(TarjanState& state, std::uint32_t blockId) {
     state.index[blockId] = state.nextIndex;
     state.lowlink[blockId] = state.nextIndex;
