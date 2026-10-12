@@ -98,6 +98,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_package_release.py)
         add_test(NAME pad_input COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_pad_input.py)
+        add_test(NAME perf_report COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_perf_report.py)
         set_tests_properties(pad_input PROPERTIES TIMEOUT 20)
     endif()
 endif()
