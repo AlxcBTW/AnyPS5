@@ -151,18 +151,18 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
-// Two adjacent ranges, each larger than the import window, are imported apart; a buffer bound across
-// both is joined into one import when it is bound, instead of being copied whole on every use.
+// Adjacent ranges, each larger than the import window, are imported apart; a buffer bound across two
+// of them joins them into one import when it is bound, instead of being copied whole on every use.
 void importJoinTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
     constexpr std::size_t large = 3 * piece;
-    void* block = ::operator new(2 * large + 2 * window, std::align_val_t{window});
+    void* block = ::operator new(3 * large + 5 * piece, std::align_val_t{window});
     auto* guest = static_cast<std::uint8_t*>(block);
-    std::memset(guest, 0x11, large);
-    std::memset(guest + large, 0x22, large);
+    std::memset(guest, 0x11, 3 * large);
     const auto first = reinterpret_cast<std::uintptr_t>(block);
     const auto second = first + large;
+    const auto third = second + large;
     auto importing = context;
     importing.hostImportAlignment = piece;
     SetHostImportWindow(window);
@@ -172,6 +172,16 @@ void importJoinTests(const Context& context) {
         if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, bytes, true, false, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto bind = [&](std::uintptr_t address) {
+        GuestBufferMemory plain(importing);
+        plain.AddReadable(address, 32);
+        plain.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = plain.Descriptor(address, 32, adjustment);
+        const auto copied = plain.CopiedBytes();
+        plain.WriteBack();
+        return std::pair{view.buffer, copied};
     };
     change(guest, large, true);
     change(guest + large, large, true);
@@ -193,35 +203,31 @@ void importJoinTests(const Context& context) {
         leased.WriteBack();
     }
     const auto joinedBuffer = HostImportFor(importing, first, 16)->buffer;
-    {
-        GuestBufferMemory plain(importing);
-        plain.AddReadable(second - 16, 32);
-        plain.Upload(false);
-        Require(plain.CopiedBytes() == 0, "a buffer bound across the joined ranges was copied");
-        std::uint32_t adjustment = 0;
-        Require(plain.Descriptor(second - 16, 32, adjustment).buffer == joinedBuffer, "a later bind across the joined ranges did not use the joined import");
-        plain.WriteBack();
-    }
+    const auto [again, copied] = bind(second - 16);
+    Require(again == joinedBuffer && copied == 0, "a later bind across the joined ranges did not use the joined import");
     // Pieces of a heap growing 64 KiB at a time are never joined across a window edge.
-    auto* heap = guest + 2 * large;
-    change(heap + window - piece, piece, true);
-    change(heap + window, piece, true);
-    {
-        GuestBufferMemory plain(importing);
-        plain.AddReadable(reinterpret_cast<std::uintptr_t>(heap + window) - 16, 32);
-        plain.Upload(false);
-        plain.WriteBack();
-    }
-    Require(HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + window) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
+    auto* heap = guest + 3 * large + 2 * piece;
+    change(heap, piece, true);
+    change(heap + piece, piece, true);
+    Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second != 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
     const auto* kept = HostImportFor(importing, first, 16);
     Require(kept != nullptr && kept->buffer == joinedBuffer && kept->bytes == 2 * large, "a registry change elsewhere re-imported the joined ranges");
-    change(heap + window - piece, piece, false);
-    change(heap + window, piece, false);
+    // A third range registered next to them joins only when a buffer is bound across it, and the
+    // join then grows: a later bind across the first two keeps the grown import.
+    change(guest + 2 * large, large, true);
+    Require(HostImportFor(importing, first, 16)->buffer == joinedBuffer, "a range registered next to the joined ranges re-imported them");
+    const auto [grownBuffer, grownCopied] = bind(third - 16);
+    const auto* grown = HostImportFor(importing, third - 16, 32);
+    Require(grown != nullptr && grown->base == first && grown->bytes == 3 * large && grownBuffer == grown->buffer && grownCopied == 0, "a bind across the next range did not grow the joined import");
+    Require(bind(second - 16).first == grownBuffer && HostImportFor(importing, first, 16)->buffer == grownBuffer, "two joins sharing a range retired each other");
+    change(heap, piece, false);
+    change(heap + piece, piece, false);
     change(guest + large, large, false);
     const auto* alone = HostImportFor(importing, first, 16);
     Require(alone != nullptr && alone->base == first && alone->bytes == large, "the joined import outlived one of its ranges");
     change(guest, large, false);
-    Require(HostImportFor(importing, first, 16) == nullptr, "the host imports outlived their ranges");
+    change(guest + 2 * large, large, false);
+    Require(HostImportFor(importing, first, 16) == nullptr && HostImportFor(importing, third, 16) == nullptr, "the host imports outlived their ranges");
     SetHostImportJoin(false);
     SetHostImportWindow(0);
     ::operator delete(block, std::align_val_t{window});

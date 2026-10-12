@@ -667,8 +667,12 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 }
 
 // Imports a bound range's joined run (see joinedRun), retiring the ranges' own imports; null when
-// [begin, end) has none or it cannot be imported, and the range keeps its copies.
+// [begin, end) has none or it cannot be imported, and the range keeps its copies. A joined import
+// at either end is taken into the run, so a join only grows: two joins that share a range never
+// retire each other in turn.
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    if (const auto* low = findImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
+    if (const auto* high = findImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
     auto run = joinedRun(lease, begin, end);
     if (run.ranges.empty() || state.failedJoins.contains(run.base)) return nullptr;
     return importRunAt(context, state, std::move(run), true, begin, lease);
