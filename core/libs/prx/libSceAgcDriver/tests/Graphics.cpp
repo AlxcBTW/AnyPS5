@@ -2860,9 +2860,11 @@ void descriptorSnapshotTests() {
                 if ((selected & (1u << index)) == 0) {
                     Require(descriptor.buffer == original[index].buffer && descriptor.offset == original[index].offset && descriptor.range == original[index].range, "snapshot update changed an untouched buffer descriptor");
                 } else {
+                    // A snapshot of its own starts at offset 0; APS5_EXP_LEAN_DRAW's slice of the batch's
+                    // data chunk at its own offset.
                     const auto& item = snapshots->snapshots[snapshot];
-                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == 0 && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
-                    Require(sameBytes(bufferBytes(descriptor.buffer), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
+                    Require(descriptor.buffer == item.buffer->Handle() && descriptor.offset == item.offset && descriptor.range == moved[snapshot].size, "snapshot descriptor used another element's buffer or range");
+                    Require(bufferBytes(descriptor.buffer).size() >= descriptor.offset + moved[snapshot].size && sameBytes(bufferBytes(descriptor.buffer).subspan(descriptor.offset), moved[snapshot].words.data(), moved[snapshot].size), "snapshot descriptor lost its buffer data");
                     ++snapshot;
                 }
             }

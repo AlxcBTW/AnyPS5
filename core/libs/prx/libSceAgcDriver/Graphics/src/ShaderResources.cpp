@@ -3529,6 +3529,55 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+namespace {
+
+// LeanDraw: the data words of a draw's moved ShaderData or FlattenedSrt binding go into a slice of
+// one chunk per open batch (kept by the batch like the buffer of its own each draw made before)
+// instead of a pooled buffer per draw. Only written while its batch records; a new batch, device
+// or recorder starts a new chunk. The batch owns the chunk: the arena only names it, so it never
+// outlives the batch's work or its device.
+struct DrawDataArena {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::weak_ptr<Buffer> chunk;
+    std::size_t used = 0;
+};
+
+constexpr std::size_t DrawDataChunkBytes = 256u * 1024u;
+
+DrawDataArena& drawDataArena() {
+    static DrawDataArena arena;
+    return arena;
+}
+
+// A slice of `bytes` for the open batch, aligned for a storage buffer descriptor; null buffer when
+// the words are too big for a shared chunk (the caller makes a buffer of their own).
+ShaderResources::DrawBindings::Snapshot drawDataSlice(const Context& context, Recorder& recorder, std::size_t bytes) {
+    if (bytes == 0 || bytes > DrawDataChunkBytes / 4) return {0, nullptr};
+    const auto align = static_cast<std::size_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+    auto& arena = drawDataArena();
+    std::lock_guard lock(arena.mutex);
+    const auto batch = recorder.Submissions() + 1u;
+    auto offset = (arena.used + align - 1) / align * align;
+    auto chunk = arena.chunk.lock();
+    if (chunk == nullptr || arena.device != context.device || arena.recorder != &recorder || arena.batch != batch || offset + bytes > DrawDataChunkBytes) {
+        chunk = std::make_shared<Buffer>(context, DrawDataChunkBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        recorder.Keep(chunk);
+        recorder.KeepBytes(chunk.get(), DrawDataChunkBytes);
+        arena.chunk = chunk;
+        arena.device = context.device;
+        arena.recorder = &recorder;
+        arena.batch = batch;
+        offset = 0;
+    }
+    arena.used = offset + bytes;
+    return {0, std::move(chunk), offset, bytes};
+}
+
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
     const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
@@ -3546,13 +3595,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
-            auto buffer = std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            std::memcpy(buffer->Bytes().data(), override->words.data(), override->size);
+            auto slice = LeanDraw() ? drawDataSlice(context, recorder, override->size) : DrawBindings::Snapshot{0, nullptr};
+            if (slice.buffer == nullptr) slice = {0, std::make_shared<Buffer>(context, override->size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)};
+            const auto view = slice.View();
+            std::memcpy(view.data(), override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                if (patch.allocation == index && patch.byte < override->size) view[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            result->snapshots.push_back(std::move(slice));
             continue;
         }
         std::uint64_t address = item.address;
@@ -3609,12 +3660,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
-            buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+            buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.View().size()};
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    // A slice's chunk was counted once when its batch took it.
+    for (const auto& snapshot : result->snapshots) {
+        if (snapshot.bytes == 0) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     return result;
 }
 

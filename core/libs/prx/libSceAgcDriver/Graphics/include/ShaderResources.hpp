@@ -136,6 +136,11 @@ public:
         struct Snapshot {
             std::uint64_t address;
             std::shared_ptr<Buffer> buffer;
+            // LeanDraw: a slice of a batch's shared data chunk (`bytes` from `offset`); 0 bytes: the
+            // whole buffer is the snapshot's.
+            std::size_t offset = 0;
+            std::size_t bytes = 0;
+            std::span<std::byte> View() const { return bytes == 0 ? buffer->Bytes() : buffer->Bytes().subspan(offset, bytes); }
         };
         DescriptorCache* cache = nullptr;
         DescriptorCache::SetAllocation fragmentAllocation;
