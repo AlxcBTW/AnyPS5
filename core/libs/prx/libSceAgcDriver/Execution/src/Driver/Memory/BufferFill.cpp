@@ -164,7 +164,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     std::optional<ConstantDwordFill> constantFill;
     if (!dwordFill && dwordFills && packet.size() >= 5 && (packet[4] & 0x20u) == 0) {
         memoryFill = Graphics::MatchMemoryValueFill(code, userData, compute.numThreads, {packet[1], packet[2], packet[3]});
-        if (memoryFill && (memoryFill->address % 16u != 0 || memoryFill->bytes % 16u != 0 || userData.size() != 8 || !compute.groupIdEnable[0] || userData[6] < 4u || ((userData[3] >> 12u) & 0x7fu) < 20u || ((userData[3] >> 12u) & 0x7fu) > 22u)) memoryFill.reset();
+        if (memoryFill && (memoryFill->address % 16u != 0 || memoryFill->bytes % 16u != 0 || userData.size() != 8 || !compute.groupIdEnable[0] || static_cast<std::uint64_t>(userData[6]) * std::max((userData[5] >> 16u) & 0x3fffu, 1u) < 4u || ((userData[3] >> 12u) & 0x7fu) < 20u || ((userData[3] >> 12u) & 0x7fu) > 22u)) memoryFill.reset();
         if (!memoryFill) constantFill = MatchConstantDwordFill(packet, code, userData, compute);
     }
     if (!dwordFill && !memoryFill && !constantFill && !matchesFillKernel(code, userData, compute)) return false;
