@@ -125,7 +125,12 @@ IrU32 TranslationContext::readU16LaneRaw(const RdnaOperand& operand, bool highLa
 }
 
 IrU32 TranslationContext::readU16LaneAsU32(const RdnaOperand& operand, bool highLane, bool signExtend) {
-    const IrU32 raw = readU16LaneRaw(operand, highLane ? operand.opSelHi : operand.opSel);
+    IrU32 raw = readU16LaneRaw(operand, highLane ? operand.opSelHi : operand.opSel);
+    // VOP3P neg_lo / neg_hi negate a 16-bit integer source the way they negate an f16 one: by flipping bit 15.
+    // Sony's compiler builds -1 as neg(lit 0x7fff) for v_pk_max_i16 (Sword of the Sea's TSR neighbour clamp).
+    if (highLane ? operand.negateHi : operand.negate) {
+        raw = IrU32(ir.BitwiseXor(raw.Value(), ir.Constant(0x8000u)));
+    }
     if (!signExtend) {
         return raw;
     }
