@@ -96,6 +96,43 @@ public:
         if (now < due) return false;
         if (!nextPoll.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(250)).count())) return false;
         std::lock_guard lock(mutex);
+        return reload(present, log);
+    }
+
+    // The file's raw value for `name` (as written, short or full name), empty when absent.
+    std::string FileValue(const std::string& name) {
+        std::lock_guard lock(mutex);
+        const auto found = file.find(name);
+        if (found != file.end()) return found->second;
+        const auto alternative = file.find(ShortName(name));
+        return alternative != file.end() ? alternative->second : std::string{};
+    }
+
+    // The file's lines as NAME=value, and every registered lever as NAME=value, for the start line.
+    std::string Describe() {
+        std::lock_guard lock(mutex);
+        std::string text = "file:";
+        for (const auto& [name, value] : file) text += " " + name + "=" + value;
+        text += "; levers here:";
+        for (const auto* slot : slots) text += " " + slot->shortName + "=" + std::to_string(slot->value.load(std::memory_order_relaxed));
+        return text;
+    }
+
+    std::uint64_t Generation() const { return generation.load(std::memory_order_acquire); }
+
+private:
+    Registry() : loaded(std::chrono::steady_clock::now()) {
+        const char* text = std::getenv("APS5_LEVER_FILE");
+        if (text != nullptr && *text != '\0') {
+            path = text;
+            active = true;
+            // The file's values hold from the first lever read on, not only from the first poll.
+            reload(-1, false);
+        }
+    }
+
+    // Poll's read, under the mutex.
+    bool reload(std::int64_t present, bool log) {
         std::error_code error;
         std::filesystem::file_time_type time{};
         std::uintmax_t size = 0;
@@ -108,15 +145,15 @@ public:
         if (polled && exists == lastExists && time == lastTime && size == lastSize) return false;
         std::map<std::string, std::string> values;
         if (exists) {
-            std::ifstream file(path, std::ios::binary);
-            if (!file) return false;
+            std::ifstream stream(path, std::ios::binary);
+            if (!stream) return false;
             std::stringstream text;
-            text << file.rdbuf();
+            text << stream.rdbuf();
             const auto all = text.str();
             if (!all.empty() && all.back() != '\n') return false;
-            std::istringstream lines(all);
+            std::istringstream rows(all);
             std::string line;
-            while (std::getline(lines, line)) {
+            while (std::getline(rows, line)) {
                 while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
                 const auto first = line.find_first_not_of(" \t");
                 if (first == std::string::npos || line[first] == '#') continue;
@@ -166,34 +203,6 @@ public:
             std::fflush(stderr);
         }
         return true;
-    }
-
-    // The file's raw value for `name` (as written, short or full name), empty when absent.
-    std::string FileValue(const std::string& name) {
-        std::lock_guard lock(mutex);
-        const auto found = file.find(name);
-        if (found != file.end()) return found->second;
-        const auto alternative = file.find(ShortName(name));
-        return alternative != file.end() ? alternative->second : std::string{};
-    }
-
-    // Every registered lever as NAME=value (value) for the start line.
-    std::string Describe() {
-        std::lock_guard lock(mutex);
-        std::string text;
-        for (const auto* slot : slots) text += (text.empty() ? "" : " ") + slot->shortName + "=" + std::to_string(slot->value.load(std::memory_order_relaxed));
-        return text;
-    }
-
-    std::uint64_t Generation() const { return generation.load(std::memory_order_acquire); }
-
-private:
-    Registry() : loaded(std::chrono::steady_clock::now()) {
-        const char* text = std::getenv("APS5_LEVER_FILE");
-        if (text != nullptr && *text != '\0') {
-            path = text;
-            active = true;
-        }
     }
 
     const std::string* fileValue(const Slot& slot) const {

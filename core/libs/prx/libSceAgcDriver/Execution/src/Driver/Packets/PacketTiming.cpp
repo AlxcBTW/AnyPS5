@@ -3,12 +3,23 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "HotLever.hpp"
+#include <atomic>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+std::atomic<std::uint64_t> queueZeroPacketNs{0};
+}
+
+std::uint64_t QueueZeroPacketNs() {
+    return queueZeroPacketNs.load(std::memory_order_relaxed);
+}
 
 PacketTimer::~PacketTimer() {
     if (!enabled) return;
     const auto now = std::chrono::steady_clock::now();
+    if (queue == 0 && Aps5Hot::Active()) queueZeroPacketNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
     auto& entry = profile.byOpcode[key];
     ++entry.first;
     entry.second += std::chrono::duration<double, std::milli>(now - start).count();

@@ -34,6 +34,10 @@ struct PacketTimer {
     ~PacketTimer();
 };
 
+// Hot levers (APS5_LEVER_FILE, never push): queue 0's packet time since start in nanoseconds (what the
+// [packets] queue 0x0 lines time, every opcode), counted only while a lever file is set, for [lever-seg].
+std::uint64_t QueueZeroPacketNs();
+
 }
 
 #endif

@@ -5,9 +5,119 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketTiming.hpp"
+#include "HotLever.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <mutex>
+#include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Hot levers (APS5_LEVER_FILE, never push): every present polls the lever file (HotLever.hpp: at most
+// every 250 ms) and logs its changes. A segment is the span between two changes of the file (the lab
+// writes SEGMENT=<name> with each step); when one ends, one [lever-seg] line gives its presents, FPS and
+// frame times (present to present) over the whole segment and over its settled part (after SETTLE=<s>
+// seconds of the file, default 10: caches a flip emptied refill first), plus per present the GPU busy
+// time ([present]'s, VulkanDevice::PresentCounts) and queue 0's packet time ([packets] queue 0x0's,
+// with APS5_PROFILE_DRAW) over the settled part.
+class LeverSegments {
+public:
+    void Present() {
+        std::lock_guard lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        ++presents;
+        if (presents == 1) {
+            std::fprintf(stderr, "[lever] lever file %s; levers: %s\n", Aps5Hot::Registry::Get().Path().c_str(), Aps5Hot::Registry::Get().Describe().c_str());
+            begin(now);
+        } else {
+            frames.push_back({now, std::chrono::duration<double, std::milli>(now - last).count()});
+        }
+        last = now;
+        if (!settled && now - start >= settle) {
+            settled = true;
+            settledAt = now;
+            settledMarks = marks();
+        }
+        if (!Aps5Hot::Poll(static_cast<std::int64_t>(presents), true)) return;
+        report(now);
+        begin(now);
+    }
+
+private:
+    struct Frame {
+        std::chrono::steady_clock::time_point at;
+        double ms;
+    };
+    struct Marks {
+        std::uint64_t presents = 0;
+        double gpuBusyMs = 0;
+        std::uint64_t queueZeroNs = 0;
+    };
+
+    static Marks marks() {
+        const auto counts = VulkanDevice::PresentCounts();
+        return {counts.presents, counts.gpuBusyMs, QueueZeroPacketNs()};
+    }
+
+    void begin(std::chrono::steady_clock::time_point now) {
+        start = now;
+        frames.clear();
+        name = Aps5Hot::Registry::Get().FileValue("SEGMENT");
+        if (name.empty()) name = "-";
+        const auto text = Aps5Hot::Registry::Get().FileValue("SETTLE");
+        settle = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(text.empty() ? 10.0 : std::max(0.0, std::atof(text.c_str()))));
+        settled = false;
+        startMarks = marks();
+        startPresents = presents;
+    }
+
+    static std::string frameStats(std::vector<double> ms, double seconds) {
+        char text[160];
+        if (ms.empty() || seconds <= 0) return "presents 0";
+        std::sort(ms.begin(), ms.end());
+        const auto at = [&](double fraction) { return ms[std::min(ms.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(ms.size())))]; };
+        std::snprintf(text, sizeof(text), "presents %zu over %.1f s, fps %.2f, frame ms p50 %.1f p95 %.1f max %.1f", ms.size(), seconds, static_cast<double>(ms.size()) / seconds, at(0.5), at(0.95), ms.back());
+        return text;
+    }
+
+    void report(std::chrono::steady_clock::time_point now) {
+        std::vector<double> all, steady;
+        for (const auto& frame : frames) {
+            all.push_back(frame.ms);
+            if (settled && frame.at > settledAt) steady.push_back(frame.ms);
+        }
+        const auto seconds = std::chrono::duration<double>(now - start).count();
+        const auto steadySeconds = settled ? std::chrono::duration<double>(now - settledAt).count() : 0.0;
+        const auto end = marks();
+        char tail[200] = "";
+        if (settled && end.presents > settledMarks.presents) {
+            const auto count = static_cast<double>(end.presents - settledMarks.presents);
+            std::snprintf(tail, sizeof(tail), "; per present (settled): GPU busy %.1f ms, queue 0 packets %.1f ms", (end.gpuBusyMs - settledMarks.gpuBusyMs) / count, static_cast<double>(end.queueZeroNs - settledMarks.queueZeroNs) / 1e6 / count);
+        }
+        std::fprintf(stderr, "[lever-seg] seg=%s t=%.1f-%.1f present=%llu-%llu settle %.0f s; all: %s; settled: %s%s\n", name.c_str(), Aps5Hot::Registry::Get().Seconds() - seconds, Aps5Hot::Registry::Get().Seconds(), static_cast<unsigned long long>(startPresents), static_cast<unsigned long long>(presents), std::chrono::duration<double>(settle).count(), frameStats(all, seconds).c_str(), settled ? frameStats(steady, steadySeconds).c_str() : "none (segment shorter than its settle time)", tail);
+        std::fflush(stderr);
+    }
+
+    std::mutex mutex;
+    std::uint64_t presents = 0, startPresents = 0;
+    std::chrono::steady_clock::time_point last{}, start{}, settledAt{};
+    std::chrono::steady_clock::duration settle{};
+    bool settled = false;
+    std::string name = "-";
+    std::vector<Frame> frames;
+    Marks startMarks, settledMarks;
+};
+
+void hotLeverPresent() {
+    static auto* segments = new LeverSegments;
+    segments->Present();
+}
+
+}
 
 void Driver::RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
     require(output != nullptr, "null video output");
@@ -129,6 +239,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         gpuReady(context);
         timing.Mark("release_and_callback");
         TracyZone::MarkFrame();
+        if (Aps5Hot::Active()) hotLeverPresent();
         if (profile) reportPresents(waitedMs, inFlight);
         CheckFailure();
     } catch (const ProcessShutdown&) {
