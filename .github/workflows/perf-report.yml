@@ -25,7 +25,7 @@ concurrency:
 env:
   CONFIGURE: >-
     -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DANYPS5_ENABLE_SPIRV_TOOLS=ON
-    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_CXX_FLAGS=-DANYPS5_ENABLE_ASAN=1
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
 jobs:
@@ -62,7 +62,7 @@ jobs:
             cmake -S . -B "build-$side" $CONFIGURE
             cmake --build "build-$side" --target $targets
             python3 "$tool" run "build-$side" "$out/$side.json" --repeats 2 || {
-              valgrind --version; perf stat -e instructions:u true 2>&1 | tail -5 || true
+              valgrind --version; sudo sysctl -w kernel.perf_event_paranoid=-1; perf stat -e instructions:u true 2>&1 | tail -5 || true
               valgrind --tool=none --trace-syscalls=yes "build-$side/tests/agc_structurizer_tests" 2>&1 | grep -E "mmap|mprotect|munmap|Bad perm|SIGSEGV" | tail -40
               exit 1
             }
