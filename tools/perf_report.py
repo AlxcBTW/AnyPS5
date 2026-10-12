@@ -9,7 +9,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
 THRESHOLD = 1.0
 CACHEGRIND_SUMMARY = re.compile(r"^summary:\s*(\d+)\s*$", re.M)
 PERF_COUNT = re.compile(r"^\s*(\d+),,instructions:u", re.M)
@@ -53,7 +52,7 @@ def measure(counter, executable, arguments, repeats):
     for _ in range(repeats):
         with tempfile.TemporaryDirectory() as scratch:
             command, log = counter_command(counter, executable, arguments, Path(scratch))
-            done = subprocess.run(command, cwd=ROOT, env=environment, capture_output=True, text=True)
+            done = subprocess.run(command, cwd=Path.cwd(), env=environment, capture_output=True, text=True)
             count = parse_count(counter, log, done.stderr)
             if done.returncode != 0 or count is None:
                 tail = (done.stdout + done.stderr).strip().splitlines()[-5:]
@@ -66,7 +65,7 @@ def run(args):
     counter = pick_counter(args.counter)
     result = {"counter": counter, "workloads": {}}
     for name, (target, arguments) in WORKLOADS.items():
-        executable = Path(args.build) / "tests" / target
+        executable = Path(args.build).resolve() / "tests" / target
         if not executable.exists():
             executable = executable.with_suffix(".exe")
         result["workloads"][name] = measure(counter, executable, arguments, args.repeats)
