@@ -1,0 +1,40 @@
+name: Alias hand-over Linux diagnostics
+
+# Throwaway diagnostics for boykopovar/AnyPS5#4286 on lavapipe; never part of a pull request.
+on:
+  push:
+    branches: [ci/alias-handover-linux-diag]
+
+permissions:
+  contents: read
+
+jobs:
+  lavapipe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ANYPS5_REQUIRE_VULKAN: 1
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: true
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-tools libpipewire-0.3-dev libpulse-dev libasound2-dev ninja-build
+      - run: uname -a; vulkaninfo --summary 2>&1 | head -40 || true
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+      - run: cmake --build build --target agc_driver_recorder_tests
+      - name: As committed (the probe decides; lavapipe compares its imports)
+        if: ${{ !cancelled() }}
+        run: ctest --test-dir build -R '^agc_driver_alias_handover(_memory)?$' -V --timeout 600
+      - name: Imports forced to watch (the PR head before the fix)
+        if: ${{ !cancelled() }}
+        env:
+          APS5_TEST_FORCE_WATCH: 1
+        run: ctest --test-dir build -R '^agc_driver_alias_handover$' -V --timeout 600
+      - name: Imports forced to watch, every page write-faulted after each submission (amdgpu userptr)
+        if: ${{ !cancelled() }}
+        env:
+          APS5_TEST_FORCE_WATCH: 1
+          APS5_TEST_REFAULT_IMPORT: 1
+        run: ctest --test-dir build -R '^agc_driver_alias_handover$' -V --timeout 600

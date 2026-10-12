@@ -5233,6 +5233,18 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::size_t surfaceB = 128 * 128 * 8;
     constexpr std::size_t keyCount = surfaceB / 256;
     constexpr std::size_t bytes = surfaceA + 65536;
+    const auto decided = PrepareImportWatch(base);
+#ifndef _WIN32
+    // Linux watches host imports only where its probe saw the device's own reads and writes of an
+    // import leave the write protection armed; elsewhere they are compared. Forced to watch there,
+    // the device's accesses read as CPU stores (amdgpu faults a userptr import in writable at every
+    // submission; lavapipe writes it with the CPU), and the drop rule gives the CPU every pending
+    // unit they touched.
+    if (watched && decided == ImportWatch::Unwatch && std::getenv("APS5_TEST_FORCE_WATCH") == nullptr) {
+        std::cout << "host imports are compared on this device: " << what << " not tested\n";
+        return;
+    }
+#endif
     void* block = nullptr;
     if (watched) {
         block = AllocateWatched(bytes, 65536);
@@ -5248,7 +5260,6 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
 #endif
     }
     Require(block != nullptr && reinterpret_cast<std::uint64_t>(block) % 65536 == 0, "cannot allocate the alias hand-over block");
-    const auto decided = PrepareImportWatch(base);
     if (watched) SetImportWatch(base, ImportWatch::Watch);
     struct RestoreWatch {
         const Context& context;
@@ -5256,6 +5267,13 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         ~RestoreWatch() { SetImportWatch(context, decided); }
     } restoreWatch{base, decided};
     auto* memory = static_cast<std::uint8_t*>(block);
+    // DIAG ONLY: APS5_TEST_REFAULT_IMPORT=1 write-faults every page of the imported block after each
+    // submission without changing a byte, as amdgpu's command submission does for a writable userptr.
+    static const bool refault = std::getenv("APS5_TEST_REFAULT_IMPORT") != nullptr;
+    const auto refaultImport = [&] {
+        if (!refault || !watched) return;
+        for (std::size_t page = 0; page < bytes; page += 4096) std::atomic_ref<std::uint8_t>(memory[page]).fetch_add(0);
+    };
     const auto address = reinterpret_cast<std::uint64_t>(block);
     const auto keysAddress = address + surfaceA;
     {
@@ -5328,6 +5346,7 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         recorder.Submit();
         device.WaitQueue();
+        refaultImport();
         recorder.Sync();
         const auto pixels = readback.Bytes();
         for (std::size_t i = 0; i < pixels.size(); ++i) {
@@ -5367,6 +5386,7 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
         recorder.Submit();
         device.WaitQueue();
+        refaultImport();
         recorder.Sync();
         const auto pixels = readback.Bytes();
         return std::vector<std::byte>(pixels.begin(), pixels.end());
@@ -5420,6 +5440,7 @@ void aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             Require(StorageTexture::FlushPending(address, bytes, nullptr, "alias hand-over test", PublishScope::Whole), where + ": nothing was pending at the end");
             recorder.Submit();
             device.WaitQueue();
+            refaultImport();
             recorder.Sync();
             outcome.bytes = readMemory(address, surfaceA);
             Require(imageHolds(imageB, 128, 128, green), where + ": B lost its results");
