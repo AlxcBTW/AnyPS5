@@ -3965,6 +3965,14 @@ void ProvokingVertexTests() {
     Require(flatPixel.fragmentParameters.size() == 1 && flatPixel.fragmentParameters[0].flat && !flatPixel.fragmentParameters[0].perVertex, "flat v_interp_mov P0 has explicit per-vertex metadata");
     const std::array<CompiledShader, 1> flatShaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatPixel, 0}}};
     ValidateProvokingVertex(supported, last, flatShaders);
+    const std::array<std::uint32_t, 7> flatP10Color{0xc8120000u, 0xc8160100u, 0xc81a0200u, 0xc81e0300u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+    const auto flatP10Pixel = recompilePixel({0x400u}, flatP10Color);
+    const auto p10Inputs = locatedInputs(flatP10Pixel.spirv.Words());
+    Require(p10Inputs.size() == 1 && p10Inputs[0].location == 0 && p10Inputs[0].flat && !p10Inputs[0].perVertex, "flat v_interp_mov P10 did not compile to a flat input");
+    Require(flatP10Pixel.fragmentParameters.size() == 1 && flatP10Pixel.fragmentParameters[0].flatP10 && !flatP10Pixel.fragmentParameters[0].perVertex && !flatPixel.fragmentParameters[0].flatP10, "flat v_interp_mov P10 was not recorded apart from P0");
+    const std::array<CompiledShader, 1> flatP10Shaders{{{ShaderRecompiler::ShaderStage::Fragment, &flatP10Pixel, 0}}};
+    ValidateProvokingVertex(supported, last, flatP10Shaders);
+    expectFailure([&] { ValidateProvokingVertex(supported, first, flatP10Shaders); }, "v_interp_mov p10 of a flat input with the first provoking vertex is not measured");
     ShaderRecompiler::RecompileResult fragment{};
     const std::array<CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
     for (const auto topology : {VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN}) {

@@ -323,6 +323,7 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.flat);
         out.Value(parameter.perVertex);
         out.Value(parameter.custom);
+        out.Value(parameter.flatP10);
     });
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
@@ -366,6 +367,7 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.flat);
         in.Value(parameter.perVertex);
         in.Value(parameter.custom);
+        in.Value(parameter.flatP10);
     });
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);

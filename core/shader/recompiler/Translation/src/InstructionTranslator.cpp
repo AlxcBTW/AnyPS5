@@ -435,7 +435,8 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             }
         }
     }
-    if (windowBase < vectorLimit) {
+    const bool ancillaryWindow = options.stage == ShaderStageKind::Pixel && options.inputInfo.pixel != nullptr && options.inputInfo.pixel->psAncillary && options.inputInfo.pixel->psInputVgpr[static_cast<std::uint32_t>(PixelInput::Ancillary)] >= windowBase;
+    if (windowBase < vectorLimit && !ancillaryWindow) {
         program.Metadata().vectorWindowBase = windowBase;
         program.Metadata().vectorWindowSize = vectorLimit - windowBase;
     }
@@ -500,6 +501,13 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     emitEntryPrologue(program, *blocks.front(), options);
     if (program.Metadata().vectorWindowSize != 0u) {
         vectorLimit = program.Metadata().vectorWindowBase + program.Metadata().vectorWindowSize;
+    }
+    if (ancillaryWindow) {
+        for (const IrValue* instruction : blocks.front()->Instructions()) {
+            if (instruction->Opcode() == IrOpcode::SetVectorRegister) {
+                vectorLimit = std::max(vectorLimit, instruction->Argument(0)->Register().index + 1u);
+            }
+        }
     }
 
     for (const auto& cfgBlock : cfg.blocks) {
