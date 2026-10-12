@@ -2554,9 +2554,15 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
         VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
         properties.pNext = &reported;
         context.memoryProperties2(context.physical, &properties);
+        // APS5_HEAP_BUDGET_MIB caps the reported budget, to rehearse a smaller machine's heap (the
+        // driver's own limit stays where it is).
+        static const std::uint64_t cap = [] {
+            const char* value = std::getenv("APS5_HEAP_BUDGET_MIB");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0ull;
+        }();
         HostHeapState state;
         state.heap = heap;
-        state.budget = reported.heapBudget[heap];
+        state.budget = cap != 0 ? std::min<std::uint64_t>(cap, reported.heapBudget[heap]) : reported.heapBudget[heap];
         state.usage = reported.heapUsage[heap];
         state.hostBuffers = LiveGpuMemory(GpuMemoryKind::HostBuffer);
         state.headroom = HeapHeadroom(state.budget);
