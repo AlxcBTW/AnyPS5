@@ -11,6 +11,16 @@ void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes);
 std::uint64_t LiveGpuMemory();
 VkResult AllocateGpuMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory, GpuMemoryKind kind, const char* what);
 std::uint64_t OutOfMemoryFailures();
+// APS5_EXP_MEMORY_CENSUS=1 (diag): [hostmem] lines every 10 s with process/system memory, every
+// Vulkan heap's budget and usage and their peaks (sampled every 250 ms from the first GPU allocation on).
+bool MemoryCensusEnabled();
+// A new host import of `bytes`, `resident` of which were in the working set before the import.
+void CountImportResidency(std::uint64_t bytes, std::uint64_t resident);
+// Bytes of [address, address + bytes) in the process's working set (Windows; 0 elsewhere).
+std::uint64_t ResidentBytes(std::uint64_t address, std::uint64_t bytes);
+// CPU-side copies of guest bytes the driver keeps (counted always, printed by the census).
+enum class HostCopyKind : std::uint8_t { StorageOriginal, StorageBaseline, MirrorShadow, Count };
+void CountHostCopy(HostCopyKind kind, std::int64_t bytes);
 
 class Buffer {
 public:

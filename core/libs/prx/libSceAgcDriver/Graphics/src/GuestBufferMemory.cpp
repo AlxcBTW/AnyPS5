@@ -72,6 +72,10 @@ struct ImageMirror {
     // Identity for the life of this mirror (see ImageMirrorSerial); the top bit keeps mirror serials
     // apart from host import serials.
     std::uint64_t serial = 0;
+    ImageMirror() = default;
+    ImageMirror(const ImageMirror&) = delete;
+    ImageMirror& operator=(const ImageMirror&) = delete;
+    ~ImageMirror() { CountHostCopy(HostCopyKind::MirrorShadow, -static_cast<std::int64_t>(shadow.size())); }
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -904,6 +908,8 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     decideImportWatch(context, state);
+    // APS5_EXP_MEMORY_CENSUS: how much of the range was resident before the driver pins it.
+    const auto residentBefore = MemoryCensusEnabled() ? ResidentBytes(base, bytes) : 0;
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
     const auto create = [&] {
@@ -949,6 +955,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         return nullptr;
     }
     CountGpuMemory(GpuMemoryKind::HostImport, static_cast<std::int64_t>(bytes));
+    if (MemoryCensusEnabled()) CountImportResidency(bytes, residentBefore);
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -1586,7 +1593,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (sparse) std::memset(target.data() + cursor, 0, target.size() - cursor);
         mirror->committed = std::move(pieces);
     }
-    if (range->writable && !heap) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
+    if (range->writable && !heap) {
+        mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
+        CountHostCopy(HostCopyKind::MirrorShadow, static_cast<std::int64_t>(mirror->shadow.size()));
+    }
     std::lock_guard lock(state.mutex);
     ++state.rebuilds;
     mirror->serial = (1ull << 63u) | ++state.serials;

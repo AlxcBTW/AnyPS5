@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -148,6 +149,12 @@ private:
                 _cachedBytes -= oldest.bytes;
                 release(oldest.raw, oldest.bytes);
             }
+            // APS5_EXP_MEMORY_CENSUS=1 (diag): the cache's committed bytes, each time its peak grows 256 MiB.
+            static const bool census = std::getenv("APS5_EXP_MEMORY_CENSUS") != nullptr;
+            if (census && _cachedBytes >= _censusPeak + (std::size_t{256} << 20)) {
+                _censusPeak = _cachedBytes;
+                std::fprintf(stderr, "[guestheap] freed large blocks kept committed: %zu MiB in %zu blocks (budget %zu MiB, APS5_HEAP_CACHE_MIB)\n", _cachedBytes >> 20, _order.size(), budget() >> 20);
+            }
         }
 
     private:
@@ -174,6 +181,7 @@ private:
         std::list<Entry> _order;
         std::unordered_map<std::size_t, std::vector<std::list<Entry>::iterator>> _bySize;
         std::size_t _cachedBytes = 0;
+        std::size_t _censusPeak = 0;
     };
 
     std::array<SizeClass, ClassCount> _classes;

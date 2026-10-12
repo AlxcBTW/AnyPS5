@@ -1961,6 +1961,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
+    CountHostCopy(HostCopyKind::StorageOriginal, static_cast<std::int64_t>(guestBytes) - static_cast<std::int64_t>(original.size()));
     original.resize(static_cast<std::size_t>(guestBytes));
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
@@ -1968,8 +1969,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
-        else if (whole) {
+        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) {
+            CountHostCopy(HostCopyKind::StorageBaseline, -static_cast<std::int64_t>(generationBaseline.size()));
+            generationBaseline.clear();
+        } else if (whole) {
+            CountHostCopy(HostCopyKind::StorageBaseline, static_cast<std::int64_t>(guestBytes) - static_cast<std::int64_t>(generationBaseline.size()));
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
         }
@@ -4350,6 +4354,8 @@ StorageTexture::~StorageTexture() {
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }
     }
+    CountHostCopy(HostCopyKind::StorageOriginal, -static_cast<std::int64_t>(original.size()));
+    CountHostCopy(HostCopyKind::StorageBaseline, -static_cast<std::int64_t>(generationBaseline.size()));
     release();
 }
 

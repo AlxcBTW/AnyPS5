@@ -11,7 +11,20 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef PSAPI_VERSION
+#define PSAPI_VERSION 2
+#endif
+#include <psapi.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -76,6 +89,177 @@ bool outOfMemory(VkResult result) {
     return result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
+// APS5_EXP_MEMORY_CENSUS=1 (diag, off by default): a sampler thread reads the process's and the
+// system's memory counters and every Vulkan heap's VK_EXT_memory_budget budget and usage every
+// 250 ms, keeps their peaks, and prints a [hostmem] line every 10 s (the [gpumem] kinds follow on
+// their own line). The driver's own host-visible (imports + host buffers) and device-local totals
+// get exact peaks from CountGpuMemory. New host imports add how much of their range was resident
+// before the import pinned it (CountImportResidency).
+struct MemoryCensus {
+    std::mutex mutex;
+    std::atomic<bool> started{false};
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 properties2 = nullptr;
+    VkPhysicalDeviceMemoryProperties memory{};
+    std::array<VkDeviceSize, VK_MAX_MEMORY_HEAPS> peakUsage{};
+    std::uint64_t peakSystemCommit = 0;
+    std::uint64_t lowestRamFree = ~std::uint64_t{0};
+    std::atomic<std::int64_t> peakHostVisible{0};
+    std::atomic<std::int64_t> peakDeviceLocal{0};
+    std::atomic<std::uint64_t> imports{0};
+    std::atomic<std::uint64_t> importedBytes{0};
+    std::atomic<std::uint64_t> residentBytes{0};
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+};
+
+MemoryCensus& Census() {
+    // Never destroyed: the sampler thread may still read it while the process exits.
+    static auto* census = new MemoryCensus;
+    return *census;
+}
+
+std::int64_t hostVisibleBytes(const GpuMemoryCounts& counts) {
+    return counts.bytes[static_cast<std::size_t>(GpuMemoryKind::HostBuffer)].load(std::memory_order_relaxed) + counts.bytes[static_cast<std::size_t>(GpuMemoryKind::HostImport)].load(std::memory_order_relaxed);
+}
+
+std::int64_t deviceLocalBytes(const GpuMemoryCounts& counts) {
+    std::int64_t total = 0;
+    for (std::size_t kind = 0; kind < counts.bytes.size(); ++kind) {
+        if (kind != static_cast<std::size_t>(GpuMemoryKind::HostBuffer) && kind != static_cast<std::size_t>(GpuMemoryKind::HostImport)) total += counts.bytes[kind].load(std::memory_order_relaxed);
+    }
+    return total;
+}
+
+void raisePeak(std::atomic<std::int64_t>& peak, std::int64_t value) {
+    auto seen = peak.load(std::memory_order_relaxed);
+    while (value > seen && !peak.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+    }
+}
+
+constexpr std::uint64_t MiB = 1048576;
+
+std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(HostCopyKind::Count)>& HostCopies() {
+    static std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(HostCopyKind::Count)> bytes{};
+    return bytes;
+}
+
+void sampleCensus(MemoryCensus& census, bool print) {
+    std::lock_guard lock(census.mutex);
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &budget;
+    const bool budgets = census.properties2 != nullptr && census.physical != VK_NULL_HANDLE;
+    if (budgets) census.properties2(census.physical, &properties);
+    const auto heaps = std::min<std::uint32_t>(census.memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
+    if (budgets) {
+        for (std::uint32_t heap = 0; heap < heaps; ++heap) census.peakUsage[heap] = std::max(census.peakUsage[heap], budget.heapUsage[heap]);
+    }
+    std::uint64_t commit = 0, peakCommit = 0, workingSet = 0, peakWorkingSet = 0, systemCommit = 0, commitLimit = 0, ramFree = 0, ramTotal = 0;
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX process{};
+    process.cb = sizeof(process);
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&process), sizeof(process))) {
+        commit = process.PrivateUsage;
+        peakCommit = process.PeakPagefileUsage;
+        workingSet = process.WorkingSetSize;
+        peakWorkingSet = process.PeakWorkingSetSize;
+    }
+    MEMORYSTATUSEX system{};
+    system.dwLength = sizeof(system);
+    if (GlobalMemoryStatusEx(&system)) {
+        systemCommit = system.ullTotalPageFile - system.ullAvailPageFile;
+        commitLimit = system.ullTotalPageFile;
+        ramFree = system.ullAvailPhys;
+        ramTotal = system.ullTotalPhys;
+    }
+#endif
+    census.peakSystemCommit = std::max(census.peakSystemCommit, systemCommit);
+    if (ramTotal != 0) census.lowestRamFree = std::min(census.lowestRamFree, ramFree);
+    if (!print) return;
+    std::string heapText;
+    for (std::uint32_t heap = 0; heap < heaps; ++heap) {
+        char item[160];
+        const bool local = (census.memory.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
+        if (budgets) std::snprintf(item, sizeof(item), "%sheap %u (%s, %llu MiB): %llu of %llu MiB budget, peak %llu", heap == 0 ? "" : "; ", heap, local ? "device" : "host", static_cast<unsigned long long>(census.memory.memoryHeaps[heap].size / MiB), static_cast<unsigned long long>(budget.heapUsage[heap] / MiB), static_cast<unsigned long long>(budget.heapBudget[heap] / MiB), static_cast<unsigned long long>(census.peakUsage[heap] / MiB));
+        else std::snprintf(item, sizeof(item), "%sheap %u (%s, %llu MiB): no VK_EXT_memory_budget", heap == 0 ? "" : "; ", heap, local ? "device" : "host", static_cast<unsigned long long>(census.memory.memoryHeaps[heap].size / MiB));
+        heapText += item;
+    }
+    const auto& counts = MemoryCounts();
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - census.start).count();
+    std::fprintf(stderr, "[hostmem] t+%.0f s: process commit %llu MiB (peak %llu), working set %llu MiB (peak %llu); system commit %llu of %llu MiB (peak %llu), RAM free %llu of %llu MiB (lowest %llu); %s; driver host-visible %lld MiB (peak %lld: imports + host buffers), device-local %lld MiB (peak %lld); imports %llu (%llu MiB), resident before the import %llu MiB\n",
+        seconds, static_cast<unsigned long long>(commit / MiB), static_cast<unsigned long long>(peakCommit / MiB), static_cast<unsigned long long>(workingSet / MiB), static_cast<unsigned long long>(peakWorkingSet / MiB),
+        static_cast<unsigned long long>(systemCommit / MiB), static_cast<unsigned long long>(commitLimit / MiB), static_cast<unsigned long long>(census.peakSystemCommit / MiB), static_cast<unsigned long long>(ramFree / MiB), static_cast<unsigned long long>(ramTotal / MiB), static_cast<unsigned long long>((census.lowestRamFree == ~std::uint64_t{0} ? 0 : census.lowestRamFree) / MiB),
+        heapText.c_str(), static_cast<long long>(hostVisibleBytes(counts) / static_cast<std::int64_t>(MiB)), static_cast<long long>(census.peakHostVisible.load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)), static_cast<long long>(deviceLocalBytes(counts) / static_cast<std::int64_t>(MiB)), static_cast<long long>(census.peakDeviceLocal.load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
+        static_cast<unsigned long long>(census.imports.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.importedBytes.load(std::memory_order_relaxed) / MiB), static_cast<unsigned long long>(census.residentBytes.load(std::memory_order_relaxed) / MiB));
+    const auto& copies = HostCopies();
+    std::fprintf(stderr, "[hostmem] gpumem: %s; CPU copies of guest bytes: storage-image originals %lld MiB, baselines %lld MiB, mirror shadows %lld MiB\n", describeGpuMemory().c_str(),
+        static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageOriginal)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
+        static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageBaseline)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
+        static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::MirrorShadow)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)));
+}
+
+void startCensus(const Context& context) {
+    auto& census = Census();
+    if (census.started.load(std::memory_order_acquire)) return;
+    {
+        std::lock_guard lock(census.mutex);
+        if (census.started.load(std::memory_order_relaxed)) return;
+        census.started.store(true, std::memory_order_release);
+        census.physical = context.physical;
+        census.properties2 = context.memoryProperties2;
+        census.memory = context.memory;
+    }
+    std::thread([&census] {
+        auto lastPrint = std::chrono::steady_clock::now();
+        sampleCensus(census, true);
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            const auto now = std::chrono::steady_clock::now();
+            const bool print = now - lastPrint >= std::chrono::seconds(10);
+            if (print) lastPrint = now;
+            sampleCensus(census, print);
+        }
+    }).detach();
+}
+
+}
+
+bool MemoryCensusEnabled() {
+    static const bool enabled = std::getenv("APS5_EXP_MEMORY_CENSUS") != nullptr;
+    return enabled;
+}
+
+void CountHostCopy(HostCopyKind kind, std::int64_t bytes) {
+    if (bytes != 0) HostCopies()[static_cast<std::size_t>(kind)].fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void CountImportResidency(std::uint64_t bytes, std::uint64_t resident) {
+    auto& census = Census();
+    census.imports.fetch_add(1, std::memory_order_relaxed);
+    census.importedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    census.residentBytes.fetch_add(resident, std::memory_order_relaxed);
+}
+
+std::uint64_t ResidentBytes(std::uint64_t address, std::uint64_t bytes) {
+#ifdef _WIN32
+    constexpr std::uint64_t page = 4096;
+    constexpr std::size_t chunk = 16384;
+    std::vector<PSAPI_WORKING_SET_EX_INFORMATION> pages;
+    std::uint64_t resident = 0;
+    for (std::uint64_t cursor = address & ~(page - 1); cursor < address + bytes;) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(chunk, (address + bytes - cursor + page - 1) / page));
+        pages.resize(count);
+        for (std::size_t index = 0; index < count; ++index) pages[index].VirtualAddress = reinterpret_cast<void*>(cursor + index * page);
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), pages.data(), static_cast<DWORD>(count * sizeof(PSAPI_WORKING_SET_EX_INFORMATION)))) return 0;
+        for (const auto& entry : pages) resident += entry.VirtualAttributes.Valid ? page : 0;
+        cursor += count * page;
+    }
+    return std::min(resident, bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return 0;
+#endif
 }
 
 void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes) {
@@ -83,6 +267,11 @@ void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes) {
     const auto index = static_cast<std::size_t>(kind);
     counts.bytes[index].fetch_add(bytes, std::memory_order_relaxed);
     counts.objects[index].fetch_add(bytes < 0 ? -1 : 1, std::memory_order_relaxed);
+    if (bytes > 0 && MemoryCensusEnabled()) {
+        auto& census = Census();
+        if (kind == GpuMemoryKind::HostBuffer || kind == GpuMemoryKind::HostImport) raisePeak(census.peakHostVisible, hostVisibleBytes(counts));
+        else raisePeak(census.peakDeviceLocal, deviceLocalBytes(counts));
+    }
     static const bool trace = std::getenv("APS5_TRACE_GPU_MEMORY") != nullptr;
     if (!trace) return;
     const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -105,6 +294,7 @@ VkResult AllocateGpuMemory(const Context& context, const VkMemoryAllocateInfo& a
     const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
     auto result = allocate(context.device, &allocation, nullptr, &memory);
     if (result == VK_SUCCESS) {
+        if (MemoryCensusEnabled()) startCensus(context);
         CountGpuMemory(kind, static_cast<std::int64_t>(allocation.allocationSize));
         return result;
     }

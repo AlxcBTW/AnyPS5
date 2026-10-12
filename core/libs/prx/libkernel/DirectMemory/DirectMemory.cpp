@@ -227,6 +227,23 @@ void Trace(const char* format, ...) {
     va_end(args);
 }
 
+// APS5_EXP_MEMORY_CENSUS=1 (diag): the live direct memory backings (one pagefile-backed section per
+// allocation on Windows, charged to the system commit in full when created), printed as [dmem] whenever
+// the live total moves 256 MiB from the last line.
+void CountDirectBacking(std::int64_t bytes) {
+    static const bool census = std::getenv("APS5_EXP_MEMORY_CENSUS") != nullptr;
+    if (!census) return;
+    static std::mutex mutex;
+    static std::int64_t live = 0, peak = 0, sections = 0, printed = 0;
+    std::lock_guard lock(mutex);
+    live += bytes;
+    sections += bytes < 0 ? -1 : 1;
+    peak = std::max(peak, live);
+    if (live - printed < (std::int64_t{256} << 20) && printed - live < (std::int64_t{256} << 20)) return;
+    printed = live;
+    std::fprintf(stderr, "[dmem] direct memory backings: %lld MiB live in %lld sections (peak %lld MiB)\n", static_cast<long long>(live >> 20), static_cast<long long>(sections), static_cast<long long>(peak >> 20));
+}
+
 #if defined(__linux__)
 int PhysicalFile() {
     static const int file = [] {
@@ -279,6 +296,7 @@ public:
             std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
             throw std::system_error(error, std::system_category(), message);
         }
+        CountDirectBacking(static_cast<std::int64_t>(bytes));
 #else
         file = PhysicalFile();
         fileOffset = start;
@@ -305,6 +323,7 @@ public:
     ~PhysicalBacking() {
 #ifdef _WIN32
         CloseHandle(section);
+        CountDirectBacking(-static_cast<std::int64_t>(bytes));
 #else
         if (hostWriteView != nullptr) ::munmap(hostWriteView, bytes);
 #endif
