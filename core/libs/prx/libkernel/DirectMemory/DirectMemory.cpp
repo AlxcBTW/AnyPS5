@@ -227,6 +227,7 @@ void Trace(const char* format, ...) {
     va_end(args);
 }
 
+#ifdef _WIN32
 // APS5_EXP_MEMORY_CENSUS=1 (diag): the live direct memory backings (one pagefile-backed section per
 // allocation on Windows, charged to the system commit in full when created), printed as [dmem] whenever
 // the live total moves 256 MiB from the last line.
@@ -243,6 +244,7 @@ void CountDirectBacking(std::int64_t bytes) {
     printed = live;
     std::fprintf(stderr, "[dmem] direct memory backings: %lld MiB live in %lld sections (peak %lld MiB)\n", static_cast<long long>(live >> 20), static_cast<long long>(sections), static_cast<long long>(peak >> 20));
 }
+#endif
 
 #if defined(__linux__)
 int PhysicalFile() {
