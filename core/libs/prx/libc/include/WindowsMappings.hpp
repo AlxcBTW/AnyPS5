@@ -237,26 +237,63 @@ public:
         if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
         auto view = views.find(address);
         if (view == views.end()) throw refuse("the range does not start at a shared view");
-        const auto section = view->second.section;
-        const auto offset = view->second.offset;
-        SYSTEM_INFO system{};
-        GetSystemInfo(&system);
+        std::vector<AliasRun> runs;
         for (std::size_t done = 0; done < bytes; done += pageBytes, ++view) {
-            if (view == views.end() || view->first != address + done || view->second.offset != offset + done) throw refuse("the range is not one contiguous run of views of a section");
-            if (view->second.section != section && !sameSection(view->second.section->handle, section->handle)) throw refuse("the range spans several sections");
+            if (view == views.end() || view->first != address + done) throw refuse("the range is not made of shared views only");
+            if (!runs.empty() && runs.back().offset + runs.back().bytes == view->second.offset && (runs.back().section == view->second.section || sameSection(view->second.section->handle, runs.back().section->handle))) runs.back().bytes += pageBytes;
+            else runs.push_back({view->second.section, view->second.offset, pageBytes});
         }
-        const auto lead = offset % system.dwAllocationGranularity;
-        void* alias = map(section->handle, GetCurrentProcess(), nullptr, offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
-        if (alias == nullptr) {
-            char text[160];
-            std::snprintf(text, sizeof(text), "MapViewOfFile3 of a read-write alias of shared guest memory 0x%llx+0x%llx", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
-            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), text);
+        const auto failed = [&](const char* step) {
+            char text[192];
+            std::snprintf(text, sizeof(text), "%s of a read-write alias of shared guest memory 0x%llx+0x%llx", step, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+            return std::system_error(static_cast<int>(GetLastError()), std::system_category(), text);
+        };
+        if (runs.size() == 1) {
+            SYSTEM_INFO system{};
+            GetSystemInfo(&system);
+            const auto lead = runs.front().offset % system.dwAllocationGranularity;
+            void* alias = map(runs.front().section->handle, GetCurrentProcess(), nullptr, runs.front().offset - lead, lead + bytes, 0, PAGE_READWRITE, nullptr, 0);
+            if (alias == nullptr) throw failed("MapViewOfFile3");
+            return static_cast<char*>(alias) + lead;
         }
-        return static_cast<char*>(alias) + lead;
+        auto* base = static_cast<char*>(allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        if (base == nullptr) throw failed("VirtualAlloc2");
+        std::vector<std::size_t> sizes;
+        std::size_t done = 0;
+        for (const auto& run : runs) {
+            const bool split = done + run.bytes == bytes || VirtualFree(base + done, run.bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            if (!split || map(run.section->handle, GetCurrentProcess(), base + done, run.offset, run.bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
+                const auto error = failed(split ? "MapViewOfFile3" : "split placeholder");
+                std::size_t unmapped = 0;
+                for (const auto size : sizes) {
+                    unmap(GetCurrentProcess(), base + unmapped, 0);
+                    unmapped += size;
+                }
+                VirtualFree(base + unmapped, 0, MEM_RELEASE);
+                if (split && done + run.bytes != bytes) VirtualFree(base + done + run.bytes, 0, MEM_RELEASE);
+                throw error;
+            }
+            sizes.push_back(run.bytes);
+            done += run.bytes;
+        }
+        aliases.emplace(base, std::move(sizes));
+        return base;
     }
 
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
+        {
+            std::lock_guard lock(mutex);
+            if (const auto found = aliases.find(alias); found != aliases.end()) {
+                auto* cursor = static_cast<char*>(alias);
+                for (const auto size : found->second) {
+                    if (!unmap(GetCurrentProcess(), cursor, 0)) fail("unmap shared guest alias");
+                    cursor += size;
+                }
+                aliases.erase(found);
+                return;
+            }
+        }
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const auto base = reinterpret_cast<std::uintptr_t>(alias) & ~(static_cast<std::uintptr_t>(system.dwAllocationGranularity) - 1);
@@ -430,6 +467,11 @@ private:
         Section(const Section&) = delete;
         Section& operator=(const Section&) = delete;
         ~Section() { CloseHandle(handle); }
+    };
+    struct AliasRun {
+        std::shared_ptr<Section> section;
+        std::uint64_t offset;
+        std::size_t bytes;
     };
     struct View {
         std::shared_ptr<SharedPage> page;
@@ -626,6 +668,7 @@ private:
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retargets;
     std::atomic<std::uint32_t> retargeting{0};
     std::atomic<bool> retargeted{false};
+    std::map<void*, std::vector<std::size_t>> aliases;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
     std::atomic<std::uint64_t> mappingSerial{0};

@@ -1166,6 +1166,51 @@ static void CheckFailedCollectKeepsWrites() {
 #endif
 }
 
+static void CheckSharedAliasAcrossViews() {
+#ifdef _WIN32
+    constexpr std::size_t page = 0x4000;
+    auto* block = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(page * 6, page));
+    Require(block != nullptr);
+    const auto first = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, page * 4, nullptr);
+    const auto second = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, page * 4, nullptr);
+    Require(first != nullptr && second != nullptr);
+    GuestArena::GuestArenaMap_nid_postfix(block, page * 2, first, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(block + page * 2, page * 2, second, page, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(block + page * 4, page, first, page * 3, PAGE_READWRITE);
+    auto* guest = static_cast<volatile unsigned char*>(block);
+    for (std::size_t index = 0; index < 5; ++index) guest[index * page] = static_cast<unsigned char>(index + 1);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    auto* alias = static_cast<volatile unsigned char*>(GuestArena::GuestArenaMapAlias_nid_postfix(address, page * 5));
+    Require(alias != nullptr);
+    for (std::size_t index = 0; index < 5; ++index) Require(alias[index * page] == index + 1);
+    alias[page * 2 + 7] = 0x5a;
+    alias[page * 4 + page - 1] = 0x6b;
+    Require(guest[page * 2 + 7] == 0x5a && guest[page * 4 + page - 1] == 0x6b);
+    guest[page + 9] = 0x7c;
+    Require(alias[page + 9] == 0x7c);
+    auto* view = static_cast<volatile unsigned char*>(MapViewOfFile(second, FILE_MAP_READ, 0, 0, page * 4));
+    Require(view != nullptr && view[page + 7] == 0x5a);
+    UnmapViewOfFile(const_cast<unsigned char*>(view));
+    GuestArena::GuestArenaUnmapAlias_nid_postfix(const_cast<unsigned char*>(alias));
+    MEMORY_BASIC_INFORMATION freed{};
+    Require(VirtualQuery(const_cast<unsigned char*>(alias), &freed, sizeof(freed)) == sizeof(freed) && freed.State == MEM_FREE && freed.RegionSize >= page * 5);
+    auto* single = static_cast<volatile unsigned char*>(GuestArena::GuestArenaMapAlias_nid_postfix(address + page * 2, page * 2));
+    Require(single != nullptr && single[7] == 0x5a);
+    GuestArena::GuestArenaUnmapAlias_nid_postfix(const_cast<unsigned char*>(single));
+    bool refused = false;
+    try {
+        GuestArena::GuestArenaMapAlias_nid_postfix(address + page * 4, page * 2);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    Require(refused);
+    GuestArena::GuestArenaReset_nid_postfix(block, page * 6);
+    GuestArena::GuestArenaRelease_nid_postfix(block, page * 6);
+    CloseHandle(first);
+    CloseHandle(second);
+#endif
+}
+
 static void CheckPinnedSharedPages() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -1844,6 +1889,7 @@ int main() {
     CheckFailedCollectKeepsWrites();
     CheckDirectMemoryMappedOnceIsPrivate();
     CheckPartialUnmapOfPrivateDirectMemory();
+    CheckSharedAliasAcrossViews();
 #if defined(__linux__)
     CheckWriteWatch();
     CheckWriteWatchArmedCollect();
