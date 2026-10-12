@@ -2780,6 +2780,43 @@ void pushConstantTests() {
     expectFailure([&] { AgcDriver::Graphics::AssemblePushConstants(shaders); }, "missing compiled shader");
 }
 
+// APS5_EXP_LEAN_DRAW's push constant assembly (a range at a time) builds the block the byte-wise one
+// builds and refuses what it refuses, with the same message, over many two-stage layouts.
+void pushConstantAssemblyEquivalenceTests() {
+    using AgcDriver::Graphics::PipelinePushConstantBytes;
+    using Block = std::array<std::byte, PipelinePushConstantBytes>;
+    ShaderRecompiler::RecompileResult first;
+    ShaderRecompiler::RecompileResult second;
+    std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &first, 0}, {ShaderRecompiler::ShaderStage::Fragment, &second, 0}}};
+    const auto outcome = [&](auto assemble) -> std::pair<std::optional<Block>, std::string> {
+        try {
+            return {assemble(std::span<const AgcDriver::Graphics::CompiledShader>(shaders)), {}};
+        } catch (const std::exception& error) {
+            return {std::nullopt, error.what()};
+        }
+    };
+    std::size_t built = 0, refused = 0;
+    for (std::uint32_t a = 0; a < PipelinePushConstantBytes + 8; a += 12) {
+        for (std::uint32_t aBytes = 0; aBytes <= 72; aBytes += 4) {
+            first.pushConstants.resize(aBytes);
+            for (std::size_t i = 0; i < aBytes; ++i) first.pushConstants[i] = static_cast<std::byte>(i * 7 + 1);
+            for (std::uint32_t b = 0; b < PipelinePushConstantBytes + 8; b += 20) {
+                for (std::uint32_t bBytes = 0; bBytes <= 136; bBytes += 8) {
+                    second.pushConstants.resize(bBytes);
+                    for (std::size_t i = 0; i < bBytes; ++i) second.pushConstants[i] = static_cast<std::byte>(i * 13 + 5);
+                    shaders[0].pushConstantOffset = a;
+                    shaders[1].pushConstantOffset = b;
+                    const auto byByte = outcome([](auto span) { return AgcDriver::Graphics::AssemblePushConstantsByByte(span); });
+                    const auto byRange = outcome([](auto span) { return AgcDriver::Graphics::AssemblePushConstantsByRange(span); });
+                    Require(byByte.first.has_value() == byRange.first.has_value() && byByte.second == byRange.second && (!byByte.first || *byByte.first == *byRange.first), "the range-wise push constant assembly differs from the byte-wise one");
+                    ++(byByte.first ? built : refused);
+                }
+            }
+        }
+    }
+    Require(built > 1000 && refused > 1000, "the push constant layouts did not cover both outcomes");
+}
+
 void descriptorSnapshotTests() {
     using AgcDriver::Graphics::DescriptorCache;
     using AgcDriver::Graphics::Recorder;
@@ -5101,6 +5138,7 @@ int main(int argc, char** argv) {
         AlphaToCoverageTests();
         descriptorPoolTests();
         pushConstantTests();
+        pushConstantAssemblyEquivalenceTests();
         resourceTests();
         descriptorSnapshotTests();
         descriptorCacheTests();

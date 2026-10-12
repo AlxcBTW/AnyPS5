@@ -3,8 +3,12 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -78,16 +82,29 @@ inline VkShaderStageFlags PushConstantStages(std::span<const CompiledShader> sha
     return result;
 }
 
-inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(std::span<const CompiledShader> shaders) {
+// exp (APS5_EXP_LEAN_DRAW=1, see LeanDraw): AssemblePushConstants copies each stage's range whole and
+// finds overlaps with a bit per byte (AssemblePushConstantsByRange) instead of a byte at a time
+// (AssemblePushConstantsByByte); the same block and the same errors.
+inline bool LeanPushAssembly() {
+    static const bool lean = std::getenv("APS5_EXP_LEAN_DRAW") != nullptr;
+    return lean;
+}
+
+inline void RequirePushConstantRange(const CompiledShader& shader) {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& bytes = shader.program->pushConstants;
+    if (bytes.empty()) return;
+    Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
+    Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
+    Require(bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
+}
+
+inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstantsByByte(std::span<const CompiledShader> shaders) {
     std::array<std::byte, PipelinePushConstantBytes> result{};
     std::array<bool, PipelinePushConstantBytes> occupied{};
     for (const auto& shader : shaders) {
-        Require(shader.program != nullptr, "missing compiled shader");
+        RequirePushConstantRange(shader);
         const auto& bytes = shader.program->pushConstants;
-        if (bytes.empty()) continue;
-        Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
-        Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
-        Require(bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
         for (std::size_t i = 0; i < bytes.size(); ++i) {
             const auto position = shader.pushConstantOffset + i;
             Require(!occupied[position], "shader push constant ranges of different stages overlap");
@@ -96,6 +113,31 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
         }
     }
     return result;
+}
+
+inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstantsByRange(std::span<const CompiledShader> shaders) {
+    std::array<std::byte, PipelinePushConstantBytes> result{};
+    std::array<std::uint64_t, PipelinePushConstantBytes / 64> occupied{};
+    for (const auto& shader : shaders) {
+        RequirePushConstantRange(shader);
+        const auto& bytes = shader.program->pushConstants;
+        if (bytes.empty()) continue;
+        const std::size_t first = shader.pushConstantOffset;
+        const std::size_t last = first + bytes.size();
+        for (std::size_t word = first / 64; word * 64 < last; ++word) {
+            const std::size_t low = std::max(first, word * 64) - word * 64;
+            const std::size_t high = std::min(last, word * 64 + 64) - word * 64;
+            const std::uint64_t mask = (high - low == 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << (high - low)) - 1u)) << low;
+            Require((occupied[word] & mask) == 0, "shader push constant ranges of different stages overlap");
+            occupied[word] |= mask;
+        }
+        std::memcpy(result.data() + first, bytes.data(), bytes.size());
+    }
+    return result;
+}
+
+inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(std::span<const CompiledShader> shaders) {
+    return LeanPushAssembly() ? AssemblePushConstantsByRange(shaders) : AssemblePushConstantsByByte(shaders);
 }
 
 }
