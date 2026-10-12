@@ -883,6 +883,11 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+bool LeanDraw() {
+    static const bool lean = std::getenv("APS5_EXP_LEAN_DRAW") != nullptr;
+    return lean;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -1725,9 +1730,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
+    // LeanDraw: the in-place reads are listed once for all queued stores, not once per store.
+    static const bool lean = LeanDraw();
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> inPlaceReads;
+    const auto readsOverlap = [&](std::uint64_t begin, std::uint64_t end) {
+        if (!lean) return resources.ReadsOverlap(begin, static_cast<std::size_t>(end - begin));
+        if (!inPlaceReads) inPlaceReads = resources.InPlaceReads();
+        return std::any_of(inPlaceReads->begin(), inPlaceReads->end(), [&](const auto& range) { return begin < range.second && range.first < end; });
+    };
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
+        if (resources.WritesOverlap(begin, bytes) || readsOverlap(begin, end)) return true;
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
@@ -1168,6 +1169,28 @@ VkDescriptorSetLayout CreateSetLayout(const Context& context, std::span<const Vk
 }
 
 std::vector<VkDescriptorPoolSize> PoolSizes(std::span<const VkDescriptorSetLayoutBinding> bindings) {
+    // LeanDraw: the same sizes (by type, ascending) summed in a small array instead of a map, as long
+    // as the set has few descriptor types.
+    if (LeanDraw()) {
+        std::array<VkDescriptorPoolSize, 16> few{};
+        std::size_t types = 0;
+        bool summed = true;
+        for (const auto& binding : bindings) {
+            auto* found = std::find_if(few.begin(), few.begin() + static_cast<std::ptrdiff_t>(types), [&](const VkDescriptorPoolSize& size) { return size.type == binding.descriptorType; });
+            if (found == few.begin() + static_cast<std::ptrdiff_t>(types)) {
+                if (types == few.size()) {
+                    summed = false;
+                    break;
+                }
+                few[types++] = {binding.descriptorType, 0};
+            }
+            found->descriptorCount += binding.descriptorCount;
+        }
+        if (summed) {
+            std::sort(few.begin(), few.begin() + static_cast<std::ptrdiff_t>(types), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+            return std::vector<VkDescriptorPoolSize>(few.begin(), few.begin() + static_cast<std::ptrdiff_t>(types));
+        }
+    }
     std::map<VkDescriptorType, std::uint32_t> counts;
     for (const auto& binding : bindings) counts[binding.descriptorType] += binding.descriptorCount;
     std::vector<VkDescriptorPoolSize> sizes;
