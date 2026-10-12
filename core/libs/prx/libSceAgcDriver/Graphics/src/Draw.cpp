@@ -1409,6 +1409,32 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
 // the record's dword as the first vertex / instance, and the constant is what the fixed-function
 // fetch must start at). The scratch is kept until the batch completed. Returns whether a copy was
 // rewritten; `argumentBuffer`/`argumentOffset` receive where the draw reads the records.
+// Whether a GPU-side indirect draw needs its record rewritten outside the render pass: a Constant
+// dimension replaces the record's own dword.
+bool IndirectNeedsRewrite(const Pm4::DrawParameters::IndirectDraw& args) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    return args.vertexRule == Rule::Constant || args.instanceRule == Rule::Constant;
+}
+
+// exp (APS5_EXP_INDIRECT_IN_PASS=1): a GPU-side indirect draw that needs no rewrite continues the
+// open render pass. The pass's opening barrier covers INDIRECT_COMMAND_READ for every store
+// recorded before the pass; stores inside the pass are draw writes, which PassHazards checks
+// against the record range (passReads). Nothing is recorded outside the pass here.
+bool IndirectInPass() {
+    static const bool enabled = std::getenv("APS5_EXP_INDIRECT_IN_PASS") != nullptr;
+    return enabled;
+}
+
+void bindIndirectArgumentsInPass(Recorder* recorder, bool recorded, const IndirectRecord& indirect, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset) {
+    const auto* args = indirect.args;
+    if (recorded) {
+        recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
+        if (args->countIndirect) recorder->NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
+    }
+    argumentBuffer = indirect.argumentImport->buffer;
+    argumentOffset = args->arguments - indirect.argumentImport->base;
+}
+
 bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier) {
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     const auto* args = indirect.args;
@@ -1421,7 +1447,7 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
     }
     argumentBuffer = indirect.argumentImport->buffer;
     argumentOffset = args->arguments - indirect.argumentImport->base;
-    const bool rewritten = args->vertexRule == Rule::Constant || args->instanceRule == Rule::Constant;
+    const bool rewritten = IndirectNeedsRewrite(*args);
     if (!rewritten) return false;
     const auto bytes = static_cast<std::size_t>(args->RangeBytes());
     scratch = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -1726,7 +1752,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const bool indirectInPass = gpuIndirect && IndirectInPass() && !IndirectNeedsRewrite(*args);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || (gpuIndirect && !indirectInPass) || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1757,13 +1784,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(commands, state);
+        if (gpuIndirect) {
+            Require(indirectInPass, "a GPU-side indirect draw that needs work outside its pass continued a pass");
+            bindIndirectArgumentsInPass(recorder, true, *record.indirect, argumentBuffer, argumentOffset);
+        }
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
             countBarrier(2);
         }
         if (start.barrier) {
-            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | (IndirectInPass() ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u)};
             context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
             countBarrier(1);
         }
