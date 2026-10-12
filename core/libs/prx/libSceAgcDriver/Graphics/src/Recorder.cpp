@@ -1393,6 +1393,10 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     return {commands, false, !elide};
 }
 
+Recorder::PassState* Recorder::OpenPassState() {
+    return open == nullptr ? nullptr : &open->renderPass.state;
+}
+
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
     auto& pass = open->renderPass;

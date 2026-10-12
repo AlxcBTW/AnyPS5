@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -49,10 +50,13 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::span<const std::uint8_t> persistent = {});
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const;
+    // With `recorded` (LeanDraw: the open pass's state, see Recorder::PassState) it notes what it
+    // recorded there.
+    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, Recorder::PassState* recorded = nullptr) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
-    // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state) const;
+    // construction: the attachment formats alone decide). With `recorded`, nothing is recorded when
+    // this pipeline object already recorded the same handle and dynamic values in the pass.
+    void Continue(VkCommandBuffer commands, const State& state, Recorder::PassState* recorded = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
     void ContinueBackFaces(VkCommandBuffer commands, const State& state) const;
@@ -71,6 +75,8 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
+    // The words Continue's commands carry (the bound handle and every dynamic value it sets).
+    Recorder::PassState continueWords(const State& state, VkPipeline bound) const;
     void setLibraryState(VkCommandBuffer commands, const State& state) const;
     Context context;
     std::vector<VkShaderModule> _modules;

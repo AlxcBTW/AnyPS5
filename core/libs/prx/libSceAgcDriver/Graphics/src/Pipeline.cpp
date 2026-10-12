@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -615,7 +616,7 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
+void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, Recorder::PassState* recorded) const {
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -642,7 +643,8 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        Continue(commands, state);
+        if (recorded != nullptr) *recorded = {};
+        Continue(commands, state, recorded);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -660,11 +662,72 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, state);
+    if (recorded != nullptr) *recorded = {};
+    Continue(commands, state, recorded);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
+Recorder::PassState Pipeline::continueWords(const State& state, VkPipeline bound) const {
+    Recorder::PassState words;
+    words.pipeline = this;
+    const auto add = [&](std::uint32_t word) {
+        Require(words.count < words.words.size(), "pipeline pass state exceeds its words");
+        words.words[words.count++] = word;
+    };
+    const auto addFloat = [&](float value) { add(std::bit_cast<std::uint32_t>(value)); };
+    const auto handle = reinterpret_cast<std::uint64_t>(bound);
+    add(static_cast<std::uint32_t>(handle));
+    add(static_cast<std::uint32_t>(handle >> 32u));
+    for (const float value : {state.viewport.x, state.viewport.y, state.viewport.width, state.viewport.height, state.viewport.minDepth, state.viewport.maxDepth}) addFloat(value);
+    add(static_cast<std::uint32_t>(state.scissor.offset.x));
+    add(static_cast<std::uint32_t>(state.scissor.offset.y));
+    add(state.scissor.extent.width);
+    add(state.scissor.extent.height);
+    if (libraries) {
+        const bool depth = state.depth.has_value();
+        add(state.cullMode);
+        add(static_cast<std::uint32_t>(state.frontFace));
+        addFloat(depthBias ? state.depthBiasConstant : 0.0f);
+        addFloat(depthBias ? state.depthBiasClamp : 0.0f);
+        addFloat(depthBias ? state.depthBiasSlope : 0.0f);
+        addFloat(depthBounds ? state.minDepthBounds : 0.0f);
+        addFloat(depthBounds ? state.maxDepthBounds : 1.0f);
+        add(depth && state.depthTest);
+        add(depth && state.depthWrite);
+        add(static_cast<std::uint32_t>(depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS));
+        add(depthBounds);
+        add(depth && state.stencilTest);
+        for (const auto& op : {depth ? state.stencilFront : VkStencilOpState{}, depth ? state.stencilBack : VkStencilOpState{}}) {
+            add(static_cast<std::uint32_t>(op.failOp));
+            add(static_cast<std::uint32_t>(op.passOp));
+            add(static_cast<std::uint32_t>(op.depthFailOp));
+            add(static_cast<std::uint32_t>(op.compareOp));
+            add(op.compareMask);
+            add(op.writeMask);
+            add(op.reference);
+        }
+        return words;
+    }
+    if (depthBias) {
+        addFloat(state.depthBiasConstant);
+        addFloat(state.depthBiasClamp);
+        addFloat(state.depthBiasSlope);
+    }
+    if (depthBounds) {
+        addFloat(state.minDepthBounds);
+        addFloat(state.maxDepthBounds);
+    }
+    return words;
+}
+
+void Pipeline::Continue(VkCommandBuffer commands, const State& state, Recorder::PassState* recorded) const {
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    if (recorded != nullptr) {
+        // The same pipeline object with the same handle and values already recorded in this pass:
+        // the bound pipeline and the dynamic state are still these (only draws record in the pass).
+        auto words = continueWords(state, best != VK_NULL_HANDLE ? best : pipeline);
+        if (recorded->pipeline == this && recorded->count == words.count && std::equal(words.words.begin(), words.words.begin() + words.count, recorded->words.begin())) return;
+        *recorded = words;
+    }
     context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, best != VK_NULL_HANDLE ? best : pipeline);
     context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);

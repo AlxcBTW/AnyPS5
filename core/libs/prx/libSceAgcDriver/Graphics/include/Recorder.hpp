@@ -66,6 +66,16 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
+    // LeanDraw (APS5_EXP_LEAN_DRAW=1): the pipeline and dynamic state the open render pass's last
+    // draw recorded (Pipeline::Continue writes it), reset with the pass. Only draws record inside
+    // a pass left open, so a continued draw that would record the same words records none.
+    struct PassState {
+        const void* pipeline = nullptr;
+        std::uint32_t count = 0;
+        std::array<std::uint32_t, 48> words{};
+    };
+    // The open batch's pass state; null without an open batch.
+    PassState* OpenPassState();
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -622,6 +632,7 @@ private:
             std::uint64_t key = 0;
             std::uint32_t timing = NoTiming;
             std::function<void(VkCommandBuffer)> afterPass;
+            PassState state;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.

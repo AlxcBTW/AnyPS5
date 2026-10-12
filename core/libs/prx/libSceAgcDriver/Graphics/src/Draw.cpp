@@ -1768,6 +1768,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool indirectInPass = gpuIndirect && IndirectInPass() && !IndirectNeedsRewrite(*args);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || (gpuIndirect && !indirectInPass) || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
+    // LeanDraw: a continued draw records the pipeline and dynamic state only when they differ from
+    // what the pass's last draw recorded (Recorder::PassState).
+    auto* passState = lean ? recorder->OpenPassState() : nullptr;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
@@ -1796,7 +1799,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
-        record.pipeline->Continue(commands, state);
+        record.pipeline->Continue(commands, state, passState);
         if (gpuIndirect) {
             Require(indirectInPass, "a GPU-side indirect draw that needs work outside its pass continued a pass");
             bindIndirectArgumentsInPass(recorder, true, *record.indirect, argumentBuffer, argumentOffset);
@@ -1821,7 +1824,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
-        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state);
+        record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, passState);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -1844,6 +1847,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    // Another pipeline is bound now (and the back faces' depth bias set): the next draw records all.
+    if (passState != nullptr && (record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel())) *passState = {};
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
