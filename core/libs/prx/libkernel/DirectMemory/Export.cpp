@@ -379,6 +379,12 @@ int APS5_VABI sceKernelConfiguredFlexibleMemorySize(size_t* size) {
  return 0;
 }
 
+int APS5_VABI sceKernelInternalMemoryGetAvailableSize(size_t* size) {
+ if (!size) return SCE_KERNEL_ERROR_EINVAL;
+ *size = 0;
+ return 0;
+}
+
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name) {
  const auto start = reinterpret_cast<uintptr_t>(addr);
  if (!addr || len == 0 || !name || len > UINTPTR_MAX - start) return SCE_KERNEL_ERROR_EINVAL;

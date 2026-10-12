@@ -398,7 +398,7 @@ if(BUILD_TESTING)
     add_test(NAME guest_pthread_start COMMAND guest_pthread_start_tests)
     set_tests_properties(guest_pthread_start PROPERTIES TIMEOUT 20)
     if(WIN32)
-        set_tests_properties(guest_pthread_start PROPERTIES TIMEOUT 60 ENVIRONMENT_MODIFICATION
+        set_tests_properties(guest_pthread_start PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_pthread_attr_errors_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadAttrErrors.cpp)

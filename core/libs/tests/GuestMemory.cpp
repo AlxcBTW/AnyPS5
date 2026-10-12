@@ -49,6 +49,7 @@ int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceKernelMapNamedFlexibleMemory(void**, std::size_t, int, int, const char*);
 int APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void**, std::size_t, int, int, const char*);
 int APS5_VABI sceKernelAvailableFlexibleMemorySize(std::size_t*);
+int APS5_VABI sceKernelInternalMemoryGetAvailableSize(std::size_t*);
 int APS5_VABI sceKernelMapFlexibleMemory(void**, std::size_t, int, int);
 int APS5_VABI sceKernelMunmap(void*, std::size_t);
 int APS5_VABI sceKernelReleaseFlexibleMemory(void*, std::size_t);
@@ -125,6 +126,12 @@ static void CheckPageTableStats() {
     Require(sceKernelGetPageTableStats(&cpuTotal, nullptr, &gpuTotal, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
     Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, nullptr, &gpuAvailable) == SCE_KERNEL_ERROR_EFAULT);
     Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, &gpuTotal, nullptr) == SCE_KERNEL_ERROR_EFAULT);
+}
+
+static void CheckInternalMemoryAvailableSize() {
+    std::size_t available = 1;
+    Require(sceKernelInternalMemoryGetAvailableSize(&available) == 0 && available == 0);
+    Require(sceKernelInternalMemoryGetAvailableSize(nullptr) == static_cast<int>(0x80020016u));
 }
 
 static void CheckNamedAndHintedMappings() {
@@ -1896,6 +1903,7 @@ int main() {
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();
     CheckSceKernelMmap();
+    CheckInternalMemoryAvailableSize();
     CheckVirtualQueryPartialMunmap();
     CheckMunmapOverUnmappedPages();
     CheckPageTableStats();

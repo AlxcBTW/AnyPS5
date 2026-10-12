@@ -84,7 +84,7 @@ SysVDynamicSection SysVDynamicSectionBuilder::BuildDynamicSection(
 
     auto symbolInfo = [](const NidReference& ref) -> std::uint8_t {
         if (ref.Nid.empty()) return static_cast<std::uint8_t>((STB_WEAK << 4) | STT_NOTYPE);
-        return static_cast<std::uint8_t>((STB_GLOBAL << 4) | STT_FUNC);
+        return static_cast<std::uint8_t>(((ref.Weak ? STB_WEAK : STB_GLOBAL) << 4) | STT_FUNC);
     };
 
     static constexpr std::size_t kRelaEntSize = 24;
