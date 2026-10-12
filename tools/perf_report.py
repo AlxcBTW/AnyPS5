@@ -71,6 +71,8 @@ def run(args):
         result["workloads"][name] = measure(counter, executable, arguments, args.repeats)
         print(f"{name}: {result['workloads'][name]}", file=sys.stderr)
     Path(args.output).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    if any("error" in entry for entry in result["workloads"].values()):
+        sys.exit(1)
 
 
 def delta(base, head):
