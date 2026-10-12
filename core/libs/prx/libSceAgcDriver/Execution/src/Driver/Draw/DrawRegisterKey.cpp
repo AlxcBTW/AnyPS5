@@ -6,8 +6,52 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, bool ringKeys) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
+    // exp (APS5_EXP_RING_POINTERS): the draw's program set (the stage enables and every program
+    // slot's registered shader) and the user registers its learned mask leaves out of the key.
+    std::span<const std::uint32_t> leftOut;
+    if (ringKeys) {
+        auto& ring = Ring::ThisDraw();
+        std::uint64_t set = 0xcbf29ce484222325ull;
+        const auto setMix = [&](std::uint64_t value) { set = (set ^ value) * 0x100000001b3ull; };
+        const auto stages = queue.context.find(0x2d5);
+        setMix(stages == queue.context.end() ? 0u : stages->second);
+        std::array<std::shared_ptr<const void>, 5> slots{};
+        std::size_t slot = 0;
+        for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
+            const auto low = queue.shader.find(base);
+            const auto high = queue.shader.find(base + 1);
+            ++slot;
+            if (low == queue.shader.end() || high == queue.shader.end()) {
+                setMix(0);
+                continue;
+            }
+            const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+            auto it = registry.upper_bound(address);
+            if (it == registry.begin()) {
+                setMix(1);
+                continue;
+            }
+            --it;
+            for (const auto& snapshot : it->second) setMix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+            if (!it->second.empty()) slots[slot - 1] = it->second.front();
+            setMix(address - it->first);
+        }
+        ring.set = set;
+        ring.mask = Ring::FindMask(set);
+        ring.keyed = true;
+        ring.pins.clear();
+        if (ring.mask == nullptr || !ring.mask->frozen) {
+            for (auto& pinned : slots) {
+                if (pinned != nullptr) ring.pins.push_back(std::move(pinned));
+            }
+        }
+        if (ring.mask != nullptr && !ring.mask->registers.empty()) {
+            leftOut = ring.mask->registers;
+            Ring::Totals().keysMasked.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -32,6 +76,7 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         const bool shader = range.bank == Graphics::RegisterBank::Shader;
         for (auto it = bank.lower_bound(range.first); it != bank.end() && it->first < end; ++it) {
             if (shader && unread(it->first)) continue;
+            if (shader && !leftOut.empty() && std::binary_search(leftOut.begin(), leftOut.end(), it->first)) continue;
             mix(it->first);
             mix(it->second);
         }

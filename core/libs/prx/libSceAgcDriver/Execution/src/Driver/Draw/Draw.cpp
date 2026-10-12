@@ -64,11 +64,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0;
     const bool registerKey = useDrawEntries && registerKeyEnabled();
     std::uint64_t drawKey = 0;
+    // exp (APS5_EXP_RING_POINTERS): this draw's program set and key mask, set by drawRegisterKey.
+    if (Ring::Draws()) {
+        auto& ringDraw = Ring::ThisDraw();
+        ringDraw.keyed = false;
+        ringDraw.mask = nullptr;
+    }
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial());
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), Ring::Draws() && !drawParameters.indirect);
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -101,6 +107,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters);
         std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
     };
+    if (Ring::Draws()) refreshRingWords(queue, programs);
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
@@ -168,7 +175,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<bool> recompiled(programs.size(), false);
     bool drawHit = false;
     bool verifyHit = false;
-    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs);
+    DrawRingHit ringHit;
+    lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, ringHit);
 
     if (registerKey) {
 
@@ -200,7 +208,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushOffsets[i] = pushCursorBytes;
         if (drawHit) {
 
-            programResults[i] = matched[i]->compiled.get();
+            programResults[i] = ringHit.any && ringHit.patched[i] != nullptr ? ringHit.patched[i].get() : matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
@@ -227,7 +235,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
+    if (drawHit && ringHit.any && Ring::VerifyEvery() != 0) {
+        // exp (APS5_EXP_RING_VERIFY=N): every Nth ring or data hit rebuilds its patched stages.
+        static std::atomic<std::uint64_t> ringHits{0};
+        if (ringHits.fetch_add(1, std::memory_order_relaxed) % Ring::VerifyEvery() == 0) {
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (ringHit.patched[i] != nullptr) verifyRingHit(i, pushOffsets[i], queue, submission, programs, graphics, pixel, vertexInfos, linked, drawParameters, localDevice, matched, matchedRegions, *ringHit.patched[i]);
+            }
+        }
+    }
     cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming);
+    if (Ring::Draws() && !drawHit && !drawParameters.indirect) learnRingMask(programs, roles, stageCaptures);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -364,7 +382,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && !ringHit.any) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

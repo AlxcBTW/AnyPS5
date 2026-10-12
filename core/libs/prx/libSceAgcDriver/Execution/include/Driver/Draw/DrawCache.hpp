@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -82,9 +83,27 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    // exp (APS5_EXP_RING_POINTERS): the capture (its read trace gives the data positions) and the
+    // stage's record relative to its ring words, when the stage has candidates.
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::optional<Ring::StageRecord> ring;
+};
+
+// exp (APS5_EXP_RING_POINTERS): per stage of a draw, what a hit with moved runs or live data words
+// uses instead of its variant's: the patched compiled stage, the live words its matched regions
+// point into, the moved runs.
+struct DrawRingHit {
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> patched;
+    std::vector<std::vector<std::uint32_t>> liveWords;
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> runs;
+    bool any = false;
+    bool moved = false;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
+
+// exp (APS5_EXP_RING_POINTERS): two variants' ring layouts hold the same words the same way.
+bool SameRingLayout(const std::shared_ptr<const Ring::Layout>& a, const std::shared_ptr<const Ring::Layout>& b);
 
 }
 

@@ -4,8 +4,20 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs) {
+void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, DrawRingHit& ringHit) {
     using Role = ShaderRecompiler::ProgramRole;
+    // exp (APS5_EXP_RING_POINTERS): variants with a ring layout or data positions validate their
+    // (moved) runs with the data words masked, and a hit that moved or saw live data draws with a
+    // patched copy of the stage.
+    const bool ringLookup = Ring::Draws();
+    if (ringLookup) {
+        ringHit.patched.assign(programs.size(), nullptr);
+        ringHit.liveWords.resize(programs.size());
+        ringHit.runs.resize(programs.size());
+        ringHit.any = false;
+        ringHit.moved = false;
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
     if (useDrawEntries) {
         if (!registerKey) {
             drawKey = 0xcbf29ce484222325ull;
@@ -100,13 +112,40 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         if (variant->pushOffset != cursor) continue;
                         auto& regions = matchedRegions[i];
                         regions.clear();
-                        appendEntryRegions(*variant, regions);
+                        const std::vector<std::pair<std::uint64_t, std::uint64_t>>* moved = nullptr;
+                        if (ringLookup && variant->ring != nullptr) {
+                            bool movedAny = false;
+                            if (!Ring::Rebase(*variant->ring, programs[i].userData, variant->runs, ringHit.runs[i], movedAny)) {
+                                Ring::Totals().rebaseMisses.fetch_add(1, std::memory_order_relaxed);
+                                if (!anyLayout) outcome = EntryOutcome::Differing;
+                                anyLayout = true;
+                                continue;
+                            }
+                            if (movedAny) moved = &ringHit.runs[i];
+                        }
+                        appendEntryRegions(*variant, regions, nullptr, moved);
                         ++compared;
-                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                        auto* live = ringLookup && !variant->dataPositions.empty() ? &liveData : nullptr;
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, moved);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live, moved);
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
-                        if (result != EntryOutcome::Equal) continue;
+                        if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                        if (result == EntryOutcome::EqualData || moved != nullptr) {
+                            // The live words (the stored ones with the differing data words
+                            // replaced) back the matched regions; the stage draws with a copy whose
+                            // flattened slots and pointer words hold the live values.
+                            auto& words = ringHit.liveWords[i];
+                            words = variant->words;
+                            for (const auto& [position, value] : liveData) words[position] = value;
+                            if (result == EntryOutcome::EqualData) {
+                                regions.clear();
+                                appendEntryRegions(*variant, regions, &words, moved);
+                            }
+                            ringHit.patched[i] = Ring::Patch(*variant->compiled, variant->ring.get(), programs[i].userData, variant->flatBinding, variant->dataPositions, variant->dataSlots, words);
+                            ringHit.any = true;
+                            if (moved != nullptr) ringHit.moved = true;
+                        }
                         matched[i] = variant;
                         ranks[i] = rank;
                         ++stageEqual;
@@ -120,6 +159,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
+            if (ringLookup && drawHit && ringHit.any) {
+                auto& totals = Ring::Totals();
+                totals.hits.fetch_add(1, std::memory_order_relaxed);
+                if (ringHit.moved) totals.moved.fetch_add(1, std::memory_order_relaxed);
+                else totals.dataHits.fetch_add(1, std::memory_order_relaxed);
+            }
             std::lock_guard cacheLock(drawCacheMutex);
             auto& counters = drawEntryCounters;
             counters.stageValidations += stageValidations;

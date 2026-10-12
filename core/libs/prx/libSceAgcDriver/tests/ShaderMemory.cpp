@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RingPointers.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/RequestMemoryView.hpp"
@@ -24,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <iostream>
 #include <map>
 #include <future>
@@ -525,6 +527,153 @@ void verifyOutOfRangeConstantReads() {
         });
     };
     require(holds(first) && holds(std::array<std::uint32_t, 8>{}), "out-of-range s_buffer_load: a T# read through a null V# was not evaluated as zero");
+}
+
+// exp (APS5_EXP_RING_POINTERS): a compute program that loads a constant through a user-data
+// pointer (s[0:1], the ring) and stores it through a user V# (s[4:7]), and with `storePointer` also
+// stores s0 itself (a push-constant word). The pointer is a ring candidate, the V# words are not;
+// a variant recorded at one pointer, moved to another (Rebase) and patched with the live words
+// (Patch), equals a fresh capture and recompile there.
+void verifyRingPointers(bool storePointer) {
+    using namespace ShaderRecompiler;
+    namespace Ring = AgcDriver::Ring;
+    std::vector<std::uint32_t> code{0xf4000200u, 0xfa000010u, 0xbf8cc07fu, 0x7e020208u, 0x7e000280u};
+    if (storePointer) code.push_back(0x7e040200u);
+    code.insert(code.end(), {0xe0700000u, 0x80010100u});
+    if (storePointer) code.insert(code.end(), {0xe0700004u, 0x80010200u});
+    code.push_back(0xbf810000u);
+    alignas(16) static std::array<std::uint32_t, 64> ring{};
+    for (std::uint32_t i = 0; i < ring.size(); ++i) ring[i] = 0x1000u + i;
+    alignas(16) static std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const auto userDataFor = [&](const std::uint32_t* pointer) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer));
+        return std::vector<std::uint32_t>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 16u, 0xfacu};
+    };
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const auto makeRequest = [&](std::span<const std::uint32_t> userData) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x24000u + (storePointer ? 0x100u : 0u), code, 0, {}};
+        request.context.waveSize = 32u;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        return request;
+    };
+    const auto userA = userDataFor(ring.data());
+    const auto userB = userDataFor(ring.data() + 8);
+    auto requestA = makeRequest(userA);
+    AgcDriver::ShaderMemory memoryA({});
+    const auto captureA = memoryA.Capture(requestA);
+    const auto own = memoryA.TakeRecentRegions();
+    requestA.context.memory = memoryA.Regions();
+    const auto compiledA = Recompile(requestA, *captureA);
+    require(Ring::ComputeCandidates(*captureA->plan) == std::vector<std::uint32_t>{0u}, "ring pointers: the user pointer was not the only candidate");
+    require(!captureA->readTrace.leaves.empty(), "ring pointers: the constant read through the pointer is not a pure flat slot");
+    auto failure = Ring::RecordFailure::None;
+    const auto record = Ring::RecordStage(std::vector<std::uint32_t>{0u}, userA, requestA.shader.codeAddress, own, {}, *compiledA, [&](const SrtRuntime& runtime) { return CaptureResources(requestA, runtime); }, [&](const ResourceCapture& moved, std::span<const std::uint32_t> userData) {
+        auto request = requestA;
+        request.context.userData = userData;
+        return Recompile(request, moved);
+    }, &failure);
+    require(record.has_value(), ("ring pointers: the stage was not recorded (failure " + std::to_string(static_cast<unsigned>(failure)) + ")").c_str());
+    require(record->words.size() == 1u && record->words[0].relative && record->classes.size() == 1u && record->classes[0] == 2u, "ring pointers: the constant was not read relative to the pointer");
+    require(storePointer == !record->push.empty() || storePointer == !record->bindingWords.empty(), "ring pointers: the stored pointer's push word was not found");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::uint32_t> words;
+    std::shared_ptr<const Ring::Layout> layout;
+    const std::array<std::uint32_t, 1> leftOut{0u};
+    Ring::BuildRuns(&*record, leftOut, userA, own, {}, runs, words, layout);
+    require(layout != nullptr && layout->words.size() == 1u && layout->runWord.size() == runs.size() && runs.size() == 1u && layout->runWord[0] == 1u, "ring pointers: the relative run was not laid out");
+    std::uint32_t flatBinding = std::numeric_limits<std::uint32_t>::max();
+    for (std::size_t b = 0; b < compiledA->bindings.size(); ++b) {
+        if (compiledA->bindings[b].role == DescriptorRole::FlattenedSrt) flatBinding = static_cast<std::uint32_t>(b);
+    }
+    require(flatBinding != std::numeric_limits<std::uint32_t>::max(), "ring pointers: no flattened SRT binding");
+    std::vector<std::uint32_t> positions, slots;
+    Ring::DataPositions(runs, words, layout.get(), captureA->readTrace, compiledA->bindings[flatBinding].guestDescriptor, positions, slots);
+    require(positions == std::vector<std::uint32_t>{0u}, "ring pointers: the relative constant is not a data position");
+    // A lookup at the other pointer: the run moves by 32 bytes and reads the live constant.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> moved;
+    bool movedAny = false;
+    require(Ring::Rebase(*layout, userB, runs, moved, movedAny) && movedAny && moved[0].first == runs[0].first + 32u, "ring pointers: the run did not move with the pointer");
+    std::vector<std::uint32_t> live(words.size());
+    std::memcpy(live.data(), reinterpret_cast<const void*>(moved[0].first), live.size() * sizeof(std::uint32_t));
+    const auto patched = Ring::Patch(*compiledA, layout.get(), userB, flatBinding, positions, slots, live);
+    auto requestB = makeRequest(userB);
+    AgcDriver::ShaderMemory memoryB({});
+    const auto captureB = memoryB.Capture(requestB);
+    requestB.context.memory = memoryB.Regions();
+    const auto compiledB = Recompile(requestB, *captureB);
+    require(patched->variantId == compiledB->variantId && patched->pushConstants == compiledB->pushConstants, "ring pointers: the patched stage's variant or push constants differ from a fresh one");
+    require(patched->bindings.size() == compiledB->bindings.size(), "ring pointers: binding count differs");
+    for (std::size_t b = 0; b < patched->bindings.size(); ++b) require(patched->bindings[b].guestDescriptor == compiledB->bindings[b].guestDescriptor, "ring pointers: a patched binding differs from a fresh one");
+    require(storePointer || compiledA->pushConstants == compiledB->pushConstants, "ring pointers: the push constants carry the pointer although the shader does not read it");
+    // An exact word repeats or misses; a null pointer misses.
+    Ring::Layout exact = *layout;
+    exact.words[0].relative = false;
+    require(!Ring::Rebase(exact, userB, runs, moved, movedAny) && Ring::Rebase(exact, userA, runs, moved, movedAny) && !movedAny, "ring pointers: an exact word did not gate the lookup");
+    auto nullData = userB;
+    nullData[0] = 0u;
+    require(!Ring::Rebase(*layout, nullData, runs, moved, movedAny), "ring pointers: a null pointer was rebased");
+}
+
+// exp (APS5_EXP_RING_POINTERS): user words map to their stage's user-data registers (a merged
+// stage's 8 leading words have none), and a program set's mask is kept once it leaves a register
+// out, or after 8 empty answers.
+void verifyRingMasks() {
+    using ShaderRecompiler::ShaderStage;
+    namespace Ring = AgcDriver::Ring;
+    require(Ring::UserWordRegister(ShaderStage::Vertex, 8u, 0x8cu, 3u) == 0x8fu && Ring::RegisterUserWord(ShaderStage::Vertex, 8u, 0x8cu, 16u, 0x8fu) == 3u, "ring masks: a vertex stage's user word");
+    require(Ring::UserWordRegister(ShaderStage::Mesh, 0u, 0x8cu, 9u) == 0x8du && !Ring::UserWordRegister(ShaderStage::Mesh, 0u, 0x8cu, 7u).has_value() && Ring::RegisterUserWord(ShaderStage::Mesh, 0u, 0x8cu, 24u, 0x8du) == 9u, "ring masks: a merged stage's user word");
+    require(Ring::UserWordRegister(ShaderStage::Fragment, 0u, 0x0cu, 0u) == 0x0cu && !Ring::RegisterUserWord(ShaderStage::Fragment, 0u, 0x0cu, 4u, 0x10u).has_value() && !Ring::RegisterUserWord(ShaderStage::Fragment, 0u, 0x0cu, 4u, 0x8cu).has_value(), "ring masks: a pixel stage's user word");
+    const std::uint64_t set = 0x5157u;
+    for (int attempt = 0; attempt < 7; ++attempt) Ring::LearnMask(set, {}, {});
+    require(Ring::FindMask(set) != nullptr && !Ring::FindMask(set)->frozen, "ring masks: an empty answer froze the mask early");
+    Ring::LearnMask(set, {}, {});
+    require(Ring::FindMask(set)->frozen && Ring::FindMask(set)->registers.empty(), "ring masks: eight empty answers did not freeze the mask");
+    Ring::LearnMask(set, {0x8cu}, {});
+    require(Ring::FindMask(set)->registers.empty(), "ring masks: a frozen mask changed");
+    const std::uint64_t other = 0x5158u;
+    Ring::LearnMask(other, {0x8fu, 0x8cu, 0x8fu}, {});
+    require(Ring::FindMask(other)->frozen && Ring::FindMask(other)->registers == std::vector<std::uint32_t>{0x8cu, 0x8fu}, "ring masks: a learned mask is not frozen, sorted and unique");
+}
+
+// exp (APS5_EXP_RING_POINTERS): a pointer whose words are also a V# the program uses as a
+// descriptor is no candidate.
+void verifyRingPointerDescriptor() {
+    using namespace ShaderRecompiler;
+    const std::vector<std::uint32_t> code{0xf4000200u, 0xfa000010u, 0xbf8cc07fu, 0x7e020208u, 0x7e000280u, 0xe0700000u, 0x80000100u, 0xbf810000u};
+    alignas(16) static std::array<std::uint32_t, 16> buffer{};
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(buffer.data()));
+    const std::vector<std::uint32_t> userData{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 64u, 0xfacu};
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x24400u, code, 0, {}};
+    request.context.waveSize = 32u;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto plan = GetResourcePlan(request);
+    require(AgcDriver::Ring::ComputeCandidates(*plan).empty(), "ring pointers: a word the program uses as a descriptor became a candidate");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
@@ -3274,6 +3423,10 @@ int main(int argc, char** argv) {
         verifyPureFlatSlots();
         verifyGuardedDescriptorSources();
         verifyBindlessTable();
+        verifyRingPointers(false);
+        verifyRingPointers(true);
+        verifyRingPointerDescriptor();
+        verifyRingMasks();
         verifyDescriptorPhis();
         verifyLaneSelectedDescriptors();
         verifyProgramCounterRelativeData();

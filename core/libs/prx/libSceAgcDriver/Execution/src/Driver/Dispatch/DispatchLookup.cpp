@@ -4,7 +4,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering, DispatchRing* ring) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -30,6 +30,9 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<ShaderRecompiler::MemoryRegion> regions;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+            // exp (APS5_EXP_RING_POINTERS=2): a variant with a ring layout validates its runs moved
+            // by the live pointers' deltas.
+            bool ringMoved = false;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
@@ -38,12 +41,21 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
                 for (std::size_t i = 0; i < variants.size(); ++i) {
                     regions.clear();
-                    appendEntryRegions(*variants[i], regions);
+                    const std::vector<std::pair<std::uint64_t, std::uint64_t>>* moved = nullptr;
+                    if (ring != nullptr && variants[i]->ring != nullptr) {
+                        bool movedAny = false;
+                        if (!Ring::Rebase(*variants[i]->ring, ring->userData, variants[i]->runs, ring->moved, movedAny)) {
+                            Ring::Totals().rebaseMisses.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                        if (movedAny) moved = &ring->moved;
+                    }
+                    appendEntryRegions(*variants[i], regions, nullptr, moved);
                     ++compared;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, moved);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData, moved);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
                     }
                     if (i == 0) outcome = result;
@@ -52,6 +64,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         variant = variants[i];
                         rank = i;
                         dataHit = result == EntryOutcome::EqualData;
+                        ringMoved = moved != nullptr;
                         break;
                     }
                 }
@@ -117,18 +130,29 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
-                if (dataHit) {
+                if (ring != nullptr) {
+                    ring->hit = dataHit || ringMoved;
+                    if (!ringMoved) ring->moved.clear();
+                }
+                if (dataHit || ringMoved) {
 
                     liveWords = variant->words;
                     for (const auto& [position, value] : liveData) liveWords[position] = value;
                     regions.clear();
-                    appendEntryRegions(*variant, regions, &liveWords);
+                    appendEntryRegions(*variant, regions, &liveWords, ringMoved ? &ring->moved : nullptr);
+                    if (variant->ring != nullptr) {
+                        // exp (APS5_EXP_RING_POINTERS=2): flattened slots and the pointer's words.
+                        compiledResult = Ring::Patch(*variant->compiled, variant->ring.get(), ring->userData, variant->flatBinding, variant->dataPositions, variant->dataSlots, liveWords);
+                    } else {
                     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant->compiled);
                     auto& descriptor = patched->bindings[variant->flatBinding].guestDescriptor;
                     for (std::size_t k = 0; k < variant->dataPositions.size(); ++k) {
                         if (variant->dataSlots[k] < descriptor.size()) descriptor[variant->dataSlots[k]] = liveWords[variant->dataPositions[k]];
                     }
                     compiledResult = std::move(patched);
+                    }
+                    dataHit = true;
+                    if (ringMoved) Ring::Totals().dispatchMoved.fetch_add(1, std::memory_order_relaxed);
                     ++counters.dataHits;
                     counters.dataWordsRefreshed += liveData.size();
                     ++counters.dataHitsByRank[rank];

@@ -6,11 +6,12 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<ShaderRecompiler::MemoryRegion>& regions, const std::vector<std::uint32_t>* words) {
+void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<ShaderRecompiler::MemoryRegion>& regions, const std::vector<std::uint32_t>* words, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* runs) {
     const auto& source = words != nullptr ? *words : variant.words;
-    regions.reserve(regions.size() + variant.runs.size());
+    const auto& ranges = runs != nullptr ? *runs : variant.runs;
+    regions.reserve(regions.size() + ranges.size());
     std::size_t offset = 0;
-    for (const auto& [begin, end] : variant.runs) {
+    for (const auto& [begin, end] : ranges) {
         const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
         regions.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(source).subspan(offset, count))});
         offset += count;
@@ -67,7 +68,9 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
     return true;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, const std::vector<std::pair<std::uint64_t, std::uint64_t>>* runs) {
+    // `runs`: the variant's runs moved by a ring-pointer hit (APS5_EXP_RING_POINTERS), else its own.
+    const auto& variantRuns = runs != nullptr ? *runs : variant.runs;
     if (live != nullptr) live->clear();
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
@@ -78,7 +81,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
     auto forget = GuestMemory::ForgetSerial();
 
-    if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) {
+    if (Graphics::StorageTexture::AnyPendingOverlaps(variantRuns) || Graphics::AnyShadowedOverlaps(variantRuns)) {
         for (const auto& region : regions) {
             if (Graphics::StorageTexture::FlushPending(region.guestAddress, region.bytes.size(), nullptr, "dispatch-cache entry")) ++imagesFlushed;
         }
@@ -87,11 +90,11 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         publish = Graphics::Recorder::PublishGeneration();
         pendingSerial = Graphics::StorageTexture::PendingSerial();
         forget = GuestMemory::ForgetSerial();
-        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return EntryOutcome::FlushingImage;
+        if (Graphics::StorageTexture::AnyPendingOverlaps(variantRuns) || Graphics::AnyShadowedOverlaps(variantRuns)) return EntryOutcome::FlushingImage;
     }
     if ((forget & 1) != 0) return EntryOutcome::ForgetMoved;
     for (const auto& label : deferredLabels().labels) {
-        for (const auto& [begin, end] : variant.runs) {
+        for (const auto& [begin, end] : variantRuns) {
             if (label.address < end && begin < label.address + label.size) return EntryOutcome::QueuedLabel;
         }
     }

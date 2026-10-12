@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RingPointers.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <span>
 #include <utility>
@@ -40,6 +42,10 @@ struct DispatchVariant {
 
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+
+    // exp (APS5_EXP_RING_POINTERS): the user words the variant's key left out, its runs relative to
+    // them and the pointer's push and shader-data words (Ring::Layout); null for a plain variant.
+    std::shared_ptr<const Ring::Layout> ring;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;
@@ -78,6 +84,17 @@ struct EntryCounters {
 struct DataMask {
     std::span<const std::uint32_t> positions;
     std::vector<std::pair<std::uint32_t, std::uint32_t>>* live;
+};
+
+// exp (APS5_EXP_RING_POINTERS=2): one dispatch's ring state: its program's key mask (the user
+// words its key leaves out), the record of a miss's capture relative to them, and a hit's moved runs.
+struct DispatchRing {
+    std::uint64_t set = 0;
+    std::span<const std::uint32_t> userData;
+    std::shared_ptr<const Ring::Mask> mask;
+    std::optional<Ring::StageRecord> record;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> moved;
+    bool hit = false;
 };
 
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };

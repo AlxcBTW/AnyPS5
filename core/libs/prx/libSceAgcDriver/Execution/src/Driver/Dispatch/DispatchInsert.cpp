@@ -10,7 +10,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     return compiled.poisonedSrtReads == 0u;
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming, DispatchRing* ring) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -30,7 +30,22 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
 
         DataWordPositionCounts dataCounts;
-        if (dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
+        // exp (APS5_EXP_RING_POINTERS=2): the reads through the words the key left out relative to
+        // them (BuildRuns over the same regions), the others exact, the pure slots as data.
+        const bool ringInsert = ring != nullptr && !stampValidate();
+        if (ringInsert) {
+            std::vector<std::uint32_t> leftOut;
+            if (ring->mask != nullptr) leftOut = ring->mask->registers;
+            Ring::BuildRuns(ring->record ? &*ring->record : nullptr, leftOut, ring->userData, srtRegions, {}, fresh->runs, fresh->words, fresh->ring);
+            if (dataHits() && capture != nullptr && !capture->readTrace.leaves.empty()) {
+                for (std::size_t b = 0; b < compiledResult->bindings.size(); ++b) {
+                    if (compiledResult->bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+                    fresh->flatBinding = static_cast<std::uint32_t>(b);
+                    Ring::DataPositions(fresh->runs, fresh->words, fresh->ring.get(), capture->readTrace, compiledResult->bindings[b].guestDescriptor, fresh->dataPositions, fresh->dataSlots);
+                    break;
+                }
+            }
+        } else if (dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
             for (std::size_t b = 0; b < compiledResult->bindings.size(); ++b) {
                 if (compiledResult->bindings[b].role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
                 fresh->flatBinding = static_cast<std::uint32_t>(b);
@@ -87,7 +102,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dispatchOrder.push_front(key);
                 created->order = dispatchOrder.begin();
                 dispatchCache.emplace(key, std::move(created));
-            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && found->second->variants.front()->words == fresh->words) {
+            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && found->second->variants.front()->words == fresh->words && SameRingLayout(found->second->variants.front()->ring, fresh->ring)) {
 
                 attachVariant = found->second->variants.front();
             } else {

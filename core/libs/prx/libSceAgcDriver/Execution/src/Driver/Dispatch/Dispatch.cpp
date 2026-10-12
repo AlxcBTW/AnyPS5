@@ -132,6 +132,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
     const bool noDispatchCache = noDispatchCacheEnv || probeThis;
+    // exp (APS5_EXP_RING_POINTERS=2): the program's key mask, the user words its key leaves out
+    // (learned from its first misses, Ring::LearnMask).
+    std::optional<DispatchRing> ring;
+    if (Ring::Dispatches() && !stampValidate() && !noDispatchCache) {
+        ring.emplace();
+        ring->set = ((((0xcbf29ce484222325ull ^ address) * 0x100000001b3ull) ^ reinterpret_cast<std::uintptr_t>(registeredShader.get())) * 0x100000001b3ull) ^ (packet[4] & 0x8000u);
+        ring->userData = userData;
+        ring->mask = Ring::FindMask(ring->set);
+    }
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -140,7 +149,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     mix(address);
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
-    for (const auto word : userData) mix(word);
+    if (ring && ring->mask != nullptr && !ring->mask->registers.empty()) {
+        const auto& leftOut = ring->mask->registers;
+        for (std::size_t i = 0; i < userData.size(); ++i) {
+            if (!std::binary_search(leftOut.begin(), leftOut.end(), static_cast<std::uint32_t>(i))) mix(userData[i]);
+        }
+        Ring::Totals().dispatchKeysMasked.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        for (const auto word : userData) mix(word);
+    }
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
@@ -229,7 +246,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering, ring ? &*ring : nullptr);
     }
     timing.Mark("lookup_cache");
     if (cached) {
@@ -262,6 +279,27 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             timing.Mark("materialize");
+            if (ring && CacheableResult(*compiledResult)) {
+                // exp (APS5_EXP_RING_POINTERS=2): the capture recorded relative to its candidate
+                // words while the program still learns its mask, else to the words it leaves out.
+                auto candidates = Ring::Candidates(capture->plan);
+                if (ring->mask != nullptr && ring->mask->frozen) {
+                    const auto& leftOut = ring->mask->registers;
+                    candidates.erase(std::remove_if(candidates.begin(), candidates.end(), [&](std::uint32_t word) { return !std::binary_search(leftOut.begin(), leftOut.end(), word); }), candidates.end());
+                }
+                if (!candidates.empty()) {
+                    std::vector<ShaderRecompiler::MemoryRegion> own;
+                    for (const auto& region : captured) {
+                        const bool registered = std::any_of(memory.begin(), memory.end(), [&](const auto& known) { return region.guestAddress >= known.guestAddress && region.guestAddress < known.guestAddress + known.bytes.size(); });
+                        if (!registered) own.push_back(region);
+                    }
+                    auto failure = Ring::RecordFailure::None;
+                    ring->record = Ring::RecordStage(candidates, userData, address, own, memory, *compiledResult, [&](const ShaderRecompiler::SrtRuntime& runtime) { return invocation.Capture(runtime); }, [&](const ShaderRecompiler::ResourceCapture& moved, std::span<const std::uint32_t>) { return invocation.Materialize(moved); }, &failure);
+                    if (ring->record) Ring::Totals().dispatchRecorded.fetch_add(1, std::memory_order_relaxed);
+                    else Ring::Totals().failures[static_cast<std::size_t>(failure)].fetch_add(1, std::memory_order_relaxed);
+                }
+                timing.Mark("ring_record");
+            }
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static double totalMs = 0;
@@ -279,7 +317,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming, ring ? &*ring : nullptr);
+        if (ring && (ring->mask == nullptr || !ring->mask->frozen)) {
+            std::vector<std::uint32_t> words;
+            if (ring->record) {
+                for (const auto& word : ring->record->words) {
+                    if (word.relative) words.push_back(word.userWord);
+                }
+            }
+            Ring::LearnMask(ring->set, std::move(words), {registeredShader});
+        }
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -304,7 +351,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (cached) ++groupStats.resolvedHits;
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    const auto* ringRuns = ring && ring->hit && !fromAhead && !ring->moved.empty() ? &ring->moved : nullptr;
+    if (verifyDataHits() && dataHit && !(fromAhead && keepVariant->ring != nullptr)) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult, ringRuns);
+    else if (ring && ring->hit && !fromAhead && Ring::VerifyEvery() != 0) {
+        // exp (APS5_EXP_RING_VERIFY=N): every Nth ring or data hit is rebuilt and compared.
+        static std::atomic<std::uint64_t> ringHits{0};
+        if (ringHits.fetch_add(1, std::memory_order_relaxed) % Ring::VerifyEvery() == 0) {
+            verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult, ringRuns);
+            Ring::Totals().verified.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
