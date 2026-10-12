@@ -18,6 +18,7 @@
 #include <io.h>
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -331,18 +332,22 @@ int OpenHostWatch(int descriptor, std::uint32_t notes, HostWatch& host) {
 struct HostWatch {
     int notify = -1;
     int target = -1;
+    int entries = -1;
     bool directory = false;
     struct stat last {};
 };
 
+struct HostEvent {
+    std::uint32_t mask;
+    std::uint32_t cookie;
+};
+
 void CloseHostWatch(HostWatch& host) {
-    if (host.notify >= 0) {
-        ::close(host.notify);
-        host.notify = -1;
-    }
-    if (host.target >= 0) {
-        ::close(host.target);
-        host.target = -1;
+    for (int* descriptor : {&host.notify, &host.target, &host.entries}) {
+        if (*descriptor >= 0) {
+            ::close(*descriptor);
+            *descriptor = -1;
+        }
     }
 }
 
@@ -376,9 +381,73 @@ std::uint32_t ModifyHint(HostWatch& host) {
     return hint;
 }
 
+int ReadHostEvents(const HostWatch& host, std::vector<HostEvent>& events) {
+    alignas(inotify_event) char buffer[16384];
+    for (;;) {
+        const auto length = ::read(host.notify, buffer, sizeof(buffer));
+        if (length < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return errno == EAGAIN ? 0 : errno;
+        }
+        if (length == 0) {
+            return 0;
+        }
+        for (char* cursor = buffer; cursor < buffer + length;) {
+            const auto* event = reinterpret_cast<const inotify_event*>(cursor);
+            events.push_back({event->mask, event->cookie});
+            cursor += sizeof(inotify_event) + event->len;
+        }
+    }
+}
+
+std::unordered_map<std::uint32_t, int> CountMoves(const std::vector<HostEvent>& events) {
+    std::unordered_map<std::uint32_t, int> moves;
+    for (const auto& event : events) {
+        if ((event.mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0) {
+            ++moves[event.cookie];
+        }
+    }
+    return moves;
+}
+
+bool HasUnpairedMove(const std::vector<HostEvent>& events, std::size_t first) {
+    const auto moves = CountMoves(events);
+    for (std::size_t index = first; index < events.size(); ++index) {
+        if ((events[index].mask & IN_MOVED_FROM) != 0 && moves.at(events[index].cookie) == 1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int WaitForRenamesInProgress(const HostWatch& host) {
+    char entries[1024];
+    if (::getdents64(host.entries, entries, sizeof(entries)) < 0 && errno != ENOENT) {
+        return errno;
+    }
+    return 0;
+}
+
+int ReadSettledHostEvents(const HostWatch& host, std::vector<HostEvent>& events) {
+    if (const int error = ReadHostEvents(host, events)) {
+        return error;
+    }
+    for (std::size_t settled = 0; HasUnpairedMove(events, settled);) {
+        settled = events.size();
+        if (const int error = WaitForRenamesInProgress(host)) {
+            return error;
+        }
+        if (const int error = ReadHostEvents(host, events)) {
+            return error;
+        }
+    }
+    return 0;
+}
+
 void RunHostWatch(std::shared_ptr<VnodeWatch> watch, HostWatch host) {
     pollfd waits[2] = {{host.notify, POLLIN, 0}, {watch->StopEvent(), POLLIN, 0}};
-    alignas(inotify_event) char buffer[16384];
     bool watching = true;
     while (watching) {
         if (::poll(waits, 2, -1) < 0) {
@@ -391,48 +460,36 @@ void RunHostWatch(std::shared_ptr<VnodeWatch> watch, HostWatch host) {
         if (waits[1].revents != 0) {
             break;
         }
-        const auto length = ::read(host.notify, buffer, sizeof(buffer));
-        if (length < 0) {
-            if (errno == EINTR || errno == EAGAIN) {
-                continue;
-            }
+        std::vector<HostEvent> events;
+        if (const int error = ReadSettledHostEvents(host, events)) {
             CloseHostWatch(host);
-            throw std::runtime_error("EVFILT_VNODE: reading inotify failed, errno=" + std::to_string(errno));
+            throw std::runtime_error("EVFILT_VNODE: reading inotify failed, errno=" + std::to_string(error));
         }
-        std::unordered_map<std::uint32_t, int> moves;
-        for (char* cursor = buffer; cursor < buffer + length;) {
-            const auto* event = reinterpret_cast<const inotify_event*>(cursor);
-            if ((event->mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0) {
-                ++moves[event->cookie];
-            }
-            cursor += sizeof(inotify_event) + event->len;
-        }
+        const auto moves = CountMoves(events);
         std::vector<std::uint32_t> hints;
-        for (char* cursor = buffer; cursor < buffer + length;) {
-            const auto* event = reinterpret_cast<const inotify_event*>(cursor);
-            const std::uint32_t link = (event->mask & IN_ISDIR) != 0 ? NOTE_LINK : 0;
-            if ((event->mask & IN_MODIFY) != 0) {
+        for (const auto& event : events) {
+            const std::uint32_t link = (event.mask & IN_ISDIR) != 0 ? NOTE_LINK : 0;
+            if ((event.mask & IN_MODIFY) != 0) {
                 hints.push_back(ModifyHint(host));
             }
-            if ((event->mask & IN_ATTRIB) != 0) {
+            if ((event.mask & IN_ATTRIB) != 0) {
                 hints.push_back(AttributeHint(host));
             }
-            if ((event->mask & (IN_CREATE | IN_DELETE)) != 0) {
+            if ((event.mask & (IN_CREATE | IN_DELETE)) != 0) {
                 hints.push_back(NOTE_WRITE | link);
             }
-            if ((event->mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0) {
-                hints.push_back(moves[event->cookie] > 1 ? NOTE_WRITE : NOTE_WRITE | NOTE_EXTEND | link);
+            if ((event.mask & (IN_MOVED_FROM | IN_MOVED_TO)) != 0) {
+                hints.push_back(moves.at(event.cookie) > 1 ? NOTE_WRITE : NOTE_WRITE | NOTE_EXTEND | link);
             }
-            if ((event->mask & IN_MOVE_SELF) != 0) {
+            if ((event.mask & IN_MOVE_SELF) != 0) {
                 hints.push_back(NOTE_RENAME);
             }
-            if ((event->mask & IN_DELETE_SELF) != 0) {
+            if ((event.mask & IN_DELETE_SELF) != 0) {
                 hints.push_back(NOTE_DELETE);
             }
-            if ((event->mask & IN_IGNORED) != 0) {
+            if ((event.mask & IN_IGNORED) != 0) {
                 watching = false;
             }
-            cursor += sizeof(inotify_event) + event->len;
         }
         for (const auto hint : hints) {
             watch->Deliver(hint);
@@ -459,6 +516,14 @@ int OpenHostWatch(int descriptor, std::uint32_t, HostWatch& host) {
         const int error = errno;
         CloseHostWatch(host);
         throw std::runtime_error("EVFILT_VNODE: opening the watched file failed, errno=" + std::to_string(error));
+    }
+    if (host.directory) {
+        host.entries = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (host.entries < 0) {
+            const int error = errno;
+            CloseHostWatch(host);
+            throw std::runtime_error("EVFILT_VNODE: opening the watched directory failed, errno=" + std::to_string(error));
+        }
     }
     host.notify = ::inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
     std::uint32_t mask = IN_MODIFY | IN_ATTRIB | IN_MOVE_SELF | IN_DELETE_SELF;

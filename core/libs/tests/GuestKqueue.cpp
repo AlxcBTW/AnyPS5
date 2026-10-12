@@ -330,6 +330,45 @@ static void RenameAndDeleteWatchedFile() {
     Require(close_nid_postfix(file) == 0);
     Require(close_nid_postfix(kq) == 0);
 }
+
+static std::uint32_t NotesThrough(int kq, std::uintptr_t ident, std::uint32_t last) {
+    std::uint32_t notes = 0;
+    KernelEvent events[4]{};
+    while ((notes & last) == 0) {
+        Require(Wait(kq, events, 4) == 1 && events[0].ident == ident);
+        notes |= events[0].fflags;
+    }
+    return notes;
+}
+
+static void MoveDirectoryEntries() {
+    const auto path = TemporaryName("moves");
+    const auto outside = path + "-outside";
+    Require(mkdir_nid_postfix(path.c_str(), 0755) == 0 && mkdir_nid_postfix(outside.c_str(), 0755) == 0);
+    const int child = open_nid_postfix((path + "/first.bin").c_str(), ReadWrite | Create, 0644);
+    Require(child >= 0 && close_nid_postfix(child) == 0);
+    const int directory = open_nid_postfix(path.c_str(), Directory, 0);
+    Require(directory >= 0);
+    const int kq = kqueue_nid_postfix();
+    KernelEvent events[4]{};
+    const auto ident = static_cast<std::uintptr_t>(directory);
+    Require(Apply(kq, Change(ident, EvfiltVnode, EvAdd | EvClear, NoteWrite | NoteExtend | NoteLink)) == 0);
+    for (int i = 0; i < 64; ++i) {
+        Require(sceKernelRename((path + "/first.bin").c_str(), (path + "/second.bin").c_str()) == SceOk);
+        Require(sceKernelRename((path + "/second.bin").c_str(), (path + "/first.bin").c_str()) == SceOk);
+    }
+    Require(mkdir_nid_postfix((path + "/sub").c_str(), 0755) == 0);
+    Require(NotesThrough(kq, ident, NoteLink) == (NoteWrite | NoteLink));
+    Require(sceKernelRename((path + "/first.bin").c_str(), (outside + "/first.bin").c_str()) == SceOk);
+    Require(Wait(kq, events, 4) == 1 && events[0].ident == ident && events[0].fflags == (NoteWrite | NoteExtend));
+    Require(sceKernelRename((outside + "/first.bin").c_str(), (path + "/first.bin").c_str()) == SceOk);
+    Require(Wait(kq, events, 4) == 1 && events[0].ident == ident && events[0].fflags == (NoteWrite | NoteExtend));
+    Require(sceKernelRename((path + "/sub").c_str(), (outside + "/sub").c_str()) == SceOk);
+    Require(Wait(kq, events, 4) == 1 && events[0].ident == ident && events[0].fflags == (NoteWrite | NoteExtend | NoteLink));
+    Require(close_nid_postfix(directory) == 0);
+    Require(close_nid_postfix(kq) == 0);
+    Require(std::filesystem::remove_all(path) == 2 && std::filesystem::remove_all(outside) == 2);
+}
 #endif
 
 static void DirectoryWatch() {
@@ -381,6 +420,7 @@ int main() {
     FileWatch();
 #ifndef _WIN32
     RenameAndDeleteWatchedFile();
+    MoveDirectoryEntries();
 #endif
     DirectoryWatch();
     Timeout();
