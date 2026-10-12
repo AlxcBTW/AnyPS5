@@ -14,6 +14,12 @@ std::uint32_t readRegister(const Registers& registers, std::uint32_t offset);
 
 std::uint32_t readUserData(const Registers& shader, std::uint32_t offset);
 
+// Gives stderr a 64 KiB buffer for the whole process (once; APS5_STDERR_UNBUFFERED=1 keeps it
+// unbuffered).
+void BufferStandardError();
+// Flushes stderr and stdout (a window boundary, shutdown).
+void FlushStandardStreams();
+
 }
 
 #endif

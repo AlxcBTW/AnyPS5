@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -51,42 +52,6 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
     mix(state.renderExtent.height);
     if (!context.provokingVertexModePerPipeline) mix(state.provokingVertexMode);
     return key;
-}
-
-namespace {
-
-std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
-    if (const auto guest = FindGuestColorTargetFormat(format, elementBytes)) return *guest;
-    throw std::runtime_error("AGC graphics: no guest texture format matches the color buffer format " + std::to_string(static_cast<int>(format)));
-}
-
-// The color buffer as a single-mip 2D surface descriptor (tile mode SW_64KB_R_X).
-GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    Require(color.tileMode != ColorTileMode::Linear, "linear color targets are not resident");
-    const bool chain = color.mipCount > 1;
-    GuestTextureResource surface{};
-    surface.baseAddress = chain ? color.surfaceAddress : color.address;
-    surface.pipeBankXor = color.pipeBankXor;
-    surface.width = chain ? color.surfaceExtent.width : color.extent.width;
-    surface.height = chain ? color.surfaceExtent.height : color.extent.height;
-    surface.depthOrLastArray = color.depth - 1u;
-    surface.baseArray = 0;
-    surface.mipCount = color.mipCount;
-    surface.baseLevel = 0;
-    surface.lastLevel = color.mipCount - 1;
-    surface.tileMode = ColorTextureTileMode(color.tileMode);
-    surface.dimension = color.depth > 1 ? TextureDimension::k3D : TextureDimension::k2D;
-    surface.format = GuestFormatFor(color.format, color.elementBytes);
-    surface.dstSelX = 4;
-    surface.dstSelY = 5;
-    surface.dstSelZ = 6;
-    surface.dstSelW = 7;
-    surface.dccAddress = color.dccAddress;
-    surface.dccAlphaOnMsb = color.dccAlphaOnMsb;
-    surface.dccPipeAligned = color.dccPipeAligned;
-    return surface;
-}
-
 }
 
 namespace {
@@ -582,8 +547,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
-    std::fprintf(stderr, "%s\n", line);
-    std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -669,6 +634,9 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
         add(context.subgroup.supportedStages);
         add(context.subgroup.supportedOperations);
         add(context.fragmentShaderBarycentric);
+        add(context.clipDistance);
+        add(context.cullDistance);
+        add(state.paClVsOutCntl);
         add(state.stages.mesh.has_value());
         if (state.stages.mesh) {
             const auto& mesh = *state.stages.mesh;
@@ -720,7 +688,7 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     }
     std::set<std::uint32_t> outputs;
     try {
-        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics);
+        outputs = ValidateShaders(shaders, state, context.subgroup, context.fragmentShaderBarycentric, context.descriptorIndexing, context.imageInt64Atomics, context.geometryShader, context.sampleRateShading, context.bufferInt64Atomics, context.runtimeDescriptorArray, context.clipDistance, context.cullDistance, context.viewportIndexLayer);
     } catch (const std::exception& error) {
         if (keyed) {
             std::lock_guard lock(validationMutex());
@@ -835,6 +803,35 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
     // Never destroyed: a completion action of a batch still in flight at static teardown may erase from it.
     static auto* const writers = new std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>>(std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>());
     return *writers;
+}
+
+namespace {
+
+// exp: APS5_EXP_INDIRECT_GPU for indirect draws (see the decide lambda in Draw): 1 records eligible
+// draws on the GPU, 2 (APS5_EXP_INDIRECT_GPU_VERIFY) only counts them.
+int IndirectGpuDrawMode() {
+    static const int mode = std::getenv("APS5_EXP_INDIRECT_GPU_VERIFY") != nullptr ? 2 : std::getenv("APS5_EXP_INDIRECT_GPU") != nullptr ? 1 : 0;
+    return mode;
+}
+
+void NoteIndirectGpuDraw(bool eligible) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static std::atomic<std::uint64_t> pending{0}, kept{0};
+    static std::atomic<std::int64_t> reported{0};
+    if (!profile) return;
+    pending.fetch_add(1, std::memory_order_relaxed);
+    if (eligible) kept.fetch_add(1, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = reported.load();
+    if (last == 0) {
+        reported.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !reported.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[exp-indirect-draw] (10 s): %llu indirect draw argument ranges with a pending label or listed writer over them, %llu eligible (%s)\n",
+        static_cast<unsigned long long>(pending.exchange(0)), static_cast<unsigned long long>(kept.exchange(0)), IndirectGpuDrawMode() == 1 ? "recorded on the GPU" : "verify: read on the CPU");
+}
+
 }
 
 const char* IndirectDrawPathName(IndirectDrawPath path) {
@@ -1870,6 +1867,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
@@ -1891,7 +1889,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice));
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -1961,10 +1959,19 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 }
                 return IndirectDrawPath::PendingImage;
             }
-            if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
             const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+            if ((recorder != nullptr && recorder->PendingLabelIn(address, bytes)) || (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps))
+                || std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) {
+                // exp (APS5_EXP_INDIRECT_GPU=1): as for indirect dispatches (VulkanDevice::decideIndirect),
+                // the draw stays on the GPU when every pending write over its arguments is recorded on
+                // the device queue; recordIndirectArguments' barrier orders them before the read.
+                if (IndirectGpuDrawMode() == 0) return IndirectDrawPath::PendingLabelOrCopy;
+                const auto copied = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
+                const bool eligible = recorder != nullptr && recorder->LabelsRecordedOnGpu(address, bytes) && !(context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), copied))
+                                      && !std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), copied);
+                NoteIndirectGpuDraw(eligible);
+                if (!eligible || IndirectGpuDrawMode() != 1) return IndirectDrawPath::PendingLabelOrCopy;
+            }
             if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
             return IndirectDrawPath::Gpu;
         };
@@ -2065,7 +2072,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     std::vector<std::shared_ptr<StorageTexture>> owners;
     owners.reserve(targets.size());
     for (const auto& binding : targets) owners.push_back(binding.resident);
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent);
+    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2441,7 +2448,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     auto framebuffer = recipe.framebuffer.lock();
-    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent);
+    if (framebuffer == nullptr) framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, targets, state.renderExtent, state.renderLayers);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;

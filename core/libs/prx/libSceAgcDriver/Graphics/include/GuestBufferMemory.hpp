@@ -33,7 +33,11 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
+    // Made for a bound range crossing adjacent registered ranges that the import window keeps apart
+    // (see GuestBufferMemory.cpp, joinedRun): it stands while exactly those ranges do.
+    bool joined = false;
     std::shared_ptr<void> chunk;
+    mutable std::uint64_t lastUse = 0;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -60,11 +64,16 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 bool WatchedImportsStampPages(const Context& context);
 bool WatchedImportsStampPages();
 
+std::uint64_t RelieveGpuMemory(const Context& context);
+std::uint64_t HostImportLimit();
+
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
+// Overrides APS5_HOST_IMPORT_JOIN (tests).
+void SetHostImportJoin(bool enabled);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
@@ -238,6 +247,10 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    // exp (APS5_EXP_INDIRECT_GPU): whether a written range over [address, address + bytes) lies in a
+    // region the CPU stores back when the work retires (HasCopiedWrites' rule, per range); a range
+    // without a region of its own, or running past it, counts as one.
+    bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
@@ -384,6 +397,7 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
+    std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.

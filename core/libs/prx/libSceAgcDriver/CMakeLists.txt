@@ -806,6 +806,20 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_host_import_retire_tests EXCLUDE_FROM_ALL tests/HostImportRetireHold.cpp)
+target_include_directories(agc_host_import_retire_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_host_import_retire_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_host_import_retire_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_host_import_retire_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_host_import_retire_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_host_import_retire COMMAND agc_host_import_retire_tests)
+    if(WIN32)
+        set_tests_properties(agc_host_import_retire PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_pm4_tests EXCLUDE_FROM_ALL
         tests/Pm4.cpp
 )
@@ -1048,6 +1062,14 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_sampled_cache_budget_memory PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    # The driver draw test again with the draw key off: the draw cache then keys on the decoded vertex
+    # stage, which must include PA_CL_VS_OUT_CNTL.
+    add_test(NAME agc_driver_vertex_clip_cull_draw_no_key COMMAND agc_driver_vertex_clip_cull_draw_tests no-key)
+    set_tests_properties(agc_driver_vertex_clip_cull_draw_no_key PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_KEY=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_vertex_clip_cull_draw_no_key PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_pm4_failure COMMAND agc_driver_pm4_tests failure)
@@ -1418,8 +1440,11 @@ if(BUILD_TESTING)
     target_link_libraries(pixel_ancillary_tests PRIVATE shader_recompiler_agc_driver libc)
     configure_windows_unwind(pixel_ancillary_tests)
     add_test(NAME pixel_ancillary COMMAND pixel_ancillary_tests)
+    add_test(NAME pixel_ancillary_trace COMMAND pixel_ancillary_tests --trace)
+    set_tests_properties(pixel_ancillary_trace PROPERTIES ENVIRONMENT "APS5_TRACE_ANCILLARY=1"
+        PASS_REGULAR_EXPRESSION "\\[ancillary\\] shader 0x0 select #[0-9]+ kept, exec-reactivated: #[0-9]+ SetAttribute runs under true[^\n]*mask #[0-9]+ IEqual32 = not a helper lane\n\\[ancillary\\] shader 0x0 live-use: #[0-9]+ SelectU32\\(#[0-9]+ IEqual32, 0x5a3c9e17, ancillary\\)")
     if(WIN32)
-        set_tests_properties(pixel_ancillary PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(pixel_ancillary pixel_ancillary_trace PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_indexed_draw_tests ${LIBS_INCLUDE_DIR}/tests/GuestIndexedDraw.cpp)
@@ -1503,6 +1528,21 @@ add_test_executable(agc_position_invariance_tests EXCLUDE_FROM_ALL tests/Positio
 target_link_libraries(agc_position_invariance_tests PRIVATE shader_recompiler_agc_driver libc)
 set_target_properties(agc_position_invariance_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_position_invariance_tests)
+
+add_test_executable(agc_vertex_layer_export_tests EXCLUDE_FROM_ALL tests/VertexLayerExport.cpp)
+target_link_libraries(agc_vertex_layer_export_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_vertex_layer_export_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vertex_layer_export_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_vertex_layer_export_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_vertex_layer_export COMMAND agc_vertex_layer_export_tests)
+    set_tests_properties(agc_vertex_layer_export PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1")
+    if(WIN32)
+        set_tests_properties(agc_vertex_layer_export PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 if(BUILD_TESTING)
     set_target_properties(agc_position_invariance_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_position_invariance COMMAND agc_position_invariance_tests)
@@ -1564,6 +1604,19 @@ if(BUILD_TESTING)
     add_test(NAME agc_embedded_vertex_fetch_aliasing COMMAND agc_embedded_vertex_fetch_aliasing_tests)
     if(WIN32)
         set_tests_properties(agc_embedded_vertex_fetch_aliasing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_constant_phi_tests EXCLUDE_FROM_ALL tests/ConstantPhi.cpp)
+target_link_libraries(agc_constant_phi_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_constant_phi_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_constant_phi_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_constant_phi_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_constant_phi COMMAND agc_constant_phi_tests)
+    if(WIN32)
+        set_tests_properties(agc_constant_phi PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

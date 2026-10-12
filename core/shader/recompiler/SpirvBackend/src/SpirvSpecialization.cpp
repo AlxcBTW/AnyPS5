@@ -442,7 +442,7 @@ private:
                     if (!retainMerge) instruction.clear();
                 }
                 const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ?
-                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                    Make(spv::OpSwitch, {terminal.at(1), target}) : terminal;
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;

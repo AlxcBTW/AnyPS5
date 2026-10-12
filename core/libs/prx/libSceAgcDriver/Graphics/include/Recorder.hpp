@@ -86,8 +86,15 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    // Keeps `object` in the open batch (opening one when the recorder is idle) and in every batch
+    // opened later in the same GpuMutex hold: what the hold recorded or will record with it, even
+    // after a Submit or Sync, completes first. A host import retired mid-hold is handed over this
+    // way, so a pointer to it that the hold took earlier stays usable (see GuestBufferMemory).
+    void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
+    // The lease waiter's release before the guest takes pages back: the deferred kept objects, and
+    // KeepThroughHold's, which would otherwise pin their ranges until the next batch opens.
     void FlushDeferredReleases();
     static constexpr std::size_t KeptBytesBudget = std::size_t{512} << 20u;
     void BoundKeptBytes();
@@ -222,6 +229,7 @@ public:
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
     static std::uint64_t ReapsWithWork();
+    static bool WaitForReleases(std::chrono::milliseconds timeout);
 
     // A store of `bytes` into a host import (a label, or a COPY_DATA/DMA_DATA/DUMP_CONST_RAM store
     // of up to 64 KiB; `address` is its guest address) recorded into the open batch: ordered
@@ -303,6 +311,10 @@ public:
     // where a per-dword lookup would not do.
     bool PendingLabelIn(std::uint64_t address, std::size_t bytes) const;
     bool CompletionLabelIn(std::uint64_t address, std::size_t bytes) const;
+    // exp (APS5_EXP_INDIRECT_GPU): whether every label over [address, address + bytes) is stored by
+    // the GPU in a recorded batch: none queued (any queue), none landing only by a completion's CPU
+    // store, no wide label. A GPU read recorded later in the queue then sees their values.
+    bool LabelsRecordedOnGpu(std::uint64_t address, std::size_t bytes) const;
     // PendingLabel of the active recorder WITHOUT GuestMemory::GpuMutex: the table has a small mutex
     // of its own (every mutation holds both), so a WAIT_REG_MEM consults it without queueing behind
     // device work. Nothing is done under the table mutex but the lookup (it never takes the GPU mutex).
@@ -711,6 +723,8 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    // Lets go of KeepThroughHold's objects once their hold has ended (the batches it opened keep them).
+    void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.
@@ -778,6 +792,9 @@ private:
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
     std::unique_ptr<Batch> open;
+    // KeepThroughHold's objects and the GpuMutex hold (GuestMemory::GpuHoldSerial) they belong to.
+    std::vector<std::shared_ptr<void>> holdKept;
+    std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.

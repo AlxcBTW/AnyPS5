@@ -48,6 +48,7 @@ private:
     IrU1 threadBit(const std::array<IrU32, 2>& mask);
     void writeRawU32(const RdnaOperand& operand, IrU32 value);
     IrF32 applyF32ResultModifiers(const RdnaOperand& operand, IrF32 value);
+    IrF32 scaleF32Result(std::uint32_t omod, IrF32 value);
     IrF32 applyF16ResultModifiers(const RdnaOperand& operand, IrF32 value);
     bool outputModifierApplies(std::uint32_t denormalShift) const;
     bool dx10Clamp() const { return !floatMode.has_value() || floatMode->dx10Clamp; }
@@ -145,6 +146,7 @@ private:
     bool dsBpermuteB32(const RdnaInstruction& inst);
     bool dsPermuteB32(const RdnaInstruction& inst);
     IrF32 selectF32(IrU1 condition, IrF32 trueValue, IrF32 falseValue);
+    IrU32 minMaxF16Bits(bool maxValue, IrU32 lhs, IrU32 rhs);
     IrU32 convertF32ToU32Saturated(IrF32 value, float upperBound, float safeUpper, std::uint32_t highResult);
     IrU32 convertF32ToI32Saturated(IrF32 value, float lowerBound, float upperBound, float safeUpper, std::uint32_t lowerResult, std::uint32_t upperResult);
     IrU32 convertFlooredF32ToI32(IrF32 source, IrF32 floored);

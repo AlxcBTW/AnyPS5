@@ -76,12 +76,26 @@ static void Check(bool value, int line) {
     }
 }
 #define Require(value) Check((value), __LINE__)
+#ifdef _WIN32
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static unsigned invalidCloseParameters = 0;
+static void CountInvalidClose(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, std::uintptr_t) { ++invalidCloseParameters; }
+#endif
 int main() {
     Require(chmod_nid_postfix(nullptr, 0600) == -1 && *__error_nid_postfix() == 14);
     Require(sceKernelChmod_nid_postfix(nullptr, 0600) == static_cast<int>(0x8002000eu));
     Require(chmod_nid_postfix("", 0600) == -1 && *__error_nid_postfix() == 2);
     Require(chmod_nid_postfix("anyps5_missing_chmod_path", 0600) == -1 && *__error_nid_postfix() == 2);
     Require(sceKernelChmod_nid_postfix("anyps5_missing_chmod_path", 0600) == static_cast<int>(0x80020002u));
+#ifdef _WIN32
+    const auto previousCloseHandler = _set_thread_local_invalid_parameter_handler(CountInvalidClose);
+#endif
+    Require(close_nid_postfix(-1) == -1 && *__error_nid_postfix() == 9);
+    Require(close_nid_postfix(1048576) == -1 && *__error_nid_postfix() == 9);
+#ifdef _WIN32
+    Require(_set_thread_local_invalid_parameter_handler(previousCloseHandler) == CountInvalidClose);
+    Require(invalidCloseParameters == 0);
+#endif
     Require(sceKernelDebugOutText(-1, "text") == static_cast<int>(0x80020016u));
     std::uint64_t throttling[4] = {1, 2, 3, 4};
     Require(sceKernelWriteThrottlingStatus(throttling) == 0);

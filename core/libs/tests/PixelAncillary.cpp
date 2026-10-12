@@ -3,6 +3,8 @@
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/ShaderInfoCollector.hpp"
+#include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <stdexcept>
@@ -18,6 +20,7 @@ struct Row {
     std::uint32_t sample;
     std::uint32_t layer;
     bool frontFacing;
+    RasterPrimitive primitive = RasterPrimitive::Triangle;
 };
 constexpr std::array<Row, 6> Rows {{{0u, 0u, false}, {0u, 0u, true}, {15u, 0x1FFFu, false}, {15u, 0x1FFFu, true}, {0u, 0x1FFFu, true}, {15u, 0u, false}}};
 
@@ -153,6 +156,7 @@ static std::uint32_t Evaluate(const IrValue* value, const Row& row) {
                 case StageInputKind::SampleId: return row.sample;
                 case StageInputKind::Layer: return row.layer;
                 case StageInputKind::FrontFacing: return row.frontFacing ? 1u : 0u;
+                case StageInputKind::RasterPrimitive: return static_cast<std::uint32_t>(row.primitive);
                 default: break;
             }
             break;
@@ -305,12 +309,13 @@ static HelperProgram HelperOnly(IrProgram& program, HelperRead read, std::uint32
     static_cast<void>(builder.Emit(IrOpcode::Return, IrType::Void, {}));
     return HelperProgram {&written, &layer, &value};
 }
-static void LowerMasked(IrProgram& program) {
+static void LowerMasked(IrProgram& program, bool compose = false) {
     ConstantFolder().Fold(program);
     DeadCodeEliminator().RemoveIdentities(program);
     DeadCodeEliminator().Eliminate(program);
     static_cast<void>(MaskedSelectEliminator().Eliminate(program));
     DeadCodeEliminator().Eliminate(program);
+    if (compose && ConstantFolder().ComposePackedAncillary(program)) DeadCodeEliminator().Eliminate(program);
     const ShaderPixelInputInfo pixel {};
     ShaderInfoCollector().Collect(program, ShaderStageInputInfo {nullptr, &pixel, nullptr});
 }
@@ -427,7 +432,95 @@ static void HelperLoopRefused(LoopRead read) {
     }
     Require(false);
 }
-int main() {
+static void RefusalNamesOperands() {
+    IrProgram program;
+    static_cast<void>(HelperOnly(program, HelperRead::FullWaveExport));
+    try {
+        LowerMasked(program);
+    } catch (const std::runtime_error& error) {
+        const std::string text = error.what();
+        Require(text.find("unsupported live use (used by #") != std::string::npos);
+        Require(text.find(" SelectU32(#") != std::string::npos && text.find(" IEqual32, 0x5a3c9e17, ancillary))") != std::string::npos);
+        Require(text.find('?') == std::string::npos);
+        return;
+    }
+    Require(false);
+}
+static void HelperRefusalReason(HelperRead read, MaskedSelectRefusalReason reason, const char* part) {
+    IrProgram program;
+    const HelperProgram built = HelperOnly(program, read);
+    ConstantFolder().Fold(program);
+    DeadCodeEliminator().RemoveIdentities(program);
+    DeadCodeEliminator().Eliminate(program);
+    const auto stats = MaskedSelectEliminator().Eliminate(program, true);
+    const auto found = std::ranges::find_if(stats.refusals, [&](const MaskedSelectRefusal& refusal) { return refusal.select == built.written->Id(); });
+    Require(found != stats.refusals.end());
+    const MaskedSelectRefusal& refusal = *found;
+    Require(refusal.reason == reason);
+    Require(refusal.line.find("[ancillary] shader 0x0 select #" + std::to_string(built.written->Id()) + " kept, " + std::string(MaskedSelectRefusalCode(reason)) + ": ") == 0u);
+    Require(refusal.line.find(part) != std::string::npos);
+}
+static bool AncillaryRemains(const IrProgram& program) {
+    for (const IrBlock* block : program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            if (inst->Opcode() == IrOpcode::GetBuiltin && static_cast<StageInputKind>(inst->Argument(0)->Resolve()->ImmediateU32()) == StageInputKind::PackedAncillary) return true;
+        }
+    }
+    return false;
+}
+static void ExportedWholeWord() {
+    IrProgram program;
+    auto& entry = Begin(program);
+    auto& body = program.CreateBlock();
+    auto& merge = program.CreateBlock();
+    program.BlockOrder().push_back(&body);
+    program.BlockOrder().push_back(&merge);
+    entry.AddBranch(&body);
+    entry.AddBranch(&merge);
+    body.AddBranch(&merge);
+    IrBuilder builder(program);
+    builder.SetInsertionPoint(entry);
+    IrValue& helper = builder.Emit(IrOpcode::GetBuiltin, IrType::U32, {&builder.Constant(static_cast<std::uint32_t>(StageInputKind::HelperInvocation)), &builder.Constant(0u)});
+    IrValue& live = builder.IEqual(helper, builder.Constant(0u));
+    IrValue& ancillary = AncillaryBuiltin(builder);
+    IrValue& tested = builder.INotEqual(builder.Select(FrontFacingBuiltin(builder), builder.Constant(7u), builder.Constant(0u)), builder.Constant(0u));
+    builder.SetInsertionPoint(body);
+    IrValue& written = builder.Select(live, builder.Constant(SelectOther), ancillary);
+    IrValue& carried = program.CreateValue(IrOpcode::Phi, IrType::U32);
+    merge.AppendInstruction(&carried);
+    carried.AddPhiOperand(&entry, &ancillary);
+    carried.AddPhiOperand(&body, &written);
+    builder.SetInsertionPoint(merge);
+    const auto channel = [&](float value) -> IrValue& {
+        IrValue& half = builder.ConstantF32(value);
+        return builder.Select(tested, builder.Emit(IrOpcode::PackFloat2x16Rtz, IrType::U32, {&half, &half}), carried);
+    };
+    IrValue& data = builder.Emit(IrOpcode::CompositeConstructU32x4, IrType::U32x4, {&channel(0.25f), &channel(0.75f), &builder.Constant(0u), &builder.Constant(0u)});
+    program.Metadata().exportInfo.push_back(ExportInfo {.kind = ExportTargetKind::Mrt, .index = 0u, .en = 0xFu, .done = true, .vm = true});
+    static_cast<void>(builder.Emit(IrOpcode::SetAttribute, IrType::Void, {&data, &live}, ExportFlags {0u, 0u}));
+    static_cast<void>(builder.Emit(IrOpcode::Return, IrType::Void, {}));
+    LowerMasked(program, true);
+    Require(!AncillaryRemains(program));
+    const IrValue* word = carried.Argument(0)->Resolve();
+    constexpr std::array<Row, 5> words {{{0u, 0u, false, RasterPrimitive::Triangle}, {0u, 0u, false, RasterPrimitive::Rectangle}, {0u, 0u, false, RasterPrimitive::Line}, {15u, 0x1FFFu, false, RasterPrimitive::Point}, {3u, 0x7FFu, false, RasterPrimitive::Triangle}}};
+    for (const Row& row : words) {
+        Require(Evaluate(word, row) == (static_cast<std::uint32_t>(row.primitive) | (row.sample << 8u) | (row.layer << 16u)));
+    }
+}
+static void WholeWordReplacesRefusal(HelperRead read) {
+    IrProgram program;
+    const HelperProgram built = HelperOnly(program, read);
+    LowerMasked(program, true);
+    Require(!AncillaryRemains(program));
+    Require(built.written->Parent() != nullptr);
+    const Row row {9u, 0x123u, false, RasterPrimitive::Rectangle};
+    Require(Evaluate(built.written->Argument(2), row) == (3u | (9u << 8u) | (0x123u << 16u)));
+}
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--trace") {
+        HelperLanesRefused(HelperRead::FullWaveExport);
+        return 0;
+    }
     Extract(IrOpcode::BitFieldUExtract, 8u, 4u, StageInputKind::SampleId, 0u);
     Extract(IrOpcode::BitFieldUExtract, 9u, 2u, StageInputKind::SampleId, 1u);
     Extract(IrOpcode::BitFieldUExtract, 16u, 13u, StageInputKind::Layer, 0u);
@@ -476,4 +569,13 @@ int main() {
     HelperLoopOnly(LoopRead::ExportInside);
     HelperLoopOnly(LoopRead::UniformLoop);
     HelperLoopRefused(LoopRead::RevivedExportInside);
+    RefusalNamesOperands();
+    HelperRefusalReason(HelperRead::FullWaveExport, MaskedSelectRefusalReason::ExecReactivated, "; mask #");
+    HelperRefusalReason(HelperRead::FullWaveExport, MaskedSelectRefusalReason::ExecReactivated, "= not a helper lane");
+    HelperRefusalReason(HelperRead::DataTestExport, MaskedSelectRefusalReason::ExecReactivated, "SetAttribute runs under #");
+    HelperRefusalReason(HelperRead::Ballot, MaskedSelectRefusalReason::CrossLane, "Ballot reads other lanes");
+    ExportedWholeWord();
+    WholeWordReplacesRefusal(HelperRead::FullWaveExport);
+    WholeWordReplacesRefusal(HelperRead::DataTestExport);
+    WholeWordReplacesRefusal(HelperRead::Ballot);
 }

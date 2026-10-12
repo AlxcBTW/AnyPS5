@@ -287,7 +287,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory texture");
+        Check(AllocateGpuMemory(context, allocation, owned->memory, GpuMemoryKind::Texture, "texture"), "vkAllocateMemory texture");
+        owned->bytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory");
 
         {
@@ -475,7 +476,7 @@ bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureR
     return geometry.imageDepth == 1 && source.ImageDepth() == 1 && source.ImageLayers() >= geometry.imageLayers && source.Descriptor().mipCount >= descriptor.mipCount;
 }
 
-Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), depthCopy(true) {
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), perUseCopy(PerUseCopy::RefreshedOnReuse) {
     try {
         Require(source != nullptr && CanDepthCopyFrom(*source, descriptor), "storage image cannot serve a depth copy of the sampled texture");
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
@@ -508,7 +509,8 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         allocation.allocationSize = requirements.size;
         allocationBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory depth copy");
+        Check(AllocateGpuMemory(context, allocation, owned->memory, GpuMemoryKind::Texture, "depth copy"), "vkAllocateMemory depth copy");
+        owned->bytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
 
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -535,7 +537,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::RefreshDepthCopy() {
-    if (!depthCopy || storageSource == nullptr) return false;
+    if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;
     std::uint64_t linearBytes = 0;
     for (std::uint32_t level = 0; level < copyLevels; ++level) linearBytes += static_cast<std::uint64_t>(std::max(copyWidth >> level, 1u)) * std::max(copyHeight >> level, 1u) * copyElementBytes * copyLayers;
@@ -612,6 +614,14 @@ Texture::DepthCopyCounts Texture::TakeDepthCopyCounts() {
     return {depthCopyTextures.exchange(0, std::memory_order_relaxed), depthCopyRefreshes.exchange(0, std::memory_order_relaxed)};
 }
 
+OwnedImage::~OwnedImage() {
+    if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::Texture, -static_cast<std::int64_t>(bytes));
+    }
+}
+
 bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor) {
     const auto& from = source.Descriptor();
     if (IsBlockCompressed(descriptor.format) || IsBlockCompressed(from.format)) return false;
@@ -660,15 +670,15 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
@@ -921,7 +931,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        Check(AllocateGpuMemory(context, allocation, memory, GpuMemoryKind::StorageImage, "storage texture"), "vkAllocateMemory storage texture");
+        memoryBytes = allocation.allocationSize;
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
         uploadReason = "first";
         upload();
@@ -1317,25 +1328,25 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
     return created;
 }
 
-VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice) {
+VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, std::uint32_t depthSlice, std::uint32_t layers) {
     Require(attachable, "storage image cannot be a color attachment");
     Require(mip < descriptor.mipCount, "attachment mip exceeds the storage image");
     const bool volume = descriptor.dimension == TextureDimension::k3D;
-    Require(depthSlice == 0 || (volume && mip == 0 && depthSlice <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
-    const auto found = attachmentViews.find({format, mip, depthSlice});
+    Require((depthSlice == 0 && layers == 1) || (volume && mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray), "attachment slice is outside the storage image");
+    const auto found = attachmentViews.find({format, mip, depthSlice, layers});
     if (found != attachmentViews.end()) return found->second;
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.pNext = &usage;
     viewInfo.image = image;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray, 1u};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray, layers};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
-    attachmentViews.emplace(std::tuple{format, mip, depthSlice}, created);
+    attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers}, created);
     return created;
 }
 
@@ -1508,6 +1519,27 @@ std::chrono::steady_clock::time_point LookupOutcomes::Add(Kind kind, std::chrono
 LookupOutcomes& ThreadLookupOutcomes() {
     thread_local LookupOutcomes outcomes;
     return outcomes;
+}
+
+namespace {
+
+// The upload and write-back trace lines go through the async profile writer under APS5_PROFILE_DRAW;
+// they never throw out of an upload or a write-back (the writer stopping at shutdown, or failed for
+// good). Without it they stay on stdout as before: the writer is a static of this module that only
+// Driver::Shutdown stops, and a process that never runs the driver (the agc_driver tests) would
+// otherwise hang at exit joining the writer thread from the module's detach.
+void LogStorageStep(const char* step, int line, const char* function) {
+    if (!LookupOutcomes::Profiled()) {
+        std::fprintf(stdout, "[%s:%d %s] StorageTexture %s\n", _APS5_FILE_, line, function, step);
+        std::fflush(stdout);
+        return;
+    }
+    try {
+        AgcDriver::ProfilePrint_nid_no_patch("[%s:%d %s] StorageTexture %s\n", _APS5_FILE_, line, function, step);
+    } catch (...) {
+    }
+}
+
 }
 
 bool StorageTexture::Refresh() {
@@ -2173,9 +2205,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
-            APS5_LOG_CHARS_OUT("StorageTexture upload submit");
+            LogStorageStep("upload submit", __LINE__, TrimNidPostfix(__func__));
             batch.SubmitAndWait();
-            APS5_LOG_CHARS_OUT("StorageTexture upload done");
+            LogStorageStep("upload done", __LINE__, TrimNidPostfix(__func__));
     }
     countStorageUpload(2, guestBytes);
     ++version;
@@ -4260,9 +4292,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &toCopy, 1, &backToGeneral);
     CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, original.size());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-    APS5_LOG_CHARS_OUT("StorageTexture writeback submit");
+    LogStorageStep("writeback submit", __LINE__, TrimNidPostfix(__func__));
     batch.SubmitAndWait();
-    APS5_LOG_CHARS_OUT("StorageTexture writeback done");
+    LogStorageStep("writeback done", __LINE__, TrimNidPostfix(__func__));
     countStorageWriteBack(guestBytes, false);
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
@@ -4341,7 +4373,10 @@ void StorageTexture::release() noexcept {
     if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
     if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
-    if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (memory) {
+        context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+        CountGpuMemory(GpuMemoryKind::StorageImage, -static_cast<std::int64_t>(memoryBytes));
+    }
 }
 
 std::uint64_t StorageTexture::GuestBytes() const {

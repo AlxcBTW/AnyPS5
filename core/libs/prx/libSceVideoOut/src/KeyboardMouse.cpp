@@ -1,0 +1,324 @@
+#include "prx/libScePad/include/KeyboardMouse.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <utility>
+
+Pad::MouseStick::MouseStick(const InputSettings& settings) : settings(settings) {}
+
+void Pad::MouseStick::Move(int deltaX, int deltaY) {
+    pendingX += deltaX;
+    pendingY += deltaY;
+    pendingCounts += std::hypot(deltaX, deltaY);
+    ++pendingReports;
+}
+
+void Pad::MouseStick::measureReportRate(double step, bool moved) {
+    if (moved) {
+        rateSeconds += std::min(idleSeconds + step, MouseRateGapSeconds);
+        rateCounts += pendingCounts;
+        rateReports += pendingReports;
+    }
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    if (rateSeconds < MouseRateWindowSeconds) return;
+    if (rateReports >= 10 && rateCounts >= 2.0 * rateReports) reportRate = rateReports / rateSeconds;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
+}
+
+double Pad::MouseStick::ReportRate() const {
+    return reportRate;
+}
+
+double Pad::MouseStick::SmoothingMs() const {
+    const double reports = reportRate > 0.0 ? std::min(MouseSmoothingReports * 1000.0 / reportRate, MouseSmoothingLimitMs) : 0.0;
+    return settings.mouseSmoothingMs > 0.0 ? std::max(settings.mouseSmoothingMs, reports) : 0.0;
+}
+
+void Pad::MouseStick::Advance(double seconds) {
+    if (!(seconds > 0.0)) return;
+    pendingSeconds += seconds;
+    if (pendingSeconds < MouseMinimumStepSeconds) return;
+    const double step = pendingSeconds;
+    pendingSeconds = 0.0;
+    const bool moved = pendingX != 0.0 || pendingY != 0.0;
+    const double scale = settings.mouseSensitivity / (MouseFullTiltCountsPerSecond * step);
+    const double targetX = pendingX * scale;
+    const double targetY = pendingY * scale * settings.mouseVerticalScale;
+    pendingX = 0.0;
+    pendingY = 0.0;
+    measureReportRate(step, moved);
+    idleSeconds = moved ? 0.0 : idleSeconds + step;
+    if (idleSeconds * 1000.0 >= settings.mouseDecayMs) {
+        speedX = 0.0;
+        speedY = 0.0;
+        return;
+    }
+    const double smoothing = SmoothingMs();
+    const double keep = smoothing > 0.0 ? std::exp(-step * 1000.0 / smoothing) : 0.0;
+    speedX = targetX + (speedX - targetX) * keep;
+    speedY = targetY + (speedY - targetY) * keep;
+    const double speed = std::hypot(speedX, speedY);
+    if (speed > settings.mouseMaxSpeed) {
+        speedX *= settings.mouseMaxSpeed / speed;
+        speedY *= settings.mouseMaxSpeed / speed;
+    }
+}
+
+void Pad::MouseStick::Reset() {
+    pendingX = 0.0;
+    pendingY = 0.0;
+    pendingSeconds = 0.0;
+    pendingCounts = 0.0;
+    pendingReports = 0;
+    rateSeconds = 0.0;
+    rateCounts = 0.0;
+    rateReports = 0;
+    speedX = 0.0;
+    speedY = 0.0;
+    idleSeconds = 0.0;
+}
+
+double Pad::MouseStick::Speed() const {
+    return std::hypot(speedX, speedY);
+}
+
+std::array<double, 2> Pad::MouseStick::Deflection() const {
+    const double speed = std::hypot(speedX, speedY);
+    if (speed <= 0.0) return {0.0, 0.0};
+    const double shaped = std::pow(std::min(speed, 1.0), settings.mouseCurve);
+    const double deflection = settings.mouseDeadzoneOffset + (1.0 - settings.mouseDeadzoneOffset) * shaped;
+    return {speedX / speed * deflection, speedY / speed * deflection};
+}
+
+std::uint8_t Pad::StickByte(double deflection) {
+    const double clamped = std::clamp(deflection, -1.0, 1.0);
+    return static_cast<std::uint8_t>(std::lround(clamped < 0.0 ? 128.0 + clamped * 128.0 : 128.0 + clamped * 127.0));
+}
+
+Pad::KeyboardMouse::KeyboardMouse(InputConfiguration configuration)
+    : configuration(std::move(configuration)),
+      pressed(this->configuration.bindings.size()),
+      wheelReleaseTimes(this->configuration.bindings.size()),
+      mouse(this->configuration.settings) {}
+
+const Pad::InputConfiguration& Pad::KeyboardMouse::Configuration() const {
+    return configuration;
+}
+
+bool Pad::KeyboardMouse::MouseMode() const {
+    return mouseMode;
+}
+
+double Pad::KeyboardMouse::MouseSpeed() const {
+    return mouseMode ? mouse.Speed() : 0.0;
+}
+
+double Pad::KeyboardMouse::MouseReportRate() const {
+    return mouse.ReportRate();
+}
+
+double Pad::KeyboardMouse::MouseSmoothingMs() const {
+    return mouse.SmoothingMs();
+}
+
+std::array<double, 4> Pad::KeyboardMouse::keyTargets() const {
+    std::array<bool, 4> negative{};
+    std::array<bool, 4> positive{};
+    bool modifier = false;
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        if (!pressed[index]) continue;
+        switch (configuration.bindings[index].control) {
+            case InputControl::LeftStickLeft: negative[0] = true; break;
+            case InputControl::LeftStickRight: positive[0] = true; break;
+            case InputControl::LeftStickUp: negative[1] = true; break;
+            case InputControl::LeftStickDown: positive[1] = true; break;
+            case InputControl::RightStickLeft: negative[2] = true; break;
+            case InputControl::RightStickRight: positive[2] = true; break;
+            case InputControl::RightStickUp: negative[3] = true; break;
+            case InputControl::RightStickDown: positive[3] = true; break;
+            case InputControl::StickModifier: modifier = true; break;
+            default: break;
+        }
+    }
+    const double scale = modifier ? configuration.settings.stickModifierScale : 1.0;
+    std::array<double, 4> targets{};
+    for (std::size_t axis = 0; axis < targets.size(); ++axis) targets[axis] = (static_cast<double>(positive[axis]) - static_cast<double>(negative[axis])) * scale;
+    return targets;
+}
+
+std::array<double, 2> Pad::KeyboardMouse::triggerTargets() const {
+    std::array<double, 2> targets{};
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        const auto& binding = configuration.bindings[index];
+        if (!pressed[index] || binding.control != InputControl::Button) continue;
+        if (binding.button == PadButton::L2) targets[0] = 1.0;
+        if (binding.button == PadButton::R2) targets[1] = 1.0;
+    }
+    return targets;
+}
+
+void Pad::KeyboardMouse::advanceKeys(Clock::time_point now) {
+    const double seconds = keysAdvanced && now > lastKeyAdvance ? std::chrono::duration<double>(now - lastKeyAdvance).count() : 0.0;
+    if (!keysAdvanced || now > lastKeyAdvance) lastKeyAdvance = now;
+    keysAdvanced = true;
+    const auto targets = keyTargets();
+    const double ramp = configuration.settings.keyboardRampMs;
+    for (std::size_t axis = 0; axis < keyAxes.size(); ++axis) {
+        if (ramp <= 0.0) {
+            keyAxes[axis] = targets[axis];
+            continue;
+        }
+        const double step = seconds * 1000.0 / ramp;
+        keyAxes[axis] = targets[axis] > keyAxes[axis] ? std::min(targets[axis], keyAxes[axis] + step) : std::max(targets[axis], keyAxes[axis] - step);
+    }
+    const auto triggers = triggerTargets();
+    const double triggerRamp = configuration.settings.triggerRampMs;
+    for (std::size_t trigger = 0; trigger < triggerAxes.size(); ++trigger) {
+        if (triggerRamp <= 0.0) {
+            triggerAxes[trigger] = triggers[trigger];
+            continue;
+        }
+        const double step = seconds * 1000.0 / triggerRamp;
+        triggerAxes[trigger] = triggers[trigger] > triggerAxes[trigger] ? std::min(triggers[trigger], triggerAxes[trigger] + step) : std::max(triggers[trigger], triggerAxes[trigger] - step);
+    }
+}
+
+void Pad::KeyboardMouse::Advance(Clock::time_point now) {
+    if (!advanced) {
+        advanced = true;
+        lastAdvance = now;
+    }
+    if (now > lastAdvance) {
+        const double seconds = std::chrono::duration<double>(now - lastAdvance).count();
+        lastAdvance = now;
+        if (mouseMode) mouse.Advance(seconds);
+    }
+    advanceKeys(now);
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        if (configuration.bindings[index].wheelDirection == 0 || !pressed[index] || now < wheelReleaseTimes[index]) continue;
+        pressed[index] = false;
+        wheelReleaseTimes[index] = {};
+    }
+    if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
+}
+
+void Pad::KeyboardMouse::SetMouseMode(bool enabled) {
+    mouseMode = enabled;
+    mouse.Reset();
+}
+
+void Pad::KeyboardMouse::Release() {
+    std::fill(pressed.begin(), pressed.end(), false);
+    std::fill(wheelReleaseTimes.begin(), wheelReleaseTimes.end(), Clock::time_point{});
+    keyAxes = {};
+    triggerAxes = {};
+    wheelTriggers = {};
+}
+
+Pad::InputRequests Pad::KeyboardMouse::HandleEvent(const SDL_Event& event, Clock::time_point now) {
+    InputRequests requests;
+    if (event.type == SDL_WINDOWEVENT) {
+        if (event.window.event != SDL_WINDOWEVENT_FOCUS_LOST && event.window.event != SDL_WINDOWEVENT_CLOSE) return requests;
+        Release();
+        requests.releaseMouse = mouseMode;
+        return requests;
+    }
+    if (event.type == SDL_MOUSEMOTION) {
+        if (mouseMode) mouse.Move(event.motion.xrel, event.motion.yrel);
+        return requests;
+    }
+    if (event.type == SDL_MOUSEWHEEL) {
+        int direction = (event.wheel.y > 0) - (event.wheel.y < 0);
+        if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) direction = -direction;
+        if (direction == 0) return requests;
+        const auto releaseTime = now + std::chrono::milliseconds(WheelPressDurationMs);
+        const double step = configuration.settings.triggerWheelStep;
+        advanceKeys(now);
+        for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+            const auto& binding = configuration.bindings[index];
+            if (binding.wheelDirection == 0) continue;
+            const bool trigger = binding.control == InputControl::Button && (binding.button == PadButton::L2 || binding.button == PadButton::R2);
+            if (step > 0.0 && trigger) {
+                auto& level = wheelTriggers[binding.button == PadButton::L2 ? 0 : 1];
+                level = std::clamp(level + (binding.wheelDirection == direction ? step : -step), 0.0, 1.0);
+                continue;
+            }
+            pressed[index] = binding.wheelDirection == direction;
+            wheelReleaseTimes[index] = pressed[index] ? releaseTime : Clock::time_point{};
+        }
+        if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
+        return requests;
+    }
+    const bool keyboard = event.type == SDL_KEYDOWN || event.type == SDL_KEYUP;
+    const bool mouseButton = event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_MOUSEBUTTONUP;
+    if (!keyboard && !mouseButton) return requests;
+    if (keyboard && event.key.repeat != 0) return requests;
+    if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_TAB && (event.key.keysym.mod & KMOD_ALT) != 0) {
+        Release();
+        requests.releaseMouse = mouseMode;
+        return requests;
+    }
+    advanceKeys(now);
+    const bool down = event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN;
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        const auto& binding = configuration.bindings[index];
+        const bool matches = keyboard
+            ? binding.key != SDL_SCANCODE_UNKNOWN && binding.key == event.key.keysym.scancode
+            : binding.mouseButton != MouseButton::None && binding.mouseButton == static_cast<MouseButton>(event.button.button);
+        if (!matches) continue;
+        if (binding.control == InputControl::ToggleFullscreen && keyboard && down && !pressed[index]) requests.toggleFullscreen = true;
+        if (binding.control == InputControl::ToggleMouse && down && !pressed[index]) requests.toggleMouse = true;
+        pressed[index] = down;
+    }
+    if (configuration.settings.keyboardRampMs <= 0.0) keyAxes = keyTargets();
+    if (configuration.settings.triggerRampMs <= 0.0) triggerAxes = triggerTargets();
+    return requests;
+}
+
+PadInputState Pad::KeyboardMouse::Compose(const PadInputState& controller) const {
+    if (configuration.settings.keyboardMouseTarget == KeyboardMouseTarget::Native) return controller;
+    PadInputState state = controller;
+    state.touchLeft = false;
+    state.touchRight = false;
+    std::array<bool, 4> held{};
+    for (std::size_t index = 0; index < configuration.bindings.size(); ++index) {
+        if (!pressed[index]) continue;
+        const auto& binding = configuration.bindings[index];
+        switch (binding.control) {
+            case InputControl::Button:
+                if (binding.button != PadButton::L2 && binding.button != PadButton::R2) state.buttons |= static_cast<std::uint32_t>(binding.button);
+                break;
+            case InputControl::LeftStickLeft:
+            case InputControl::LeftStickRight: held[0] = true; break;
+            case InputControl::LeftStickUp:
+            case InputControl::LeftStickDown: held[1] = true; break;
+            case InputControl::RightStickLeft:
+            case InputControl::RightStickRight: held[2] = true; break;
+            case InputControl::RightStickUp:
+            case InputControl::RightStickDown: held[3] = true; break;
+            case InputControl::TouchLeft: state.touchLeft = true; break;
+            case InputControl::TouchRight: state.touchRight = true; break;
+            case InputControl::StickModifier: break;
+            case InputControl::ToggleMouse: break;
+            case InputControl::ToggleFullscreen: break;
+        }
+    }
+    for (std::size_t axis = 0; axis < state.sticks.size(); ++axis) {
+        if (held[axis] || keyAxes[axis] != 0.0) state.sticks[axis] = StickByte(keyAxes[axis]);
+    }
+    if (mouseMode) {
+        const auto deflection = mouse.Deflection();
+        const std::size_t axis = configuration.settings.mouseStick == MouseStickSide::Left ? 0 : 2;
+        state.sticks[axis] = StickByte(deflection[0]);
+        state.sticks[axis + 1] = StickByte(deflection[1]);
+    }
+    const auto triggerByte = [](double value) { return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0, 1.0) * 255.0)); };
+    state.analogButtonsL2 = std::max(state.analogButtonsL2, triggerByte(std::max(triggerAxes[0], wheelTriggers[0])));
+    state.analogButtonsR2 = std::max(state.analogButtonsR2, triggerByte(std::max(triggerAxes[1], wheelTriggers[1])));
+    if (state.analogButtonsL2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::L2);
+    if (state.analogButtonsR2 != 0) state.buttons |= static_cast<std::uint32_t>(PadButton::R2);
+    return state;
+}

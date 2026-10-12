@@ -75,6 +75,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && indirectArguments == 0 && matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
     } else {
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) Graphics::NoteHtileDepthClear(htile);
+        if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
+            if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
+        }
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
@@ -365,7 +368,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::shared_ptr<PreparedDispatch> prepared;
         if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) {
             try {
-                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads);
+                const auto flushBeforePipelineWait = [&] {
+                    GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (!recordLabelsForPacket(localDevice.get(), submission.queue)) localDevice->SubmitRecorded(submission.queue == 0);
+                };
+                prepared = localDevice->PrepareDispatch(compiled, snapshots, dispatchThreads, address, flushBeforePipelineWait);
             } catch (const std::exception& error) {
                 if (rethrow(error)) return;
             }

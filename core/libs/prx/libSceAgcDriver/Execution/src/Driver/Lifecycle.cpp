@@ -51,10 +51,12 @@ void Driver::stop() {
     replacedDevices.clear();
     Graphics::ShutdownGuestBufferWorkers();
     StopProfileOutput_nid_no_patch();
+    FlushStandardStreams();
     stopped = true;
 }
 
 Driver::Driver() {
+    BufferStandardError();
     ShaderMemory::SetWaitedMsProvider(&Graphics::Recorder::ThreadWaitedMs);
     try {
         LibcRegisterShutdown_nid_postfix([] { Driver::Get().Shutdown(); });

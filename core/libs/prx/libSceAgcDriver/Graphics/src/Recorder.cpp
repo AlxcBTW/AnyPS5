@@ -1117,6 +1117,7 @@ Recorder::~Recorder() {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
+    holdKept.clear();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
@@ -1356,6 +1357,15 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+bool Recorder::WaitForReleases(std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (deferredPending.load(std::memory_order_acquire) != 0) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
@@ -1516,6 +1526,10 @@ void Recorder::ensureOpen() {
         }
         batch->queue = GuestMemory::GpuLockThreadTag();
         if (countingSamples && !segmentMode()) beginSamples(*batch);
+        // Objects handed over earlier in this hold (KeepThroughHold) outlive this batch too; those
+        // of an earlier hold are kept by the batches that hold opened.
+        dropStaleHoldKept();
+        batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
@@ -2452,6 +2466,20 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
+    GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
+    if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {
+        holdKept.clear();
+        holdKeptSerial = hold;
+    }
+    Keep(object);
+    holdKept.push_back(std::move(object));
+}
+
+void Recorder::dropStaleHoldKept() {
+    if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
+}
+
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
@@ -2906,6 +2934,17 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     return false;
 }
 
+bool Recorder::LabelsRecordedOnGpu(std::uint64_t address, std::size_t bytes) const {
+    std::lock_guard tableLock(labelTableMutex);
+    if (bytes == 0) return true;
+    const auto end = address + bytes;
+    for (auto it = labels.lower_bound(address); it != labels.end() && it->first < end; ++it) {
+        if (it->second.batch == nullptr || it->second.behindCompletion) return false;
+    }
+    if (const auto first = queuedLabels.lower_bound(address); first != queuedLabels.end() && first->first < end) return false;
+    return !wideLabelInLocked(address, bytes);
+}
+
 bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const {
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;
@@ -3074,6 +3113,7 @@ void Recorder::Submit() {
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
+    dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
@@ -3228,6 +3268,7 @@ void Recorder::Sync() {
 }
 
 void Recorder::FlushDeferredReleases() {
+    holdKept.clear();
     ReleaseDeferredKeeps();
 }
 
@@ -3490,6 +3531,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
 
 bool Recorder::Reap() {
     PerformanceTimer frameTiming("Recorder.Reap");
+    dropStaleHoldKept();
     const bool profile = DrawProfiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;

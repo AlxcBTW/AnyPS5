@@ -11,6 +11,7 @@
 #endif
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -123,6 +124,36 @@ void CheckOwnStore() {
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
 
+// The storage write-back's keep rule (StorageTexture::writeBackLayers, unchangedSinceBaseline): a
+// driver store landing after an upload's generation (an aliasing image's write-back, which the
+// upload's snapshot read waited for) reads as written since that generation, as a CPU store does;
+// only the cpu flag tells them apart. The keep rule does not ask for it: it stores the image's
+// results there because the bytes still equal a snapshot read after the store landed. So the
+// snapshot cannot be left out (APS5_EXP_SNAPSHOT_NOWAIT, wfix1: 73% of the checked write-back
+// decisions differed without it).
+void CheckDriverStoreAfterGeneration() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    const auto generation = CollectWrites(base, 2 * Block);
+    Require(generation != 0, "the upload's generation block is not collected");
+
+    std::array<std::byte, 4096> result{};
+    result.fill(std::byte{0x55});
+    Write(base, result);
+    CollectWritesUncached(base, 2 * Block);
+    std::array<std::uint64_t, 2> generations{generation, generation};
+    std::array<std::uint8_t, 2> changed{};
+    std::array<std::uint8_t, 2> cpu{};
+    Require(ChangedBlocks(base, 2 * Block, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 0 && changed[1] == BlockUnchanged,
+        "a driver store after the generation does not read as written by the driver alone");
+
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    Require(ChangedBlocks(base, 2 * Block, generations, changed, cpu) && changed[1] == BlockWritten && cpu[1] != 0 && cpu[0] == 0,
+        "a CPU store after the generation does not read as a CPU write");
+}
+
 void CheckUnwatch() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -183,6 +214,57 @@ void CheckPrivateMappingReuse() {
     Require(!Watched(base + Block, Block) && CollectWrites(base + Block, Block) == 0, "a second import of fresh backing stayed watched");
     GuestArena::GuestArenaReset_nid_postfix(replacement, 3 * Block);
     GuestArena::GuestArenaRelease_nid_postfix(replacement, 3 * Block);
+}
+
+void CheckPrewalk() {
+    if (std::getenv("APS5_NO_PREWALK") != nullptr) return;
+    void* memory = AllocateWatched(4 * Block);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto key = base;
+    const auto second = base + Block;
+    const auto third = base + 2 * Block;
+    std::memset(memory, 0x11, 4 * Block);
+    BeginPrewalk();
+    struct End {
+        void* memory;
+        ~End() {
+            EndPrewalk();
+            GuestArena::GuestArenaRelease_nid_postfix(memory, 4 * Block);
+        }
+    } end{memory};
+    const auto epoch = [&] {
+        BumpCollectEpoch();
+        Require(CollectWrites(key, 64) != 0, "the epoch's first walk failed");
+        DrainPrewalk();
+    };
+    epoch();
+    CollectWrites(second, Block);
+    CollectWrites(third, Block);
+
+    epoch();
+    auto before = PrewalkStatistics();
+    CollectWrites(second, Block);
+    const auto seen = CollectWrites(third, Block);
+    Require(seen != 0, "a skipped collect lost its generation");
+    Require(PrewalkStatistics().skippedCollects == before.skippedCollects + 2, "clean ranges of the last epoch were walked again");
+
+    bytes[2 * Block + 4096 + 5] = 0x22;
+    epoch();
+    before = PrewalkStatistics();
+    CollectWrites(second, Block);
+    const auto written = CollectWrites(third, Block);
+    Require(written > seen && !UnchangedSince(third, Block, seen), "a write before the ordering point was hidden by the prewalk");
+    Require(PrewalkStatistics().skippedCollects == before.skippedCollects + 1, "a written range was skipped, or a clean one walked");
+
+    epoch();
+    CollectWrites(second, Block);
+    const auto looked = CollectWrites(third, Block);
+    bytes[2 * Block + 8] = 0x33;
+    epoch();
+    CollectWrites(second, Block);
+    CollectWrites(third, Block);
+    Require(!UnchangedSince(third, Block, looked), "a write after a look was lost at the next epoch");
 }
 #endif
 
@@ -309,9 +391,11 @@ int main() {
         }
         CheckSharedBlock();
         CheckOwnStore();
+        CheckDriverStoreAfterGeneration();
         CheckUnwatch();
 #ifdef _WIN32
         CheckPrivateMappingReuse();
+        CheckPrewalk();
 #endif
         CheckVersionRanges();
         CheckCollectBoundaries();

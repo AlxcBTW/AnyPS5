@@ -221,6 +221,9 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
             deadCodeEliminator.Eliminate(program);
         }
+        if (constantFolder.ComposePackedAncillary(program)) {
+            deadCodeEliminator.Eliminate(program);
+        }
     };
     simplify();
     if (stageKind == ShaderStageKind::Pixel && !translateOptions.fragmentShaderBarycentricEnabled && !HostInterpolationChecker{}.Lower(program, *inputInfo.pixel)) {
@@ -408,6 +411,7 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     targetOptions.nonConstantImageOffsets = request.target.nonConstantImageOffsets;
     targetOptions.narrowSubgroupClock = request.target.narrowSubgroupClock;
     targetOptions.float64DenormPreserve = request.target.float64DenormPreserve;
+    targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -419,9 +423,6 @@ CompiledVariant compileVariant(const RecompileRequest& request, IrProgram progra
     result.shaderDataDwords = bindings.layout.ShaderDataDwords();
     result.imageMetadataDword = bindings.layout.ImageMetadataDword();
     result.runtimeImageCount = bindings.layout.runtimeImageCount;
-    for (std::uint32_t index = 0; index < program.Info().images.size(); ++index) {
-        if (program.Info().images[index].indirectRoot != ImageResource::NoIndirectImage) result.runtimeImageResources.push_back(index);
-    }
     result.hostSubgroupSize = HostSubgroupSize(request);
     result.vertexOffsetSgpr = program.Info().vertexOffsetSgpr;
     result.instanceOffsetSgpr = program.Info().instanceOffsetSgpr;
@@ -641,6 +642,10 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
+std::uint32_t moduleRasterPrimitive(const ShaderPixelStageInfo& pixel) {
+    return static_cast<std::uint32_t>(pixel.ancillary ? pixel.rasterPrimitive : RasterPrimitive::Triangle);
+}
+
 std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
@@ -704,6 +709,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (request.context.pixel) {
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
+        moduleKey.push_back(moduleRasterPrimitive(*request.context.pixel));
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -747,6 +753,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (request.context.pixel) {
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
+                constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -779,12 +786,22 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
+    const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, artifact.variantId);
     BindingAllocationResult bindings;
-    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request));
+    DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+    if (!tables.map.empty()) {
+        result.imageTablePoison.reserve(tables.poison.size());
+        for (const auto& poison : tables.poison) result.imageTablePoison.push_back({poison.words, poison.dwordCount, poison.resource, static_cast<std::uint32_t>(poison.reason)});
+        result.imageTableRanges = snapshot.tables.ranges;
+        result.imageTableReadRanges.reserve(snapshot.tables.tables.size());
+        for (const auto& table : snapshot.tables.tables) result.imageTableReadRanges.push_back(table.readRanges);
+        result.imageTableShader = snapshot.tables.shader;
+        result.imageTableFaults = tables.faults;
+    }
     return result;
 }
 
@@ -928,12 +945,36 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
     mix(snapshot.uniformFill.words);
     mix(snapshot.uniformFill.value);
+    const auto& tables = snapshot.tables;
+    mix(tables.shader);
+    mix(tables.tables.size());
+    for (const auto& table : tables.tables) {
+        mix(table.base);
+        mix(table.size);
+        mix(table.records);
+        mix(table.keys);
+        mix(table.fault);
+        mix(table.outside ? 1u : 0u);
+        mixWords(table.codes);
+        mix(table.readRanges.size());
+        for (const auto& [base, size] : table.readRanges) {
+            mix(base);
+            mix(size);
+        }
+    }
+    mixDescriptors(tables.words);
+    mix(tables.ranges.size());
+    for (const auto& [base, size] : tables.ranges) {
+        mix(base);
+        mix(size);
+    }
     for (const auto threads : partialThreads(request)) mix(threads);
     mix(request.layout.pushConstantOffsetBytes);
     if (request.context.pixel) {
         for (const auto mapping : request.context.pixel->targetExportMapping) mix(mapping);
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
+        mix(moduleRasterPrimitive(*request.context.pixel));
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;

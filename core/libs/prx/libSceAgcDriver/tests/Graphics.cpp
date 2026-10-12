@@ -18,6 +18,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "ImageTableAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -47,6 +48,7 @@ using AgcDriver::Graphics::Require;
 
 alignas(256) std::array<std::byte, 1024> colorMemory{};
 alignas(256) std::array<std::byte, 2048> sliceMemory{};
+alignas(256) std::array<std::uint8_t, 4> volumeKeyMemory{};
 
 AgcDriver::QueueState makeState() {
     AgcDriver::QueueState queue;
@@ -1116,11 +1118,24 @@ void DepthStencilTests() {
     queue.context[0x31b] = 2u | (2u << 13u);
     const auto volume = AgcDriver::Graphics::DecodeState(queue);
     Require(volume.color.address == sliced && volume.color.depth == 4u && volume.color.depthSlice == 2u, "a color view of one 3D depth slice did not keep the surface address and select the slice");
+    Require(volume.color.layers == 1 && volume.renderLayers == 1 && volume.layerExports == 0, "a color view of one 3D depth slice became layered");
     queue.context[0x31b] = 4u | (4u << 13u);
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "beyond the 3D surface");
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "outside the 3D surface");
+    queue.context[0x31b] = 2u | (1u << 13u);
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "outside the 3D surface");
+    queue.context[0x31b] = 1u | (3u << 13u);
+    queue.context[0x207] = (1u << 18u) | (1u << 21u) | (1u << 24u);
+    const auto layered = AgcDriver::Graphics::DecodeState(queue);
+    Require(layered.color.depthSlice == 1u && layered.color.layers == 3u && layered.renderLayers == 3u && layered.layerExports == (1u << 18u), "a color view of three 3D depth slices did not render three layers from the vertex layer export");
+    queue.context[0x31b] = 1u | (8u << 13u);
+    Require(AgcDriver::Graphics::DecodeState(queue).renderLayers == 3u, "a color view past the 3D surface was not clamped to its last slice");
+    queue.context[0x207] = 0;
     queue.context[0x31b] = 0;
     queue.context[0x31c] |= 0x10000000;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "DCC 3D color targets");
+    const auto volumeKeys = reinterpret_cast<std::uintptr_t>(volumeKeyMemory.data());
+    queue.context[0x325] = static_cast<std::uint32_t>(volumeKeys >> 8u);
+    queue.context[0x3a8] = static_cast<std::uint32_t>(volumeKeys >> 40u);
+    Require(AgcDriver::Graphics::DecodeState(queue).color.dccAddress == volumeKeys, "a DCC 3D color target lost its keys");
 }
 
 void OneDimensionalColorTests() {
@@ -1146,6 +1161,39 @@ void htileDepthClearTests() {
     other[6] ^= 1u;
     Require(address(other, {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0, "a different kernel was taken for RADV's HTILE update");
     Require(address(std::span(kernel).first(16), {0, 0, 0x0dc50000u, 0x40u, 0u, 0x00000ff0u}, wave) == 0, "a truncated kernel was taken for RADV's HTILE update");
+}
+
+void memoryValueFillTests() {
+    static constexpr std::array<std::uint32_t, 9> kernel{0xd7460000u, 0x04010c08u, 0xf4201a82u, 0xfa000000u, 0xbf8cc07fu, 0x7e02026au, 0xe0102000u, 0x80000100u, 0xbf810000u};
+    const std::array<std::uint32_t, 3> wave{64, 1, 1};
+    const std::array<std::uint32_t, 8> userData{0x50b00000u, 0x00040020u, 0x20000u, 0x00027facu, 0x34be64e0u, 0x20u, 0u, 0u};
+    const auto match = [&](std::span<const std::uint32_t> code, std::array<std::uint32_t, 8> words, std::array<std::uint32_t, 3> threads, std::array<std::uint32_t, 3> groups) {
+        return AgcDriver::Graphics::MatchMemoryValueFill(code, words, threads, groups);
+    };
+    const auto fill = match(kernel, userData, wave, {2048, 1, 1});
+    Require(fill.has_value() && fill->address == 0x2050b00000ull && fill->bytes == 0x80000u && fill->valueAddress == 0x2034be64e0ull, "Kena's HTILE fill from a value in memory was not recognized");
+    const auto partial = match(kernel, userData, wave, {1024, 1, 1});
+    Require(partial.has_value() && partial->bytes == 0x40000u, "a fill of half the groups did not cover half the buffer");
+    auto records = userData;
+    records[2] = 0x100u;
+    const auto clipped = match(kernel, records, wave, {2048, 1, 1});
+    Require(clipped.has_value() && clipped->bytes == 0x400u, "a fill past NUM_RECORDS was not clipped to it");
+    Require(!match(kernel, userData, {32, 1, 1}, {2048, 1, 1}), "the memory value fill matched with another group size");
+    Require(!match(kernel, userData, wave, {2048, 2, 1}), "a two-dimensional dispatch was taken for a linear fill");
+    auto strided = userData;
+    strided[1] = 0x00080020u;
+    Require(!match(kernel, strided, wave, {2048, 1, 1}), "a fill with an 8-byte stride was taken for a dword fill");
+    auto indexed = userData;
+    indexed[3] |= 1u << 23u;
+    Require(!match(kernel, indexed, wave, {2048, 1, 1}), "a buffer with ADD_TID_ENABLE was taken for a plain fill");
+    auto nowhere = userData;
+    nowhere[4] = 0;
+    nowhere[5] = 0;
+    Require(!match(kernel, nowhere, wave, {2048, 1, 1}), "a fill from a null value pointer was recognized");
+    auto other = kernel;
+    other[6] ^= 1u;
+    Require(!match(other, userData, wave, {2048, 1, 1}), "a different kernel was taken for the memory value fill");
+    Require(!match(std::span(kernel).first(8), userData, wave, {2048, 1, 1}), "a truncated kernel was taken for the memory value fill");
 }
 
 void depthMaintenanceTests() {
@@ -1607,6 +1655,18 @@ void uint16ExportTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "color export format 8");
 }
 
+void clipDistanceTests() {
+    auto queue = makeState();
+    queue.context[0x207] = 0x0040000f;
+    Require(AgcDriver::Graphics::DecodeState(queue).paClVsOutCntl == 0x0040000fu, "DecodeState dropped the PA_CL_VS_OUT_CNTL value the validator quotes");
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "four clip distances were rejected by the precheck");
+    queue.context[0x207] = 0x004001ff;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "more than eight clip and cull distances");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("more than eight") != std::string::npos, "nine clip distances passed the precheck");
+}
+
 void DepthClipTests() {
     auto queue = makeState();
     const auto direct = AgcDriver::Graphics::DecodeState(queue);
@@ -1727,6 +1787,7 @@ struct MockDescriptorWrite {
     std::uint32_t count;
     VkDescriptorType type;
     std::vector<VkDescriptorBufferInfo> buffers;
+    std::vector<VkDescriptorImageInfo> images;
 };
 
 struct MockVulkan {
@@ -1745,6 +1806,7 @@ struct MockVulkan {
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
     VkDescriptorSetLayoutCreateFlags layoutFlags = 0;
     std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
+    std::map<VkDescriptorSetLayout, std::uint32_t> variableLayoutCounts;
     std::vector<VkDescriptorPoolSize> poolSizes;
     std::uint32_t poolMaxSets = 0;
     VkDescriptorPoolCreateFlags poolFlags = 0;
@@ -1758,7 +1820,10 @@ struct MockVulkan {
     std::map<VkDescriptorPool, DescriptorPool> descriptorPools;
     std::uint32_t descriptorPoolLimit = 1000000;
     VkResult descriptorResetResult = VK_SUCCESS;
+    std::optional<std::uint32_t> variableDescriptorCount;
     std::vector<MockDescriptorWrite> writes;
+    std::map<VkSampler, VkSamplerCreateFlags> samplerFlags;
+    std::uint32_t samplerCreateCount = 0;
     std::vector<VkCopyDescriptorSet> copies;
     bool allowCopies = false;
     std::uint32_t boundSets = 0;
@@ -1848,11 +1913,15 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateDescriptorSetLayout(VkDevice, const VkD
     const auto* bindingFlags = static_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(info->pNext);
     if (bindingFlags != nullptr) mock.layoutBindingFlags.assign(bindingFlags->pBindingFlags, bindingFlags->pBindingFlags + bindingFlags->bindingCount);
     else mock.layoutBindingFlags.clear();
+    for (std::size_t index = 0; index < mock.layoutBindingFlags.size(); ++index) {
+        if ((mock.layoutBindingFlags[index] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0) mock.variableLayoutCounts[*layout] = info->pBindings[index].descriptorCount;
+    }
     ++mock.live;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout layout, const VkAllocationCallbacks*) {
+    mock.variableLayoutCounts.erase(layout);
     --mock.live;
 }
 
@@ -1877,6 +1946,13 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDesc
     ++pool.attempts;
     if (pool.allocated == pool.maxSets) return VK_ERROR_OUT_OF_POOL_MEMORY;
     ++pool.allocated;
+    mock.variableDescriptorCount.reset();
+    if (info->pNext != nullptr) {
+        const auto* variable = static_cast<const VkDescriptorSetVariableDescriptorCountAllocateInfo*>(info->pNext);
+        Require(variable->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO && variable->descriptorSetCount == 1, "variable descriptor allocation is malformed");
+        mock.variableDescriptorCount = variable->pDescriptorCounts[0];
+        Require(*mock.variableDescriptorCount <= mock.variableLayoutCounts.at(info->pSetLayouts[0]), "variable descriptor count exceeds its layout binding");
+    }
     sets[0] = makeHandle<VkDescriptorSet>();
     return VK_SUCCESS;
 }
@@ -1891,12 +1967,26 @@ VKAPI_ATTR VkResult VKAPI_CALL mockResetDescriptorPool(VkDevice, VkDescriptorPoo
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateSampler(VkDevice, const VkSamplerCreateInfo* info, const VkAllocationCallbacks*, VkSampler* sampler) {
+    *sampler = makeHandle<VkSampler>();
+    mock.samplerFlags[*sampler] = info->flags;
+    ++mock.samplerCreateCount;
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroySampler(VkDevice, VkSampler sampler, const VkAllocationCallbacks*) {
+    mock.samplerFlags.erase(sampler);
+    --mock.live;
+}
+
 VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
     Require(copyCount == 0 || mock.allowCopies, "descriptor copies are not expected");
     if (copyCount != 0) mock.copies.insert(mock.copies.end(), copies, copies + copyCount);
     for (std::uint32_t i = 0; i < count; ++i) {
-        MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}};
-        write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}, {}};
+        if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        if (writes[i].pImageInfo != nullptr) write.images.assign(writes[i].pImageInfo, writes[i].pImageInfo + writes[i].descriptorCount);
         mock.writes.push_back(write);
     }
 }
@@ -2034,6 +2124,8 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
         {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
+        {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
+        {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},
         {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
         {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
@@ -2546,6 +2638,249 @@ void descriptorCacheTests() {
         expectFailure([&] { cache.Allocate(large, uniformBuffers); }, "descriptor set uses an unsupported descriptor type 6");
     }
     Require(mock.live == 0, "the descriptor cache leaked a pool or layout");
+    mock = MockVulkan{};
+    context.limits.maxDescriptorSetStorageBuffers = 16;
+    context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers = 8192;
+    context.descriptorIndexingLimits.maxPerStageUpdateAfterBindResources = 16384;
+    context.limits.maxPerStageDescriptorSampledImages = 2048;
+    {
+        AgcDriver::Graphics::DescriptorCache cache(context);
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}}};
+        constexpr auto tableFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+        const std::array<VkDescriptorBindingFlags, 2> flags{0, tableFlags};
+        const std::array<std::uint32_t, 10> key{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, tableFlags, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT};
+        const auto layout = cache.Layout(key, bindings, true, flags);
+        Require(mock.layoutFlags == VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT && mock.layoutBindingFlags == std::vector<VkDescriptorBindingFlags>{VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, tableFlags}, "a variable image table lost its flags when the storage binding used update-after-bind");
+        Require(cache.Layout(key, bindings, true, flags) == layout && cache.Counters().layoutHits == 1, "the combined descriptor layout was not reused");
+        const std::array<VkDescriptorPoolSize, 2> oversized{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto dedicated = cache.Allocate(layout, oversized, true, 3u);
+        Require(mock.poolMaxSets == 1 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT && mock.variableDescriptorCount == 3u, "a dedicated update-after-bind pool lost the variable image count");
+        cache.Free(dedicated);
+        auto fittingBindings = bindings;
+        fittingBindings[0].descriptorCount = 17;
+        auto fittingKey = key;
+        fittingKey[2] = 17;
+        const auto fittingLayout = cache.Layout(fittingKey, fittingBindings, true, flags);
+        const std::array<VkDescriptorPoolSize, 2> fitting{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto chained = cache.Allocate(fittingLayout, fitting, true, 3u);
+        Require(mock.poolMaxSets == 1024 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT && mock.variableDescriptorCount == 3u, "a chained update-after-bind pool lost the variable image count");
+        cache.Free(chained);
+        const auto reused = cache.Allocate(fittingLayout, fitting, true, 0u);
+        Require(reused.pool == chained.pool && mock.variableDescriptorCount == 0u, "reusing an update-after-bind pool lost an empty variable image table");
+        cache.Free(reused);
+        expectFailure([&] { cache.Allocate(fittingLayout, fitting, false, 3u); }, "descriptor set exceeds the device's per-set descriptor limit");
+    }
+    Require(mock.live == 0, "the combined descriptor cache leaked a pool or layout");
+}
+
+void imageTableAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    for (const bool cached : {false, true}) {
+        for (const std::uint32_t count : {0u, 2u, 3u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.imageTableCapacity = 2;
+            context.limits.maxDescriptorSetSampledImages = 2;
+            context.limits.maxPerStageDescriptorSampledImages = 2;
+            {
+                AgcDriver::Graphics::DescriptorCache cache(context);
+                if (cached) context.descriptorCache = &cache;
+                ShaderRecompiler::RecompileResult program;
+                auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+                map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+                map.guestDescriptor[Abi::HeaderElementCount] = count;
+                map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+                map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+                program.bindings.push_back(map);
+                auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
+                images.kind = Kind::SampledImage;
+                images.imageShapes.resize(count);
+                images.imageDepthCompare.resize(count);
+                images.imageSamplers.resize(count);
+                program.bindings.push_back(std::move(images));
+                const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+                {
+                    AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                    Require(findLayoutBinding(ShaderRecompiler::RuntimeAbi::ImageTableBinding).descriptorCount == 2u, "the image table layout changed its device capacity");
+                    const auto physicalCount = std::max(1u, std::min(count, 2u));
+                    Require(mock.variableDescriptorCount == physicalCount, "image table allocation did not reserve its bounded physical descriptor count");
+                    const auto sampled = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; });
+                    Require(sampled != mock.poolSizes.end() && sampled->descriptorCount >= physicalCount && (cached || sampled->descriptorCount == physicalCount), "the image table pool did not cover its bounded allocation");
+                    resources.Complete();
+                    const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                    std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                    std::memcpy(actual.data(), bytes.data(), bytes.size());
+                    Require(actual[Abi::HeaderElementCount] == count, "bounding the Vulkan allocation truncated the guest table domain");
+                    if (count > context.imageTableCapacity) Require((actual[Abi::HeaderWords + 2u] & Abi::PoisonFlag) != 0u, "an image beyond Vulkan capacity lost its deferred fault");
+                }
+            }
+            Require(mock.live == 0, "the bounded image table leaked Vulkan objects");
+        }
+    }
+}
+
+void imageTableSnapshotAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.imageTableCapacity = 2;
+    context.limits.maxDescriptorSetSampledImages = 2;
+    context.limits.maxPerStageDescriptorSampledImages = 2;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto buffer = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16));
+        buffer.bufferWritten = {false};
+        vertex.bindings.push_back(buffer);
+        auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords));
+        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        vertex.bindings.push_back(map);
+        auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 0, {});
+        images.kind = Kind::SampledImage;
+        vertex.bindings.push_back(images);
+        const auto state = DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const auto originalMap = findWrite(map.binding).buffers.at(0);
+        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, 16, {11, 22, 33, 44}}}};
+        const auto sets = cache.Counters().sets;
+        mock.writes.clear();
+        mock.variableDescriptorCount.reset();
+        const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
+        Require(snapshots != nullptr && snapshots->snapshots.size() == 1 && cache.Counters().sets == sets + 1, "an empty image table prevented draw snapshot allocation");
+        Require(mock.variableDescriptorCount == 1u, "an empty draw snapshot table did not reserve one physical image descriptor");
+        Require(sameBytes(bufferBytes(snapshots->snapshots[0].buffer->Handle()), moved[0].words.data(), moved[0].size), "an empty image table changed draw snapshot contents");
+        const auto& currentMap = findWrite(map.binding).buffers.at(0);
+        Require(currentMap.buffer == originalMap.buffer && currentMap.offset == originalMap.offset && currentMap.range == originalMap.range, "draw snapshots replaced the empty image table map");
+        std::array<std::uint32_t, Abi::HeaderWords> header{};
+        std::memcpy(header.data(), bufferBytes(currentMap.buffer).data() + currentMap.offset, sizeof(header));
+        Require(header[Abi::HeaderElementCount] == 0u, "draw snapshots changed the empty guest table domain");
+        Require(std::none_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.binding == ShaderRecompiler::RuntimeAbi::ImageTableBinding; }), "an empty draw snapshot table wrote an image descriptor");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "the empty image table draw snapshot leaked Vulkan objects");
+}
+
+void samplerTableNonSeamlessCubeTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr auto count = 2u * Abi::SamplerEntryElements;
+    for (const bool supported : {false, true}) {
+        for (const std::uint32_t flaggedEntry : {0u, 1u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.nonSeamlessCubeMap = supported;
+            context.samplerTableCapacity = count;
+            context.limits.maxDescriptorSetSamplers = count;
+            context.limits.maxPerStageDescriptorSamplers = count;
+            context.limits.maxSamplerAnisotropy = 1.0f;
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            program.bindings.push_back(map);
+            auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            samplers.kind = Kind::Sampler;
+            for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                const std::array<std::uint32_t, 4> words{0x92u | (entry == flaggedEntry ? 1u << 28u : 0u), (4u * 256u) << 12u, 0u, 0u};
+                for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
+                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                }
+            }
+            const auto samplerBinding = samplers.binding;
+            program.bindings.push_back(std::move(samplers));
+            const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            {
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderSamplerCount] == count, "non-seamless sampler rejection changed the guest table domain");
+                Require(actual[Abi::HeaderPoisonCount] == (supported ? 0u : 1u), "non-seamless sampler table has the wrong deferred poison count");
+                for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                    const auto expected = !supported && entry == flaggedEntry ? Abi::PoisonCode(0u) : 0u;
+                    Require(actual[Abi::HeaderWords + entry] == expected, "non-seamless sampler rejection poisoned the wrong entry");
+                }
+                const auto& write = findWrite(samplerBinding);
+                const auto first = supported ? 0u : (1u - flaggedEntry) * Abi::SamplerEntryElements;
+                const auto written = supported ? count : Abi::SamplerEntryElements;
+                Require(findLayoutBinding(samplerBinding).descriptorCount == count && write.type == VK_DESCRIPTOR_TYPE_SAMPLER && write.arrayElement == first && write.count == written && write.images.size() == written, "non-seamless sampler rejection compacted or truncated descriptor indices");
+                Require(mock.samplerFlags.size() == written, "a rejected sampler table entry allocated a Vulkan sampler");
+                for (std::uint32_t index = 0; index < written; ++index) {
+                    const auto expected = supported && (first + index) / Abi::SamplerEntryElements == flaggedEntry ? VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT : 0u;
+                    Require(mock.samplerFlags.at(write.images[index].sampler) == expected, "a sampler table variant has the wrong non-seamless cube creation flag");
+                }
+            }
+            Require(mock.live == 0 && mock.samplerFlags.empty(), "the non-seamless sampler table leaked Vulkan objects");
+        }
+    }
+}
+
+void samplerTableDeviceLimitTests(std::optional<std::uint32_t> selected = std::nullopt) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr auto count = 2u * Abi::SamplerEntryElements;
+    const std::array<std::uint32_t, 4> valid{0x92u, (4u * 256u) << 12u, 0u, 0u};
+    const std::array<std::array<std::uint32_t, 4>, 3> invalid{{
+        {0x92u, valid[1], 256u, 0u},
+        {0x92u | (2u << 9u), valid[1], (2u << 20u) | (2u << 22u), 0u},
+        {0x92u | (1u << 29u), valid[1], 0u, 0u}
+    }};
+    for (std::uint32_t kind = 0; kind < invalid.size(); ++kind) {
+        if (selected.has_value() && kind != *selected) continue;
+        for (const std::uint32_t badEntry : {0u, 1u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.samplerTableCapacity = count;
+            context.limits.maxDescriptorSetSamplers = count;
+            context.limits.maxPerStageDescriptorSamplers = count;
+            context.samplerAnisotropy = true;
+            context.samplerFilterMinmax = true;
+            context.limits.maxSamplerAnisotropy = 2.0f;
+            context.limits.maxSamplerLodBias = 0.5f;
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            program.bindings.push_back(map);
+            auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            samplers.kind = Kind::Sampler;
+            for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                const auto& words = entry == badEntry ? invalid[kind] : valid;
+                for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
+                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                }
+            }
+            const auto samplerBinding = samplers.binding;
+            program.bindings.push_back(std::move(samplers));
+            const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            {
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderSamplerCount] == count && actual[Abi::HeaderPoisonCount] == 1u, "sampler device validation changed the domain or deferred poison count");
+                for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                    Require(actual[Abi::HeaderWords + entry] == (entry == badEntry ? Abi::PoisonCode(0u) : 0u), "sampler device validation poisoned the valid entry");
+                }
+                const auto& write = findWrite(samplerBinding);
+                Require(write.type == VK_DESCRIPTOR_TYPE_SAMPLER && write.arrayElement == (1u - badEntry) * Abi::SamplerEntryElements && write.count == Abi::SamplerEntryElements && write.images.size() == Abi::SamplerEntryElements, "sampler device validation changed valid descriptor indices");
+                Require(mock.samplerCreateCount == Abi::SamplerEntryElements && mock.samplerFlags.size() == Abi::SamplerEntryElements, "a rejected sampler table entry created a Vulkan sampler");
+            }
+            Require(mock.live == 0 && mock.samplerFlags.empty(), "sampler device validation leaked Vulkan objects");
+        }
+    }
 }
 
 void textureCacheBudgetTests() {
@@ -2661,6 +2996,9 @@ struct ModuleShape {
     bool fragDepth = false;
     std::uint32_t sampleMaskLength = 0;
     std::uint32_t floatControlsWidth = 0;
+    std::uint32_t clipDistanceLength = 0;
+    std::uint32_t cullDistanceLength = 0;
+    bool layerOutput = false;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -2698,6 +3036,14 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(declarations, spv::OpVariable, {outputPointer, parameter, spv::StorageClassOutput});
         emit(annotations, spv::OpDecorate, {parameter, spv::DecorationLocation, shape.parameterLocation});
         extraInterface.push_back(parameter);
+    }
+    if (shape.layerOutput) {
+        const auto pointer = id();
+        const auto layer = id();
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, uintType});
+        emit(declarations, spv::OpVariable, {pointer, layer, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {layer, spv::DecorationBuiltIn, spv::BuiltInLayer});
+        extraInterface.push_back(layer);
     }
     if (shape.secondTarget) {
         const auto target = id();
@@ -2758,6 +3104,30 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
         emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
         emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInSampleMask});
+        extraInterface.push_back(variable);
+    }
+    if (shape.clipDistanceLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.clipDistanceLength});
+        emit(declarations, spv::OpTypeArray, {array, floatType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInClipDistance});
+        extraInterface.push_back(variable);
+    }
+    if (shape.cullDistanceLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.cullDistanceLength});
+        emit(declarations, spv::OpTypeArray, {array, floatType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInCullDistance});
         extraInterface.push_back(variable);
     }
     if (shape.perVertex) {
@@ -2829,6 +3199,17 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     emit(words, spv::OpCapability, {spv::CapabilityShader});
     if (shape.sampleId) emit(words, spv::OpCapability, {spv::CapabilitySampleRateShading});
     if (shape.layer) emit(words, spv::OpCapability, {spv::CapabilityGeometry});
+    if (shape.clipDistanceLength != 0) emit(words, spv::OpCapability, {spv::CapabilityClipDistance});
+    if (shape.cullDistanceLength != 0) emit(words, spv::OpCapability, {spv::CapabilityCullDistance});
+    if (shape.layerOutput) {
+        emit(words, spv::OpCapability, {spv::CapabilityShaderViewportIndexLayerEXT});
+        const std::string extension = "SPV_EXT_shader_viewport_index_layer";
+        const auto count = (extension.size() + 4) / 4;
+        words.push_back((static_cast<std::uint32_t>(count + 1) << 16u) | spv::OpExtension);
+        const auto start = words.size();
+        words.resize(start + count, 0);
+        for (std::size_t i = 0; i < extension.size(); ++i) words[start + i / 4] |= static_cast<std::uint32_t>(static_cast<unsigned char>(extension[i])) << ((i % 4) * 8);
+    }
     if (shape.barycentric) {
         emit(words, spv::OpCapability, {spv::CapabilityFragmentBarycentricKHR});
         const std::string extension = "SPV_KHR_fragment_shader_barycentric";
@@ -3778,6 +4159,19 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, true, false); }, "unsupported device capability 35");
         pixel.spirv = makeModule({.fragment = true, .sampleMaskLength = 2});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment built-in");
+        pixel.spirv = makeModule({.fragment = true});
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 4, .cullDistanceLength = 4});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true, true);
+        state.paClVsOutCntl = 0x0040000fu;
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 4});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, false, true); }, "PA_CL_VS_OUT_CNTL=0x0040000f");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true, false);
+        vertex.spirv = makeModule({.parameterOutput = true, .cullDistanceLength = 4});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true, false); }, "PA_CL_VS_OUT_CNTL=0x0040000f");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, false, true);
+        state.paClVsOutCntl = 0;
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 9});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true, true); }, "clip or cull distance");
         vertex.spirv = makeModule({.parameterOutput = true, .sampleId = true});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 35");
         vertex.spirv = makeModule({.parameterOutput = true});
@@ -3905,6 +4299,14 @@ void validationTests() {
         const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 12");
         AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, true);
+    }
+    {
+        ShaderRecompiler::RecompileResult vertex;
+        vertex.spirv = makeModule({.layerOutput = true});
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        const VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "VK_EXT_shader_viewport_index_layer");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, false, false, true);
     }
     for (const auto capability : {spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformShuffle}) {
         ShaderRecompiler::RecompileResult vertex;
@@ -4248,6 +4650,21 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-allocation") {
+            imageTableAllocationTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot") {
+            imageTableSnapshotAllocationTests();
+            return 0;
+        }
+        const std::array<std::string_view, 3> samplerCases{"--sampler-table-lod-bias", "--sampler-table-anisotropy", "--sampler-table-reduction-compare"};
+        for (std::uint32_t index = 0; index < samplerCases.size(); ++index) {
+            if (argc == 2 && std::string_view(argv[1]) == samplerCases[index]) {
+                samplerTableDeviceLimitTests(index);
+                return 0;
+            }
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
             descriptorPoolResetFailureTest();
             std::cerr << "descriptor pool reset failure did not terminate\n";
@@ -4293,6 +4710,7 @@ int main(int argc, char** argv) {
         DepthStencilTests();
         OneDimensionalColorTests();
         htileDepthClearTests();
+        memoryValueFillTests();
         ZExportTests();
         unorm10_11_11TargetTests();
         DepthBoundsBiasTests();
@@ -4310,6 +4728,7 @@ int main(int argc, char** argv) {
         cmaskTests();
         uint16ExportTests();
         uint8x4TargetTests();
+        clipDistanceTests();
         ShaderStageTests();
         NggVertexWorkgroupTests();
         TuningFieldTests();
@@ -4325,6 +4744,10 @@ int main(int argc, char** argv) {
         resourceTests();
         descriptorSnapshotTests();
         descriptorCacheTests();
+        imageTableAllocationTests();
+        imageTableSnapshotAllocationTests();
+        samplerTableNonSeamlessCubeTests();
+        samplerTableDeviceLimitTests();
         misalignedShaderDataTests();
         debugBranchTests();
         textureCacheBudgetTests();

@@ -117,6 +117,24 @@ static void CheckReadQueue(int handle) {
     Require(data[0].buttons == 0);
 }
 
+static void CheckAnalogTriggers() {
+    PadInputState partial;
+    partial.analogButtonsL2 = 100;
+    partial.analogButtonsR2 = 1;
+    partial.buttons = static_cast<std::uint32_t>(Pad::PadButton::L2) | static_cast<std::uint32_t>(Pad::PadButton::R2);
+    PadPublishInput_nid_postfix(partial);
+    auto data = Pad::ReadState();
+    Require(data.analog_buttons_l2 == 100);
+    Require(data.analog_buttons_r2 == 1);
+    PadInputState digital;
+    digital.buttons = static_cast<std::uint32_t>(Pad::PadButton::R2);
+    PadPublishInput_nid_postfix(digital);
+    data = Pad::ReadState();
+    Require(data.analog_buttons_r2 == 255);
+    Require(data.analog_buttons_l2 == 0);
+    PadPublishInput_nid_postfix(PadInputState{});
+}
+
 static void CheckReadStateHandle(int handle) {
     PadData data{};
     Require(scePadReadState(0, &data) == PAD_ERROR_INVALID_HANDLE);
@@ -190,6 +208,7 @@ int main() {
     CheckTiltCorrection(handle);
     CheckTouchContact();
     CheckReadQueue(handle);
+    CheckAnalogTriggers();
     CheckReadStateHandle(handle);
     CheckRemoteController(handle);
     CheckInjectedState(path);

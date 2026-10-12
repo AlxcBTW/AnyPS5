@@ -151,6 +151,152 @@ void importWindowTests(const Context& context) {
     ::operator delete(block, std::align_val_t{window});
 }
 
+// Adjacent ranges, each larger than the import window, are imported apart; a buffer bound across two
+// of them joins them into one import when it is bound, instead of being copied whole on every use.
+void importJoinTests(const Context& context) {
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = 2 * piece;
+    constexpr std::size_t large = 3 * piece;
+    void* block = ::operator new(3 * large + 5 * piece, std::align_val_t{window});
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(guest, 0x11, 3 * large);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    const auto second = first + large;
+    const auto third = second + large;
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    SetHostImportWindow(window);
+    SetHostImportJoin(true);
+    const auto change = [&](std::uint8_t* range, std::size_t bytes, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto bind = [&](std::uintptr_t address) {
+        GuestBufferMemory plain(importing);
+        plain.AddReadable(address, 32);
+        plain.Upload(false);
+        std::uint32_t adjustment = 0;
+        const auto view = plain.Descriptor(address, 32, adjustment);
+        const auto copied = plain.CopiedBytes();
+        plain.WriteBack();
+        return std::pair{view.buffer, copied};
+    };
+    change(guest, large, true);
+    change(guest + large, large, true);
+    const auto* low = HostImportFor(importing, first, 16);
+    Require(low != nullptr && low->base == first && low->bytes == large, "a range larger than the import window was not imported alone");
+    const auto* high = HostImportFor(importing, second, 16);
+    Require(high != nullptr && high->base == second && high->bytes == large, "the next range larger than the import window was not imported alone");
+    Require(HostImportFor(importing, second - 16, 32) == nullptr, "a view across two imported ranges was imported before it was bound");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(second - 16, 32);
+        leased.Upload(true);
+        const auto* joined = HostImportFor(importing, second - 16, 32);
+        Require(joined != nullptr && joined->base == first && joined->bytes == 2 * large, "a buffer bound across two adjacent ranges larger than the import window was not imported as one");
+        std::uint32_t adjustment = 0;
+        const auto crossing = leased.Descriptor(second - 16, 32, adjustment);
+        Require(crossing.buffer == joined->buffer && crossing.offset + adjustment == second - 16 - first, "a buffer bound across the joined ranges is not bound in place");
+        leased.WriteBack();
+    }
+    const auto joinedBuffer = HostImportFor(importing, first, 16)->buffer;
+    const auto [again, copied] = bind(second - 16);
+    Require(again == joinedBuffer && copied == 0, "a later bind across the joined ranges did not use the joined import");
+    // Pieces of a heap growing 64 KiB at a time are never joined across a window edge.
+    auto* heap = guest + 3 * large + 2 * piece;
+    change(heap, piece, true);
+    change(heap + piece, piece, true);
+    Require(bind(reinterpret_cast<std::uintptr_t>(heap + piece) - 16).second != 0 && HostImportFor(importing, reinterpret_cast<std::uintptr_t>(heap + piece) - 16, 32) == nullptr, "two pieces no larger than the import window were joined");
+    const auto* kept = HostImportFor(importing, first, 16);
+    Require(kept != nullptr && kept->buffer == joinedBuffer && kept->bytes == 2 * large, "a registry change elsewhere re-imported the joined ranges");
+    // A third range registered next to them joins only when a buffer is bound across it, and the
+    // join then grows: a later bind across the first two keeps the grown import.
+    change(guest + 2 * large, large, true);
+    Require(HostImportFor(importing, first, 16)->buffer == joinedBuffer, "a range registered next to the joined ranges re-imported them");
+    const auto [grownBuffer, grownCopied] = bind(third - 16);
+    const auto* grown = HostImportFor(importing, third - 16, 32);
+    Require(grown != nullptr && grown->base == first && grown->bytes == 3 * large && grownBuffer == grown->buffer && grownCopied == 0, "a bind across the next range did not grow the joined import");
+    Require(bind(second - 16).first == grownBuffer && HostImportFor(importing, first, 16)->buffer == grownBuffer, "two joins sharing a range retired each other");
+    change(heap, piece, false);
+    change(heap + piece, piece, false);
+    change(guest + large, large, false);
+    const auto* alone = HostImportFor(importing, first, 16);
+    Require(alone != nullptr && alone->base == first && alone->bytes == large, "the joined import outlived one of its ranges");
+    change(guest, large, false);
+    change(guest + 2 * large, large, false);
+    Require(HostImportFor(importing, first, 16) == nullptr && HostImportFor(importing, third, 16) == nullptr, "the host imports outlived their ranges");
+    SetHostImportJoin(false);
+    SetHostImportWindow(0);
+    ::operator delete(block, std::align_val_t{window});
+}
+
+// A registered range larger than the import window, its first window imported by an earlier access: an address-based
+// build (AcquireRegistered) must import the whole range, so a view in its last window binds (Demon's Souls threw
+// "guest buffer view ... exceeds its GPU owner" with the 64 MiB windows).
+void importWholeRangeOverWindowTests(const Context& context) {
+    // The window of one large range (APS5_HOST_IMPORT_WINDOW_MIB, 64 MiB by default; read once per process).
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = std::size_t{64} << 20u;
+    constexpr std::size_t bytes = 2 * window;
+    void* block = ::operator new(bytes, std::align_val_t{piece});
+    std::memset(block, 0x33, bytes);
+    const auto first = reinterpret_cast<std::uintptr_t>(block);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto change = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(true);
+    const auto* windowed = HostImportFor(importing, first + 16, 32);
+    Require(windowed != nullptr && windowed->base == first && windowed->bytes == window, "an access to the first window of a large range was not imported as that window");
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(first + bytes - piece + 16, 32, adjustment);
+        Require(view.range == 32 + adjustment, "a view in the last window of a large registered range has no descriptor");
+        const auto* whole = HostImportFor(importing, first, bytes);
+        Require(whole != nullptr && whole->base == first && whole->bytes == bytes && view.buffer == whole->buffer, "an address-based build was served by the range's first window, not an import of the whole range");
+        leased.WriteBack();
+    }
+    change(false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+// RelieveGpuMemory (after an out-of-memory allocation) retires the least recently used imports, but none used in the
+// last 256 import lookups: an import a build may still hold a pointer to survives it.
+void importReliefTests(const Context& context) {
+    constexpr std::size_t bytes = 65536;
+    void* blocks[2] = {::operator new(bytes, std::align_val_t{bytes}), ::operator new(bytes, std::align_val_t{bytes})};
+    auto importing = context;
+    importing.hostImportAlignment = bytes;
+    const auto change = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        for (auto* block : blocks) {
+            if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+            else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        }
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    change(true);
+    const auto old = reinterpret_cast<std::uintptr_t>(blocks[0]);
+    const auto recent = reinterpret_cast<std::uintptr_t>(blocks[1]);
+    Require(HostImportFor(importing, old, 16) != nullptr && HostImportFor(importing, recent, 16) != nullptr, "the relief test ranges were not imported");
+    for (int use = 0; use < 300; ++use) static_cast<void>(HostImportFor(importing, recent, 16));
+    static_cast<void>(RelieveGpuMemory(importing));
+    Require(!HostImportCovers(importing, old, 16), "relief kept an import unused for 300 lookups");
+    Require(HostImportCovers(importing, recent, 16), "relief retired an import used in the last 256 lookups");
+    change(false);
+    for (auto* block : blocks) ::operator delete(block, std::align_val_t{bytes});
+}
+
 ShaderRecompiler::DescriptorBinding binding(Role role, std::uint32_t slot) {
     return {ShaderRecompiler::DescriptorKind::StorageBuffer, role, 0, slot, 1, {}, false};
 }
@@ -1070,6 +1216,9 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     importWindowTests(context);
+    importJoinTests(context);
+    importWholeRangeOverWindowTests(context);
+    importReliefTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();

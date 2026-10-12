@@ -296,6 +296,18 @@ bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }
 
+void GuestArenaBeginRetarget_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().BeginRetarget(address, bytes);
+}
+
+void GuestArenaEndRetarget_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().EndRetarget(address, bytes);
+}
+
+bool GuestArenaAwaitRetarget_nid_postfix(std::uintptr_t address, std::uintptr_t access) {
+    return WindowsMappings::Get().AwaitRetarget(address, static_cast<ULONG_PTR>(access));
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -312,6 +324,18 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
 
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
+}
+
+bool GuestArenaProbeClean_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t* serial) {
+    return WindowsMappings::Get().ProbeClean(address, bytes, serial);
+}
+
+std::uint64_t GuestArenaMappingSerial_nid_postfix() {
+    return WindowsMappings::Get().MappingSerial();
+}
+
+void GuestArenaCollectStatistics_nid_postfix(std::uint64_t* values, std::size_t count) {
+    WindowsMappings::Get().CollectStatistics(values, count);
 }
 
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {

@@ -113,6 +113,13 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11
 };
 
+enum class RasterPrimitive : std::uint8_t {
+    Point,
+    Line,
+    Triangle,
+    Rectangle
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -141,6 +148,7 @@ struct ShaderPixelStageInfo {
     std::array<ColorExportPacking, 8> targetExportPacking;
     bool dualSourceBlend;
     bool alphaToCoverage;
+    RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
 };
 
 struct ShaderVertexBufferResource {
@@ -162,6 +170,7 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchAttribReg;
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 struct ShaderFloatMode {
@@ -228,6 +237,7 @@ struct SpirvTarget {
     bool narrowSubgroupClock = false;
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
+    bool robustBufferAccess2 = false;
 };
 
 struct BindingLayout {
@@ -337,7 +347,10 @@ enum class DescriptorRole {
     BdaPagetable,
     FaultBuffer,
     FlattenedSrt,
-    ShaderData
+    ShaderData,
+    ImageTable,
+    SamplerTable,
+    ImageTableMap
 };
 
 struct DescriptorBinding {
@@ -355,6 +368,7 @@ struct DescriptorBinding {
     std::vector<bool> imageDepthCompare;
     std::vector<bool> imageAtomic;
     std::vector<bool> imageAtomic64;
+    std::vector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
     // (~0.4-0.5 us each on NVIDIA), so a driver may keep these elements in device-local memory.
@@ -371,6 +385,13 @@ struct DescriptorBinding {
     std::vector<bool> imageUnnormalizedBaseLevel;
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
+};
+
+struct ImageTableEntryPoison {
+    std::array<std::uint32_t, 8> words{};
+    std::uint32_t dwordCount = 0;
+    std::uint32_t resource = 0;
+    std::uint32_t reason = 0;
 };
 
 struct VertexAttribute {
@@ -497,6 +518,11 @@ struct ShaderInvocation {
     std::vector<std::byte> pushConstants;
     std::vector<VertexAttribute> vertexAttributes;
     std::uint32_t poisonedSrtReads = 0;
+    std::vector<ImageTableEntryPoison> imageTablePoison;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint64_t>>> imageTableReadRanges;
+    std::uint64_t imageTableShader = 0;
+    std::uint32_t imageTableFaults = 0;
 };
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {

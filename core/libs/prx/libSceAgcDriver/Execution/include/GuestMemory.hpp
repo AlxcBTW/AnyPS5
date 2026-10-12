@@ -95,6 +95,18 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
+std::uint64_t ThreadCollectEpoch();
+std::uint64_t UnwatchSerial();
+void BeginPrewalk();
+void EndPrewalk();
+void DrainPrewalk();
+struct PrewalkCounts {
+    std::uint64_t looks = 0;
+    std::uint64_t clean = 0;
+    std::uint64_t trimmedCollects = 0;
+    std::uint64_t skippedCollects = 0;
+};
+PrewalkCounts PrewalkStatistics();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
@@ -149,6 +161,9 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// Counts the outermost acquisitions of GpuMutex (one per hold): an object one hold must keep for
+// every batch it opens (Recorder::KeepThroughHold) is tied to the hold it was handed over in.
+std::uint64_t GpuHoldSerial();
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
