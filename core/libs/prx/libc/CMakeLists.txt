@@ -4,6 +4,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/CreationMask.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/FreeQuarantine.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
@@ -551,6 +552,9 @@ if(BUILD_TESTING)
         set_tests_properties(application_heap_replacement application_heap_invalid_metadata application_heap_default application_heap_exit_order
             PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(free_quarantine_tests ${LIBS_INCLUDE_DIR}/tests/FreeQuarantine.cpp)
+    target_include_directories(free_quarantine_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test(NAME free_quarantine COMMAND free_quarantine_tests)
     add_test_executable(application_heap_stats_tests ${LIBS_INCLUDE_DIR}/tests/ApplicationHeapStats.cpp)
     target_include_directories(application_heap_stats_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(application_heap_stats_tests PRIVATE libc)
