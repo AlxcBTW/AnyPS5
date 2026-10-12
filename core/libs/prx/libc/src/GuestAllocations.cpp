@@ -41,11 +41,19 @@ struct Registry {
     std::shared_ptr<const Lease> shared;
     std::uint64_t sharedGeneration = 0;
     std::uint32_t openMutations = 0;
+    std::weak_ptr<const Lease::Ranges> readableLease;
+    std::weak_ptr<const Lease::Ranges> allLease;
 };
 
 Registry& registry() {
     static Registry value;
     return value;
+}
+
+// exp (APS5_EXP_UP4698=1, upstream #4698): leases taken while the registry is unchanged share one snapshot.
+bool snapshotsShared() {
+    static const bool enabled = std::getenv("APS5_EXP_UP4698") != nullptr;
+    return enabled;
 }
 
 std::atomic<std::uint64_t> generation{1};
@@ -119,6 +127,8 @@ void* GuestAllocationsBegin_nid_postfix() {
     // lets go of it before anything here waits for a range to be unpinned.
     ++registry().openMutations;
     registry().shared.reset();
+    registry().readableLease.reset();
+    registry().allLease.reset();
     return state;
 }
 
@@ -136,7 +146,7 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     }
     if (!state->gpuMapped.empty()) gpuMapObserverCalls.fetch_add(1);
     const auto observer = state->gpuMapped.empty() ? nullptr : gpuMapObserver.load();
-    Lease mapped;
+    Lease::Ranges mapped;
     if (observer != nullptr) {
         const auto& ranges = registry().ranges;
         for (const auto& [address, bytes] : state->gpuMapped) {
@@ -153,6 +163,8 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const Mapped weak(mapped.begin(), mapped.end());
     mapped.clear();
     const bool noted = !state->gpuMapped.empty();
+    registry().readableLease.reset();
+    registry().allLease.reset();
     delete state;
     if (!weak.empty()) observer(weak, ended);
     if (noted) gpuMapObserverCalls.fetch_sub(1);
@@ -328,6 +340,8 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
     for (;;) {
+        registry().readableLease.reset();
+        registry().allLease.reset();
         bool pinned = false;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
@@ -503,11 +517,13 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
 
 Lease GuestAllocationsAcquire_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    Lease result;
+    if (const auto shared = snapshotsShared() ? registry().readableLease.lock() : nullptr) return Lease(shared);
+    auto ranges = std::make_shared<Lease::Ranges>();
     for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) result.push_back(range);
+        if (range->readable && range->bytes != 0) ranges->push_back(range);
     }
-    return result;
+    if (snapshotsShared()) registry().readableLease = ranges;
+    return Lease(std::move(ranges));
 }
 
 std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
@@ -515,10 +531,11 @@ std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
     std::lock_guard lock(state.mutex);
     const auto current = generation.load(std::memory_order_acquire);
     if (state.shared != nullptr && state.sharedGeneration == current) return state.shared;
-    auto lease = std::make_shared<Lease>();
+    auto ranges = std::make_shared<Lease::Ranges>();
     for (const auto& [address, range] : state.ranges) {
-        if (range->readable && range->bytes != 0) lease->push_back(range);
+        if (range->readable && range->bytes != 0) ranges->push_back(range);
     }
+    const auto lease = std::make_shared<Lease>(std::move(ranges));
     // A mutation waiting for its ranges to be unpinned (the lock is released inside it) must not
     // find them pinned by the registry's own copy.
     if (state.openMutations == 0) {
@@ -530,12 +547,14 @@ std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    Lease result;
-    result.reserve(registry().ranges.size());
+    if (const auto shared = snapshotsShared() ? registry().allLease.lock() : nullptr) return Lease(shared);
+    auto ranges = std::make_shared<Lease::Ranges>();
+    ranges->reserve(registry().ranges.size());
     for (const auto& [address, range] : registry().ranges) {
-        if (range->bytes != 0) result.push_back(range);
+        if (range->bytes != 0) ranges->push_back(range);
     }
-    return result;
+    if (snapshotsShared()) registry().allLease = ranges;
+    return Lease(std::move(ranges));
 }
 
 }
