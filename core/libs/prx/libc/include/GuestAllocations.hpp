@@ -43,6 +43,11 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply);
 Lease GuestAllocationsAcquire_nid_postfix();
 Lease GuestAllocationsAcquireAll_nid_postfix();
+// The ranges GuestAllocationsAcquire returns, as one copy shared by every caller until the registry
+// changes (built at most once per generation). Like any lease it pins its ranges while a caller
+// holds it; the registry's own reference is dropped when a mutation begins and never taken while
+// one is open, so it never holds up a mutation's RequireUnpinned.
+std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix();
 // Changes whenever a mutation ends, so callers can cache facts about guest mappings between changes.
 std::uint64_t GuestAllocationsGeneration_nid_postfix();
 // Precise invalidation for such caches: the callback runs, after the generation changed, for every

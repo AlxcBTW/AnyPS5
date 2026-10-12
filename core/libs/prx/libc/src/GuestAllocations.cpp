@@ -36,6 +36,11 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
+    // GuestAllocationsAcquireShared's copy and the generation it was built at, and the mutations
+    // begun and not yet ended (a pin wait releases the lock inside one).
+    std::shared_ptr<const Lease> shared;
+    std::uint64_t sharedGeneration = 0;
+    std::uint32_t openMutations = 0;
 };
 
 Registry& registry() {
@@ -109,11 +114,22 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    // The shared lease pins every range it holds (RequireUnpinned counts owners), so the registry
+    // lets go of it before anything here waits for a range to be unpinned.
+    ++registry().openMutations;
+    registry().shared.reset();
+    return state;
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
+    if (state->lock.owns_lock()) {
+        --registry().openMutations;
+    } else {
+        std::lock_guard lock(registry().mutex);
+        --registry().openMutations;
+    }
     const auto ended = generation.fetch_add(1, std::memory_order_release) + 1;
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
@@ -492,6 +508,24 @@ Lease GuestAllocationsAcquire_nid_postfix() {
         if (range->readable && range->bytes != 0) result.push_back(range);
     }
     return result;
+}
+
+std::shared_ptr<const Lease> GuestAllocationsAcquireShared_nid_postfix() {
+    auto& state = registry();
+    std::lock_guard lock(state.mutex);
+    const auto current = generation.load(std::memory_order_acquire);
+    if (state.shared != nullptr && state.sharedGeneration == current) return state.shared;
+    auto lease = std::make_shared<Lease>();
+    for (const auto& [address, range] : state.ranges) {
+        if (range->readable && range->bytes != 0) lease->push_back(range);
+    }
+    // A mutation waiting for its ranges to be unpinned (the lock is released inside it) must not
+    // find them pinned by the registry's own copy.
+    if (state.openMutations == 0) {
+        state.shared = lease;
+        state.sharedGeneration = current;
+    }
+    return lease;
 }
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {

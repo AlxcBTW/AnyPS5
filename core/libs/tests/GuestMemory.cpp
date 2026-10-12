@@ -603,6 +603,53 @@ static void CheckClearingTheObserverWaitsForItsCalls() {
     Require(sceKernelReleaseDirectMemory(phys, page) == 0);
 }
 
+// The shared lease is one copy until the registry changes and holds the ranges a copy holds. It pins
+// a range only while a caller holds it: the registry's own reference never holds up an unmap, not
+// even one taken while an unmap waits for its range with the registry lock released.
+static void CheckSharedLeaseFollowsTheRegistry() {
+    constexpr std::size_t page = 0x4000;
+    const auto listing = [](const GuestAllocations::Lease& lease, const void* pointer) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        return std::any_of(lease.begin(), lease.end(), [&](const auto& range) { return address >= range->address && address - range->address < range->bytes; });
+    };
+    void* mapping = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&mapping, page, 3, 0, "shared lease") == 0);
+    {
+        auto first = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+        auto second = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+        Require(first != nullptr && first == second && listing(*first, mapping));
+        const auto copy = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        Require(copy.size() == first->size() && std::equal(copy.begin(), copy.end(), first->begin()));
+    }
+    const auto unmapStarted = std::chrono::steady_clock::now();
+    Require(sceKernelMunmap(mapping, page) == 0);
+    Require(std::chrono::steady_clock::now() - unmapStarted < std::chrono::milliseconds(500));
+    {
+        const auto after = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+        Require(!listing(*after, mapping));
+    }
+    void* held = nullptr;
+    Require(sceKernelMapNamedFlexibleMemory(&held, page, 3, 0, "held lease") == 0);
+    auto holder = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+    Require(listing(*holder, held));
+    std::atomic<bool> unmapped{false};
+    std::thread unmapper([&] {
+        Require(sceKernelMunmap(held, page) == 0);
+        unmapped = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Require(!unmapped);
+    {
+        // Taken while the unmap waits with the registry lock released: never kept by the registry.
+        const auto during = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+        Require(listing(*during, held));
+    }
+    holder.reset();
+    unmapper.join();
+    Require(unmapped);
+    Require(!listing(*GuestAllocations::GuestAllocationsAcquireShared_nid_postfix(), held));
+}
+
 static void CheckGpuMapsAreObserved() {
     GuestAllocations::GuestAllocationsSetGpuMapObserver_nid_postfix([](const GuestAllocations::Mapped& mapped, std::uint64_t) {
         const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
@@ -1923,6 +1970,7 @@ int main() {
     CheckGpuAccessFollowsProtection();
     CheckGpuMapsAreObserved();
     CheckClearingTheObserverWaitsForItsCalls();
+    CheckSharedLeaseFollowsTheRegistry();
     CheckHintedVirtualReservation();
     CheckFixedVirtualReservation();
     CheckReservedRangeIsNotCommitted();

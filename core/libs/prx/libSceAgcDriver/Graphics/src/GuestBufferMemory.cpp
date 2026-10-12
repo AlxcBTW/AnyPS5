@@ -1991,6 +1991,32 @@ void SetHostImportWindow(std::uint64_t bytes) {
     importWindow.store(bytes, std::memory_order_relaxed);
 }
 
+namespace {
+
+// exp (APS5_EXP_SHARED_LEASE=1): the lookups that go through the registry (an address without an
+// import, or the registry moved since the imports were reconciled) take the registry's shared lease
+// (GuestAllocationsAcquireShared, built once per registry generation) instead of copying every range
+// per call. The same ranges either way; APS5_VERIFY_SHARED_LEASE=1 compares them with a copy.
+bool sharedLease() {
+    static const bool enabled = std::getenv("APS5_EXP_SHARED_LEASE") != nullptr;
+    return enabled;
+}
+
+void verifySharedLease(const GuestAllocations::Lease& shared) {
+    static const bool verify = std::getenv("APS5_VERIFY_SHARED_LEASE") != nullptr;
+    if (!verify) return;
+    const auto before = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto copy = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    // A copy taken after a registry change differs for good reason; only an unchanged registry compares.
+    if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != before) return;
+    if (copy.size() == shared.size() && std::equal(copy.begin(), copy.end(), shared.begin())) return;
+    std::fprintf(stderr, "[imports] APS5_VERIFY_SHARED_LEASE: the shared lease (%zu ranges) differs from a copy (%zu ranges) at generation %llu\n", shared.size(), copy.size(), static_cast<unsigned long long>(before));
+    std::fflush(stderr);
+    std::abort();
+}
+
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
@@ -2000,11 +2026,18 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
     }
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    refreshImports(context, state, lease);
-    if (!runCovers(lease, address, address + bytes)) return nullptr;
-    const auto* entry = importAllocation(context, state, address, lease);
-    return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
+    const auto resolve = [&](const GuestAllocations::Lease& lease) -> const HostImport* {
+        refreshImports(context, state, lease);
+        if (!runCovers(lease, address, address + bytes)) return nullptr;
+        const auto* entry = importAllocation(context, state, address, lease);
+        return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
+    };
+    if (sharedLease()) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquireShared_nid_postfix();
+        verifySharedLease(*lease);
+        return resolve(*lease);
+    }
+    return resolve(GuestAllocations::GuestAllocationsAcquire_nid_postfix());
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
