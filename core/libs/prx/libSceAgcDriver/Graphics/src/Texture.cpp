@@ -4393,4 +4393,20 @@ VkImageView StorageTexture::View() const {
     return view;
 }
 
+StorageOriginalStats StorageOriginalCensus() {
+    StorageOriginalStats stats;
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    for (const auto* texture : live.textures) {
+        ++stats.images;
+        const auto bytes = texture->OriginalBytes();
+        if (bytes == 0) continue;
+        ++stats.withOriginal;
+        stats.bytes += bytes;
+        // Read without the texture's lock: a census figure, not a decision.
+        if (texture->GuestSnapshotValid()) stats.validBytes += bytes;
+    }
+    return stats;
+}
+
 }

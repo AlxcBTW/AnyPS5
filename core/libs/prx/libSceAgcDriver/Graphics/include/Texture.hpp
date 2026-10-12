@@ -27,6 +27,16 @@ class CommandBatch;
 class StorageTexture;
 struct HostImport;
 
+// APS5_EXP_MEMORY_CENSUS: the live storage images and their CPU copies of guest bytes (`original`),
+// all and those that currently vouch for the guest bytes (the rest are re-read before use).
+struct StorageOriginalStats {
+    std::uint64_t images = 0;
+    std::uint64_t withOriginal = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t validBytes = 0;
+};
+StorageOriginalStats StorageOriginalCensus();
+
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
 // vkGetPhysicalDeviceFormatProperties call before).
@@ -315,6 +325,8 @@ public:
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
     bool GuestSnapshotValid() const { return originalValid; }
+    // APS5_EXP_MEMORY_CENSUS: the CPU copy of the guest bytes this image holds.
+    std::size_t OriginalBytes() const { return original.size(); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
     DccKeys ProvedKeys() const;
