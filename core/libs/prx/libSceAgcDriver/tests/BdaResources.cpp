@@ -793,20 +793,22 @@ void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
     auto* guest = static_cast<std::uint8_t*>(block);
     std::memset(block, 0x11, bytes);
     const auto address = reinterpret_cast<std::uintptr_t>(block);
-    const auto registry = [&](bool add) {
+    const auto registry = [&](bool add, bool writable = false) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, writable, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
-    const auto build = [&] {
+    const auto build = [&](std::uint64_t written = 0, const std::function<void(GuestBufferMemory&)>& gpu = {}) {
         GuestBufferMemory leased(context);
         leased.AcquireRegistered();
+        if (written != 0) leased.AddWritable(written, 32);
         leased.Upload(true);
         const auto ranges = leased.AddressRanges();
         const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
         Require(found != ranges.end() && found->deviceAddress != 0u && found->permissions == ShaderRecompiler::BdaAbi::Read, "the device-local mirror is missing from the BDA table or writable");
         const auto device = found->deviceAddress;
+        if (gpu) gpu(leased);
         leased.WriteBack();
         return device;
     };
@@ -840,6 +842,33 @@ void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
     static_cast<void>(build());
     Require(DeviceMirrorCounters().mirrors == made.mirrors, "a mirror went to device-local memory with room in the host heap");
     registry(false);
+    sweep();
+
+    // =1 keeps a writable range's mirror host-visible; =2 puts it in device-local memory, and its
+    // write-back takes the written range's bytes from copies made before and after the work.
+    deviceMirrorBudget.heapUsage[1] = VkDeviceSize{1} << 30u;
+    Require(PollHostHeap(context, 0, true).tight, "a full host heap is not tight again");
+    std::memset(block, 0x11, bytes);
+    registry(true, true);
+    static_cast<void>(build());
+    Require(DeviceMirrorCounters().mirrors == made.mirrors, "a writable range went to device-local memory with APS5_EXP_HEAP_BUDGET=1");
+    registry(false, true);
+    sweep();
+    SetHeapBudgetExperiment(2);
+    registry(true, true);
+    const auto writableBefore = DeviceMirrorCounters();
+    const auto writable = build(address + 16, [&](GuestBufferMemory& leased) {
+        std::uint32_t adjustment = 0;
+        const auto view = leased.Descriptor(address + 16, 32, adjustment);
+        access.bytes(view.buffer)[view.offset + adjustment] = std::byte{0x77};
+        guest[16 + 8] = 0x55;
+    });
+    const auto stored = DeviceMirrorCounters();
+    Require(stored.mirrors == writableBefore.mirrors + 1, "a writable range in a tight host heap was not mirrored in device-local memory with APS5_EXP_HEAP_BUDGET=2");
+    Require(stored.readbacks == writableBefore.readbacks + 2, "the written range was not copied out before and after the work");
+    Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a device-local mirror's write-back lost the GPU's store or rolled back the CPU's");
+    Require(build() == writable && access.addressBytes(writable)[16] == std::byte{0x77} && access.addressBytes(writable)[16 + 8] == std::byte{0x55}, "the device-local mirror missed the stores");
+    registry(false, true);
     sweep();
     SetHeapBudgetExperiment(0);
     SetHostImportHeap(UINT32_MAX);

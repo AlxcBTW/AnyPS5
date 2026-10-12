@@ -101,7 +101,8 @@ std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others
 HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bool force = false);
 // The heap host imports land in (learned from the first import's memory type; tests set it).
 void SetHostImportHeap(std::uint32_t heap);
-// Overrides APS5_EXP_HEAP_BUDGET (tests): 1 on, 0 off, -1 back to the variable.
+// Overrides APS5_EXP_HEAP_BUDGET (tests): 1 on (read-only mirrors may go device-local), 2 on with
+// writable ones too, 0 off, -1 back to the variable.
 void SetHeapBudgetExperiment(int mode);
 // Device-local image mirrors made while the heap was tight (APS5_EXP_HEAP_BUDGET).
 struct DeviceMirrorStats {
@@ -109,6 +110,9 @@ struct DeviceMirrorStats {
     std::uint64_t bytes = 0;
     std::uint64_t uploadedBytes = 0;
     std::uint64_t uploads = 0;
+    // Written ranges of writable device-local mirrors copied out for the write-back (=2).
+    std::uint64_t readbacks = 0;
+    std::uint64_t readbackBytes = 0;
 };
 DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the
@@ -434,6 +438,10 @@ private:
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
     void takeHeapReferences();
+    // [begin, begin + length) of a device-local mirror (APS5_EXP_HEAP_BUDGET=2) copied into a host
+    // buffer: recorded into the open batch, or with `wait` (and without a recorder) through a batch of
+    // its own that is waited for, so the bytes can be read at once.
+    std::shared_ptr<Buffer> readMirror(const ImageMirror& mirror, std::uint64_t begin, std::size_t length, bool wait);
     Context context;
     bool stagingAllowed = false;
     bool adjustedRegions = false;
@@ -453,6 +461,16 @@ private:
     bool regionsSorted = false;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> heapReferences;
+    // A written range of a device-local writable mirror: its bytes before the work (heap mirrors; a
+    // shadowed mirror compares with its shadow) and after it, copied out by the GPU (takeHeapReferences,
+    // RecordCopyBacks) since the mirror has no mapping.
+    struct DeviceReadback {
+        std::uint64_t begin = 0;
+        std::size_t length = 0;
+        std::shared_ptr<Buffer> reference;
+        std::shared_ptr<Buffer> current;
+    };
+    std::vector<DeviceReadback> deviceReadbacks;
     // UploadPrepare ran (regions are frozen); `uploaded` once UploadFinish ran.
     bool prepared = false;
     bool uploaded = false;

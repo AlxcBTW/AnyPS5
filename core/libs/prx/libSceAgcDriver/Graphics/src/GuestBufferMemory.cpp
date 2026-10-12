@@ -769,7 +769,8 @@ std::atomic<int> heapBudgetMode{-1};
 bool heapBudgetEnabled() {
     auto enabled = heapBudgetMode.load(std::memory_order_relaxed);
     if (enabled < 0) {
-        enabled = std::getenv("APS5_EXP_HEAP_BUDGET") != nullptr ? 1 : 0;
+        const char* value = std::getenv("APS5_EXP_HEAP_BUDGET");
+        enabled = value == nullptr || std::strcmp(value, "0") == 0 ? 0 : std::strcmp(value, "2") == 0 ? 2 : 1;
         heapBudgetMode.store(enabled, std::memory_order_relaxed);
     }
     return enabled != 0;
@@ -791,6 +792,8 @@ struct HeapWatch {
     std::atomic<std::uint64_t> deviceBytes{0};
     std::atomic<std::uint64_t> uploadedBytes{0};
     std::atomic<std::uint64_t> uploads{0};
+    std::atomic<std::uint64_t> readbacks{0};
+    std::atomic<std::uint64_t> readbackBytes{0};
 };
 
 HeapWatch& Heaps() {
@@ -1411,9 +1414,10 @@ void uploadStagedBlocks(const Context& context, std::span<const RefreshBlock> bl
 
 // exp (APS5_EXP_HEAP_BUDGET): a new mirror goes to device-local memory while the host-visible heap is
 // tight and the device-local heap keeps a reserve (max(512 MiB, an eighth of its budget)) beside it.
-// Read-only ranges only: a writable mirror's write-back reads its bytes on the CPU.
+// Read-only ranges with =1; writable ones too with =2: their written ranges are copied out before and
+// after the work for the write-back (takeHeapReferences, RecordCopyBacks, readMirror).
 bool deviceMirrorWanted(const Context& context, std::uint64_t bytes, bool writable) {
-    if (!heapBudgetEnabled() || writable || bytes < 65536) return false;
+    if (!heapBudgetEnabled() || (writable && heapBudgetMode.load(std::memory_order_relaxed) < 2) || bytes < 65536) return false;
     std::uint64_t imports = 0;
     {
         auto& state = Imports();
@@ -2620,7 +2624,7 @@ void SetHeapBudgetExperiment(int mode) {
 
 DeviceMirrorStats DeviceMirrorCounters() {
     auto& heaps = Heaps();
-    return {heaps.deviceMirrors.load(std::memory_order_relaxed), heaps.deviceBytes.load(std::memory_order_relaxed), heaps.uploadedBytes.load(std::memory_order_relaxed), heaps.uploads.load(std::memory_order_relaxed)};
+    return {heaps.deviceMirrors.load(std::memory_order_relaxed), heaps.deviceBytes.load(std::memory_order_relaxed), heaps.uploadedBytes.load(std::memory_order_relaxed), heaps.uploads.load(std::memory_order_relaxed), heaps.readbacks.load(std::memory_order_relaxed), heaps.readbackBytes.load(std::memory_order_relaxed)};
 }
 
 void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes) {
@@ -3974,6 +3978,14 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
+    // Device-local writable mirrors: the written ranges' bytes after the work, for WriteBack.
+    for (auto& readback : deviceReadbacks) {
+        if (readback.current != nullptr) continue;
+        const auto* found = owner(readback.begin);
+        Require(found != nullptr && found->mirror != nullptr && found->mirror->device, "a device-local mirror readback lost its mirror");
+        Require(Recorder::Active() == &recorder, "mirror readbacks recorded into a recorder that is not the device's");
+        readback.current = readMirror(*found->mirror, readback.begin, readback.length, false);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
@@ -4250,16 +4262,57 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> mergeWrites(std::vector<std
 
 void GuestBufferMemory::takeHeapReferences() {
     heapReferences.clear();
+    deviceReadbacks.clear();
     for (const auto& [begin, end] : mergeWrites(writes)) {
         const auto* found = owner(begin);
-        if (found == nullptr || found->mirror == nullptr || !found->mirror->heap || !found->mirror->writable) continue;
-        Require(end <= found->end, "written range exceeds its heap mirror");
+        if (found == nullptr || found->mirror == nullptr || !found->mirror->writable) continue;
         const auto& mirror = *found->mirror;
+        if (mirror.device) {
+            // The bytes WriteBack compares with: a heap mirror's as they are before the work, copied out
+            // now (recorded ahead of it); a shadowed mirror's shadow. The bytes after the work are
+            // copied out by RecordCopyBacks, or by WriteBack itself.
+            Require(end <= found->end, "written range exceeds its device-local mirror");
+            const auto served = mirror.heap ? std::min(end, servedEnd(*found)) : end;
+            if (begin >= served) continue;
+            DeviceReadback readback;
+            readback.begin = begin;
+            readback.length = static_cast<std::size_t>(served - begin);
+            if (mirror.heap) readback.reference = readMirror(mirror, begin, readback.length, false);
+            deviceReadbacks.push_back(std::move(readback));
+            continue;
+        }
+        if (!mirror.heap) continue;
+        Require(end <= found->end, "written range exceeds its heap mirror");
         const auto served = std::min(end, servedEnd(*found));
         if (begin >= served) continue;
         const auto bytes = mirror.buffer->Bytes().subspan(static_cast<std::size_t>(begin - mirror.base), static_cast<std::size_t>(served - begin));
         heapReferences.emplace_back(begin, std::vector<std::byte>(bytes.begin(), bytes.end()));
     }
+}
+
+std::shared_ptr<Buffer> GuestBufferMemory::readMirror(const ImageMirror& mirror, std::uint64_t begin, std::size_t length, bool wait) {
+    auto readback = std::make_shared<Buffer>(context, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto* recorder = !wait && GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
+    std::unique_ptr<CommandBatch> batch;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (recorder != nullptr) {
+        commands = recorder->Commands();
+        recorder->Keep(readback, length);
+    } else {
+        batch = std::make_unique<CommandBatch>(context);
+        commands = batch->Handle();
+    }
+    // Earlier work's stores into the mirror precede the copy; later work's stores wait for it, and
+    // the host reads the copy once the batch completed.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    const VkBufferCopy region{begin - mirror.base, 0, static_cast<VkDeviceSize>(length)};
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, mirror.buffer->Handle(), readback->Handle(), 1, &region);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+    if (batch != nullptr) batch->SubmitAndWait();
+    auto& heaps = Heaps();
+    heaps.readbacks.fetch_add(1, std::memory_order_relaxed);
+    heaps.readbackBytes.fetch_add(length, std::memory_order_relaxed);
+    return readback;
 }
 
 void GuestBufferMemory::WriteBack() {
@@ -4288,6 +4341,24 @@ void GuestBufferMemory::WriteBack() {
             const auto served = std::min(end, servedEnd(region));
             if (mirror.heap && begin >= served) continue;
             const auto length = static_cast<std::size_t>((mirror.heap ? served : end) - begin);
+            if (mirror.device) {
+                // No mapping: the bytes come from the copies takeHeapReferences and RecordCopyBacks
+                // recorded (a use without RecordCopyBacks, a synchronous draw, copies them out now).
+                const auto readback = std::find_if(deviceReadbacks.begin(), deviceReadbacks.end(), [&](const auto& entry) { return entry.begin == begin; });
+                Require(readback != deviceReadbacks.end() && readback->length == length, "device-local mirror write-back has no readback");
+                if (readback->current == nullptr) readback->current = readMirror(mirror, begin, length, true);
+                const auto current = readback->current->Bytes().first(length);
+                if (mirror.heap) {
+                    Require(readback->reference != nullptr, "device-local heap mirror write-back has no reference");
+                    const auto before = readback->reference->Bytes().first(length);
+                    if (mirror.sparse) storeSparse(mirror, begin, current, before);
+                    else storeChanged(begin, current, before);
+                    continue;
+                }
+                GuestMemory::WriteChanged(begin, current, std::span<const std::byte>(mirror.shadow).subspan(offset, length));
+                std::memcpy(mirror.shadow.data() + offset, current.data(), length);
+                continue;
+            }
             const auto current = mirror.buffer->Bytes().subspan(offset, length);
             if (mirror.heap) {
                 const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });
@@ -4346,6 +4417,7 @@ void GuestBufferMemory::WriteBack() {
     lease.clear();
     space.reset();
     heapReferences.clear();
+    deviceReadbacks.clear();
 }
 
 std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
