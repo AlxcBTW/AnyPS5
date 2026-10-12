@@ -780,7 +780,16 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     };
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    static const bool lean = LeanDraw();
     for (const auto& shader : shaders) {
+        if (lean) {
+            // The stage's words straight into the key, its length written in front once known.
+            const auto lengthAt = key.size();
+            key.push_back(0);
+            ShaderResources::AppendContentKey(key, shader, true, MovableBuffers());
+            key[lengthAt] = static_cast<std::uint32_t>(key.size() - lengthAt - 1);
+            continue;
+        }
         const auto part = ShaderResources::ContentKey(shader, true, MovableBuffers());
         key.push_back(static_cast<std::uint32_t>(part.size()));
         key.insert(key.end(), part.begin(), part.end());

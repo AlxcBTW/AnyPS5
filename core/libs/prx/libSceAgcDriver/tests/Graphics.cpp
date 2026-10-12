@@ -2817,6 +2817,25 @@ void pushConstantAssemblyEquivalenceTests() {
     Require(built > 1000 && refused > 1000, "the push constant layouts did not cover both outcomes");
 }
 
+// APS5_EXP_LEAN_DRAW's DrawResourceKey appends each stage's content key in place: the words equal
+// ContentKey's for every combination of the data-word and movable-buffer flags, after any prefix.
+void contentKeyAppendTests() {
+    using AgcDriver::Graphics::ShaderResources;
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(reinterpret_cast<const void*>(0x10000), 16), vsharp(reinterpret_cast<const void*>(0x20000), 32))));
+    program.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, ShaderDataWords({7, 8, 9})));
+    program.bindings.push_back(makeBinding(Role::FlattenedSrt, 43, 1, {1, 2, 3}));
+    const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Vertex, &program, 0};
+    for (const bool dataWords : {false, true}) {
+        for (const bool movable : {false, true}) {
+            const auto whole = ShaderResources::ContentKey(shader, dataWords, movable);
+            std::vector<std::uint32_t> appended{0xffffffffu, 42u};
+            ShaderResources::AppendContentKey(appended, shader, dataWords, movable);
+            Require(appended.size() == whole.size() + 2 && std::equal(whole.begin(), whole.end(), appended.begin() + 2), "an appended content key differs from ContentKey");
+        }
+    }
+}
+
 void descriptorSnapshotTests() {
     using AgcDriver::Graphics::DescriptorCache;
     using AgcDriver::Graphics::Recorder;
@@ -5141,6 +5160,7 @@ int main(int argc, char** argv) {
         descriptorPoolTests();
         pushConstantTests();
         pushConstantAssemblyEquivalenceTests();
+        contentKeyAppendTests();
         resourceTests();
         descriptorSnapshotTests();
         descriptorCacheTests();
