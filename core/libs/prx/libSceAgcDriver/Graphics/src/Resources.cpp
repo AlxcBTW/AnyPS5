@@ -287,6 +287,11 @@ std::uint64_t LiveGpuMemory() {
     return total > 0 ? static_cast<std::uint64_t>(total) : 0;
 }
 
+std::uint64_t LiveGpuMemory(GpuMemoryKind kind) {
+    const auto bytes = MemoryCounts().bytes[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+    return bytes > 0 ? static_cast<std::uint64_t>(bytes) : 0;
+}
+
 std::uint64_t OutOfMemoryFailures() {
     return outOfMemoryFailures;
 }

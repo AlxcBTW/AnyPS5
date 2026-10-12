@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -485,6 +486,82 @@ void PartialSlabDoesNotRetry() {
     Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "partial slab failure leaked a resource");
 }
 
+VkPhysicalDeviceMemoryBudgetPropertiesEXT mockBudget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+std::uint64_t budgetReads = 0;
+
+VKAPI_ATTR void VKAPI_CALL mockMemoryProperties2(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    ++budgetReads;
+    for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) continue;
+        auto* budget = reinterpret_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
+        std::memcpy(budget->heapBudget, mockBudget.heapBudget, sizeof(budget->heapBudget));
+        std::memcpy(budget->heapUsage, mockBudget.heapUsage, sizeof(budget->heapUsage));
+    }
+}
+
+// APS5_EXP_HEAP_BUDGET: parl0v's 16 GB box (AlxcBTW/AnyPS5#44, comment 6133280764) as the heaps report
+// it: the host-visible heap 1 at 8110 MiB (RAM / 2) holding 7129 MiB of imports, the device-local
+// heap at 8188 MiB with 4473 MiB used.
+void HeapBudget() {
+    Expect(HeapImportAllowance(8110 * MiB, 409 * MiB, 811 * MiB) == 6890 * MiB, "the import allowance is not the budget less the other use and the headroom");
+    Expect(HeapImportAllowance(1000 * MiB, 600 * MiB, 500 * MiB) == 0 && HeapImportAllowance(500 * MiB, 600 * MiB, 0) == 0, "an overcommitted heap allows imports");
+    Expect(HeapHeadroom(8110 * MiB) == 811 * MiB && HeapHeadroom(2048 * MiB) == 512 * MiB, "the headroom is not a tenth of the budget, at least 512 MiB");
+    mock = MockDevice{};
+    {
+        auto context = mockContext();
+        context.memory.memoryHeapCount = 2;
+        context.memory.memoryHeaps[0] = {8188 * MiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        context.memory.memoryHeaps[1] = {8110 * MiB, 0};
+        context.memory.memoryTypes[0].heapIndex = 0;
+        context.memory.memoryTypes[1].heapIndex = 1;
+        context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x1000});
+        context.memoryProperties2 = mockMemoryProperties2;
+        SetHeapBudgetExperiment(0);
+        SetHostImportHeap(1);
+        Expect(PollHostHeap(context, 7129 * MiB, true).allowance == UINT64_MAX && budgetReads == 0, "the heap was read without APS5_EXP_HEAP_BUDGET");
+        SetHeapBudgetExperiment(1);
+        SetHostImportHeap(UINT32_MAX);
+        Expect(PollHostHeap(context, 7129 * MiB, true).allowance == UINT64_MAX && budgetReads == 0, "the heap was read before an import named it");
+        SetHostImportHeap(1);
+        mockBudget.heapBudget[0] = 8188 * MiB;
+        mockBudget.heapUsage[0] = 4473 * MiB;
+        mockBudget.heapBudget[1] = 8110 * MiB;
+        mockBudget.heapUsage[1] = (7129 + 409 + 300) * MiB;
+        const auto host = LiveGpuMemory(GpuMemoryKind::HostBuffer);
+        auto state = PollHostHeap(context, 7129 * MiB, true);
+        Expect(state.heap == 1 && state.budget == 8110 * MiB && state.usage == (7129 + 409 + 300) * MiB && state.headroom == 811 * MiB, "the import heap's budget, usage or headroom is wrong");
+        Expect(state.allowance == HeapImportAllowance(8110 * MiB, std::max<std::uint64_t>(host, 709 * MiB), 811 * MiB), "the allowance does not take the heap's use without the imports");
+        Expect(state.tight && BufferPool::HostHeapTight(), "7129 MiB of imports in an 8110 MiB heap is not tight");
+        Expect(state.deviceHeap == 0 && state.deviceBudget == 8188 * MiB && state.deviceUsage == 4473 * MiB, "the device-local heap's figures are wrong");
+        const auto reads = budgetReads;
+        static_cast<void>(PollHostHeap(context, 7129 * MiB));
+        Expect(budgetReads == reads, "the heap was read again within 100 ms");
+        // While tight, a released host-visible buffer of a MiB or more is freed, not retained.
+        const auto frees = mock.frees;
+        { Buffer large(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        Expect(mock.frees == frees + 1, "a large host-visible buffer was retained while the host heap was tight");
+        // Relaxed again: imports well under the allowance.
+        mockBudget.heapUsage[1] = (2000 + 409 + 300) * MiB;
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(!state.tight && !BufferPool::HostHeapTight(), "2000 MiB of imports in an 8110 MiB heap is tight");
+        const auto retained = mock.frees;
+        { Buffer large(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        Expect(mock.frees == retained, "a large host-visible buffer was not retained with room in the host heap");
+        // Turning tight trims what the pool retains on the host side.
+        mockBudget.heapUsage[1] = (7129 + 409 + 300) * MiB;
+        state = PollHostHeap(context, 7129 * MiB, true);
+        Expect(state.tight && mock.frees == retained + 1, "turning tight did not free the retained host-visible buffer");
+        // The driver's own use of the heap counts when it exceeds ours (usage without the imports).
+        mockBudget.heapUsage[1] = (5000 + 2500) * MiB;
+        state = PollHostHeap(context, 5000 * MiB, true);
+        Expect(state.allowance == 8110 * MiB - 2500 * MiB - 811 * MiB, "the heap's use without the imports was not taken as the other use");
+        SetHeapBudgetExperiment(0);
+        SetHostImportHeap(UINT32_MAX);
+        Expect(!BufferPool::HostHeapTight(), "switching the experiment off left the pool tight");
+    }
+    Expect(mock.liveBytes == 0 && mock.liveBuffers.empty(), "the heap budget case leaked a resource");
+}
+
 }
 
 int main() {
@@ -508,6 +585,7 @@ int main() {
         AllocationFailure(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_ERROR_DEVICE_LOST, true);
         SuccessfulAllocationKeepsPool();
         PartialSlabDoesNotRetry();
+        HeapBudget();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

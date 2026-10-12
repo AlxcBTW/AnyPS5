@@ -30,6 +30,7 @@
 #include <condition_variable>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -62,6 +63,9 @@ struct ImageMirror {
     bool writable = false;
     bool heap = false;
     bool sparse = false;
+    // exp (APS5_EXP_HEAP_BUDGET): `buffer` is device-local (made while the host-visible heap was
+    // tight); its bytes arrive through staged GPU copies (DeviceUpload), never through a mapping.
+    bool device = false;
     std::uint64_t reserved = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
     std::vector<std::uint64_t> generations;
@@ -272,6 +276,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(types));
     if (const auto result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &entry.memory); result != VK_SUCCESS) return failed("vkAllocateMemory", result);
     allocated = true;
+    entry.memoryType = allocation.memoryTypeIndex;
     if (const auto result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, entry.buffer, entry.memory, 0); result != VK_SUCCESS) return failed("vkBindBufferMemory", result);
     const VkBufferDeviceAddressInfo addressInfo{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, entry.buffer};
     entry.address = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &addressInfo);
@@ -752,9 +757,64 @@ std::uint64_t configuredBudget() {
     return budget;
 }
 
+// exp (APS5_EXP_HEAP_BUDGET=1): host imports and host-visible buffers share one Vulkan heap, which
+// Windows sizes at half of RAM on 16-32 GB machines (TotalSystemMemoryAvailableForGraphics), so
+// max(6 GiB, RAM / 2) of imports alone fills it on 16 GB and the next host-visible allocation fails
+// with VK_ERROR_OUT_OF_DEVICE_MEMORY (AlxcBTW/AnyPS5#44). With the switch the import budget is also
+// held under that heap's VK_EXT_memory_budget budget (PollHostHeap), and while the heap is tight new
+// read-only mirrors live in device-local memory and the buffer pool keeps no large host-visible
+// allocation. SetHeapBudgetExperiment overrides the switch (tests).
+std::atomic<int> heapBudgetMode{-1};
+
+bool heapBudgetEnabled() {
+    auto enabled = heapBudgetMode.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        enabled = std::getenv("APS5_EXP_HEAP_BUDGET") != nullptr ? 1 : 0;
+        heapBudgetMode.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
+}
+
+// The heap watch: the import heap (learned from the first import), its last reading and the
+// device-local mirrors' counters.
+struct HeapWatch {
+    std::mutex mutex;
+    std::atomic<std::uint32_t> importHeap{UINT32_MAX};
+    VkPhysicalDevice physical = VK_NULL_HANDLE;
+    std::chrono::steady_clock::time_point read{};
+    HostHeapState last{};
+    bool reported = false;
+    // The tightness the buffer pool was last told (BufferPool::SetHostHeapTight).
+    bool poolTight = false;
+    std::chrono::steady_clock::time_point lastPrint{};
+    std::atomic<std::uint64_t> deviceMirrors{0};
+    std::atomic<std::uint64_t> deviceBytes{0};
+    std::atomic<std::uint64_t> uploadedBytes{0};
+    std::atomic<std::uint64_t> uploads{0};
+};
+
+HeapWatch& Heaps() {
+    static HeapWatch heaps;
+    return heaps;
+}
+
+void learnImportHeap(std::uint32_t heap) {
+    auto expected = UINT32_MAX;
+    Heaps().importHeap.compare_exchange_strong(expected, heap, std::memory_order_relaxed);
+}
+
+constexpr std::uint64_t TightSlack = std::uint64_t{64} << 20u;
+
+bool heapTight(const HostHeapState& state, std::uint64_t liveImports) {
+    if (state.allowance == UINT64_MAX) return false;
+    return liveImports + TightSlack >= state.allowance || state.usage + state.headroom / 2 >= state.budget;
+}
+
 std::uint64_t importBudget(const Context& context, const HostImports& state) {
     const auto limit = state.limit.load(std::memory_order_relaxed);
-    return limit != 0 ? std::min(configuredBudget(), limit) : configuredBudget();
+    const auto configured = limit != 0 ? std::min(configuredBudget(), limit) : configuredBudget();
+    if (!heapBudgetEnabled()) return configured;
+    return std::min(configured, PollHostHeap(context, state.liveBytes).allowance);
 }
 
 ImportRun windowRun(ImportRun run, std::uint64_t begin, std::uint64_t end, std::uint64_t alignment) {
@@ -956,6 +1016,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     CountGpuMemory(GpuMemoryKind::HostImport, static_cast<std::int64_t>(bytes));
     if (MemoryCensusEnabled()) CountImportResidency(bytes, residentBefore);
+    if (entry.memoryType < context.memory.memoryTypeCount) learnImportHeap(context.memory.memoryTypes[entry.memoryType].heapIndex);
     static std::uint64_t importedBytes = 0;
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -1156,30 +1217,214 @@ struct RefreshBlock {
     std::size_t length;
     std::uint64_t generation = 0;
     std::uint8_t fill = 0;
+    // A device-local mirror's block the compare found to need new bytes (set by the one thread that
+    // compares the block): uploadStagedBlocks stages and copies it after the compare.
+    mutable std::uint8_t staged = 0;
 };
 
 constexpr std::uint8_t SparseCopy = 1;
 constexpr std::uint8_t SparseZero = 2;
 
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
+// buffer. A device-local mirror (APS5_EXP_HEAP_BUDGET) has no mapping: the block is marked `staged`
+// instead, and uploadStagedBlocks copies it on the GPU.
 bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
+    const bool device = block.mirror->device;
     if (block.fill != 0) {
+        if (device) {
+            block.staged = 1;
+            return true;
+        }
         auto* target = block.mirror->buffer->Bytes().data() + offset;
         if (block.fill == SparseZero) std::memset(target, 0, block.length);
         else std::memcpy(target, guest, block.length);
         return true;
     }
     if (block.mirror->heap) {
-        std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
+        if (device) block.staged = 1;
+        else std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
         block.mirror->generations[static_cast<std::size_t>(block.address / 65536 - block.mirror->base / 65536)] = block.generation;
         return true;
     }
     if (std::memcmp(block.mirror->shadow.data() + offset, guest, block.length) == 0) return false;
-    std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
+    if (device) block.staged = 1;
+    else std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
     std::memcpy(block.mirror->shadow.data() + offset, guest, block.length);
     return true;
+}
+
+// Bytes for device-local buffers, staged through host-visible chunks and copied on the GPU: into the
+// open batch when this thread holds the device lock (the work recorded after the call reads the new
+// bytes; earlier recorded work the old ones), else through a batch of its own that is waited for. At
+// most StagedInFlight bytes of staging are held by unfinished work before the recorder is synced, so
+// filling a large mirror never needs its size in the host-visible heap.
+class DeviceUpload {
+public:
+    explicit DeviceUpload(const Context& context) : context(context) {}
+    DeviceUpload(const DeviceUpload&) = delete;
+    DeviceUpload& operator=(const DeviceUpload&) = delete;
+
+    // The bytes the caller will stage in all (sizes the staging chunks; 16 MiB at most each).
+    void Expect(std::size_t bytes) { expected = bytes; }
+
+    // Stages [offset, offset + bytes) of `target`, filled by `read` (called per chunk with the chunk's
+    // offset into the range and its span).
+    template <typename Read>
+    void Copy(VkBuffer target, VkDeviceSize offset, std::size_t bytes, Read&& read) {
+        for (std::size_t done = 0; done < bytes;) {
+            if (staging == nullptr || used == staging->Bytes().size()) {
+                flush();
+                const auto want = std::min(std::max(expected, bytes - done), ChunkBytes);
+                staging = std::make_shared<Buffer>(context, std::clamp<std::size_t>(std::bit_ceil(want), 65536, ChunkBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                used = 0;
+            }
+            const auto length = std::min(bytes - done, staging->Bytes().size() - used);
+            read(done, staging->Bytes().subspan(used, length));
+            copies.push_back({target, {static_cast<VkDeviceSize>(used), offset + done, static_cast<VkDeviceSize>(length)}});
+            used += length;
+            done += length;
+            expected = expected > length ? expected - length : 0;
+        }
+    }
+
+    // Zeroes [offset, offset + bytes) of `target` (a multiple of 4 at a multiple of 4; else staged zeros).
+    void Zero(VkBuffer target, VkDeviceSize offset, std::size_t bytes) {
+        if (offset % 4 != 0 || bytes % 4 != 0) {
+            Copy(target, offset, bytes, [](std::size_t, std::span<std::byte> span) { std::memset(span.data(), 0, span.size()); });
+            return;
+        }
+        fills.push_back({target, offset, static_cast<VkDeviceSize>(bytes)});
+    }
+
+    // Records what is staged (and waits for it without a device lock).
+    void Finish() {
+        flush();
+        if (batch != nullptr) {
+            batch->SubmitAndWait();
+            batch.reset();
+            kept.clear();
+        }
+    }
+
+private:
+    static constexpr std::size_t ChunkBytes = std::size_t{16} << 20u;
+    static constexpr std::size_t StagedInFlight = std::size_t{256} << 20u;
+
+    struct Staged {
+        VkBuffer target;
+        VkBufferCopy region;
+    };
+    struct Fill {
+        VkBuffer target;
+        VkDeviceSize offset;
+        VkDeviceSize bytes;
+    };
+
+    void flush() {
+        if (copies.empty() && fills.empty()) {
+            staging = nullptr;
+            return;
+        }
+        auto* recorder = GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
+        VkCommandBuffer commands = VK_NULL_HANDLE;
+        if (recorder != nullptr) {
+            commands = recorder->Commands();
+            if (staging != nullptr) recorder->Keep(staging, used);
+        } else {
+            if (batch == nullptr) batch = std::make_unique<CommandBatch>(context);
+            commands = batch->Handle();
+            if (staging != nullptr) kept.push_back(staging);
+        }
+        // Earlier recorded work may still read (or, for a fill target, write) the bytes replaced here.
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+        for (const auto& zero : fills) fill(commands, zero.target, zero.offset, zero.bytes, 0);
+        const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+        std::vector<VkBufferCopy> regions;
+        for (std::size_t first = 0; first < copies.size();) {
+            auto last = first;
+            regions.clear();
+            while (last < copies.size() && copies[last].target == copies[first].target) regions.push_back(copies[last++].region);
+            copy(commands, staging->Handle(), copies[first].target, static_cast<std::uint32_t>(regions.size()), regions.data());
+            first = last;
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        auto& heaps = Heaps();
+        heaps.uploads.fetch_add(1, std::memory_order_relaxed);
+        heaps.uploadedBytes.fetch_add(used, std::memory_order_relaxed);
+        inFlight += used;
+        copies.clear();
+        fills.clear();
+        staging = nullptr;
+        used = 0;
+        if (recorder != nullptr && inFlight >= StagedInFlight) {
+            Recorder::CountSync(4);
+            recorder->Sync();
+            inFlight = 0;
+        }
+        if (recorder == nullptr && batch != nullptr && kept.size() * ChunkBytes >= StagedInFlight) {
+            batch->SubmitAndWait();
+            batch.reset();
+            kept.clear();
+        }
+    }
+
+    Context context;
+    std::shared_ptr<Buffer> staging;
+    std::size_t used = 0;
+    std::size_t expected = 0;
+    std::size_t inFlight = 0;
+    std::vector<Staged> copies;
+    std::vector<Fill> fills;
+    std::unique_ptr<CommandBatch> batch;
+    std::vector<std::shared_ptr<Buffer>> kept;
+};
+
+// Uploads the device-local mirrors' blocks a compare marked `staged`: from the shadow a writable
+// mirror keeps (what the compare copied), from guest memory otherwise (a heap mirror's generation
+// was stamped before this read, so a later CPU store is seen at the next refresh), zeros for a
+// sparse mirror's uncommitted pieces.
+void uploadStagedBlocks(const Context& context, std::span<const RefreshBlock> blocks) {
+    std::optional<DeviceUpload> upload;
+    std::size_t staged = 0;
+    for (const auto& block : blocks) staged += block.staged != 0 && block.fill != SparseZero ? block.length : 0;
+    for (const auto& block : blocks) {
+        if (block.staged == 0) continue;
+        block.staged = 0;
+        if (!upload) {
+            upload.emplace(context);
+            upload->Expect(staged);
+        }
+        auto& mirror = *block.mirror;
+        const auto offset = block.address - mirror.base;
+        if (block.fill == SparseZero) {
+            upload->Zero(mirror.buffer->Handle(), offset, block.length);
+            continue;
+        }
+        const auto* source = !mirror.heap && block.fill == 0 ? mirror.shadow.data() + offset : reinterpret_cast<const std::byte*>(block.address);
+        upload->Copy(mirror.buffer->Handle(), offset, block.length, [source](std::size_t at, std::span<std::byte> span) { std::memcpy(span.data(), source + at, span.size()); });
+    }
+    if (upload) upload->Finish();
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): a new mirror goes to device-local memory while the host-visible heap is
+// tight and the device-local heap keeps a reserve (max(512 MiB, an eighth of its budget)) beside it.
+// Read-only ranges only: a writable mirror's write-back reads its bytes on the CPU.
+bool deviceMirrorWanted(const Context& context, std::uint64_t bytes, bool writable) {
+    if (!heapBudgetEnabled() || writable || bytes < 65536) return false;
+    std::uint64_t imports = 0;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        imports = state.liveBytes;
+    }
+    const auto state = PollHostHeap(context, imports);
+    // Tight already, or this mirror would not fit beside the imports (an import of its range was refused).
+    if ((!state.tight && state.imports + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
+    const auto reserve = std::max<std::uint64_t>(std::uint64_t{512} << 20u, state.deviceBudget / 8);
+    return state.deviceBudget > state.deviceUsage + bytes + reserve;
 }
 
 class RefreshPool {
@@ -1316,20 +1561,23 @@ void appendBlocks(std::vector<RefreshBlock>& blocks, ImageMirror& mirror, std::u
 }
 
 // Compares the gathered blocks (of one or many mirrors) and counts them.
-void compareBlocks(std::span<const RefreshBlock> blocks) {
+void compareBlocks(const Context& context, std::span<const RefreshBlock> blocks) {
     if (blocks.empty()) return;
     const auto copied = RefreshPool::Get().Run(blocks);
-    auto& state = Mirrors();
-    state.blocksCompared += blocks.size();
-    state.blocksCopied += copied;
+    {
+        auto& state = Mirrors();
+        state.blocksCompared += blocks.size();
+        state.blocksCopied += copied;
+    }
+    uploadStagedBlocks(context, blocks);
 }
 
 // Brings [address, address + bytes) of a writable mirror up to date with guest memory.
-void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
+void refreshMirror(const Context& context, ImageMirror& mirror, std::uint64_t address, std::uint64_t bytes) {
     if (!prepareRefresh(mirror, address, bytes)) return;
     std::vector<RefreshBlock> blocks;
     appendBlocks(blocks, mirror, address, bytes);
-    compareBlocks(blocks);
+    compareBlocks(context, blocks);
 }
 
 void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
@@ -1568,8 +1816,17 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
         }
     }
+    const bool device = deviceMirrorWanted(context, mirror->bytes, range->writable);
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        if (device) {
+            try {
+                mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                mirror->device = true;
+            } catch (const std::runtime_error& error) {
+                std::fprintf(stderr, "[gpu] device-local mirror of 0x%llx+0x%llx failed: %s; mirroring in host memory\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(mirror->bytes), error.what());
+            }
+        }
+        if (mirror->buffer == nullptr) mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     } catch (const std::runtime_error& error) {
         if (heap) throw std::runtime_error(heapMirrorError(*range, heapMirrorsBeside(*range), error.what()));
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
@@ -1579,7 +1836,39 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     }
     // Read stores GPU results pending in the range first (write-backs of earlier copies of it);
     // named for the [hooksync] attribution like the refresh's flush.
-    {
+    if (mirror->device) {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
+        const bool shadowed = range->writable && !heap;
+        if (shadowed) {
+            mirror->shadow.resize(static_cast<std::size_t>(mirror->bytes));
+            GuestMemory::Read(range->address, std::span<std::byte>(mirror->shadow));
+            CountHostCopy(HostCopyKind::MirrorShadow, static_cast<std::int64_t>(mirror->shadow.size()));
+        }
+        DeviceUpload upload(context);
+        upload.Expect(static_cast<std::size_t>(mirror->bytes));
+        const auto target = mirror->buffer->Handle();
+        if (shadowed) {
+            const auto* shadow = mirror->shadow.data();
+            upload.Copy(target, 0, mirror->shadow.size(), [shadow](std::size_t at, std::span<std::byte> span) { std::memcpy(span.data(), shadow + at, span.size()); });
+        } else if (!sparse) {
+            const auto base = range->address;
+            upload.Copy(target, 0, static_cast<std::size_t>(mirror->bytes), [base](std::size_t at, std::span<std::byte> span) { GuestMemory::Read(base + at, span); });
+        } else {
+            std::uint64_t cursor = 0;
+            for (const auto& [first, last] : pieces) {
+                const auto at = first - mirror->base;
+                if (at > cursor) upload.Zero(target, cursor, static_cast<std::size_t>(at - cursor));
+                upload.Copy(target, at, static_cast<std::size_t>(last - first), [first](std::size_t offset, std::span<std::byte> span) { GuestMemory::Read(first + offset, span); });
+                cursor = last - mirror->base;
+            }
+            if (cursor < mirror->bytes) upload.Zero(target, cursor, static_cast<std::size_t>(mirror->bytes - cursor));
+        }
+        upload.Finish();
+        mirror->committed = std::move(pieces);
+        auto& heaps = Heaps();
+        heaps.deviceMirrors.fetch_add(1, std::memory_order_relaxed);
+        heaps.deviceBytes.fetch_add(mirror->bytes, std::memory_order_relaxed);
+    } else {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
         const auto target = mirror->buffer->Bytes().first(static_cast<std::size_t>(mirror->bytes));
         if (!sparse) GuestMemory::Read(range->address, target);
@@ -1592,10 +1881,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
         if (sparse) std::memset(target.data() + cursor, 0, target.size() - cursor);
         mirror->committed = std::move(pieces);
-    }
-    if (range->writable && !heap) {
-        mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
-        CountHostCopy(HostCopyKind::MirrorShadow, static_cast<std::int64_t>(mirror->shadow.size()));
+        if (range->writable && !heap) {
+            mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
+            CountHostCopy(HostCopyKind::MirrorShadow, static_cast<std::int64_t>(mirror->shadow.size()));
+        }
     }
     std::lock_guard lock(state.mutex);
     ++state.rebuilds;
@@ -2241,6 +2530,93 @@ std::uint64_t HostImportLimit() {
     return Imports().limit.load(std::memory_order_relaxed);
 }
 
+std::uint64_t HeapHeadroom(std::uint64_t heapBudget) {
+    static const std::uint64_t forced = [] {
+        const char* value = std::getenv("APS5_HEAP_HEADROOM_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20u : 0ull;
+    }();
+    return forced != 0 ? forced : std::max<std::uint64_t>(std::uint64_t{512} << 20u, heapBudget / 10);
+}
+
+std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom) {
+    return heapBudget > others && heapBudget - others > headroom ? heapBudget - others - headroom : 0;
+}
+
+HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bool force) {
+    if (!heapBudgetEnabled() || context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return {};
+    auto& heaps = Heaps();
+    const auto heap = heaps.importHeap.load(std::memory_order_relaxed);
+    if (heap >= std::min<std::uint32_t>(context.memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS)) return {};
+    std::lock_guard lock(heaps.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (force || heaps.physical != context.physical || heaps.last.heap != heap || now - heaps.read >= std::chrono::milliseconds(100)) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        context.memoryProperties2(context.physical, &properties);
+        HostHeapState state;
+        state.heap = heap;
+        state.budget = reported.heapBudget[heap];
+        state.usage = reported.heapUsage[heap];
+        state.hostBuffers = LiveGpuMemory(GpuMemoryKind::HostBuffer);
+        state.headroom = HeapHeadroom(state.budget);
+        // Whether the driver counts imports in the heap's usage is its own business: what is left of
+        // the usage without them (when it holds them) covers its own allocations, the host buffers ours.
+        const auto withoutImports = state.usage >= liveImports ? state.usage - liveImports : state.usage;
+        state.allowance = HeapImportAllowance(state.budget, std::max(state.hostBuffers, withoutImports), state.headroom);
+        const auto heapCount = std::min<std::uint32_t>(context.memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
+        for (std::uint32_t index = 0; index < heapCount; ++index) {
+            if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || index == heap) continue;
+            if (state.deviceHeap == UINT32_MAX || context.memory.memoryHeaps[index].size > context.memory.memoryHeaps[state.deviceHeap].size) state.deviceHeap = index;
+        }
+        if (state.deviceHeap != UINT32_MAX) {
+            state.deviceBudget = reported.heapBudget[state.deviceHeap];
+            state.deviceUsage = reported.heapUsage[state.deviceHeap];
+        }
+        heaps.last = state;
+        heaps.read = now;
+        heaps.physical = context.physical;
+    }
+    auto& state = heaps.last;
+    state.imports = liveImports;
+    state.tight = heapTight(state, liveImports);
+    if (!heaps.reported || state.tight != heaps.poolTight) {
+        heaps.reported = true;
+        heaps.poolTight = state.tight;
+        BufferPool::SetHostHeapTight(state.tight);
+        const auto trimmed = state.tight && context.bufferPool != nullptr ? context.bufferPool->TrimHost() : 0;
+        const bool first = heaps.lastPrint == std::chrono::steady_clock::time_point{};
+        if (first || now - heaps.lastPrint >= std::chrono::seconds(5)) {
+            heaps.lastPrint = now;
+            std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %s; budget %llu MiB, usage %llu MiB, imports %llu MiB, host buffers %llu MiB, headroom %llu MiB, import allowance %llu MiB; device-local heap %u: %llu of %llu MiB; pool trimmed %llu MiB of host buffers\n", heap, state.tight ? "tight" : "relaxed",
+                static_cast<unsigned long long>(state.budget >> 20u), static_cast<unsigned long long>(state.usage >> 20u), static_cast<unsigned long long>(liveImports >> 20u), static_cast<unsigned long long>(state.hostBuffers >> 20u), static_cast<unsigned long long>(state.headroom >> 20u), static_cast<unsigned long long>(state.allowance >> 20u),
+                state.deviceHeap, static_cast<unsigned long long>(state.deviceUsage >> 20u), static_cast<unsigned long long>(state.deviceBudget >> 20u), static_cast<unsigned long long>(trimmed >> 20u));
+        }
+    }
+    return state;
+}
+
+void SetHostImportHeap(std::uint32_t heap) {
+    auto& heaps = Heaps();
+    heaps.importHeap.store(heap, std::memory_order_relaxed);
+    std::lock_guard lock(heaps.mutex);
+    heaps.last = {};
+    heaps.reported = false;
+    heaps.poolTight = false;
+    heaps.physical = VK_NULL_HANDLE;
+    BufferPool::SetHostHeapTight(false);
+}
+
+void SetHeapBudgetExperiment(int mode) {
+    heapBudgetMode.store(mode, std::memory_order_relaxed);
+    if (mode <= 0) BufferPool::SetHostHeapTight(false);
+}
+
+DeviceMirrorStats DeviceMirrorCounters() {
+    auto& heaps = Heaps();
+    return {heaps.deviceMirrors.load(std::memory_order_relaxed), heaps.deviceBytes.load(std::memory_order_relaxed), heaps.uploadedBytes.load(std::memory_order_relaxed), heaps.uploads.load(std::memory_order_relaxed)};
+}
+
 void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes) {
     if (!MemoryCensusEnabled() || bytes == 0) return;
     auto& state = Imports();
@@ -2603,7 +2979,7 @@ void GuestBufferMemory::AcquireRegistered() {
     else refreshHeapMirrors(heaps, blocks);
     lap(timing.mirrorsUs, at);
     const auto copiedBefore = Mirrors().blocksCopied;
-    compareBlocks(blocks);
+    compareBlocks(context, blocks);
     for (const auto& [run, collected] : checked) space->verified[run].store(collected, std::memory_order_relaxed);
     lap(timing.compareUs, at);
     if (profile) {
@@ -2752,7 +3128,7 @@ bool GuestBufferMemory::bindSparseMirror(Region& region, const GuestAllocations:
         std::vector<ImageMirror*> whole{mirror.get()};
         refreshHeapMirrors(whole, blocks);
     }
-    compareBlocks(blocks);
+    compareBlocks(context, blocks);
     if (mirror == nullptr || !mirror->heap || region.begin < mirror->base || (region.begin - mirror->base) % context.limits.minStorageBufferOffsetAlignment != 0) return false;
     region.mirror = std::move(mirror);
     if (!servesView(region, std::max(region.lastView, region.begin))) {
@@ -3295,7 +3671,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // Read-only mirrors are never written back; a writable one is diffed for this sub-range
             // at write-back.
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            refreshMirror(*region.mirror, region.begin, bytes);
+            refreshMirror(context, *region.mirror, region.begin, bytes);
             if (profile) refreshUs += microsecondsSince(refreshStart);
             continue;
         }

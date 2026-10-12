@@ -2069,6 +2069,24 @@ VKAPI_ATTR void VKAPI_CALL mockCmdUpdateBuffer(VkCommandBuffer, VkBuffer buffer,
     std::memcpy(memory.data() + offset, data, static_cast<std::size_t>(size));
 }
 
+// Copies and fills take effect when recorded (the mock runs no queue).
+VKAPI_ATTR void VKAPI_CALL mockCmdCopyBuffer(VkCommandBuffer, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    const auto from = mockBufferMemory(source);
+    const auto to = mockBufferMemory(destination);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        const auto& region = regions[index];
+        Require(region.srcOffset + region.size <= from.size() && region.dstOffset + region.size <= to.size(), "a buffer copy exceeds its buffers");
+        std::memcpy(to.data() + region.dstOffset, from.data() + region.srcOffset, static_cast<std::size_t>(region.size));
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL mockCmdFillBuffer(VkCommandBuffer, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t data) {
+    auto memory = mockBufferMemory(buffer);
+    if (size == VK_WHOLE_SIZE) size = (memory.size() - offset) / 4 * 4;
+    Require(offset % 4 == 0 && size % 4 == 0 && offset + size <= memory.size(), "a buffer fill is misaligned or exceeds its buffer");
+    for (VkDeviceSize at = 0; at < size; at += 4) std::memcpy(memory.data() + offset + at, &data, 4);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateCommandBuffers(VkDevice, const VkCommandBufferAllocateInfo* info, VkCommandBuffer* commands) {
     for (std::uint32_t index = 0; index < info->commandBufferCount; ++index) commands[index] = makeHandle<VkCommandBuffer>();
     mock.live += info->commandBufferCount;
@@ -2137,7 +2155,9 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindPipeline)},
         {"vkCmdPushConstants", reinterpret_cast<PFN_vkVoidFunction>(mockCmdPushConstants)},
         {"vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(mockCmdDispatch)},
-        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)}
+        {"vkCmdUpdateBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdUpdateBuffer)},
+        {"vkCmdCopyBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdCopyBuffer)},
+        {"vkCmdFillBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockCmdFillBuffer)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;

@@ -73,6 +73,12 @@ public:
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
     VkDeviceSize Trim() noexcept;
+    // exp (APS5_EXP_HEAP_BUDGET, see GuestBufferMemory's heap watch): while the host-visible heap is
+    // tight, a released host-visible allocation of a MiB or more is destroyed instead of retained, and
+    // TrimHost destroys the ones the large tier retains.
+    static void SetHostHeapTight(bool tight);
+    static bool HostHeapTight();
+    VkDeviceSize TrimHost() noexcept;
     std::pair<VkDeviceSize, VkDeviceSize> RetainedBytes();
 
 private:

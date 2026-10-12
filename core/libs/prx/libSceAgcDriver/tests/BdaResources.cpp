@@ -748,6 +748,107 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 }
 
+VkPhysicalDeviceMemoryBudgetPropertiesEXT deviceMirrorBudget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+
+VKAPI_ATTR void VKAPI_CALL deviceMirrorMemoryProperties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
+    for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) continue;
+        auto* budget = reinterpret_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
+        std::memcpy(budget->heapBudget, deviceMirrorBudget.heapBudget, sizeof(budget->heapBudget));
+        std::memcpy(budget->heapUsage, deviceMirrorBudget.heapUsage, sizeof(budget->heapUsage));
+    }
+}
+
+// APS5_EXP_HEAP_BUDGET: while the host-visible heap is tight, a read-only range no import serves is
+// mirrored in device-local memory. Its bytes reach it by staged copies (the mock runs a copy when it
+// is recorded): the fill, a CPU write's block refill, and nothing for an unchanged range.
+void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
+        std::cout << "guest arena unavailable or not write-watched: device-local mirrors not tested\n";
+        return;
+    }
+    // One memory type (the mock's buffers allow only type 0), device-local and host-visible so host
+    // buffers still map, in the 1 GiB host heap 1 imports would use; heap 0 is the device's 8 GiB.
+    auto context = base;
+    context.memory.memoryTypes[0].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    context.memory.memoryTypes[0].heapIndex = 1;
+    context.memory.memoryHeapCount = 2;
+    context.memory.memoryHeaps[0] = {VkDeviceSize{8} << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    context.memory.memoryHeaps[1] = {VkDeviceSize{1} << 30u, 0};
+    context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x2000});
+    context.memoryProperties2 = deviceMirrorMemoryProperties;
+    deviceMirrorBudget.heapBudget[0] = VkDeviceSize{8} << 30u;
+    deviceMirrorBudget.heapUsage[0] = 0;
+    deviceMirrorBudget.heapBudget[1] = VkDeviceSize{1} << 30u;
+    deviceMirrorBudget.heapUsage[1] = VkDeviceSize{1} << 30u;
+    SetHeapBudgetExperiment(1);
+    SetHostImportHeap(1);
+    Require(PollHostHeap(context, 0, true).tight, "a full host heap is not tight");
+
+    constexpr std::size_t bytes = 2 * 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+#ifdef _WIN32
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#endif
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto registry = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto build = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        const auto ranges = leased.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
+        Require(found != ranges.end() && found->deviceAddress != 0u && found->permissions == ShaderRecompiler::BdaAbi::Read, "the device-local mirror is missing from the BDA table or writable");
+        const auto device = found->deviceAddress;
+        leased.WriteBack();
+        return device;
+    };
+    const auto sweep = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+    };
+    sweep();
+    registry(true);
+    const auto before = DeviceMirrorCounters();
+    const auto mirrors = MirrorCounters();
+    const auto first = build();
+    const auto made = DeviceMirrorCounters();
+    Require(made.mirrors == before.mirrors + 1 && made.bytes == before.bytes + bytes && MirrorCounters().heapMirrors == mirrors.heapMirrors + 1, "a read-only range in a tight host heap was not mirrored in device-local memory");
+    Require(made.uploadedBytes == before.uploadedBytes + bytes, "the device-local mirror was not filled by one staged copy of its bytes");
+    Require(access.addressBytes(first)[3] == std::byte{0x11} && access.addressBytes(first)[65536 + 3] == std::byte{0x11}, "the device-local mirror does not hold the guest bytes");
+    Require(build() == first && DeviceMirrorCounters().uploadedBytes == made.uploadedBytes, "an unchanged range was uploaded to its device-local mirror again");
+    guest[65536 + 3] = 0x22;
+    Require(build() == first && DeviceMirrorCounters().uploadedBytes == made.uploadedBytes + 65536, "a written block was not uploaded alone");
+    Require(access.addressBytes(first)[65536 + 3] == std::byte{0x22} && access.addressBytes(first)[3] == std::byte{0x11}, "the device-local mirror missed the CPU write");
+    registry(false);
+    sweep();
+    Require(MirrorCounters().heapMirrors == mirrors.heapMirrors, "the device-local mirror outlived its range");
+
+    // Relaxed, a new mirror is host-visible again.
+    deviceMirrorBudget.heapUsage[1] = 0;
+    Require(!PollHostHeap(context, 0, true).tight, "an empty host heap is tight");
+    registry(true);
+    static_cast<void>(build());
+    Require(DeviceMirrorCounters().mirrors == made.mirrors, "a mirror went to device-local memory with room in the host heap");
+    registry(false);
+    sweep();
+    SetHeapBudgetExperiment(0);
+    SetHostImportHeap(UINT32_MAX);
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+#endif
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
+}
+
 }
 
 void gpuMappingTests(const Context& context) {
@@ -1220,6 +1321,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importWholeRangeOverWindowTests(context);
     importReliefTests(context);
     heapMirrorTests(context, access);
+    deviceMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
     importedFreshTests(context);

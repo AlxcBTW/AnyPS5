@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdio>
@@ -27,6 +28,41 @@ bool exactSizes() {
 
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
+std::atomic<bool> hostHeapTight{false};
+
+}
+
+void BufferPool::SetHostHeapTight(bool tight) {
+    hostHeapTight.store(tight, std::memory_order_relaxed);
+}
+
+bool BufferPool::HostHeapTight() {
+    return hostHeapTight.load(std::memory_order_relaxed);
+}
+
+VkDeviceSize BufferPool::TrimHost() noexcept {
+    std::vector<BufferAllocation> evicted;
+    VkDeviceSize bytes = 0;
+    try {
+        std::lock_guard lock(mutex);
+        evicted.reserve(largeTier.slots);
+        for (const auto& [key, slots] : largeTier.free) {
+            for (const auto& slot : slots) {
+                evicted.push_back(slot.allocation);
+                bytes += slot.allocation.allocationBytes;
+            }
+        }
+        largeTier.evictions += largeTier.slots;
+        largeTier.free.clear();
+        largeTier.retainedBytes = 0;
+        largeTier.slots = 0;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::system_error&) {
+        return 0;
+    }
+    for (const auto& gone : evicted) destroy(gone);
+    return bytes;
 }
 
 BufferPool::BufferPool(const Context& context) : device(context.device), unmap(context.Function<PFN_vkUnmapMemory>("vkUnmapMemory")), destroyBuffer(context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")), freeMemory(context.Function<PFN_vkFreeMemory>("vkFreeMemory")), allocateMemory(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")), mapMemory(context.Function<PFN_vkMapMemory>("vkMapMemory")), maxSlots(std::max<std::size_t>(1, std::min<std::size_t>(MaxSlots(), context.limits.maxMemoryAllocationCount / 6u))) {
@@ -320,7 +356,8 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        if (allocation.allocationBytes > tier.budget) {
+        const bool hostHeld = HostHeapTight() && (allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && !allocation.slab && allocation.bytes >= classLimit;
+        if (allocation.allocationBytes > tier.budget || hostHeld) {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);

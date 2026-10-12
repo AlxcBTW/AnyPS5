@@ -9,6 +9,8 @@ namespace AgcDriver::Graphics {
 enum class GpuMemoryKind : std::uint8_t { HostBuffer, DeviceBuffer, HostImport, Texture, StorageImage, DepthSurface, RenderTarget, ShadowSlab, Count };
 void CountGpuMemory(GpuMemoryKind kind, std::int64_t bytes);
 std::uint64_t LiveGpuMemory();
+// Live bytes of one kind.
+std::uint64_t LiveGpuMemory(GpuMemoryKind kind);
 VkResult AllocateGpuMemory(const Context& context, const VkMemoryAllocateInfo& allocation, VkDeviceMemory& memory, GpuMemoryKind kind, const char* what);
 std::uint64_t OutOfMemoryFailures();
 // APS5_EXP_MEMORY_CENSUS=1 (diag): [hostmem] lines every 10 s with process/system memory, every

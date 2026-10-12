@@ -40,6 +40,8 @@ struct HostImport {
     mutable std::uint64_t lastUse = 0;
     // APS5_EXP_MEMORY_CENSUS: a store through the BDA table landed in it (NoteBdaWritten).
     mutable bool bdaWritten = false;
+    // The memory type the import was allocated with (UINT32_MAX: not known).
+    std::uint32_t memoryType = UINT32_MAX;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -68,6 +70,47 @@ bool WatchedImportsStampPages();
 
 std::uint64_t RelieveGpuMemory(const Context& context);
 std::uint64_t HostImportLimit();
+
+// exp (APS5_EXP_HEAP_BUDGET=1, see GuestBufferMemory.cpp): the heap host imports land in, as
+// VK_EXT_memory_budget reports it. `allowance` is the import bytes it leaves: its budget less the
+// headroom and less what else uses it (the host-visible buffers, or the heap's usage without the
+// imports when that is larger: the driver's own allocations). `tight` once the imports reach it or
+// the heap's usage comes within half the headroom of its budget. The device-local heap's figures
+// decide whether a mirror fits there.
+struct HostHeapState {
+    std::uint32_t heap = UINT32_MAX;
+    std::uint64_t budget = 0;
+    std::uint64_t usage = 0;
+    std::uint64_t hostBuffers = 0;
+    // The live import bytes the state was computed for.
+    std::uint64_t imports = 0;
+    std::uint64_t headroom = 0;
+    std::uint64_t allowance = UINT64_MAX;
+    bool tight = false;
+    std::uint32_t deviceHeap = UINT32_MAX;
+    std::uint64_t deviceBudget = 0;
+    std::uint64_t deviceUsage = 0;
+};
+// APS5_HEAP_HEADROOM_MIB, default max(512 MiB, a tenth of the heap's budget).
+std::uint64_t HeapHeadroom(std::uint64_t heapBudget);
+// The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
+std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);
+// Reads the import heap's budget at most every 100 ms (always with `force`); without the switch, the
+// extension or a known import heap the allowance is unlimited and nothing is tight. Updates the buffer
+// pool's host retention (BufferPool::SetHostHeapTight) when the state changes.
+HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bool force = false);
+// The heap host imports land in (learned from the first import's memory type; tests set it).
+void SetHostImportHeap(std::uint32_t heap);
+// Overrides APS5_EXP_HEAP_BUDGET (tests): 1 on, 0 off, -1 back to the variable.
+void SetHeapBudgetExperiment(int mode);
+// Device-local image mirrors made while the heap was tight (APS5_EXP_HEAP_BUDGET).
+struct DeviceMirrorStats {
+    std::uint64_t mirrors = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t uploadedBytes = 0;
+    std::uint64_t uploads = 0;
+};
+DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the
 // BDA table, and describes the live imports and mirrors by kind (one line, for [hostmem]).
 void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes);
