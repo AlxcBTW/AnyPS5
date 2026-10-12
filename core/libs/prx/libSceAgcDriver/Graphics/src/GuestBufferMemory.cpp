@@ -2241,6 +2241,82 @@ std::uint64_t HostImportLimit() {
     return Imports().limit.load(std::memory_order_relaxed);
 }
 
+void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes) {
+    if (!MemoryCensusEnabled() || bytes == 0) return;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    auto it = state.imports.upper_bound(address);
+    if (it != state.imports.begin()) --it;
+    for (; it != state.imports.end() && it->first < address + bytes; ++it) {
+        if (it->second.base + it->second.bytes > address) it->second.bdaWritten = true;
+    }
+}
+
+std::string DescribeImportCensus() {
+    struct Kind {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+    };
+    Kind writable, readOnly, written, releasable, joined, largest[4];
+    std::uint64_t largestBase[4]{};
+    bool largestWritable[4]{};
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        for (const auto& [base, entry] : state.imports) {
+            const bool canWrite = std::all_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; });
+            auto& access = canWrite ? writable : readOnly;
+            ++access.count;
+            access.bytes += entry.bytes;
+            if (entry.bdaWritten) {
+                ++written.count;
+                written.bytes += entry.bytes;
+            }
+            if (std::any_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->releasable; })) {
+                ++releasable.count;
+                releasable.bytes += entry.bytes;
+            }
+            if (entry.joined) {
+                ++joined.count;
+                joined.bytes += entry.bytes;
+            }
+            for (std::size_t slot = 0; slot < 4; ++slot) {
+                if (entry.bytes <= largest[slot].bytes) continue;
+                for (std::size_t move = 3; move > slot; --move) {
+                    largest[move] = largest[move - 1];
+                    largestBase[move] = largestBase[move - 1];
+                    largestWritable[move] = largestWritable[move - 1];
+                }
+                largest[slot] = {1, entry.bytes};
+                largestBase[slot] = base;
+                largestWritable[slot] = canWrite;
+                break;
+            }
+        }
+    }
+    Kind heapMirrors, imageMirrors, shadowed;
+    {
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        for (const auto& [base, mirror] : state.entries) {
+            auto& kind = mirror->heap ? heapMirrors : imageMirrors;
+            ++kind.count;
+            kind.bytes += mirror->bytes;
+            if (!mirror->shadow.empty()) {
+                ++shadowed.count;
+                shadowed.bytes += mirror->shadow.size();
+            }
+        }
+    }
+    const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
+    char text[768];
+    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), CPU shadows %llu (%llu MiB)",
+        static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
+        static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
+        static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes), static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes));
+    return text;
+}
+
 std::uint64_t RelieveGpuMemory(const Context& context) {
     if (GuestMemory::GpuMutex().HeldByThisThread()) return 0;
     const auto before = LiveGpuMemory();

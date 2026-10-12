@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -316,6 +317,7 @@ void BdaResources::markWrittenPages() const {
             }
         }
         GuestMemory::MarkWritten(begin, bytes);
+        NoteBdaWritten(begin, bytes);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

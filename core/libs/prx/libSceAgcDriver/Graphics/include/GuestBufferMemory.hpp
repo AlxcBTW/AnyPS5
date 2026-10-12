@@ -38,6 +38,8 @@ struct HostImport {
     bool joined = false;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
+    // APS5_EXP_MEMORY_CENSUS: a store through the BDA table landed in it (NoteBdaWritten).
+    mutable bool bdaWritten = false;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -66,6 +68,10 @@ bool WatchedImportsStampPages();
 
 std::uint64_t RelieveGpuMemory(const Context& context);
 std::uint64_t HostImportLimit();
+// APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the
+// BDA table, and describes the live imports and mirrors by kind (one line, for [hostmem]).
+void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes);
+std::string DescribeImportCensus();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in

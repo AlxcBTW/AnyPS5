@@ -196,6 +196,7 @@ void sampleCensus(MemoryCensus& census, bool print) {
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageOriginal)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageBaseline)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::MirrorShadow)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)));
+    std::fprintf(stderr, "[hostmem] %s\n", DescribeImportCensus().c_str());
 }
 
 void startCensus(const Context& context) {
