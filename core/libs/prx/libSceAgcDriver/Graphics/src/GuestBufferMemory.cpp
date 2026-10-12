@@ -794,6 +794,11 @@ struct HeapWatch {
     std::atomic<std::uint64_t> uploads{0};
     std::atomic<std::uint64_t> readbacks{0};
     std::atomic<std::uint64_t> readbackBytes{0};
+    // Read-only imports given up for writable ones (spillReadOnly), by base: their mirrors go to
+    // device-local memory whatever the heap's state (under `mutex`).
+    std::set<std::uint64_t> spilled;
+    std::atomic<std::uint64_t> spills{0};
+    std::atomic<std::uint64_t> spilledBytes{0};
 };
 
 HeapWatch& Heaps() {
@@ -874,6 +879,66 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     return importRunAt(context, state, std::move(run), true, begin, lease, 0, true);
 }
 
+bool runWritable(const ImportRun& run) {
+    return std::all_of(run.ranges.begin(), run.ranges.end(), [](const auto& range) { return range->writable; });
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): a writable run that does not fit the host heap takes the place of
+// read-only imports no build holds, which then become device-local mirrors (spilled: kept out of the
+// imports, see deviceMirrorWanted). A read-only range takes no store through any table, so its mirror
+// serves the GPU exactly as its import did, while a refused writable range would lose the stores that
+// address it directly. At most half the headroom moves per call, since the spilled imports' memory is
+// freed only when the batches holding them complete; nothing moves unless that covers the shortfall.
+void spillReadOnly(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, const ImportRun& run, std::uint64_t needed) {
+    if (!runWritable(run)) return;
+    const auto heap = PollHostHeap(context, state.liveBytes);
+    const auto cap = std::max<std::uint64_t>(heap.headroom / 2, needed);
+    std::vector<std::map<std::uint64_t, HostImport>::iterator> victims;
+    for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
+        const auto& entry = it->second;
+        if (entry.joined || pointerHeld(state, entry) || entry.bytes > cap) continue;
+        if (entry.base < run.base + run.bytes && run.base < entry.base + entry.bytes) continue;
+        if (std::any_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; })) continue;
+        victims.push_back(it);
+    }
+    std::sort(victims.begin(), victims.end(), [](const auto& left, const auto& right) { return left->second.bytes > right->second.bytes; });
+    std::uint64_t freed = 0;
+    std::size_t taken = 0;
+    while (taken < victims.size() && freed < needed) {
+        if (freed + victims[taken]->second.bytes > cap) {
+            ++taken;
+            continue;
+        }
+        freed += victims[taken++]->second.bytes;
+    }
+    if (freed < needed) return;
+    auto& heaps = Heaps();
+    std::uint64_t spilled = 0;
+    std::uint64_t spilledBytes = 0;
+    for (std::size_t index = 0; index < taken; ++index) {
+        auto it = victims[index];
+        if (spilledBytes >= needed) break;
+        const auto victimBase = it->first;
+        const auto victimBytes = it->second.bytes;
+        if (spilledBytes + victimBytes > cap) continue;
+        {
+            std::lock_guard lock(heaps.mutex);
+            heaps.spilled.insert(victimBase);
+        }
+        state.failed.insert(victimBase);
+        retireImport(context.device, state, it, lease);
+        ++spilled;
+        spilledBytes += victimBytes;
+    }
+    heaps.spills.fetch_add(spilled, std::memory_order_relaxed);
+    heaps.spilledBytes.fetch_add(spilledBytes, std::memory_order_relaxed);
+    static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    if (spilled != 0 && std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
+        lastReport = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): %llu read-only imports (%llu MiB) make room for the writable 0x%llx+0x%llx and go to device-local mirrors; %llu (%llu MiB) so far\n", static_cast<unsigned long long>(spilled), static_cast<unsigned long long>(spilledBytes >> 20u), static_cast<unsigned long long>(run.base), static_cast<unsigned long long>(run.bytes), static_cast<unsigned long long>(heaps.spills.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heaps.spilledBytes.load(std::memory_order_relaxed) >> 20u));
+    }
+}
+
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict) {
     const auto base = run.base;
     const auto bytes = run.bytes;
@@ -907,6 +972,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || failures.contains(base)) return nullptr;
     const auto budget = importBudget(context, state);
     if (evict && state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
+    if (heapBudgetEnabled() && !joined && state.liveBytes + bytes > budget) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - budget);
     const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.
@@ -1416,7 +1482,7 @@ void uploadStagedBlocks(const Context& context, std::span<const RefreshBlock> bl
 // tight and the device-local heap keeps a reserve (max(512 MiB, an eighth of its budget)) beside it.
 // Read-only ranges with =1; writable ones too with =2: their written ranges are copied out before and
 // after the work for the write-back (takeHeapReferences, RecordCopyBacks, readMirror).
-bool deviceMirrorWanted(const Context& context, std::uint64_t bytes, bool writable) {
+bool deviceMirrorWanted(const Context& context, std::uint64_t address, std::uint64_t bytes, bool writable) {
     if (!heapBudgetEnabled() || (writable && heapBudgetMode.load(std::memory_order_relaxed) < 2) || bytes < 65536) return false;
     std::uint64_t imports = 0;
     {
@@ -1425,8 +1491,15 @@ bool deviceMirrorWanted(const Context& context, std::uint64_t bytes, bool writab
         imports = state.liveBytes;
     }
     const auto state = PollHostHeap(context, imports);
-    // Tight already, or this mirror would not fit beside the imports (an import of its range was refused).
-    if ((!state.tight && state.imports + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
+    bool spilled = false;
+    {
+        auto& heaps = Heaps();
+        std::lock_guard lock(heaps.mutex);
+        spilled = heaps.spilled.contains(address);
+    }
+    // Spilled, tight already, or this mirror would not fit beside the imports (an import of its range
+    // was refused).
+    if ((!spilled && !state.tight && state.imports + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
     const auto reserve = std::max<std::uint64_t>(std::uint64_t{512} << 20u, state.deviceBudget / 8);
     return state.deviceBudget > state.deviceUsage + bytes + reserve;
 }
@@ -1820,7 +1893,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             if (const auto held = heapMirrorsBeside(*range); held + mirror->bytes > heapMirrorBudget()) throw std::runtime_error(heapMirrorError(*range, held, "past the budget"));
         }
     }
-    const bool device = deviceMirrorWanted(context, mirror->bytes, range->writable);
+    const bool device = deviceMirrorWanted(context, range->address, mirror->bytes, range->writable);
     try {
         if (device) {
             try {
@@ -2613,6 +2686,7 @@ void SetHostImportHeap(std::uint32_t heap) {
     heaps.last = {};
     heaps.reported = false;
     heaps.poolTight = false;
+    heaps.spilled.clear();
     heaps.physical = VK_NULL_HANDLE;
     BufferPool::SetHostHeapTight(false);
 }
@@ -2624,7 +2698,7 @@ void SetHeapBudgetExperiment(int mode) {
 
 DeviceMirrorStats DeviceMirrorCounters() {
     auto& heaps = Heaps();
-    return {heaps.deviceMirrors.load(std::memory_order_relaxed), heaps.deviceBytes.load(std::memory_order_relaxed), heaps.uploadedBytes.load(std::memory_order_relaxed), heaps.uploads.load(std::memory_order_relaxed), heaps.readbacks.load(std::memory_order_relaxed), heaps.readbackBytes.load(std::memory_order_relaxed)};
+    return {heaps.deviceMirrors.load(std::memory_order_relaxed), heaps.deviceBytes.load(std::memory_order_relaxed), heaps.uploadedBytes.load(std::memory_order_relaxed), heaps.uploads.load(std::memory_order_relaxed), heaps.readbacks.load(std::memory_order_relaxed), heaps.readbackBytes.load(std::memory_order_relaxed), heaps.spills.load(std::memory_order_relaxed), heaps.spilledBytes.load(std::memory_order_relaxed)};
 }
 
 void NoteBdaWritten(std::uint64_t address, std::uint64_t bytes) {

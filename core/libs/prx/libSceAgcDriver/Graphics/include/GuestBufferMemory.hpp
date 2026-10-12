@@ -113,6 +113,9 @@ struct DeviceMirrorStats {
     // Written ranges of writable device-local mirrors copied out for the write-back (=2).
     std::uint64_t readbacks = 0;
     std::uint64_t readbackBytes = 0;
+    // Read-only imports given up so a writable run fits (their ranges then mirror device-local).
+    std::uint64_t spills = 0;
+    std::uint64_t spilledBytes = 0;
 };
 DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the
