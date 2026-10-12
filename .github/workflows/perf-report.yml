@@ -55,6 +55,7 @@ jobs:
           cp tools/perf_report.py "$tool"
           targets=$(python3 "$tool" targets)
           mkdir -p "$out" "$report"
+          ulimit -s 1048576
           for side in base head; do
             git checkout --quiet --detach "${!side}"
             git submodule update --init --recursive --quiet

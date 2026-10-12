@@ -27,7 +27,7 @@ def targets():
 def counter_command(counter, executable, arguments, scratch):
     if counter == "valgrind":
         log = scratch / "cachegrind.out"
-        return ["valgrind", "--tool=cachegrind", "--cache-sim=no", "--fair-sched=yes",
+        return ["valgrind", "--tool=cachegrind", "--cache-sim=no", "--fair-sched=yes", "--main-stacksize=268435456",
                 f"--cachegrind-out-file={log}", "--", str(executable), *arguments], log
     return ["perf", "stat", "-x,", "-e", "instructions:u", "--", str(executable), *arguments], None
 
