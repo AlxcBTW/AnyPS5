@@ -433,6 +433,10 @@ private:
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    // exp (APS5_EXP_MARKS_MEMO=1): the recorder batch this object's in-place reads were last noted
+    // in (Recorder::Submissions() + 1), so a repeat use in the same open batch skips the re-note.
+    std::uint64_t notedReadsBatch = 0;
+    const Recorder* notedReadsRecorder = nullptr;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
