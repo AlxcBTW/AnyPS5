@@ -112,6 +112,21 @@ inline bool ParseSpec(const char* text, std::uint64_t& holdMicros, std::uint64_t
     return true;
 }
 
+// "<addr>[:<addr>...]" (C notation, 0x for hex) into at most `capacity` nonzero addresses; items that are not
+// numbers (e.g. APS5_EXP_WATCH_WRITE's heap-relative "h0+0x...") are skipped. Returns the count.
+inline unsigned ParseAddressList(const char* text, std::uint64_t* out, unsigned capacity) {
+    unsigned count = 0;
+    const char* cursor = text;
+    while (cursor != nullptr && *cursor != 0 && count < capacity) {
+        char* end = nullptr;
+        const std::uint64_t address = (*cursor >= '0' && *cursor <= '9') ? std::strtoull(cursor, &end, 0) : 0;
+        if (address != 0 && end != cursor && (*end == 0 || *end == ':')) out[count++] = address;
+        while (*cursor != 0 && *cursor != ':') ++cursor;
+        if (*cursor == ':') ++cursor;
+    }
+    return count;
+}
+
 // Windows glue only: whether one of the traced addresses (APS5_EXP_FREE_QUARANTINE_TRACE) lies in a block held
 // right now. Lock-free, so a write-watch exception handler may ask.
 bool HoldsTraced(std::uint64_t address);
