@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -142,7 +143,23 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 regions.clear();
                                 appendEntryRegions(*variant, regions, &words, moved);
                             }
-                            ringHit.patched[i] = Ring::Patch(*variant->compiled, variant->ring.get(), programs[i].userData, variant->flatBinding, variant->dataPositions, variant->dataSlots, words);
+                            // A run of hits on one variant patches one copy of its stage in place
+                            // (the calling thread's, per stage slot): every patch rewrites all data
+                            // positions and pointer words, and the copy only lives through a draw.
+                            struct PatchSlot {
+                                std::shared_ptr<DispatchVariant> variant;
+                                std::shared_ptr<ShaderRecompiler::RecompileResult> result;
+                            };
+                            struct PatchSlotsTag {};
+                            auto& slots = HostThreadLocal<std::array<PatchSlot, 8>, PatchSlotsTag>();
+                            auto* slot = i < slots.size() ? &slots[i] : nullptr;
+                            if (slot != nullptr && slot->variant == variant && slot->result != nullptr && slot->result.use_count() == 1) {
+                                Ring::PatchInto(*slot->result, variant->ring.get(), programs[i].userData, variant->flatBinding, variant->dataPositions, variant->dataSlots, words);
+                                ringHit.patched[i] = slot->result;
+                            } else {
+                                ringHit.patched[i] = Ring::Patch(*variant->compiled, variant->ring.get(), programs[i].userData, variant->flatBinding, variant->dataPositions, variant->dataSlots, words);
+                                if (slot != nullptr) *slot = {variant, ringHit.patched[i]};
+                            }
                             ringHit.any = true;
                             if (moved != nullptr) ringHit.moved = true;
                         }

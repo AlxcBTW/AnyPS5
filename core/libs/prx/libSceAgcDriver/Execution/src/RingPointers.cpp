@@ -578,6 +578,12 @@ bool Rebase(const Layout& layout, std::span<const std::uint32_t> liveUserData, s
 
 std::shared_ptr<ShaderRecompiler::RecompileResult> Patch(const ShaderRecompiler::RecompileResult& compiled, const Layout* layout, std::span<const std::uint32_t> liveUserData, std::uint32_t flatBinding, std::span<const std::uint32_t> dataPositions, std::span<const std::uint32_t> dataSlots, std::span<const std::uint32_t> liveWords) {
     auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(compiled);
+    PatchInto(*patched, layout, liveUserData, flatBinding, dataPositions, dataSlots, liveWords);
+    return patched;
+}
+
+void PatchInto(ShaderRecompiler::RecompileResult& target, const Layout* layout, std::span<const std::uint32_t> liveUserData, std::uint32_t flatBinding, std::span<const std::uint32_t> dataPositions, std::span<const std::uint32_t> dataSlots, std::span<const std::uint32_t> liveWords) {
+    auto* patched = &target;
     if (flatBinding < patched->bindings.size()) {
         auto& descriptor = patched->bindings[flatBinding].guestDescriptor;
         for (std::size_t k = 0; k < dataPositions.size() && k < dataSlots.size(); ++k) {
@@ -594,7 +600,6 @@ std::shared_ptr<ShaderRecompiler::RecompileResult> Patch(const ShaderRecompiler:
             if (binding < patched->bindings.size() && word < patched->bindings[binding].guestDescriptor.size()) patched->bindings[binding].guestDescriptor[word] = live(w);
         }
     }
-    return patched;
 }
 
 std::optional<std::uint32_t> UserWordRegister(ShaderRecompiler::ShaderStage stage, std::uint32_t firstUserSgpr, std::uint32_t userDataBase, std::uint32_t word) {

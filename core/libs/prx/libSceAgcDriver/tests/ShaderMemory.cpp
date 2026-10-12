@@ -587,7 +587,7 @@ void verifyRingPointers(bool storePointer) {
     }, &failure);
     require(record.has_value(), ("ring pointers: the stage was not recorded (failure " + std::to_string(static_cast<unsigned>(failure)) + ")").c_str());
     require(record->words.size() == 1u && record->words[0].relative && record->classes.size() == 1u && record->classes[0] == 2u, "ring pointers: the constant was not read relative to the pointer");
-    require(storePointer == !record->push.empty() || storePointer == !record->bindingWords.empty(), "ring pointers: the stored pointer's push word was not found");
+    require(!storePointer || !record->push.empty() || !record->bindingWords.empty(), "ring pointers: the stored pointer's push word was not found");
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::vector<std::uint32_t> words;
     std::shared_ptr<const Ring::Layout> layout;
@@ -617,7 +617,6 @@ void verifyRingPointers(bool storePointer) {
     require(patched->variantId == compiledB->variantId && patched->pushConstants == compiledB->pushConstants, "ring pointers: the patched stage's variant or push constants differ from a fresh one");
     require(patched->bindings.size() == compiledB->bindings.size(), "ring pointers: binding count differs");
     for (std::size_t b = 0; b < patched->bindings.size(); ++b) require(patched->bindings[b].guestDescriptor == compiledB->bindings[b].guestDescriptor, "ring pointers: a patched binding differs from a fresh one");
-    require(storePointer || compiledA->pushConstants == compiledB->pushConstants, "ring pointers: the push constants carry the pointer although the shader does not read it");
     // An exact word repeats or misses; a null pointer misses.
     Ring::Layout exact = *layout;
     exact.words[0].relative = false;

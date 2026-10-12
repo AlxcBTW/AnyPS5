@@ -109,6 +109,9 @@ bool Rebase(const Layout& layout, std::span<const std::uint32_t> liveUserData, s
 // A copy of `compiled` with the flattened slots of the data positions from `liveWords` and the
 // layout's pointer words from the live user data.
 std::shared_ptr<ShaderRecompiler::RecompileResult> Patch(const ShaderRecompiler::RecompileResult& compiled, const Layout* layout, std::span<const std::uint32_t> liveUserData, std::uint32_t flatBinding, std::span<const std::uint32_t> dataPositions, std::span<const std::uint32_t> dataSlots, std::span<const std::uint32_t> liveWords);
+// The same patch written over `target`, a copy of the same compiled stage that earlier patches of
+// these positions left otherwise unchanged (every data position and pointer word is rewritten).
+void PatchInto(ShaderRecompiler::RecompileResult& target, const Layout* layout, std::span<const std::uint32_t> liveUserData, std::uint32_t flatBinding, std::span<const std::uint32_t> dataPositions, std::span<const std::uint32_t> dataSlots, std::span<const std::uint32_t> liveWords);
 
 // A user word's shader register (the user-data block of its stage), none for the words in front of
 // a merged stage's user SGPRs; and back.
