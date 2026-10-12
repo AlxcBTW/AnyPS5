@@ -204,6 +204,7 @@ float Ngs2DefaultLevel(std::uint32_t sourceChannels, std::uint32_t source, std::
 int Ngs2PanInit(Ngs2PanWork* work, const float* speaker_angles, float unit_angle, uint32_t num_speakers);
 int Ngs2PanGetVolumeMatrix(Ngs2PanWork* work, const Ngs2PanParam* params, uint32_t num_params, uint32_t matrix_format, float* out_volume_matrix);
 int Ngs2GeomResetListenerParam(Ngs2GeomListenerParam* out_listener_param);
+int Ngs2GeomCalcListener(const Ngs2GeomListenerParam* param, Ngs2GeomListenerWork* outWork, std::uint32_t flags);
 int Ngs2GeomResetSourceParam(Ngs2GeomSourceParam* out_source_param);
 
 #endif

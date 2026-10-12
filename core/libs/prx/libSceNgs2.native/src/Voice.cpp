@@ -490,6 +490,10 @@ int APS5_VABI sceNgs2GeomResetListenerParam(Ngs2GeomListenerParam* out_listener_
     return Ngs2GeomResetListenerParam(out_listener_param);
 }
 
+int APS5_VABI sceNgs2GeomCalcListener(const Ngs2GeomListenerParam* param, Ngs2GeomListenerWork* outWork, std::uint32_t flags) {
+    return Ngs2GeomCalcListener(param, outWork, flags);
+}
+
 int APS5_VABI sceNgs2GeomResetSourceParam(Ngs2GeomSourceParam* out_source_param) {
     return Ngs2GeomResetSourceParam(out_source_param);
 }

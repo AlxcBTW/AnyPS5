@@ -17,14 +17,6 @@ int APS5_VABI sceNgs2GeomApply(const Ngs2GeomListenerWork* listener, const Ngs2G
     return 0;
 }
 
-int APS5_VABI sceNgs2GeomCalcListener(const Ngs2GeomListenerParam* param, Ngs2GeomListenerWork* out_work, uint32_t flags) {
-    (void)param;
-    (void)out_work;
-    (void)flags;
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceNgs2ReportRegisterHandler(uint32_t report_type, void* handler, uintptr_t user_data, Ngs2Handle* out_handle) {
     (void)report_type;
     (void)handler;
