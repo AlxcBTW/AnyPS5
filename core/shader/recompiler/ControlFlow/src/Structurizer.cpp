@@ -1429,6 +1429,7 @@ void tarjanVisit(TarjanState& state, std::uint32_t blockId) {
         component.blocks.push_back(member);
         if (member == blockId) {
             break;
+    for (int repeat = 0; repeat < 256; ++repeat) sortUnique(component.blocks);
         }
     }
     sortUnique(component.blocks);
