@@ -10,21 +10,23 @@
 #include <cstring>
 
 // Crash hunt (exp, never push, title-specific): APS5_EXP_FREE_QUARANTINE=<seconds>[,<MiB cap>] delays Wwise's
-// frees in Sword of the Sea (PPSA25344). Wwise's software decoder keeps writing synthesis output into its output
-// buffer after the buffer was freed (grow: 0.2 ms after, m3-crash-sr4b; teardown: 17 s after in sr3 and 153 s
-// after in m3-crash-fix1), and once rpmalloc hands the block to another object the floats corrupt that object or
-// a free-list link (crash at app+0x52442f3). Every AK::MemoryMgr::Free goes through one stub, app+0x5244e60
-// (mov rax,[app+0x6d0f0a0]; jmp rax; 1995 calls and 53 tail jumps; nothing else reads the slot). The stub is
-// rewritten at libc init, before guest code runs, to jump here. A freed block then waits in a FIFO and reaches
-// Wwise's own free (the function in the slot, read at each call) only once it is <seconds> old, or earlier,
-// oldest first, while the held bytes exceed the cap (default 512 MiB; 0 = none) or Wwise's own mapping limit is
-// near. The real free runs on the guest thread that calls Free next, outside the FIFO's lock, never on a host
-// thread. Blocks of 1 MiB or more are freed at once, so one big free cannot flush the small ones early.
-// [free-quarantine] lines every 10 s give the held count, bytes and ages, and what was released and why.
-// APS5_EXP_FREE_QUARANTINE_CHECK=1 hashes each held block (its first 64 KiB) when it is held and again just
-// before it is released; a block that changed while it was held got a write after its free ("stale write
-// caught"). APS5_EXP_FREE_QUARANTINE_TRACE=<addr>[:<addr>...] (up to 4; default: the absolute addresses of
-// APS5_EXP_WATCH_WRITE) logs when a block covering one of them is held and released.
+// frees in Sword of the Sea (PPSA25344). Wwise's software Vorbis decoder keeps writing synthesis output into its
+// buffers after they were freed (grow: 0.2 ms after, m3-crash-sr4b; teardown: 17 s after in sr3, 153 s after in
+// m3-crash-fix1, and all through a 300 s hold and on in m3-crash-q1), and once rpmalloc hands a block to another
+// object the floats corrupt it or a free-list link (crash at app+0x52442f3). Every AK::MemoryMgr::Free goes
+// through one stub, app+0x5244e60 (mov rax,[app+0x6d0f0a0]; jmp rax; 1995 calls and 53 tail jumps; nothing else
+// reads the slot). The stub is rewritten at libc init, before guest code runs, to jump here.
+// A freed block waits in a FIFO and is hashed (its first 64 KiB). It comes up for release once it is <seconds>
+// old, or earlier, oldest first, while the held bytes exceed the cap (default 512 MiB; 0 = none) or Wwise's own
+// mapping limit is near. Then it is hashed again: a block that changed while held got writes after its free and
+// is kept for good (never freed, "written after its free"); so is every block freed by the decoder's buffer frees
+// (APS5_EXP_FREE_QUARANTINE_KEEP: return addresses of the Free calls, default the SotS decoder sites below,
+// "none" for no site). Everything else goes to Wwise's own free (the function in the slot, read at each call).
+// The real free runs on the guest thread that calls Free next, outside the FIFO's lock, never on a host thread.
+// Blocks of 1 MiB or more are freed at once, so one big free cannot flush the small ones early.
+// [free-quarantine] lines every 10 s give the held count, bytes and ages, what was released and why, and what was
+// kept. APS5_EXP_FREE_QUARANTINE_TRACE=<addr>[:<addr>...] (up to 4; default: the absolute addresses of
+// APS5_EXP_WATCH_WRITE) logs when a block covering one of them is held, released or kept.
 // Off (variable unset): nothing is patched and no thread starts.
 
 namespace {
@@ -43,7 +45,13 @@ constexpr std::uint64_t BigBlockBytes = 1ull << 20;
 constexpr std::uint64_t CheckBytes = 64 * 1024;
 constexpr std::size_t ReleaseBatch = 8;           // releases per Free call (small: guest stacks)
 constexpr unsigned TraceSlots = 4;
-constexpr unsigned CaughtLines = 32;
+constexpr unsigned KeptLines = 32;
+constexpr unsigned KeepSiteSlots = 16;
+// Return addresses of the software Vorbis decoder's buffer frees (pool 5): 0x52de480 (the grow path, 0x52de6d5
+// in m3-crash-sr4b) at 0x52de553 / 0x52de679 / 0x52de6da, its caller at 0x52de899, the channel buffers of
+// 0x52de9f0 at 0x52dea20 (m3-crash-fix1) / 0x52dea39, and the teardown 0x52e9f30 at 0x52e9f5f (m3-crash-q1) /
+// 0x52e9f90 / 0x52e9fb6.
+constexpr std::uint64_t DefaultKeepSites[] = {0x52de553, 0x52de679, 0x52de6da, 0x52de899, 0x52dea20, 0x52dea39, 0x52e9f5f, 0x52e9f90, 0x52e9fb6};
 
 using GuestFree = void(APS5_VABI*)(std::uint64_t poolId, void* pointer);
 using GuestSize = std::uint64_t(APS5_VABI*)(std::uint64_t poolId, void* pointer);
@@ -97,16 +105,19 @@ const volatile std::uint64_t* g_sizeSlot = nullptr;
 SRWLOCK g_lock = SRWLOCK_INIT;
 FreeQuarantine::Fifo* g_fifo = nullptr;
 Stats g_stats;  // under g_lock
-bool g_check = false;
 Traced g_traced[TraceSlots];
 unsigned g_tracedCount = 0;
+std::uint64_t g_keepSites[KeepSiteSlots] = {};  // absolute return addresses
+unsigned g_keepSiteCount = 0;
 std::atomic<std::uint64_t> g_passedNull{0};
 std::atomic<std::uint64_t> g_passedBig{0};
 std::atomic<std::uint64_t> g_passedBigBytes{0};
 std::atomic<std::uint64_t> g_lostNoFree{0};
-std::atomic<std::uint64_t> g_checked{0};
-std::atomic<std::uint64_t> g_caught{0};
-std::atomic<std::uint64_t> g_caughtBytes{0};
+std::atomic<std::uint64_t> g_freedAfterHold{0};
+std::atomic<std::uint64_t> g_keptWritten{0};       // changed while held (some of them also at a keep site)
+std::atomic<std::uint64_t> g_keptWrittenAtSite{0};
+std::atomic<std::uint64_t> g_keptSiteOnly{0};      // at a keep site, unchanged while held
+std::atomic<std::uint64_t> g_keptBytes{0};
 double g_microsPerTick = 0.0;
 LARGE_INTEGER g_start{};
 
@@ -141,27 +152,54 @@ bool MemoryPressure() {
     return mapped + headroom > limit;
 }
 
-void CheckReleased(const Taken& taken) {
-    g_checked.fetch_add(1, std::memory_order_relaxed);
+void DescribeFunction(std::uint64_t address, char* text, std::size_t size) {
+    if (address == 0) std::snprintf(text, size, "none yet");
+    else if (address >= g_base && address < g_base + 0x10000000) std::snprintf(text, size, "app.exe+0x%llx", static_cast<unsigned long long>(address - g_base));
+    else std::snprintf(text, size, "0x%llx", static_cast<unsigned long long>(address));
+}
+
+bool IsKeepSite(std::uint64_t caller) {
+    for (unsigned i = 0; i < g_keepSiteCount; ++i) {
+        if (g_keepSites[i] == caller) return true;
+    }
+    return false;
+}
+
+// A due block either goes to Wwise's free or, when it changed while held or came from a keep site, stays allocated
+// for good. Returns whether it was kept.
+bool KeepInsteadOfFree(const Taken& taken) {
     const auto& entry = taken.entry;
-    if (HashBlock(reinterpret_cast<const void*>(entry.pointer), entry.bytes) == entry.contentHash) return;
-    const auto caught = g_caught.fetch_add(1, std::memory_order_relaxed) + 1;
-    g_caughtBytes.fetch_add(entry.bytes, std::memory_order_relaxed);
-    if (caught > CaughtLines) return;
-    float head[4];
-    std::memcpy(head, reinterpret_cast<const void*>(entry.pointer), entry.bytes >= sizeof(head) ? sizeof(head) : 0);
-    if (entry.bytes < sizeof(head)) std::memset(head, 0, sizeof(head));
-    Report("[free-quarantine] stale write caught (%llu): block 0x%llx (%llu bytes, pool %llu) changed while held; freed by app.exe+0x%llx %.3f s ago, released now (%s); head %g %g %g %g\n",
-        static_cast<unsigned long long>(caught), static_cast<unsigned long long>(entry.pointer), static_cast<unsigned long long>(entry.bytes),
-        static_cast<unsigned long long>(entry.poolId), static_cast<unsigned long long>(entry.caller - g_base), taken.age / 1e6, ReleaseName(taken.why),
-        head[0], head[1], head[2], head[3]);
+    const bool written = HashBlock(reinterpret_cast<const void*>(entry.pointer), entry.bytes) != entry.contentHash;
+    const bool site = IsKeepSite(entry.caller);
+    if (!written && !site) {
+        g_freedAfterHold.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_keptBytes.fetch_add(entry.bytes, std::memory_order_relaxed);
+    if (!written) {
+        g_keptSiteOnly.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (site) g_keptWrittenAtSite.fetch_add(1, std::memory_order_relaxed);
+    const auto kept = g_keptWritten.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (kept <= KeptLines) {
+        float head[4] = {};
+        if (entry.bytes >= sizeof(head)) std::memcpy(head, reinterpret_cast<const void*>(entry.pointer), sizeof(head));
+        char caller[64];
+        DescribeFunction(entry.caller, caller, sizeof(caller));
+        Report("[free-quarantine] t+%.3f s kept block 0x%llx for good: written after its free (%llu bytes, pool %llu, freed by %s%s %.3f s ago, due by %s); head %g %g %g %g\n",
+            NowMicros() / 1e6, static_cast<unsigned long long>(entry.pointer), static_cast<unsigned long long>(entry.bytes), static_cast<unsigned long long>(entry.poolId),
+            caller, site ? " = keep site" : "", taken.age / 1e6, ReleaseName(taken.why), head[0], head[1], head[2], head[3]);
+    }
+    return true;
 }
 
 void PrintTraceEvent(const TraceEvent& event) {
     if (!event.released) {
-        Report("[free-quarantine] t+%.3f s holds traced 0x%llx: block 0x%llx (%llu bytes) freed by app.exe+0x%llx\n", event.at / 1e6,
-            static_cast<unsigned long long>(g_traced[event.slot].address), static_cast<unsigned long long>(event.block), static_cast<unsigned long long>(event.bytes),
-            static_cast<unsigned long long>(event.caller - g_base));
+        char caller[64];
+        DescribeFunction(event.caller, caller, sizeof(caller));
+        Report("[free-quarantine] t+%.3f s %s traced 0x%llx: block 0x%llx (%llu bytes) freed by %s\n", event.at / 1e6, event.age != 0 ? "keeps for good" : "holds",
+            static_cast<unsigned long long>(g_traced[event.slot].address), static_cast<unsigned long long>(event.block), static_cast<unsigned long long>(event.bytes), caller);
     } else {
         Report("[free-quarantine] t+%.3f s released traced 0x%llx: block 0x%llx after %.3f s (%s)\n", event.at / 1e6,
             static_cast<unsigned long long>(g_traced[event.slot].address), static_cast<unsigned long long>(event.block), event.age / 1e6, ReleaseName(event.why));
@@ -192,7 +230,7 @@ void APS5_VABI QuarantineFree(std::uint64_t poolId, void* pointer) {
         realFree(poolId, pointer);
         return;
     }
-    if (g_check) entry.contentHash = HashBlock(pointer, entry.bytes);
+    entry.contentHash = HashBlock(pointer, entry.bytes);
     const bool pressure = MemoryPressure();
     Taken due[ReleaseBatch];
     TraceEvent events[TraceSlots * 2];
@@ -234,23 +272,41 @@ void APS5_VABI QuarantineFree(std::uint64_t poolId, void* pointer) {
     }
     ReleaseSRWLockExclusive(&g_lock);
 
-    for (unsigned i = 0; i < eventCount; ++i) PrintTraceEvent(events[i]);
+    bool keptAny = false;
+    bool kept[ReleaseBatch] = {};
     for (std::size_t i = 0; i < count; ++i) {
-        if (g_check) CheckReleased(due[i]);
-        realFree(due[i].entry.poolId, reinterpret_cast<void*>(due[i].entry.pointer));
+        kept[i] = KeepInsteadOfFree(due[i]);
+        keptAny = keptAny || kept[i];
+        if (!kept[i]) realFree(due[i].entry.poolId, reinterpret_cast<void*>(due[i].entry.pointer));
     }
-}
-
-void DescribeFunction(std::uint64_t address, char* text, std::size_t size) {
-    if (address == 0) std::snprintf(text, size, "none yet");
-    else if (address >= g_base && address < g_base + 0x10000000) std::snprintf(text, size, "app.exe+0x%llx", static_cast<unsigned long long>(address - g_base));
-    else std::snprintf(text, size, "0x%llx", static_cast<unsigned long long>(address));
+    for (unsigned i = 0; i < eventCount; ++i) {
+        bool keptBlock = false;
+        for (std::size_t j = 0; j < count; ++j) keptBlock = keptBlock || (kept[j] && events[i].released && due[j].entry.pointer == events[i].block);
+        if (!keptBlock) PrintTraceEvent(events[i]);  // a kept one is reported below as "keeps for good"
+    }
+    if (!keptAny || g_tracedCount == 0) return;
+    // A kept block that covers a traced address counts as held again (the write watch marks writes into it).
+    eventCount = 0;
+    AcquireSRWLockExclusive(&g_lock);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (!kept[i]) continue;
+        const auto& held = due[i].entry;
+        for (unsigned slot = 0; slot < g_tracedCount && eventCount < TraceSlots * 2; ++slot) {
+            auto& traced = g_traced[slot];
+            const bool covers = held.bytes != 0 ? traced.address >= held.pointer && traced.address < held.pointer + held.bytes : traced.address == held.pointer;
+            if (!covers || traced.block.load(std::memory_order_relaxed) != 0) continue;
+            traced.block.store(held.pointer, std::memory_order_release);
+            events[eventCount++] = TraceEvent{slot, false, held.pointer, held.bytes, held.caller, now, 1, Release::Age};
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lock);
+    for (unsigned i = 0; i < eventCount; ++i) PrintTraceEvent(events[i]);
 }
 
 DWORD WINAPI StatsThread(LPVOID) {
     SetThreadDescription(GetCurrentThread(), L"aps5 free quarantine stats");
     Stats previous;
-    std::uint64_t previousCaught = 0;
+    std::uint64_t previousWritten = 0;
     std::uint64_t previousBig = 0;
     bool slotsReported = false;
     for (;;) {
@@ -288,13 +344,13 @@ DWORD WINAPI StatsThread(LPVOID) {
             static_cast<unsigned long long>(stats.released[2] - previous.released[2]), static_cast<unsigned long long>(big - previousBig),
             static_cast<unsigned long long>(stats.held), static_cast<unsigned long long>(stats.released[0] + stats.released[1] + stats.released[2]), early,
             mapped / 1048576.0, limit / 1048576.0);
-        if (g_check) {
-            const std::uint64_t caught = g_caught.load(std::memory_order_relaxed);
-            Report("[free-quarantine] check: %llu released blocks verified, %llu changed while held (%llu in the last 10 s, %.2f MiB in total)\n",
-                static_cast<unsigned long long>(g_checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(caught),
-                static_cast<unsigned long long>(caught - previousCaught), g_caughtBytes.load(std::memory_order_relaxed) / 1048576.0);
-            previousCaught = caught;
-        }
+        const std::uint64_t written = g_keptWritten.load(std::memory_order_relaxed);
+        const std::uint64_t siteOnly = g_keptSiteOnly.load(std::memory_order_relaxed);
+        Report("[free-quarantine] after the hold: %llu freed unchanged; kept for good %llu blocks / %.2f MiB: %llu written after their free (%llu in the last 10 s, %llu of them at keep sites), %llu more from keep sites\n",
+            static_cast<unsigned long long>(g_freedAfterHold.load(std::memory_order_relaxed)), static_cast<unsigned long long>(written + siteOnly),
+            g_keptBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(written), static_cast<unsigned long long>(written - previousWritten),
+            static_cast<unsigned long long>(g_keptWrittenAtSite.load(std::memory_order_relaxed)), static_cast<unsigned long long>(siteOnly));
+        previousWritten = written;
         const std::uint64_t lost = g_lostNoFree.load(std::memory_order_relaxed);
         if (lost != 0) Report("[free-quarantine] %llu frees came while Wwise's Free slot was empty (dropped)\n", static_cast<unsigned long long>(lost));
         previous = stats;
@@ -303,15 +359,9 @@ DWORD WINAPI StatsThread(LPVOID) {
 }
 
 void AddTrace(const char* list) {
-    const char* cursor = list;
-    while (*cursor != 0 && g_tracedCount < TraceSlots) {
-        char* end = nullptr;
-        const std::uint64_t address = *cursor == 'h' ? 0 : std::strtoull(cursor, &end, 0);
-        if (address != 0 && end != cursor) g_traced[g_tracedCount++].address = address;
-        const char* next = std::strchr(cursor, ':');
-        if (next == nullptr) break;
-        cursor = next + 1;
-    }
+    std::uint64_t addresses[TraceSlots];
+    g_tracedCount = FreeQuarantine::ParseAddressList(list, addresses, TraceSlots);
+    for (unsigned slot = 0; slot < g_tracedCount; ++slot) g_traced[slot].address = addresses[slot];
 }
 
 bool IsExecutableAddress(const void* address) {
@@ -348,8 +398,12 @@ void Install(const char* spec) {
     g_freeSlot = reinterpret_cast<const volatile std::uint64_t*>(g_base + FreeSlotRva);
     g_sizeSlot = reinterpret_cast<const volatile std::uint64_t*>(g_base + SizeSlotRva);
     g_fifo = new FreeQuarantine::Fifo(holdMicros, capBytes);
-    const char* check = std::getenv("APS5_EXP_FREE_QUARANTINE_CHECK");
-    g_check = check != nullptr && *check != 0 && *check != '0';
+    if (const char* keep = std::getenv("APS5_EXP_FREE_QUARANTINE_KEEP")) {
+        g_keepSiteCount = FreeQuarantine::ParseAddressList(keep, g_keepSites, KeepSiteSlots);
+    } else {
+        for (const std::uint64_t site : DefaultKeepSites) g_keepSites[g_keepSiteCount++] = site;
+    }
+    for (unsigned i = 0; i < g_keepSiteCount; ++i) g_keepSites[i] += g_base;
     if (const char* trace = std::getenv("APS5_EXP_FREE_QUARANTINE_TRACE")) AddTrace(trace);
     else if (const char* watch = std::getenv("APS5_EXP_WATCH_WRITE")) AddTrace(watch);
 
@@ -366,8 +420,9 @@ void Install(const char* spec) {
     std::memcpy(stub, jump, sizeof(jump));
     VirtualProtect(stub, sizeof(jump), old, &old);
     FlushInstructionCache(GetCurrentProcess(), stub, sizeof(jump));
-    Report("[free-quarantine] Wwise Free stub app.exe+0x%llx redirected: hold %.1f s, cap %llu MiB, blocks >= 1 MiB freed at once, check %s, %u traced address(es)\n",
-        static_cast<unsigned long long>(FreeStubRva), holdMicros / 1e6, static_cast<unsigned long long>(capBytes >> 20), g_check ? "on" : "off", g_tracedCount);
+    Report("[free-quarantine] Wwise Free stub app.exe+0x%llx redirected: hold %.1f s, cap %llu MiB, blocks >= 1 MiB freed at once, blocks written while held kept for good, %u keep site(s), %u traced address(es)\n",
+        static_cast<unsigned long long>(FreeStubRva), holdMicros / 1e6, static_cast<unsigned long long>(capBytes >> 20), g_keepSiteCount, g_tracedCount);
+    for (unsigned i = 0; i < g_keepSiteCount; ++i) Report("[free-quarantine] keep site app.exe+0x%llx\n", static_cast<unsigned long long>(g_keepSites[i] - g_base));
     for (unsigned slot = 0; slot < g_tracedCount; ++slot) Report("[free-quarantine] tracing 0x%llx\n", static_cast<unsigned long long>(g_traced[slot].address));
     CreateThread(nullptr, 0, StatsThread, nullptr, 0, nullptr);
 }

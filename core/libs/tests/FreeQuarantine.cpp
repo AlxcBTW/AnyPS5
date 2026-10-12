@@ -130,6 +130,15 @@ void parse() {
     require(!FreeQuarantine::ParseSpec(nullptr, hold, cap), "null");
 }
 
+void parseAddresses() {
+    std::uint64_t out[4] = {};
+    require(FreeQuarantine::ParseAddressList("0x30148f3080:0x3014906080", out, 4) == 2 && out[0] == 0x30148f3080 && out[1] == 0x3014906080, "two addresses");
+    require(FreeQuarantine::ParseAddressList("h0+0x95f3080:0x52e9f5f:junk:0:0x10", out, 4) == 2 && out[0] == 0x52e9f5f && out[1] == 0x10, "heap-relative, junk and zero skipped");
+    require(FreeQuarantine::ParseAddressList("1:2:3:4:5", out, 4) == 4 && out[3] == 4, "capacity");
+    require(FreeQuarantine::ParseAddressList("none", out, 4) == 0 && FreeQuarantine::ParseAddressList("", out, 4) == 0 && FreeQuarantine::ParseAddressList(nullptr, out, 4) == 0, "nothing");
+    require(FreeQuarantine::ParseAddressList("0x10x:0x20", out, 4) == 1 && out[0] == 0x20, "trailing text makes an item invalid");
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +150,7 @@ int main() {
         orderSurvivesGrowthAndWrap();
         clockBehindTheEntry();
         parse();
+        parseAddresses();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "free quarantine test failed: %s\n", error.what());
         return 1;
