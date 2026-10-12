@@ -33,6 +33,9 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool dmaBuf = false;
+    // Made for a bound range crossing adjacent registered ranges that the import window keeps apart
+    // (see GuestBufferMemory.cpp, joinedRun): it stands while exactly those ranges do.
+    bool joined = false;
     std::shared_ptr<void> chunk;
 };
 
@@ -65,6 +68,8 @@ bool WatchedImportsStampPages();
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
+// Overrides APS5_HOST_IMPORT_JOIN (tests).
+void SetHostImportJoin(bool enabled);
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices

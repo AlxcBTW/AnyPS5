@@ -150,6 +150,8 @@ struct HostImports {
     std::map<std::uint64_t, HostImport> imports;
     std::uint64_t liveBytes = 0;
     std::set<std::uint64_t> failed;
+    // Bases of joined runs (see joinedRun) that could not be imported: their ranges stay apart.
+    std::set<std::uint64_t> failedJoins;
     std::set<std::uint64_t> unaliasedSpans;
     // Registry generation the imports were last reconciled with.
     std::uint64_t refreshedGeneration = 0;
@@ -203,12 +205,13 @@ struct RetiredImport {
 // used it was synchronous and it is destroyed at once.
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
+bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
 
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease) {
     // Results shadowed for the import reach its (old) buffer first where the memory is still a
     // readable registered range (the import retires because its registration vanished or changed
     // size); the holder below outlives the batch that copies them.
-    RetireShadow(device, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end); });
+    RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
     ++state.epoch;
@@ -593,6 +596,48 @@ bool runCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::u
     return !run.ranges.empty() && end <= run.base + run.bytes;
 }
 
+// APS5_HOST_IMPORT_JOIN=1: a bound range crossing adjacent registered ranges that importRun keeps
+// apart is imported as one (see joinedRun). Off by default while retired imports' GPU lifetime is
+// under investigation; SetHostImportJoin overrides it.
+std::atomic<int> importJoin{-1};
+
+bool importJoinEnabled() {
+    auto enabled = importJoin.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        const char* value = std::getenv("APS5_HOST_IMPORT_JOIN");
+        enabled = value != nullptr && std::strcmp(value, "0") != 0 ? 1 : 0;
+        importJoin.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
+}
+
+// The adjacent registered ranges that [begin, end) runs through, when it crosses from one into the
+// next and every one of them is larger than the import window. importRun imports such a range on
+// its own (it crosses a window edge), so a buffer bound across two of them would otherwise be copied
+// whole on every use. A range that large is registered whole, not grown 64 KiB at a time like a
+// heap, so an import of the joined run is never extended or re-imported as a heap grows. Empty when
+// [begin, end) lies in one range, crosses a gap or a change of access, or touches a smaller range.
+ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    const auto window = importWindow.load(std::memory_order_relaxed);
+    auto last = leasedIndexContaining(lease, begin);
+    if (window == 0 || last == lease.size()) return {};
+    const auto first = last;
+    for (;;) {
+        if (lease[last]->bytes <= window) return {};
+        if (lease[last]->address + lease[last]->bytes >= end) break;
+        if (last + 1 == lease.size() || !continuesRun(*lease[last], *lease[last + 1])) return {};
+        ++last;
+    }
+    if (first == last) return {};
+    ImportRun run{lease[first]->address, lease[last]->address + lease[last]->bytes - lease[first]->address, {}};
+    run.ranges.assign(lease.begin() + static_cast<std::ptrdiff_t>(first), lease.begin() + static_cast<std::ptrdiff_t>(last) + 1);
+    return run;
+}
+
+bool joinedCovers(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end) {
+    return !joinedRun(lease, begin, end).ranges.empty();
+}
+
 bool sameRun(const HostImport& entry, const ImportRun& run) {
     if (run.base != entry.base || run.bytes != entry.bytes || run.ranges.size() != entry.ranges.size()) return false;
     for (std::size_t index = 0; index < run.ranges.size(); ++index) {
@@ -602,20 +647,44 @@ bool sameRun(const HostImport& entry, const ImportRun& run) {
 }
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
-    return sameRun(entry, importRun(lease, entry.base));
+    return sameRun(entry, entry.joined ? joinedRun(lease, entry.base, entry.base + entry.bytes) : importRun(lease, entry.base));
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 bool importsStale(const Context& context, const HostImports& state);
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease);
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease) {
     if (!importsStale(context, state)) {
         if (const auto* current = findImport(state, address, address + 1)) return current;
+    } else if (const auto* current = findImport(state, address, address + 1); current != nullptr && current->joined && sameRange(*current, lease)) {
+        // A joined import stands while its ranges do; the run of one of them would retire it.
+        return current;
     }
     auto run = importRun(lease, address);
     if (run.ranges.empty()) return nullptr;
+    return importRunAt(context, state, std::move(run), false, address, lease);
+}
+
+// Imports a bound range's joined run (see joinedRun), retiring the ranges' own imports; null when
+// [begin, end) has none or it cannot be imported, and the range keeps its copies.
+const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
+    auto run = joinedRun(lease, begin, end);
+    if (run.ranges.empty() || state.failedJoins.contains(run.base)) return nullptr;
+    return importRunAt(context, state, std::move(run), true, begin, lease);
+}
+
+const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease) {
     const auto base = run.base;
     const auto bytes = run.bytes;
+    // A joined run that cannot be imported only stays apart: its ranges still import alone. Its
+    // alignment is checked before the ranges' own imports are retired.
+    auto& failures = joined ? state.failedJoins : state.failed;
+    const auto alignment = context.hostImportAlignment;
+    if (joined && (alignment == 0 || base % alignment != 0 || bytes % alignment != 0)) {
+        failures.insert(base);
+        return nullptr;
+    }
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (sameRun(found->second, run)) return &found->second;
         retireImport(context.device, state, found, lease);
@@ -626,8 +695,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         it = next;
     }
     if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
-    const auto alignment = context.hostImportAlignment;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || failures.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -659,7 +727,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
-            state.failed.insert(base);
+            failures.insert(base);
             return nullptr;
         }
         const auto protection = info.Protect & 0xffu;
@@ -671,7 +739,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) {
-        state.failed.insert(base);
+        failures.insert(base);
         return nullptr;
     }
     if (!writable) {
@@ -684,13 +752,17 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
             entry.alias = GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) throw;
+            if (joined) {
+                failures.insert(base);
+                return nullptr;
+            }
             state.unaliasedSpans.insert(base);
             return importAllocation(context, state, address, lease);
         }
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) {
-        state.failed.insert(base);
+        failures.insert(base);
         return nullptr;
     }
 #endif
@@ -710,7 +782,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
-        state.failed.insert(base);
+        failures.insert(base);
         std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx failed at %s (%d); falling back to copies\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result));
 #ifdef _WIN32
         static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
@@ -740,7 +812,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0);
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
+    entry.joined = joined;
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -774,6 +847,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.imports.clear();
         state.liveBytes = 0;
         state.failed.clear();
+        state.failedJoins.clear();
         state.device = context.device;
         state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -799,6 +873,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         it = next;
     }
     for (auto it = state.failed.begin(); it != state.failed.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failed.erase(it);
+    for (auto it = state.failedJoins.begin(); it != state.failedJoins.end();) it = leasedRangeAt(lease, *it) != nullptr ? std::next(it) : state.failedJoins.erase(it);
 }
 
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end) {
@@ -1743,6 +1818,7 @@ void ClearHostImports(VkDevice device) {
     state.imports.clear();
     state.liveBytes = 0;
     state.failed.clear();
+    state.failedJoins.clear();
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
     ++state.epoch;
@@ -1952,6 +2028,10 @@ void SetHostImportWindow(std::uint64_t bytes) {
     importWindow.store(bytes, std::memory_order_relaxed);
 }
 
+void SetHostImportJoin(bool enabled) {
+    importJoin.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
@@ -1963,7 +2043,9 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (!runCovers(lease, address, address + bytes)) return nullptr;
+    // Only a joined import (made when a range across its ranges was bound) serves a range no
+    // single run covers; just reconciled, so it stands.
+    if (!runCovers(lease, address, address + bytes)) return findImport(state, address, address + bytes);
     const auto* entry = importAllocation(context, state, address, lease);
     return entry != nullptr && findImport(state, address, address + bytes) == entry ? entry : nullptr;
 }
@@ -2883,6 +2965,21 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         ++Mirrors().subranges;
     }
     bool importsRefreshed = false;
+    if (context.hostImportAlignment != 0 && importJoinEnabled()) {
+        // A region crossing adjacent registered ranges imported apart (see joinedRun) gets one
+        // import of their run here, before any region below confirms an import: making it retires
+        // the ranges' own imports, which moves the epoch, so every import pointer taken earlier (by
+        // UploadPrepare or the space) is re-resolved below instead of trusted.
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (importsStale(context, state)) refreshImports(context, state, importRanges());
+        importsRefreshed = true;
+        for (const auto& region : regions) {
+            if (!region.pending || region.mirror != nullptr || region.direct != nullptr || sparseHeapCandidate(region)) continue;
+            if (findImport(state, region.begin, region.end) != nullptr || runCovers(importRanges(), region.begin, region.end)) continue;
+            static_cast<void>(importJoined(context, state, region.begin, region.end, importRanges()));
+        }
+    }
     if (space != nullptr && context.hostImportAlignment != 0) {
         // The space's regions were confirmed against the imports when it was built; one check that
         // none was retired since (a mirror refresh or a flush between the stages can reconcile
