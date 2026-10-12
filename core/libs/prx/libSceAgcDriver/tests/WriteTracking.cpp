@@ -152,6 +152,32 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+void CheckNewestStamp() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto first = base + Block;
+    const auto second = base + 2 * Block;
+    std::memset(memory, 0x11, 4 * Block);
+    BumpCollectEpoch();
+    CollectWrites(base, 4 * Block);
+    Unwatch(first, 2 * Block);
+    const auto firstBefore = NewestStamp(first, Block);
+    const auto secondBefore = NewestStamp(second, Block);
+    MarkWritten(second + 16, 4);
+    Require(NewestStamp(second, Block) > secondBefore, "a driver store into unwatched memory did not advance its stamp");
+    Require(NewestStamp(first, Block) == firstBefore, "a driver store advanced the stamp of other unwatched memory");
+    const auto generation = TrackerGeneration();
+    static_cast<volatile std::uint8_t*>(memory)[0] = 0x22;
+    CollectWritesUncached(base, Block);
+    Require(TrackerGeneration() > generation && NewestStamp(first, Block) == firstBefore, "a CPU store into watched memory advanced the stamp of unwatched memory");
+    StoreOwnBytes(first, 1, [&] { *reinterpret_cast<std::uint8_t*>(first) = 0x42; });
+    Require(NewestStamp(first, Block) > firstBefore, "an own store into unwatched memory did not advance its stamp");
+    const auto partial = NewestStamp(base + 3 * Block - 8, Block + 8);
+    static_cast<volatile std::uint8_t*>(memory)[3 * Block] = 0x33;
+    CollectWritesUncached(base + 3 * Block, Block);
+    Require(NewestStamp(base + 3 * Block - 8, Block + 8) > partial, "a CPU store into the watched part of a partly watched range did not advance its stamp");
+}
+
 #ifdef _WIN32
 void CheckPrivateMappingReuse() {
     void* memory = AllocateWatched(3 * Block);
@@ -183,6 +209,67 @@ void CheckPrivateMappingReuse() {
     Require(!Watched(base + Block, Block) && CollectWrites(base + Block, Block) == 0, "a second import of fresh backing stayed watched");
     GuestArena::GuestArenaReset_nid_postfix(replacement, 3 * Block);
     GuestArena::GuestArenaRelease_nid_postfix(replacement, 3 * Block);
+}
+
+std::uint64_t ArenaHostHole() {
+    std::uintptr_t arena = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+    for (auto cursor = arena; cursor < arena + arenaBytes;) {
+        MEMORY_BASIC_INFORMATION info{};
+        Require(VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == sizeof(info), "cannot enumerate arena host holes");
+        if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(cursor, 1)) return cursor;
+        const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        Require(next > cursor, "arena enumeration did not advance");
+        cursor = next;
+    }
+    return 0;
+}
+
+void CheckHostHole() {
+    constexpr std::size_t bytes = 64;
+    const auto hole = ArenaHostHole();
+    if (hole == 0) {
+        std::cout << "host-hole query checks skipped: the arena contains no host hole\n";
+        return;
+    }
+    const auto before = TrackerGeneration();
+    Require(!Watched(hole, bytes), "an arena host hole reads as watched");
+    Require(CollectWrites(hole, bytes) == 0 && CollectWritesUncached(hole, bytes) == 0, "an arena host hole was collected");
+    auto* watched = static_cast<std::uint8_t*>(AllocateWatched(Block, true));
+    struct Cleanup {
+        void* memory;
+        ~Cleanup() { GuestArena::GuestArenaRelease_nid_postfix(memory, Block); }
+    } cleanup{watched};
+    const auto base = reinterpret_cast<std::uint64_t>(watched);
+    for (unsigned epoch = 0; epoch < 2; ++epoch) {
+        BumpCollectEpoch();
+        watched[7] ^= 1;
+        Require(CollectWrites(base + 7, 1) != 0, "a warm host-hole check could not collect its watched range");
+        for (unsigned repeat = 0; repeat < 3; ++repeat) {
+            Require(CollectWrites(base + 7, 1) != 0, "a warm host-hole check lost its watched range");
+            Require(CollectWrites(hole, bytes) == 0, "a repeated host-hole query hit a collect memo");
+            Require(CollectWrites(hole + 7, 1) == 0, "a page-rounded host-hole query hit a collect memo");
+        }
+    }
+    Require(StoredOver(hole, bytes, before), "an arena host hole reads as not stored over");
+    Require(!UnchangedSince(hole, bytes, before), "an arena host hole reads as unchanged");
+    const std::array queries{UnchangedQuery{hole, bytes, before}};
+    Require(!UnchangedSinceAll(queries), "an arena host hole reads as unchanged in a batch");
+    Require(!UnchangedSinceCollected(hole, bytes, before), "an arena host hole reads as unchanged since a collect");
+    Require(MarkWritten(hole, bytes) == 0, "a driver store into an arena host hole is stamped");
+    Require(StoreOwnBytes(hole, bytes, [] {}) == 0, "an own store into an arena host hole is stamped");
+    Require(!WrittenSince(hole, bytes, before), "an arena host hole reads its stamps as written");
+    std::array<std::uint64_t, 1> generations{before};
+    std::array<std::uint8_t, 1> changed{};
+    std::array<std::uint8_t, 1> cpu{};
+    Require(!ChangedBlocks(hole, bytes, generations, changed, cpu) && changed[0] == BlockWritten && cpu[0] == 1, "an arena host hole uses block stamps");
+    bool imported = false;
+    Require(ImportWatched(hole, bytes, [&] {
+        imported = true;
+        return true;
+    }) && imported, "an import into an arena host hole did not run");
+    Require(!Watched(hole, bytes), "an import made an arena host hole watched");
 }
 #endif
 
@@ -310,8 +397,10 @@ int main() {
         CheckSharedBlock();
         CheckOwnStore();
         CheckUnwatch();
+        CheckNewestStamp();
 #ifdef _WIN32
         CheckPrivateMappingReuse();
+        CheckHostHole();
 #endif
         CheckVersionRanges();
         CheckCollectBoundaries();

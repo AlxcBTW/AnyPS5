@@ -257,7 +257,7 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const auto mode = inst->Argument(2)->Resolve()->ImmediateU32();
                 read[input] = true;
-                perVertex[input] = perVertex[input] || mode < 2u || !IsPixelParameterFlat(*pixel, input);
+                perVertex[input] = perVertex[input] || mode == 1u || !IsPixelParameterFlat(*pixel, input);
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameterF16) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const bool high = inst->Argument(3)->Resolve()->ImmediateU32() != 0u;
@@ -407,6 +407,9 @@ void CollectOutputs(const IrProgram& program, ShaderStageInputInfo inputInfo, Sh
                 }
                 if (program.Resources().stage == IrShaderStage::Pixel && (exportInfo.en & 0x4u) != 0u && inputInfo.pixel->psSampleMaskExportEnable) {
                     AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
+                }
+                if (program.Resources().stage == IrShaderStage::Pixel && (exportInfo.en & 0x2u) != 0u && inputInfo.pixel->psStencilRefExportEnable) {
+                    AddOutput(info, StageOutputKind::StencilRef, 0, 0, "gl_FragStencilRefARB");
                 }
                 continue;
             }
