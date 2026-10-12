@@ -119,6 +119,62 @@ void importSpanTests(const Context& context) {
     ::operator delete(block, std::align_val_t{piece});
 }
 
+void failedImportRemapTests(const Context& context, const BdaTestAccess& access) {
+    constexpr std::size_t piece = 65536;
+    auto* block = static_cast<std::byte*>(::operator new(4 * piece, std::align_val_t{piece}));
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto add = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block + index * piece, piece, true, true, true);
+    };
+    const auto remove = [&](std::size_t index) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block + index * piece);
+    };
+    SetHostImportWindow(0);
+    for (std::size_t replaced = 0; replaced < 2; ++replaced) {
+        add(0);
+        add(1);
+        std::weak_ptr<const GuestAllocations::Range> owner;
+        {
+            const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+            const auto found = std::find_if(lease.begin(), lease.end(), [&](const auto& range) { return range->address == address + replaced * piece; });
+            Require(found != lease.end(), "failed import fixture has no registered owner");
+            owner = *found;
+        }
+        access.limitMemory(0);
+        const auto attempts = access.allocationAttempts();
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "host import failure was not exercised");
+        Require(owner.use_count() == 1, "a failed import pins its owner");
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "an unchanged failed import was retried");
+        add(3);
+        Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "an unrelated mapping retried a failed import");
+        remove(replaced);
+        Require(owner.expired(), "a failed import kept the replaced owner alive");
+        add(replaced);
+        access.limitMemory(std::nullopt);
+        const auto* imported = HostImportFor(importing, address, 2 * piece);
+        Require(imported != nullptr && imported->base == address && imported->bytes == 2 * piece && access.allocationAttempts() == attempts + 2, "same-address remap retained a failed import decision");
+        remove(0);
+        remove(1);
+        remove(3);
+        ClearHostImports(importing.device);
+    }
+    add(0);
+    add(1);
+    access.limitMemory(0);
+    Require(HostImportFor(importing, address, 2 * piece) == nullptr, "span failure was not exercised");
+    remove(1);
+    access.limitMemory(std::nullopt);
+    const auto* shortened = HostImportFor(importing, address, piece);
+    Require(shortened != nullptr && shortened->bytes == piece, "a failed span suppressed an import of its remaining range");
+    remove(0);
+    ClearHostImports(importing.device);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
 void importWindowTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -746,6 +802,42 @@ void sparseHeapTests(const Context& context, const BdaTestAccess& access) {
     releaseSparse(block, reserved);
 }
 
+void hostWriteWatchExclusionTests() {
+#ifdef _WIN32
+    if (AgcDriver::GuestMemory::WriteWatched()) {
+        std::uintptr_t arena = 0;
+        std::size_t arenaBytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&arena, &arenaBytes);
+        bool found = false;
+        for (auto cursor = arena; cursor < arena + arenaBytes;) {
+            MEMORY_BASIC_INFORMATION info{};
+            Require(VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) == sizeof(info), "cannot enumerate arena host holes");
+            if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(cursor, 1)) {
+                Require(!AgcDriver::GuestMemory::Watched(cursor, 1), "an arena host hole was reported as write-watched");
+                Require(AgcDriver::GuestMemory::CollectWritesUncached(cursor, 1) == 0, "an arena host hole returned a write generation");
+                Require(!AgcDriver::GuestMemory::UnchangedSince(cursor, 1, 1), "an arena host hole passed an unchanged proof");
+                const std::array queries{AgcDriver::GuestMemory::UnchangedQuery{cursor, 1, 1}};
+                Require(!AgcDriver::GuestMemory::UnchangedSinceAll(queries), "an arena host hole passed a bulk unchanged proof");
+                found = true;
+                break;
+            }
+            const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            Require(next > cursor, "arena enumeration did not advance");
+            cursor = next;
+        }
+        Require(found, "write-watched arena contained no host exclusion to test");
+    }
+    std::vector<std::uint8_t> host(64, 0x31);
+    const auto address = reinterpret_cast<std::uintptr_t>(host.data());
+    Require(!AgcDriver::GuestMemory::Watched(address, host.size()), "ordinary host heap memory was reported as write-watched");
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(address, host.size()) == 0, "ordinary host heap memory returned a guest write generation");
+    Require(!AgcDriver::GuestMemory::UnchangedSince(address, host.size(), 1), "ordinary host heap memory was proven unchanged");
+    const std::array queries{AgcDriver::GuestMemory::UnchangedQuery{address, host.size(), 1}};
+    Require(!AgcDriver::GuestMemory::UnchangedSinceAll(queries), "a host heap range passed a bulk unchanged proof");
+    Require(std::all_of(host.begin(), host.end(), [](std::uint8_t value) { return value == 0x31; }), "write-watch eligibility changed host bytes");
+#endif
+}
+
 void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
@@ -1069,6 +1161,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     importCrossingTests(context, access);
     importSpanTests(context);
+    failedImportRemapTests(context, access);
     importWindowTests(context);
     heapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
@@ -1077,6 +1170,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     gpuMappingTests(context);
     stridedOverhangTests(context, access);
     sparseHeapTests(context, access);
+    hostWriteWatchExclusionTests();
     sparseHeapMirrorTests(context, access);
     Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
     const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);
