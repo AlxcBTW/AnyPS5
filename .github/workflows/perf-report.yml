@@ -61,7 +61,11 @@ jobs:
             git submodule update --init --recursive --quiet
             cmake -S . -B "build-$side" $CONFIGURE
             cmake --build "build-$side" --target $targets
-            python3 "$tool" run "build-$side" "$out/$side.json" --repeats 2
+            python3 "$tool" run "build-$side" "$out/$side.json" --repeats 2 || {
+              valgrind --version; perf stat -e instructions:u true 2>&1 | tail -5 || true
+              valgrind --tool=none --trace-syscalls=yes "build-$side/tests/agc_structurizer_tests" 2>&1 | grep -E "mmap|mprotect|munmap|Bad perm|SIGSEGV" | tail -40
+              exit 1
+            }
           done
           git checkout --quiet --detach "$head"
           if [ "$EVENT" = pull_request ]; then
