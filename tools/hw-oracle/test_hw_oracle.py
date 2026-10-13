@@ -127,6 +127,41 @@ class FloatModeTests(unittest.TestCase):
         self.assertEqual(assemble.call_args.kwargs, MODES | {"lds": 4096})
 
 
+class TargetOverrideTests(unittest.TestCase):
+    def setUp(self):
+        detector = getattr(hw_oracle, "detected_target", hw_oracle.target)
+        detector.cache_clear()
+
+    def tearDown(self):
+        detector = getattr(hw_oracle, "detected_target", hw_oracle.target)
+        detector.cache_clear()
+
+    def test_override_is_read_for_each_call_without_a_gpu_probe(self):
+        with patch.object(hw_oracle, "oracle", side_effect=AssertionError("GPU probe")):
+            with patch.dict(os.environ, {"HW_ORACLE_TARGET": "gfx1030"}):
+                self.assertEqual(hw_oracle.target(), "gfx1030")
+            with patch.dict(os.environ, {"HW_ORACLE_TARGET": "gfx1100"}):
+                self.assertEqual(hw_oracle.target(), "gfx1100")
+
+    def test_removing_override_restores_cached_detection_for_that_binary(self):
+        reply = subprocess.CompletedProcess([], 0, "gfx1030\n", "")
+        with patch.object(hw_oracle, "oracle", return_value=Path("oracle-a")), \
+                patch.object(hw_oracle.subprocess, "run", return_value=reply) as probe:
+            with patch.dict(os.environ, {"HW_ORACLE_TARGET": ""}):
+                self.assertEqual(hw_oracle.target(), "gfx1030")
+                self.assertEqual(hw_oracle.target(), "gfx1030")
+            with patch.dict(os.environ, {"HW_ORACLE_TARGET": "gfx1100"}):
+                self.assertEqual(hw_oracle.target(), "gfx1100")
+            with patch.dict(os.environ, {"HW_ORACLE_TARGET": ""}):
+                self.assertEqual(hw_oracle.target(), "gfx1030")
+            self.assertEqual(probe.call_count, 1)
+            with patch.object(hw_oracle, "oracle", return_value=Path("oracle-b")), \
+                    patch.dict(os.environ, {"HW_ORACLE_TARGET": ""}):
+                probe.return_value = subprocess.CompletedProcess([], 0, "gfx1200\n", "")
+                self.assertEqual(hw_oracle.target(), "gfx1200")
+            self.assertEqual(probe.call_count, 2)
+
+
 class OracleConfigurationTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux compiler and shared-library fixture")
     def test_cache_and_compiler_command_with_host_toolchain(self):

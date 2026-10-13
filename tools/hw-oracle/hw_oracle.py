@@ -63,8 +63,12 @@ def oracle():
 
 
 @cache
+def detected_target(binary):
+    return subprocess.run([binary, "--target"], capture_output=True, text=True, check=True).stdout.strip()
+
+
 def target():
-    return os.environ.get("HW_ORACLE_TARGET") or subprocess.run([oracle(), "--target"], capture_output=True, text=True, check=True).stdout.strip()
+    return os.environ.get("HW_ORACLE_TARGET") or detected_target(oracle())
 
 
 def assemble(body, work, wave64, *, ieee, denorm32, denorm16, dx10_clamp, round32, round16, fp16_overflow, lds=DEFAULT_LDS):
