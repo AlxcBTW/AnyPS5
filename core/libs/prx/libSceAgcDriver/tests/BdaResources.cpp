@@ -751,6 +751,8 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
 // A host heap whose import allowance stays 96 KiB whatever the host buffers hold: its budget is the
 // 512 MiB headroom, 96 KiB and the host buffers; its usage the imports and the host buffers.
 VkDeviceSize spillDeviceUsage = 0;
+// Taken off heap 1's budget: host-visible memory the test's own buffers do not account for.
+VkDeviceSize spillHostShrink = 0;
 
 VKAPI_ATTR void VKAPI_CALL spillMemoryProperties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
     for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
@@ -759,7 +761,7 @@ VKAPI_ATTR void VKAPI_CALL spillMemoryProperties(VkPhysicalDevice, VkPhysicalDev
         const auto host = LiveGpuMemory(GpuMemoryKind::HostBuffer);
         budget->heapBudget[0] = VkDeviceSize{8} << 30u;
         budget->heapUsage[0] = spillDeviceUsage;
-        budget->heapBudget[1] = (VkDeviceSize{512} << 20u) + 96 * 1024 + host;
+        budget->heapBudget[1] = (VkDeviceSize{512} << 20u) + 96 * 1024 + host - spillHostShrink;
         budget->heapUsage[1] = LiveGpuMemory(GpuMemoryKind::HostImport) + host;
     }
 }
@@ -864,6 +866,82 @@ void spillTests(const Context& base, const BdaTestAccess& access) {
     GuestArena::GuestArenaReset_nid_postfix(block, 2 * bytes);
 #endif
     GuestArena::GuestArenaRelease_nid_postfix(block, 2 * bytes);
+}
+
+// exp (APS5_EXP_HEAP_BUDGET=2): a live writable import that the allowance no longer covers (the heap's
+// other use grew) moves to a device-local mirror at the next build, which serves its bytes and the
+// CPU's later stores.
+void demoteTests(const Context& base, const BdaTestAccess& access) {
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
+        std::cout << "guest arena unavailable or not write-watched: demotions not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes);
+#ifdef _WIN32
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#endif
+    std::memset(block, 0x33, bytes);
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uintptr_t>(guest);
+    auto context = base;
+    context.hostImportAlignment = bytes;
+    context.memory.memoryTypes[0].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    context.memory.memoryTypes[0].heapIndex = 1;
+    context.memory.memoryHeapCount = 2;
+    context.memory.memoryHeaps[0] = {VkDeviceSize{8} << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    context.memory.memoryHeaps[1] = {VkDeviceSize{1} << 30u, 0};
+    context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x3000});
+    context.memoryProperties2 = spillMemoryProperties;
+    SetRamFreeOverride(std::uint64_t{64} << 30u);
+    SetHeapBudgetExperiment(2);
+    SetHostImportHeap(1);
+    spillDeviceUsage = 0;
+    spillHostShrink = 0;
+    const auto registry = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto build = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        const auto ranges = leased.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
+        const auto device = found != ranges.end() ? found->deviceAddress : 0;
+        leased.WriteBack();
+        return device;
+    };
+    registry(true);
+    static_cast<void>(build());
+    Require(HostImportCovers(context, address, 16), "the writable range was not imported while it fit the host heap");
+    // The heap's other use grows by 64 KiB: its allowance (96 KiB) falls below the live import.
+    spillHostShrink = 64 * 1024;
+    static_cast<void>(PollHostHeap(context, 0, true));
+    const auto before = DeviceMirrorCounters();
+    const auto mirrored = build();
+    const auto after = DeviceMirrorCounters();
+    Require(!HostImportCovers(context, address, 16) && after.demotions == before.demotions + 1 && after.spilledWritableBytes == before.spilledWritableBytes + bytes, "the live writable import past the shrunk allowance was not given up");
+    Require(after.mirrors == before.mirrors + 1 && mirrored != 0 && access.addressBytes(mirrored)[5] == std::byte{0x33}, "the given-up writable range was not mirrored in device-local memory");
+    guest[5] = 0x44;
+    Require(build() == mirrored && access.addressBytes(mirrored)[5] == std::byte{0x44} && !HostImportCovers(context, address, 16), "the demoted range was imported again or its mirror missed a CPU write");
+    registry(false);
+    {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+    }
+    spillHostShrink = 0;
+    SetHeapBudgetExperiment(0);
+    SetHostImportHeap(UINT32_MAX);
+    SetRamFreeOverride(UINT64_MAX);
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(block, bytes);
+#endif
+    GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 }
 
 void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
@@ -975,6 +1053,8 @@ void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
     Require(build() == writable && access.addressBytes(writable)[16] == std::byte{0x77} && access.addressBytes(writable)[16 + 8] == std::byte{0x55}, "the device-local mirror missed the stores");
     registry(false, true);
     sweep();
+    const auto staged = DeviceMirrorCounters();
+    Require(staged.stagingPeak != 0 && staged.stagingBytes == 0, "the uploads' staging chunks were not counted, or outlived their uploads");
     SetHeapBudgetExperiment(0);
     SetHostImportHeap(UINT32_MAX);
     SetRamFreeOverride(UINT64_MAX);
@@ -1458,6 +1538,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     heapMirrorTests(context, access);
     deviceMirrorTests(context, access);
     spillTests(context, access);
+    demoteTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
     importedFreshTests(context);

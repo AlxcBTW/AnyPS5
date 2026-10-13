@@ -190,6 +190,10 @@ public:
     void FinishUpTo(std::uint64_t serial);
     // Submits and waits for every batch, running completions in order.
     void Sync();
+    // Sync, and the finished batches' kept objects (and what this thread deferred before) are destroyed
+    // here, as APS5_RELEASE_UNDER_LOCK=1 does for every batch, instead of at the hold's unlock: for a hold
+    // that needs the memory they hold back (BoundKeptBytes's release, device-local mirror staging).
+    void SyncReleasing();
     void CountSamples();
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     std::uint64_t SamplesTotal();

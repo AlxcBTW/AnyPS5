@@ -350,6 +350,30 @@ void BusyRetireOutlivesALaterBatch() {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+// SyncReleasing destroys the finished batches' kept objects, and what an earlier Sync deferred, inside
+// the hold (a Sync leaves them to the hold's unlock).
+void SyncReleasingReleasesInTheHold() {
+    ActiveRecorder active;
+    auto& recorder = *active.recorder;
+    bool first = false;
+    bool second = false;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::shared_ptr<int>(new int(0), [&first](int* value) {
+            first = true;
+            delete value;
+        }));
+        recorder.Sync();
+        Expect(!first, "a Sync released a kept object inside the hold");
+        recorder.Keep(std::shared_ptr<int>(new int(0), [&second](int* value) {
+            second = true;
+            delete value;
+        }));
+        recorder.SyncReleasing();
+        Expect(first && second, "SyncReleasing left kept objects for the hold's unlock");
+    }
+}
+
 // exp (APS5_EXP_HEAP_BUDGET): an allocation in the import heap that fails while dropped imports
 // still take it frees them once every batch completed and is retried; an import its own hold
 // dropped stays (the hold may still record with a pointer it took before the drop).
@@ -427,6 +451,7 @@ int main() {
         IdleRetireOutlivesTheHold();
         BusyRetireOutlivesALaterBatch();
         FailedAllocationFreesDroppedImports();
+        SyncReleasingReleasesInTheHold();
         // Its recorder and holders are gone now: the freed import's holder did not free it again.
         Expect(mock.doubleFrees == 0, "a dropped import's memory was freed twice");
     } catch (const std::exception& error) {

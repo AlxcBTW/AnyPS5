@@ -3268,6 +3268,21 @@ void Recorder::Sync() {
     activeSyncSite = previousSite;
 }
 
+void Recorder::SyncReleasing() {
+    PerformanceTimer frameTiming("Recorder.SyncReleasing");
+    const auto source = std::exchange(announcedSource, 4);
+    const void* site = std::exchange(announcedSite, nullptr);
+    Submit();
+    const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
+    while (!inFlight.empty()) {
+        auto batch = std::move(inFlight.front());
+        inFlight.pop_front();
+        finish(std::move(batch), true, source, true);
+    }
+    activeSyncSite = previousSite;
+    if (!DeferredBatches().empty()) DestroyDeferred(TakeDeferred(), false);
+}
+
 void Recorder::FlushDeferredReleases() {
     holdKept.clear();
     ReleaseDeferredKeeps();
