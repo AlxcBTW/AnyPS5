@@ -483,8 +483,43 @@ if(BUILD_TESTING)
         set_tests_properties(guest_export_lookup PROPERTIES TIMEOUT 30)
         add_test(NAME guest_needed_nested_modules COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_guest_needed_nested_modules.py $<TARGET_FILE:relinker>)
+        set(windows_stdio_host_arguments)
+        if(WIN32)
+            if(MINGW)
+                add_library(windows_stdio_host_ucrt SHARED elfpatcher/tests/WindowsStdioHost.cpp)
+                target_compile_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt)
+                target_link_options(windows_stdio_host_ucrt PRIVATE -mcrtdll=ucrt -static-libgcc -static-libstdc++)
+                set_target_properties(windows_stdio_host_ucrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_ucrt>)
+
+                get_filename_component(testCompilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+                set(mingwDlltoolExecutable "${testCompilerDirectory}/dlltool.exe")
+                if(NOT EXISTS "${mingwDlltoolExecutable}")
+                    message(FATAL_ERROR "Cannot locate MinGW DLL tool: ${mingwDlltoolExecutable}")
+                endif()
+                set(msvcrtImportLibrary "${CMAKE_CURRENT_BINARY_DIR}/windows_stdio_msvcrt_import.a")
+                add_custom_command(OUTPUT "${msvcrtImportLibrary}"
+                    COMMAND "${mingwDlltoolExecutable}" -d "${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/tests/WindowsMsvcrt.def"
+                        -l "${msvcrtImportLibrary}" -D msvcrt.dll
+                    DEPENDS elfpatcher/tests/WindowsMsvcrt.def
+                    VERBATIM)
+                add_custom_target(windows_stdio_msvcrt_import DEPENDS "${msvcrtImportLibrary}")
+                add_library(windows_stdio_host_msvcrt SHARED elfpatcher/tests/WindowsMsvcrtStdioHost.cpp)
+                add_dependencies(windows_stdio_host_msvcrt windows_stdio_msvcrt_import)
+                target_link_libraries(windows_stdio_host_msvcrt PRIVATE "${msvcrtImportLibrary}")
+                target_compile_options(windows_stdio_host_msvcrt PRIVATE -fno-builtin)
+                target_link_options(windows_stdio_host_msvcrt PRIVATE -nostdlib -Wl,--no-undefined -Wl,--entry,0)
+                set_target_properties(windows_stdio_host_msvcrt PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host_msvcrt>)
+            else()
+                add_library(windows_stdio_host SHARED elfpatcher/tests/WindowsStdioHost.cpp)
+                set_target_properties(windows_stdio_host PROPERTIES PREFIX "" WINDOWS_EXPORT_ALL_SYMBOLS ON)
+                list(APPEND windows_stdio_host_arguments $<TARGET_FILE:windows_stdio_host>)
+            endif()
+        endif()
         add_test(NAME windows_import_modules COMMAND ${Python3_EXECUTABLE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py $<TARGET_FILE:relinker>)
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_import_modules.py
+            $<TARGET_FILE:relinker> ${windows_stdio_host_arguments})
         add_test(NAME elf_header COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_elf_header.py $<TARGET_FILE:relinker>)
         add_test(NAME weak_imports COMMAND ${Python3_EXECUTABLE}
