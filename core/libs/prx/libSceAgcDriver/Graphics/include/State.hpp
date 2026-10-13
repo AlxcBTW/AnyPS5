@@ -121,6 +121,10 @@ struct State {
     std::uint32_t paClVsOutCntl = 0;
 };
 
+// PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
+// distance vectors); a vertex program's artifact depends on them.
+inline constexpr std::uint32_t PositionExportLayoutBits = 0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u);
+
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
 std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
