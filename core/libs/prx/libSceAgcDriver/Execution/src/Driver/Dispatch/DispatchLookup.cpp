@@ -257,6 +257,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     if (relocatedHit) {
                         ApplyRelocation(*patched, *variant->relocation, liveWords, userData);
                         ++counters.relocatedHits;
+                        relocatedDispatchHits.fetch_add(1, std::memory_order_relaxed);
                         if (movedPointers) ++counters.relocatedPointers;
                         if (movedAddresses) ++counters.relocatedAddresses;
                     }

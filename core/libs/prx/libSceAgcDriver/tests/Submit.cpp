@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "execution/VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -717,6 +718,63 @@ void testRegisteredVertexWorkgroupRouting() {
     check(expectFailure([&] { static_cast<void>(VertexWorkgroupRequired(queue, registry)); }).find("reserved graphics program address") != std::string::npos, "reserved NGG program address bits were accepted");
 }
 
+// Address-free dispatch-cache keys: a program that loads its input and output V#s from a table
+// behind user words 0..1 copies 256 words. Every round the table moves (a per-frame ring) and so
+// do both buffers; each dispatch must copy its own input into its own output. With content keys on
+// (the default) the moved rounds hit the cache relocated; a table that names a smaller input must
+// miss (a wrong hit would copy every word). Registered three times: in the agc_driver run, as
+// agc_driver_content_key_verify (APS5_VERIFY_CONTENT_HITS=1: every relocated hit recaptured and
+// compared) and as agc_driver_content_key_off (APS5_NO_DISPATCH_CONTENT_KEY=1: no relocated hits).
+void testContentKeyDispatch() {
+    // s_load_dwordx8 s[4:11], s[0:1]; v0 = (s2 << 6) + v0; buffer_load v1 via s[4:7]; buffer_store v1 via s[8:11].
+    alignas(256) static const std::array<std::uint32_t, 12> code{0xf40c0100u, 0xfa000000u, 0xbf8cc07fu, 0xd7460000u, 0x04010c02u, 0xe0302000u, 0x80010100u, 0xbf8c3f70u, 0xe0702000u, 0x80020100u, 0xbf810000u, 0xbf9f0000u};
+    constexpr std::uint32_t threads = 256;
+    constexpr std::uint32_t rounds = 6;
+    constexpr std::uint32_t smallRound = 4;
+    const bool contentKeys = std::getenv("APS5_NO_DISPATCH_CONTENT_KEY") == nullptr;
+    auto* ring = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 65536));
+    auto* buffers = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 2 * rounds * threads * 4));
+    std::fill(ring, ring + 16384, 0u);
+    const auto descriptor = [](const std::uint32_t* at, std::uint32_t records) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at));
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), records, 0x31016facu};
+    };
+    const auto codeAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(code.data()));
+    const auto before = AgcDriver::DriverDetail::relocatedDispatchHits.load();
+    for (std::uint32_t round = 0; round < rounds; ++round) {
+        auto* table = ring + 64 + round * 96;
+        auto* input = buffers + round * 2 * threads;
+        auto* output = input + threads;
+        for (std::uint32_t i = 0; i < threads; ++i) {
+            input[i] = (round << 24u) | 0x00c0de00u | i;
+            output[i] = 0;
+        }
+        const auto records = round == smallRound ? threads / 2 : threads;
+        const auto in = descriptor(input, records);
+        const auto out = descriptor(output, threads);
+        std::copy(in.begin(), in.end(), table);
+        std::copy(out.begin(), out.end(), table + 4);
+        const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table));
+        submit(0x2a, {
+            0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
+            0xc0037600u, 0x207u, 64u, 1u, 1u,
+            0xc0027600u, 0x212u, 0u, (2u << 1u) | (1u << 7u),
+            0xc0027600u, 0x240u, static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u),
+            0xc0031500u, threads / 64u, 1u, 1u, 0x8041u});
+        AgcDriverWaitIdle_nid_postfix();
+        for (std::uint32_t i = 0; i < threads; ++i) {
+            const auto expected = i < records ? input[i] : 0u;
+            if (output[i] != expected) throw std::runtime_error("content-key dispatch round " + std::to_string(round) + ": word " + std::to_string(i) + " is " + std::to_string(output[i]) + ", expected " + std::to_string(expected));
+        }
+    }
+    const auto relocated = AgcDriver::DriverDetail::relocatedDispatchHits.load() - before;
+    std::printf("content-key dispatch: %llu relocated hits over %u rounds (content keys %s)\n", static_cast<unsigned long long>(relocated), rounds, contentKeys ? "on" : "off");
+    if (contentKeys) check(relocated >= 2, "moved tables with the same content did not hit the dispatch cache relocated");
+    else check(relocated == 0, "APS5_NO_DISPATCH_CONTENT_KEY=1 still relocated dispatch-cache hits");
+    GuestHeap::GuestHeapFree_nid_postfix(buffers);
+    GuestHeap::GuestHeapFree_nid_postfix(ring);
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -745,6 +803,12 @@ int main(int argc, char** argv) {
         }
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
+        if (argc == 2 && std::string_view(argv[1]) == "--content-key") {
+            testContentKeyDispatch();
+            LibcRunShutdown_nid_postfix();
+            std::puts("Content-key dispatch passed");
+            return 0;
+        }
         alignas(256) std::array<std::uint32_t, 64> rawCode{};
         rawCode.fill(0xbf800000);
         rawCode[0] = 0xbe8003ff;
@@ -838,6 +902,7 @@ int main(int argc, char** argv) {
         testCopyBehindWriters();
         testRegisteredFloatMode();
         testReadOnlyResummarize();
+        testContentKeyDispatch();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");

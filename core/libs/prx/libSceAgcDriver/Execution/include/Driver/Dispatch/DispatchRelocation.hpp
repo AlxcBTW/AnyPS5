@@ -4,6 +4,7 @@
 #include "Recompiler.hpp"
 #include "UserDataUse.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -33,6 +34,8 @@ namespace AgcDriver::DriverDetail {
 inline constexpr std::uint32_t BufferBaseLowMask = 0xfffffffcu;
 inline constexpr std::uint32_t BufferBaseHighMask = 0x0000ffffu;
 inline constexpr std::uint32_t PointerWordMask = 0xffffffffu;
+// Relocated dispatch-cache hits since start (tests).
+extern std::atomic<std::uint64_t> relocatedDispatchHits;
 // Bound on the words a content key hashes behind the pointer words.
 inline constexpr std::size_t ContentKeyMaxWords = 256;
 

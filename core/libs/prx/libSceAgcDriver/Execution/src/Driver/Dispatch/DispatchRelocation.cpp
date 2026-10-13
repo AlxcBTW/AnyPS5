@@ -7,6 +7,8 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::atomic<std::uint64_t> relocatedDispatchHits{0};
+
 namespace {
 
 // The range a guard treats as a V#'s buffer: at least this many bytes (a null-sized V# still names
