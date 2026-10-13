@@ -318,14 +318,27 @@ public:
 };
 
 struct ResourceProgram {
-    explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))), plan(std::make_shared<const IrResourcePlan>(ResourceMaterializer{}.ExtractPlan(*program))) {}
+    explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
+        const auto clearRegisterState = [](const auto& storage) {
+            for (const auto& block : storage) {
+                block->ssaScalarValues.fill(nullptr);
+                block->ssaVectorValues.fill(nullptr);
+                block->ssaThreadBitScalarValues.fill(nullptr);
+                block->ssaScalarMaskTags.fill(nullptr);
+            }
+        };
+        clearRegisterState(program->Blocks());
+        clearRegisterState(program->Resources().blockStorage);
+        if (reclaim) program->ReclaimUnusedValues();
+        plan = std::make_shared<const IrResourcePlan>(ResourceMaterializer{}.ExtractPlan(*program));
+    }
 
     std::unique_ptr<IrProgram> program;
     std::shared_ptr<const IrResourcePlan> plan;
 };
 
 std::shared_ptr<const IrResourcePlan> makeResourcePlan(const RecompileRequest& request) {
-    return ResourceProgram(request).plan;
+    return ResourceProgram(request, nullptr, false).plan;
 }
 
 struct SourceKeyHash {
@@ -344,7 +357,7 @@ bool FailureMemo() {
     return memo;
 }
 
-std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) {
+std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) {
     static PrimedSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
@@ -388,7 +401,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         if (source->plan == nullptr) {
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
             try {
-                ResourceProgram resource(request, preparation);
+                ResourceProgram resource(request, preparation, reclaim);
                 source->plan = std::move(resource.plan);
                 source->program = std::move(resource.program);
             } catch (...) {
@@ -1187,7 +1200,7 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
     return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
         auto handle = std::make_shared<SourceHandle>();
-        handle->source = getSource(request, preparation);
+        handle->source = getSource(request, preparation, false);
         RecompileCacheKey::BuildInterface(request, handle->staticKey);
         handle->staticKey.push_back(HostSubgroupSize(request));
         bool cacheHit = false;
