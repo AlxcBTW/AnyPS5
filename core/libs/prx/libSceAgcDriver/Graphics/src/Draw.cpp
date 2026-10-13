@@ -854,6 +854,12 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+// Lab switch APS5_EXP_PR4947 (default off): draw recipes may cover draws with a depth target.
+static bool DepthRecipesEnabled() {
+    static const bool enabled = std::getenv("APS5_EXP_PR4947") != nullptr;
+    return enabled;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -2148,7 +2154,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && (!state.depth || DepthRecipesEnabled()) && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;

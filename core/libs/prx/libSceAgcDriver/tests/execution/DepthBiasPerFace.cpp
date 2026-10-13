@@ -5,6 +5,7 @@
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <span>
@@ -273,6 +274,11 @@ void DepthDrawRecipe(AgcDriver::VulkanDevice& device) {
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_EXP_PR4947", "1");
+#else
+        setenv("APS5_EXP_PR4947", "1", 1);
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Draw(*device, -Bias, Bias);
