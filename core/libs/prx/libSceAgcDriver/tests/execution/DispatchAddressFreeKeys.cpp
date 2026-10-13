@@ -85,7 +85,6 @@ public:
             device.ComputeTarget(64),
             {0, 0, 0, 128}
         };
-        request.useCache = false;
         results.push_back(std::make_unique<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request)));
         const auto& result = *results.back();
         auto prepared = prepare ? device.PrepareDispatch(result, {}, Threads, codeAddress) : nullptr;
