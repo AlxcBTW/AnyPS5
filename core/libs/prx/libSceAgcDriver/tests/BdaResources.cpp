@@ -175,6 +175,177 @@ void failedImportRemapTests(const Context& context, const BdaTestAccess& access)
     ::operator delete(block, std::align_val_t{piece});
 }
 
+// exp (APS5_EXP_BDA_SWEEP_SKIP): the space's part of InPlaceReads is one list per cached address space,
+// shared by the builds of an unchanged registry, rebuilt with the space when the registry changes
+// (a range added or removed), and the two parts always concatenate to InPlaceReads().
+void spaceReadListTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    void* block = ::operator new(3 * piece, std::align_val_t{piece});
+    std::memset(block, 0x5c, 3 * piece);
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    auto* guest = static_cast<std::uint8_t*>(block);
+    const auto change = [&](std::uint8_t* range, bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, true, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto build = [&](const char* step) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        const auto split = leased.SplitInPlaceReads();
+        Require(split.has_value() && split->space != nullptr, std::string("an address-based build that took the space whole has no split reads: ") + step);
+        auto joined = *split->space;
+        joined.insert(joined.end(), split->own.begin(), split->own.end());
+        Require(joined == leased.InPlaceReads(), std::string("the split reads differ from InPlaceReads: ") + step);
+        Require(Recorder::ValidReadList(*split->space), std::string("the space's read list is not sorted and disjoint: ") + step);
+        leased.WriteBack();
+        Require(!leased.SplitInPlaceReads().has_value(), "a committed build still offers split reads");
+        return split->space;
+    };
+    const auto lists = [&](const std::shared_ptr<const Recorder::ReadList>& list, const std::uint8_t* range) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(range);
+        return std::any_of(list->begin(), list->end(), [&](const auto& read) { return read.first <= begin && begin + piece <= read.second; });
+    };
+    change(guest, true);
+    change(guest + piece, true);
+    const auto first = build("first build");
+    Require(lists(first, guest) && lists(first, guest + piece) && !lists(first, guest + 2 * piece), "the space's read list does not hold exactly the registered pieces");
+    const auto again = build("unchanged registry");
+    Require(again == first, "a build in an unchanged registry did not share the space's read list");
+    change(guest + 2 * piece, true);
+    const auto added = build("range added");
+    Require(added != first && lists(added, guest + 2 * piece), "a registered range is missing from the read list after the registry changed");
+    change(guest + piece, false);
+    const auto removed = build("range removed");
+    Require(removed != added && !lists(removed, guest + piece) && lists(removed, guest), "a removed range is still in the read list");
+    {
+        // A descriptor build without the address space has nothing to split.
+        GuestBufferMemory plain(importing);
+        plain.AddReadable(reinterpret_cast<std::uintptr_t>(guest), 256);
+        plain.Upload(false);
+        Require(!plain.SplitInPlaceReads().has_value(), "a build without the address space offers split reads");
+        plain.WriteBack();
+    }
+    change(guest, false);
+    change(guest + 2 * piece, false);
+    ::operator delete(block, std::align_val_t{piece});
+}
+
+// exp (APS5_EXP_BDA_SWEEP_SKIP mask 2): a build with regions of its own takes its BDA table ranges from
+// the space's memo, equal to AddressRanges() (verify on every hit); equal own entries and writes hit
+// under the same serial, other writes or a changed registry do not, and mask 0 leaves such builds to
+// the merge as before.
+void spaceTableMemoTests(const Context& context) {
+    if (!AddressSpaceCounters().enabled) return;
+    constexpr std::size_t piece = 65536;
+    auto* mapped = static_cast<std::uint8_t*>(::operator new(piece, std::align_val_t{piece}));
+    auto* cpuOnly = static_cast<std::uint8_t*>(::operator new(piece, std::align_val_t{piece}));
+    auto* added = static_cast<std::uint8_t*>(::operator new(piece, std::align_val_t{piece}));
+    std::memset(mapped, 0x11, piece);
+    std::memset(cpuOnly, 0x22, piece);
+    std::memset(added, 0x33, piece);
+    alignas(256) std::array<std::uint32_t, 64> unregistered{};
+    auto importing = context;
+    importing.hostImportAlignment = piece;
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(mapped, piece, true, true, true);
+        mutation.Add(cpuOnly, piece, true, true, false);
+    }
+    const auto same = [](const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right) {
+        return left.size() == right.size() && (left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(left.front())) == 0);
+    };
+    struct Built {
+        std::uint64_t serial;
+        std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    };
+    const auto build = [&](bool written, const char* step) {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        // Outside the space: a range registered without GPU access (an import of its own once made)
+        // and, when written, an unregistered one (copied per build).
+        leased.AddReadable(reinterpret_cast<std::uintptr_t>(cpuOnly), 4096);
+        if (written) leased.AddWritable(reinterpret_cast<std::uintptr_t>(unregistered.data()), sizeof(unregistered));
+        leased.Upload(true);
+        const auto table = leased.CachedAddressTable();
+        Require(table.has_value() && table->ranges != nullptr, std::string("a build with regions of its own has no memo table: ") + step);
+        Built result{table->serial, leased.AddressRanges()};
+        Require(same(*table->ranges, result.ranges), std::string("the memo's BDA table ranges differ from AddressRanges(): ") + step);
+        leased.WriteBack();
+        return result;
+    };
+    SetBdaSweepSkip(2, 1);
+    const auto before = SweepSkipCounters();
+    const auto first = build(false, "first");
+    const auto second = build(false, "unchanged");
+    const auto hits = SweepSkipCounters().tables - before.tables;
+    if (same(first.ranges, second.ranges)) Require(hits == 1 && second.serial == first.serial, "equal own entries and writes missed the memo");
+    else Require(hits == 0 && second.serial != first.serial, "different own entries hit the memo");
+    Require(SweepSkipCounters().tablesVerified == SweepSkipCounters().tables, "a memo hit was not verified with SKIP_VERIFY=1");
+    const auto written = build(true, "written");
+    Require(written.serial != first.serial && written.serial != second.serial, "a build with other writes took another key's memo table");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(added, piece, true, true, true);
+    }
+    const auto changed = build(false, "registry changed");
+    Require(changed.serial != second.serial && std::any_of(changed.ranges.begin(), changed.ranges.end(), [&](const auto& range) { return range.begin == reinterpret_cast<std::uintptr_t>(added); }), "a changed registry kept the old space's memo table");
+    SetBdaSweepSkip(0, 0);
+    {
+        GuestBufferMemory leased(importing);
+        leased.AcquireRegistered();
+        leased.AddReadable(reinterpret_cast<std::uintptr_t>(cpuOnly), 4096);
+        leased.Upload(true);
+        Require(!leased.CachedAddressTable().has_value(), "mask 0 still serves a build with regions of its own from the memo");
+        leased.WriteBack();
+    }
+    // Mask 4: a build whose only regions are the space's and whose writes land in a writable import
+    // binds the space's own table (the serial of a build without writes); its ranges equal
+    // AddressRanges() and the per-writes table mask 0 builds for the same writes.
+    {
+        const auto table = [&](std::int64_t mask, bool written, const char* step) {
+            SetBdaSweepSkip(mask, 1);
+            GuestBufferMemory leased(importing);
+            leased.AcquireRegistered();
+            if (written) leased.AddWritable(reinterpret_cast<std::uintptr_t>(mapped) + 256, 512);
+            leased.Upload(true);
+            const auto cached = leased.CachedAddressTable();
+            Require(cached.has_value() && cached->ranges != nullptr, std::string("a build of the space alone has no cached table: ") + step);
+            Built result{cached->serial, leased.AddressRanges()};
+            Require(same(*cached->ranges, result.ranges), std::string("the cached table differs from AddressRanges(): ") + step);
+            leased.WriteBack();
+            return result;
+        };
+        const auto plain = table(4, false, "no writes");
+        const auto tablesBefore = SweepSkipCounters().tables;
+        const auto written = table(4, true, "writes in a writable import, mask 4");
+        Require(written.serial == plain.serial && SweepSkipCounters().tables == tablesBefore + 1, "writes in a writable import did not bind the space's table");
+        const auto keyed = table(0, true, "writes in a writable import, mask 0");
+        Require(keyed.serial != plain.serial && same(keyed.ranges, written.ranges), "the per-writes table differs from the space's table it replaces");
+        // Mask 8: builds taking the space stamp its imports from the compact list; the verify (every
+        // stamp here) checks each base region's import against the walk's stamp.
+        const auto stampsBefore = SweepSkipCounters();
+        table(8, false, "stamps from the list");
+        table(8, true, "stamps from the list, written");
+        const auto stampsAfter = SweepSkipCounters();
+        Require(stampsAfter.stamps == stampsBefore.stamps + 2 && stampsAfter.stampsVerified == stampsBefore.stampsVerified + 2, "builds taking the space did not stamp their imports from the list");
+    }
+    SetBdaSweepSkip(-1, 0);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(mapped);
+        mutation.Remove(cpuOnly);
+        mutation.Remove(added);
+    }
+    ::operator delete(mapped, std::align_val_t{piece});
+    ::operator delete(cpuOnly, std::align_val_t{piece});
+    ::operator delete(added, std::align_val_t{piece});
+}
+
 void importWindowTests(const Context& context) {
     constexpr std::size_t piece = 65536;
     constexpr std::size_t window = 2 * piece;
@@ -1430,6 +1601,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importCrossingTests(context, access);
     importSpanTests(context);
     failedImportRemapTests(context, access);
+    spaceReadListTests(context);
+    spaceTableMemoTests(context);
     importWindowTests(context);
     importJoinTests(context);
     importWholeRangeOverWindowTests(context);

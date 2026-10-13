@@ -17,24 +17,27 @@ namespace AgcDriver::Graphics {
 void ShutdownGuestBufferWorkers();
 
 // exp (APS5_EXP_BDA_SWEEP_SKIP, never push): the lever's mask (1 = an address-based build notes the
-// space's in-place reads by reference, 2 = a build with regions of its own takes its BDA table ranges
-// from the space's memo, 4 = a build whose writes all land in writable ranges binds the space's own
-// table; bit 8 of the original, the import use stamps, has no counterpart on this branch) and
+// space's in-place reads by reference, 2 = it takes its BDA table ranges from the space's memo, 4 = a
+// build whose writes all land in writable ranges binds the space's own table, 8 = a build taking the
+// space stamps its imports' use from a compact list; 15 = all) and
 // APS5_EXP_BDA_SWEEP_SKIP_VERIFY, both hot (Aps5Hot::Lever); callers read each once per use.
 // SetBdaSweepSkip overrides both (tests); a negative mask returns them to the levers.
 std::int64_t BdaSweepSkip();
 std::int64_t BdaSweepSkipVerify();
 void SetBdaSweepSkip(std::int64_t mask, std::int64_t verify);
-// Counts one per-build walk of the cached address space that was skipped (`what`: 0 = the in-place
-// read notes, 1 = the BDA table ranges) and, when `verify` is positive, runs `same` on every
-// verify-th skip of that kind: false aborts the process ("FATAL: [bda-skip] verify"). Under
-// APS5_PROFILE_DRAW the counts are printed as [bda-skip] every 10 s.
+// exp (APS5_EXP_BDA_SWEEP_SKIP, never push): counts one per-build walk of the cached address space
+// that was skipped (`what`: 0 = the in-place read notes, 1 = the BDA table ranges, 2 = the import
+// use stamps) and, when `verify`
+// is positive, runs `same` on every verify-th skip of that kind: false aborts the process ("FATAL:
+// [bda-skip] verify"). Under APS5_PROFILE_DRAW the counts are printed as [bda-skip] every 10 s.
 void NoteSweepSkip(int what, std::int64_t verify, const std::function<bool()>& same);
 struct SweepSkipStats {
     std::uint64_t readNotes = 0;
     std::uint64_t readNotesVerified = 0;
     std::uint64_t tables = 0;
     std::uint64_t tablesVerified = 0;
+    std::uint64_t stamps = 0;
+    std::uint64_t stampsVerified = 0;
 };
 SweepSkipStats SweepSkipCounters();
 

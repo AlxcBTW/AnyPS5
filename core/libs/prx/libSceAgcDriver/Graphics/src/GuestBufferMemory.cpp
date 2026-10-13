@@ -113,6 +113,10 @@ struct GuestBufferMemory::AddressSpace {
     // exp (APS5_EXP_BDA_SWEEP_SKIP): the ranges of `base` served in place by imports, in its order
     // (the space's part of InPlaceReads), when they form a valid Recorder read list; else null.
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
+    // exp (APS5_EXP_BDA_SWEEP_SKIP mask 8): the distinct imports `base` binds (`direct`), in its order:
+    // a build taking the space stamps their use from this list instead of walking `base`. Valid
+    // while the import epoch is the space's (no import retired since), as the `direct` pointers are.
+    std::vector<const HostImport*> directImports;
     mutable std::mutex tableMutex;
     mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
     // exp (APS5_EXP_BDA_SWEEP_SKIP mask 2): AddressRanges() of builds with regions of their own, keyed
@@ -2354,8 +2358,18 @@ void GuestBufferMemory::AcquireRegistered() {
             importFloor = state.useCounter + 1;
             if (hit) {
                 const auto stamp = ++state.useCounter;
-                for (const auto& region : current->base) {
-                    if (region.direct != nullptr) region.direct->lastUse = stamp;
+                // exp (APS5_EXP_BDA_SWEEP_SKIP mask 8, hot: read once per build here): the same stamp on
+                // the same imports from the space's compact list (the ~9000 base regions are walked
+                // only to find those pointers, which the space already knows).
+                if ((BdaSweepSkip() & 8) != 0) {
+                    for (const auto* entry : current->directImports) entry->lastUse = stamp;
+                    NoteSweepSkip(2, BdaSweepSkipVerify(), [&] {
+                        return std::all_of(current->base.begin(), current->base.end(), [&](const Region& region) { return region.direct == nullptr || region.direct->lastUse == stamp; });
+                    });
+                } else {
+                    for (const auto& region : current->base) {
+                        if (region.direct != nullptr) region.direct->lastUse = stamp;
+                    }
                 }
             }
         }
@@ -2512,6 +2526,9 @@ void GuestBufferMemory::AcquireRegistered() {
                         if (region.direct != nullptr) reads->emplace_back(region.begin, region.end);
                     }
                     if (Recorder::ValidReadList(*reads)) built->directReads = std::move(reads);
+                    for (const auto& region : built->base) {
+                        if (region.direct != nullptr && (built->directImports.empty() || built->directImports.back() != region.direct)) built->directImports.push_back(region.direct);
+                    }
                 }
                 space = std::move(built);
                 spaces.droppedByWaiter.store(false, std::memory_order_relaxed);
@@ -4021,8 +4038,8 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
 namespace {
 
 struct SweepSkipTotals {
-    std::atomic<std::uint64_t> skips[2]{};
-    std::atomic<std::uint64_t> verified[2]{};
+    std::atomic<std::uint64_t> skips[3]{};
+    std::atomic<std::uint64_t> verified[3]{};
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::int64_t> forcedMask{-1};
     std::atomic<std::int64_t> forcedVerify{0};
@@ -4059,11 +4076,11 @@ void SetBdaSweepSkip(std::int64_t mask, std::int64_t verify) {
 
 void NoteSweepSkip(int what, std::int64_t verify, const std::function<bool()>& same) {
     auto& totals = SweepSkips();
-    const auto index = static_cast<std::size_t>(std::clamp(what, 0, 1));
+    const auto index = static_cast<std::size_t>(std::clamp(what, 0, 2));
     const auto number = totals.skips[index].fetch_add(1, std::memory_order_relaxed) + 1;
     if (verify > 0 && number % static_cast<std::uint64_t>(verify) == 0) {
         if (!same()) {
-            std::fprintf(stderr, "FATAL: [bda-skip] verify: the %s of skip %llu differ from the full walk's\n", what == 0 ? "in-place read notes" : "BDA table ranges", static_cast<unsigned long long>(number));
+            std::fprintf(stderr, "FATAL: [bda-skip] verify: the %s of skip %llu differ from the full walk's\n", what == 0 ? "in-place read notes" : what == 1 ? "BDA table ranges" : "import use stamps", static_cast<unsigned long long>(number));
             std::fflush(stderr);
             std::abort();
         }
@@ -4079,12 +4096,12 @@ void NoteSweepSkip(int what, std::int64_t verify, const std::function<bool()>& s
     }
     if (now - last < 10000 || !totals.lastReport.compare_exchange_strong(last, now)) return;
     const auto counts = SweepSkipCounters();
-    AgcDriver::ProfilePrint_nid_no_patch("[bda-skip] (cumulative) in-place read notes by reference %llu (verified %llu), BDA table ranges from the memo or the space %llu (verified %llu); a verify mismatch aborts\n", static_cast<unsigned long long>(counts.readNotes), static_cast<unsigned long long>(counts.readNotesVerified), static_cast<unsigned long long>(counts.tables), static_cast<unsigned long long>(counts.tablesVerified));
+    AgcDriver::ProfilePrint_nid_no_patch("[bda-skip] (cumulative) in-place read notes by reference %llu (verified %llu), BDA table ranges from the memo %llu (verified %llu), import stamps from the space's list %llu (verified %llu); a verify mismatch aborts\n", static_cast<unsigned long long>(counts.readNotes), static_cast<unsigned long long>(counts.readNotesVerified), static_cast<unsigned long long>(counts.tables), static_cast<unsigned long long>(counts.tablesVerified), static_cast<unsigned long long>(counts.stamps), static_cast<unsigned long long>(counts.stampsVerified));
 }
 
 SweepSkipStats SweepSkipCounters() {
     auto& totals = SweepSkips();
-    return {totals.skips[0].load(std::memory_order_relaxed), totals.verified[0].load(std::memory_order_relaxed), totals.skips[1].load(std::memory_order_relaxed), totals.verified[1].load(std::memory_order_relaxed)};
+    return {totals.skips[0].load(std::memory_order_relaxed), totals.verified[0].load(std::memory_order_relaxed), totals.skips[1].load(std::memory_order_relaxed), totals.verified[1].load(std::memory_order_relaxed), totals.skips[2].load(std::memory_order_relaxed), totals.verified[2].load(std::memory_order_relaxed)};
 }
 
 std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {
