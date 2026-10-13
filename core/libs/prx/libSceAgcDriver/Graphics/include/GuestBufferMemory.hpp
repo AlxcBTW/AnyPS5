@@ -136,6 +136,8 @@ void ResetHeapRebalance();
 struct DevicePressure {
     std::uint64_t excess = 0;
     std::uint64_t reading = 0;
+    // The host import heap was tight at that reading.
+    bool hostTight = false;
 };
 DevicePressure DeviceHeapPressure();
 // exp (APS5_EXP_HEAP_BUDGET): `bytes` of host-visible staging were recorded into the open batch; past 128 MiB
@@ -180,6 +182,8 @@ struct DeviceMirrorStats {
     std::uint64_t syncPromotions = 0;
     std::uint64_t devicePromotions = 0;
     std::uint64_t devicePromotedBytes = 0;
+    // ... and those that came back instead of a host-visible mirror (no device-local room for theirs).
+    std::uint64_t hostMirrorPromotions = 0;
 };
 DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the

@@ -202,6 +202,7 @@ void destroyImport(const Context& context, const HostImport& entry) {
 using ImportNode = std::map<std::uint64_t, HostImport>::node_type;
 
 bool heapBudgetEnabled();
+void unspillForHostMirror(std::uint64_t base);
 
 // The bytes of dropped imports whose Vulkan objects still exist (RetiredImport).
 std::atomic<std::uint64_t> retiredImportBytes{0};
@@ -871,6 +872,8 @@ struct HeapWatch {
     std::atomic<std::uint64_t> syncPromotions{0};
     std::atomic<std::uint64_t> devicePromotions{0};
     std::atomic<std::uint64_t> devicePromotedBytes{0};
+    // Ranges given up that came back as imports instead of a host-visible mirror (unspillForHostMirror).
+    std::atomic<std::uint64_t> hostMirrorPromotions{0};
     // Readings of the heaps' budgets taken so far (under `mutex`).
     std::uint64_t readings = 0;
 };
@@ -2271,6 +2274,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
     }
     const bool device = deviceMirrorWanted(context, range->address, mirror->bytes, range->writable);
+    if (!device && heap && heapBudgetEnabled()) unspillForHostMirror(range->address);
     try {
         if (device) {
             try {
@@ -3101,9 +3105,38 @@ DevicePressure DeviceHeapPressure() {
     auto& heaps = Heaps();
     std::lock_guard lock(heaps.mutex);
     const auto& last = heaps.last;
-    if (last.deviceHeap == UINT32_MAX || last.deviceBudget == 0) return {};
+    DevicePressure pressure;
+    pressure.reading = heaps.readings;
+    pressure.hostTight = last.tight;
+    if (last.deviceHeap == UINT32_MAX || last.deviceBudget == 0) return pressure;
     const auto wanted = last.deviceUsage + DeviceHeapReserve(last.deviceBudget);
-    return {wanted > last.deviceBudget ? wanted - last.deviceBudget : 0, heaps.readings};
+    pressure.excess = wanted > last.deviceBudget ? wanted - last.deviceBudget : 0;
+    return pressure;
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): a mirror about to be made in host-visible memory for a range given up for a
+// device-local one (no room there now): the range is imported again from the next build on, and that
+// build releases the mirror (releaseImportedMirrors). An import takes the same host heap as such a mirror
+// without the copy (parl0v's 16 GB run of f579c8687: host-visible storage buffers swung from 0.25 to
+// 1.1 GB, peak 1,287 MiB, whenever heap 0 went short).
+namespace {
+
+void unspillForHostMirror(std::uint64_t base) {
+    auto& heaps = Heaps();
+    {
+        std::lock_guard lock(heaps.mutex);
+        if (heaps.spilled.erase(base) == 0) return;
+        heaps.lastPromotion = std::chrono::steady_clock::now();
+    }
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        state.failed.erase(base);
+        ++state.epoch;
+    }
+    heaps.hostMirrorPromotions.fetch_add(1, std::memory_order_relaxed);
+}
+
 }
 
 void NoteRecordedStaging(std::size_t bytes) {
@@ -3239,6 +3272,7 @@ DeviceMirrorStats DeviceMirrorCounters() {
     stats.syncPromotions = heaps.syncPromotions.load(std::memory_order_relaxed);
     stats.devicePromotions = heaps.devicePromotions.load(std::memory_order_relaxed);
     stats.devicePromotedBytes = heaps.devicePromotedBytes.load(std::memory_order_relaxed);
+    stats.hostMirrorPromotions = heaps.hostMirrorPromotions.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -3340,13 +3374,13 @@ std::string DescribeImportCensus() {
     const auto made = DeviceMirrorCounters();
     const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
     char text[2000];
-    std::snprintf(text, sizeof(text), "imports: dropped and still allocated %llu MiB (%llu MiB in the ledger, %llu parked for a replaced device, %llu MiB); CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance; back as imports: %llu for sync targets, %llu (%llu MiB) for device-local room), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+    std::snprintf(text, sizeof(text), "imports: dropped and still allocated %llu MiB (%llu MiB in the ledger, %llu parked for a replaced device, %llu MiB); CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance; back as imports: %llu for sync targets, %llu (%llu MiB) for device-local room, %llu instead of a host-visible mirror); resource cache %zu entries, CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
         mib(retiredImportBytes.load(std::memory_order_relaxed)), mib(ledgerBytes), static_cast<unsigned long long>(parked.count), mib(parked.bytes),
         static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(gpuWritten.count), mib(gpuWritten.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
         static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
         static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes),
         static_cast<unsigned long long>(deviceMirrors.count), mib(deviceMirrors.bytes), static_cast<unsigned long long>(made.mirrors), mib(made.uploadedBytes), static_cast<unsigned long long>(made.uploads), mib(made.stagingBytes), mib(made.stagingPeak), static_cast<unsigned long long>(made.stagingSyncs), static_cast<unsigned long long>(made.readbacks), mib(made.readbackLive), mib(made.readbackPeak),
-        static_cast<unsigned long long>(made.spills), mib(made.spilledBytes), mib(made.spilledWritableBytes), static_cast<unsigned long long>(made.demotions), static_cast<unsigned long long>(made.syncPromotions), static_cast<unsigned long long>(made.devicePromotions), mib(made.devicePromotedBytes),
+        static_cast<unsigned long long>(made.spills), mib(made.spilledBytes), mib(made.spilledWritableBytes), static_cast<unsigned long long>(made.demotions), static_cast<unsigned long long>(made.syncPromotions), static_cast<unsigned long long>(made.devicePromotions), mib(made.devicePromotedBytes), static_cast<unsigned long long>(made.hostMirrorPromotions), SharedResourceCache().Size(),
         static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
         static_cast<unsigned long long>(originals.images), static_cast<unsigned long long>(originals.withOriginal), mib(originals.bytes), mib(originals.validBytes));
     return text;

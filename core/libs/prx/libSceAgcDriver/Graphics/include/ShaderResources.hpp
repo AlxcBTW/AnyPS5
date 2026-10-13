@@ -588,6 +588,9 @@ private:
     mutable std::mutex mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    // exp (APS5_EXP_HEAP_BUDGET): the bound while a heap is short, set once per heap reading (see Insert).
+    std::uint64_t shortReading = 0;
+    std::size_t shortBound = 0;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

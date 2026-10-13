@@ -2851,7 +2851,21 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         const auto parsed = value ? std::strtoull(value, nullptr, 10) : 1024ull;
         return static_cast<std::size_t>(parsed != 0 ? parsed : 1024ull);
     }();
-    while (entries.size() > capacity) {
+    // exp (APS5_EXP_HEAP_BUDGET): while a heap is short (the device-local one past its budget less an eighth,
+    // or the host import heap tight), the bound is three quarters of what the cache held at that heap
+    // reading, down to 512 entries, set once per reading: the entries pin their textures, storage images and
+    // buffers past every other budget, so trimming them is what gives memory back (parl0v's 16 GB / 8 GB run
+    // of f579c8687, with the guide's 8192 entries, died on VRAM with 3 GB of device buffers in 13k objects
+    // and 1.8 GB of textures). An evicted entry is built again when its content comes back.
+    auto bound = capacity;
+    if (const auto pressure = DeviceHeapPressure(); pressure.excess != 0 || pressure.hostTight) {
+        if (shortReading != pressure.reading) {
+            shortReading = pressure.reading;
+            shortBound = std::max<std::size_t>(512, entries.size() * 3 / 4);
+        }
+        bound = std::min(bound, shortBound);
+    }
+    while (entries.size() > bound) {
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();

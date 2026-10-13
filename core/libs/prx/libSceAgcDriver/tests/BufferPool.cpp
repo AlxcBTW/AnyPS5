@@ -520,6 +520,10 @@ void HeapBudget() {
         // Plenty of free physical memory unless a case says otherwise (the runner's own would vary).
         SetRamFreeOverride(std::uint64_t{64} << 30u);
         SetHeapBudgetExperiment(0);
+        // A resource cache filled while no heap is short (the switch is off): nothing trimmed.
+        ResourceCache resources;
+        for (std::uint32_t entry = 0; entry < 1000; ++entry) resources.Insert({0xcafe0000u, entry}, nullptr);
+        Expect(resources.Size() == 1000, "the resource cache was trimmed without a short heap");
         SetHostImportHeap(1);
         Expect(PollHostHeap(context, 7129 * MiB, true).allowance == UINT64_MAX && budgetReads == 0, "the heap was read without APS5_EXP_HEAP_BUDGET");
         SetHeapBudgetExperiment(1);
@@ -591,6 +595,15 @@ void HeapBudget() {
         // Meanwhile the texture caches give up their shares of the excess (half the reserve), down to 512 MiB,
         // set once per reading of the heap.
         const auto excess = DeviceHeapPressure().excess;
+        // So does the resource cache: three quarters of what it held at this reading, the same bound
+        // within the reading, the next quarter at the next one.
+        resources.Insert({0xcafe0000u, 1000u}, nullptr);
+        Expect(resources.Size() == 750, "the resource cache did not drop to three quarters while the device-local heap was short");
+        resources.Insert({0xcafe0000u, 1001u}, nullptr);
+        Expect(resources.Size() == 750, "the resource cache's short bound moved within one reading");
+        static_cast<void>(PollHostHeap(context, 2000 * MiB, true));
+        resources.Insert({0xcafe0000u, 1002u}, nullptr);
+        Expect(resources.Size() == 563, "the resource cache did not drop again at the next reading (three quarters of 751)");
         Expect(excess == deviceReserve / 2, "the device-local heap's excess is not its use past the budget less the reserve");
         ShortTextureBudget sampledShort;
         const auto target = ShortTextureCacheBudget(sampledShort, 2048 * MiB, 1536 * MiB, 3072 * MiB);
@@ -602,6 +615,8 @@ void HeapBudget() {
         state = PollHostHeap(context, 2000 * MiB, true);
         Expect(!BufferPool::DeviceHeapTight() && DeviceHeapRoom() == 8188 * MiB - 4473 * MiB - deviceReserve, "the device-local heap's room is wrong once it has room again");
         Expect(DeviceHeapPressure().excess == 0 && ShortTextureCacheBudget(sampledShort, 2048 * MiB, 1536 * MiB, 3072 * MiB) == 2048 * MiB, "a texture cache stayed short once the device-local heap had room");
+        resources.Insert({0xcafe0000u, 1003u}, nullptr);
+        Expect(resources.Size() == 564, "the resource cache stayed short once the device-local heap had room");
         SetRamFreeOverride(UINT64_MAX);
         SetHeapBudgetExperiment(0);
         SetHostImportHeap(UINT32_MAX);

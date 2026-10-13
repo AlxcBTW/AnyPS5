@@ -961,6 +961,22 @@ void demoteTests(const Context& base, const BdaTestAccess& access) {
     const auto beforeBoth = DeviceMirrorCounters();
     static_cast<void>(build());
     Require(!HostImportCovers(context, plainAddress, 16) && DeviceMirrorCounters().devicePromotions == beforeBoth.devicePromotions && DeviceMirrorCounters().demotions == beforeBoth.demotions, "imports moved while both heaps were short");
+    // Its range registered anew (a new allocation at the same address) while heap 0 has no room: the
+    // mirror made for it now is host-visible, so the range comes back as an import from the next build on.
+    {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, plain);
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, plain, bytes, true, true, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    const auto beforeHost = DeviceMirrorCounters();
+    static_cast<void>(build());
+    Require(DeviceMirrorCounters().hostMirrorPromotions == beforeHost.hostMirrorPromotions + 1, "a range given up got a host-visible mirror and stayed given up");
+    static_cast<void>(build());
+    Require(HostImportCovers(context, plainAddress, 16), "the range did not come back as an import after its host-visible mirror");
+    heapIs(0, bytes, 0);
+    static_cast<void>(build());
+    Require(!HostImportCovers(context, plainAddress, 16), "the range was not given up again");
     // The device-local heap runs short while the host heap has room again (1 GiB more, so that it is not
     // tight either): the range comes back.
     heapIs(VkDeviceSize{1} << 30u, 0, VkDeviceSize{8} << 30u);
