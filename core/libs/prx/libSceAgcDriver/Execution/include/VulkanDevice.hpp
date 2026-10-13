@@ -72,6 +72,8 @@ public:
     bool CanWaitUnlocked() const;
     std::uint64_t SubmitAndEpoch();
     void WaitRecorded(std::uint64_t serial);
+    // exp (APS5_EXP_WAIT_WAKE=2): Recorder::WaitNextCompletion, without the mutex (nullopt: no recorder or timeline).
+    std::optional<bool> WaitNextGpuCompletion(std::chrono::microseconds bound);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();

@@ -18,6 +18,7 @@ void Check(bool condition, const char* message) {
 
 void LeversDefaultOff() {
     Check(!AgcDriver::DriverDetail::WaitWakeOn(), "APS5_EXP_WAIT_WAKE is off unless set");
+    Check(AgcDriver::DriverDetail::WaitWakeMode() == 0, "and its mode is 0");
     Check(!AgcDriver::DriverDetail::EarlyLabelSubmitOn(), "APS5_EXP_EARLY_LABEL_SUBMIT is off unless set");
 }
 
@@ -40,6 +41,16 @@ void BoundWithoutSignal() {
     Check(!WaitWake::Sleep(seen, std::chrono::milliseconds(3)), "no signal: the bound ends the sleep");
     Check(Clock::now() - start >= std::chrono::milliseconds(2), "the sleep lasted about its bound");
     Check(WaitWake::TakeCounts().timedOut == 1, "the sleep is counted as timed out");
+}
+
+void GpuSleepCounts() {
+    WaitWake::TakeCounts();
+    WaitWake::NoteGpuSleep(true);
+    WaitWake::NoteGpuSleep(true);
+    WaitWake::NoteGpuSleep(false);
+    const auto counts = WaitWake::TakeCounts();
+    Check(counts.gpuCompleted == 2 && counts.gpuBound == 1, "landing sleeps on the GPU timeline are counted by how they ended");
+    Check(WaitWake::TakeCounts().gpuCompleted == 0, "and taken");
 }
 
 // Another thread's signal wakes a sleeper long before its bound, in every interleaving.
@@ -110,6 +121,7 @@ int main() {
         LeversDefaultOff();
         SignalBeforeSleep();
         BoundWithoutSignal();
+        GpuSleepCounts();
         CrossThreadWake();
         AwaitedRegistry();
         std::cout << "wait wake tests passed\n";

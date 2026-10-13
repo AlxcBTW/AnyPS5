@@ -11,7 +11,10 @@ namespace AgcDriver::DriverDetail {
 
 // Hot levers (Aps5Hot, flippable mid-run; each wait and each packet boundary reads the live value):
 // APS5_EXP_WAIT_WAKE=1: a blocked WAIT_REG_MEM sleeps on WaitWake instead of PollSleep's plain timer.
+// =2: in addition a landing wait (it needs the GPU's own write) sleeps until the GPU timeline's next
+// completion (Recorder::WaitNextCompletion), still bounded by the same 200 us.
 bool WaitWakeOn();
+std::int64_t WaitWakeMode();
 // APS5_EXP_EARLY_LABEL_SUBMIT=1: landing and noted cross-queue waits announce their dword in AwaitedLabels,
 // and the worker whose open batch (or queue of deferred labels) holds it submits at its next packet.
 bool EarlyLabelSubmitOn();
@@ -28,10 +31,14 @@ public:
     // Sleeps until a Signal() after `seen`, or `bound`. True when a signal ended (or prevented) the sleep.
     static bool Sleep(std::uint64_t seen, std::chrono::microseconds bound);
     static void Signal();
+    // A landing sleep on the GPU timeline (WAIT_WAKE=2) ended by a completion (true) or by its bound.
+    static void NoteGpuSleep(bool completed);
     struct Counts {
         std::uint64_t signals = 0;
         std::uint64_t woken = 0;
         std::uint64_t timedOut = 0;
+        std::uint64_t gpuCompleted = 0;
+        std::uint64_t gpuBound = 0;
     };
     // Since the last call (the [waitmem] line).
     static Counts TakeCounts();

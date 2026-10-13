@@ -183,6 +183,10 @@ public:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
     void WaitSerial(std::uint64_t serial);
+    // exp (APS5_EXP_WAIT_WAKE=2, never push): like WaitSerial WITHOUT the mutex, waits until the timeline
+    // passes the value it holds now (the next batch completes) or `bound` elapses: true when a batch
+    // completed, false at the bound, nullopt without a timeline (the caller sleeps its timer instead).
+    std::optional<bool> WaitNextCompletion(std::chrono::microseconds bound);
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);

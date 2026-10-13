@@ -3258,6 +3258,26 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     Check(result, "vkWaitSemaphoresKHR recorder");
 }
 
+std::optional<bool> Recorder::WaitNextCompletion(std::chrono::microseconds bound) {
+    if (timeline == VK_NULL_HANDLE) return std::nullopt;
+    const auto counterValue = context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR");
+    const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    if (counterValue == nullptr || waitSemaphores == nullptr) return std::nullopt;
+    const UnlockedWaiter waiter{id};
+    std::uint64_t value = 0;
+    Check(counterValue(context.device, timeline, &value), "vkGetSemaphoreCounterValueKHR recorder");
+    // A host wait may name a value no batch signals yet (timeline wait-before-signal): it then runs to the bound.
+    const std::uint64_t next = value + 1;
+    VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &timeline;
+    wait.pValues = &next;
+    const auto result = waitSemaphores(context.device, &wait, static_cast<std::uint64_t>(bound.count()) * 1000u);
+    if (result == VK_TIMEOUT) return false;
+    Check(result, "vkWaitSemaphoresKHR recorder (next completion)");
+    return true;
+}
+
 void Recorder::FinishUpTo(std::uint64_t serial) {
     // A drain: the wait already happened (unlocked), the fences are signaled, so the source-0 wait
     // recorded here is the bookkeeping only (a caller that did not wait first, WaitForLeases, shows

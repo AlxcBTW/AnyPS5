@@ -1799,6 +1799,11 @@ void VulkanDevice::WaitRecorded(std::uint64_t serial) {
     if (state->recorder) state->recorder->WaitSerial(serial);
 }
 
+std::optional<bool> VulkanDevice::WaitNextGpuCompletion(std::chrono::microseconds bound) {
+    if (!state->recorder) return std::nullopt;
+    return state->recorder->WaitNextCompletion(bound);
+}
+
 void VulkanDevice::ReapRecorded(std::uint64_t serial) {
     if (!state->recorder) return;
     // The drain's site in the [recorder] table is this call's caller (Driver::execute's drain,

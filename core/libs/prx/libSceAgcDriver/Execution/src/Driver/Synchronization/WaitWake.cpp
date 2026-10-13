@@ -16,7 +16,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 std::atomic<std::uint64_t> generation{0};
-std::atomic<std::uint64_t> signals{0}, woken{0}, timedOut{0};
+std::atomic<std::uint64_t> signals{0}, woken{0}, timedOut{0}, gpuCompleted{0}, gpuBound{0};
 
 #ifdef _WIN32
 // One auto-reset event per sleeping thread (the queue workers), so a Signal wakes every sleeper and an
@@ -51,9 +51,21 @@ std::int64_t envInteger(const char* name) {
 
 }
 
-bool WaitWakeOn() {
+namespace {
+
+const Aps5Hot::Lever& waitWakeLever() {
     static const Aps5Hot::Lever lever("APS5_EXP_WAIT_WAKE", envInteger("APS5_EXP_WAIT_WAKE"));
-    return lever.On();
+    return lever;
+}
+
+}
+
+bool WaitWakeOn() {
+    return waitWakeLever().On();
+}
+
+std::int64_t WaitWakeMode() {
+    return waitWakeLever().Value();
 }
 
 bool EarlyLabelSubmitOn() {
@@ -113,8 +125,12 @@ void WaitWake::Signal() {
 #endif
 }
 
+void WaitWake::NoteGpuSleep(bool completed) {
+    (completed ? gpuCompleted : gpuBound).fetch_add(1, std::memory_order_relaxed);
+}
+
 WaitWake::Counts WaitWake::TakeCounts() {
-    return {signals.exchange(0, std::memory_order_relaxed), woken.exchange(0, std::memory_order_relaxed), timedOut.exchange(0, std::memory_order_relaxed)};
+    return {signals.exchange(0, std::memory_order_relaxed), woken.exchange(0, std::memory_order_relaxed), timedOut.exchange(0, std::memory_order_relaxed), gpuCompleted.exchange(0, std::memory_order_relaxed), gpuBound.exchange(0, std::memory_order_relaxed)};
 }
 
 struct AwaitedLabels::Entry {

@@ -265,7 +265,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 stats = WaitCensus::PerQueue{};
             }
             const auto wakes = WaitWake::TakeCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[waitwake] (10 s): WAIT_WAKE %d: sleeps ended by a label store %llu, ran to the 200 us bound %llu, signals sent to sleepers %llu; EARLY_LABEL_SUBMIT %d: batches submitted early for an awaited label %llu\n", WaitWakeOn() ? 1 : 0, static_cast<unsigned long long>(wakes.woken), static_cast<unsigned long long>(wakes.timedOut), static_cast<unsigned long long>(wakes.signals), EarlyLabelSubmitOn() ? 1 : 0, static_cast<unsigned long long>(AwaitedLabels::TakeEarlySubmits()));
+            AgcDriver::ProfilePrint_nid_no_patch("[waitwake] (10 s): WAIT_WAKE %lld: sleeps ended by a label store %llu, ran to the 200 us bound %llu, signals sent to sleepers %llu; landing sleeps on the GPU timeline: ended by a completion %llu, by the bound %llu; EARLY_LABEL_SUBMIT %d: batches submitted early for an awaited label %llu\n", static_cast<long long>(WaitWakeMode()), static_cast<unsigned long long>(wakes.woken), static_cast<unsigned long long>(wakes.timedOut), static_cast<unsigned long long>(wakes.signals), static_cast<unsigned long long>(wakes.gpuCompleted), static_cast<unsigned long long>(wakes.gpuBound), EarlyLabelSubmitOn() ? 1 : 0, static_cast<unsigned long long>(AwaitedLabels::TakeEarlySubmits()));
         }
     } censusWait{*this, CensusOn(), queue, awaited, std::chrono::steady_clock::now()};
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
@@ -486,8 +486,17 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
         } else if (pauseSpin || polls >= 4000) {
             censusWait.slept = true;
-            if (wakeOn) WaitWake::Sleep(wakeSeen, std::chrono::microseconds(200));
-            else PollSleep();
+            if (wakeOn) {
+                // WAIT_WAKE=2: a landing wait needs the GPU's write, which no store signals; the GPU timeline does.
+                std::optional<bool> completed;
+                if (requireMemory && WaitWakeMode() >= 2) {
+                    if (const auto localDevice = device.Load()) completed = localDevice->WaitNextGpuCompletion(std::chrono::microseconds(200));
+                }
+                if (completed.has_value()) WaitWake::NoteGpuSleep(*completed);
+                else WaitWake::Sleep(wakeSeen, std::chrono::microseconds(200));
+            } else {
+                PollSleep();
+            }
         } else {
             std::this_thread::yield();
         }
