@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -211,10 +212,14 @@ int main(int argc, char** argv) {
             AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), colors);
             Check(step, colors);
         }
+        // The driver's worker threads stop only in the libc shutdown; without it the process does not
+        // end after main returns.
+        LibcRunShutdown_nid_postfix();
         std::puts(noKey ? "vertex clip and cull distance draws passed without the draw key" : "vertex clip and cull distance draws passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
+        try { LibcRunShutdown_nid_postfix(); } catch (...) {}
         return 1;
     }
 }
