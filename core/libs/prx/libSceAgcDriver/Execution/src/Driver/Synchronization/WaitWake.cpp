@@ -2,6 +2,7 @@
 #include "HotLever.hpp"
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #ifdef _WIN32
@@ -17,6 +18,12 @@ namespace {
 
 std::atomic<std::uint64_t> generation{0};
 std::atomic<std::uint64_t> signals{0}, woken{0}, timedOut{0}, gpuCompleted{0}, gpuBound{0};
+
+// The portable sleep (other systems, or a thread without an event slot): a condition variable whose waiters
+// count first, so Signal() takes the mutex only while one may be waiting.
+std::mutex wakeMutex;
+std::condition_variable wakeChanged;
+std::atomic<std::uint32_t> waitingOnCondition{0};
 
 #ifdef _WIN32
 // One auto-reset event per sleeping thread (the queue workers), so a Signal wakes every sleeper and an
@@ -103,17 +110,21 @@ bool WaitWake::Sleep(std::uint64_t seen, std::chrono::microseconds bound) {
         return signalled;
     }
 #endif
-    if (generation.load(std::memory_order_seq_cst) != seen) {
-        woken.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    std::this_thread::sleep_for(bound);
-    timedOut.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    std::unique_lock lock(wakeMutex);
+    waitingOnCondition.fetch_add(1, std::memory_order_seq_cst);
+    const bool signalled = wakeChanged.wait_for(lock, bound, [seen] { return generation.load(std::memory_order_seq_cst) != seen; });
+    waitingOnCondition.fetch_sub(1, std::memory_order_seq_cst);
+    (signalled ? woken : timedOut).fetch_add(1, std::memory_order_relaxed);
+    return signalled;
 }
 
 void WaitWake::Signal() {
     generation.fetch_add(1, std::memory_order_seq_cst);
+    if (waitingOnCondition.load(std::memory_order_seq_cst) != 0) {
+        { std::lock_guard lock(wakeMutex); }
+        signals.fetch_add(1, std::memory_order_relaxed);
+        wakeChanged.notify_all();
+    }
 #ifdef _WIN32
     if (sleepingNow.load(std::memory_order_seq_cst) == 0) return;
     signals.fetch_add(1, std::memory_order_relaxed);

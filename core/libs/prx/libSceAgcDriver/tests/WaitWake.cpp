@@ -70,13 +70,8 @@ void CrossThreadWake() {
         if (round % 2 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
         WaitWake::Signal();
         sleeper.join();
-#ifdef _WIN32
         Check(result.load(), "the signal woke the sleeper");
         Check(elapsedMs.load() < 1000, "the sleeper woke well before its 5 s bound");
-#else
-        (void)result;
-        Check(elapsedMs.load() <= 6000, "the sleeper returned");
-#endif
     }
 }
 
