@@ -12,6 +12,7 @@ struct CompileProgress {
     std::uint64_t lastBeginMs;
     std::uint64_t lastEndMs;
     std::uint64_t lastDurationMs;
+    std::uint64_t expected;
 };
 
 inline std::uint64_t CompileClockMs() {
@@ -22,6 +23,7 @@ extern "C" {
 
 void CompileBegin_nid_postfix();
 void CompileEnd_nid_postfix();
+void SetCompileExpected_nid_postfix(std::uint64_t total);
 CompileProgress CompileSnapshot_nid_postfix();
 
 }

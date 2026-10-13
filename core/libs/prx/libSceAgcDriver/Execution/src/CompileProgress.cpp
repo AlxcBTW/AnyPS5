@@ -9,6 +9,7 @@ std::atomic<std::uint32_t> active{0};
 std::atomic<std::uint64_t> lastBeginMs{0};
 std::atomic<std::uint64_t> lastEndMs{0};
 std::atomic<std::uint64_t> lastDurationMs{0};
+std::atomic<std::uint64_t> expected{0};
 
 }
 
@@ -28,8 +29,12 @@ void CompileEnd_nid_postfix() {
     active.fetch_sub(1, std::memory_order_relaxed);
 }
 
+void SetCompileExpected_nid_postfix(std::uint64_t total) {
+    expected.store(total, std::memory_order_relaxed);
+}
+
 CompileProgress CompileSnapshot_nid_postfix() {
-    return CompileProgress{completed.load(std::memory_order_relaxed), active.load(std::memory_order_relaxed), lastBeginMs.load(std::memory_order_relaxed), lastEndMs.load(std::memory_order_relaxed), lastDurationMs.load(std::memory_order_relaxed)};
+    return CompileProgress{completed.load(std::memory_order_relaxed), active.load(std::memory_order_relaxed), lastBeginMs.load(std::memory_order_relaxed), lastEndMs.load(std::memory_order_relaxed), lastDurationMs.load(std::memory_order_relaxed), expected.load(std::memory_order_relaxed)};
 }
 
 }
