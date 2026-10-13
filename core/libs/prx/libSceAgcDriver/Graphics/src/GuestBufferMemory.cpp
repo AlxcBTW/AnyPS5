@@ -2850,7 +2850,7 @@ std::string DescribeImportCensus() {
             }
         }
     }
-    Kind heapMirrors, imageMirrors, shadowed;
+    Kind heapMirrors, imageMirrors, shadowed, deviceMirrors;
     {
         auto& state = Mirrors();
         std::lock_guard lock(state.mutex);
@@ -2858,6 +2858,10 @@ std::string DescribeImportCensus() {
             auto& kind = mirror->heap ? heapMirrors : imageMirrors;
             ++kind.count;
             kind.bytes += mirror->bytes;
+            if (mirror->device) {
+                ++deviceMirrors.count;
+                deviceMirrors.bytes += mirror->bytes;
+            }
             if (!mirror->shadow.empty()) {
                 ++shadowed.count;
                 shadowed.bytes += mirror->shadow.size();
@@ -2865,12 +2869,15 @@ std::string DescribeImportCensus() {
         }
     }
     const auto originals = StorageOriginalCensus();
+    const auto made = DeviceMirrorCounters();
     const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
-    char text[1024];
-    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+    char text[1400];
+    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies, %llu readbacks, %llu read-only imports spilled), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
         static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
         static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
-        static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes), static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
+        static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes),
+        static_cast<unsigned long long>(deviceMirrors.count), mib(deviceMirrors.bytes), static_cast<unsigned long long>(made.mirrors), mib(made.uploadedBytes), static_cast<unsigned long long>(made.uploads), static_cast<unsigned long long>(made.readbacks), static_cast<unsigned long long>(made.spills),
+        static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
         static_cast<unsigned long long>(originals.images), static_cast<unsigned long long>(originals.withOriginal), mib(originals.bytes), mib(originals.validBytes));
     return text;
 }
