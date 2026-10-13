@@ -144,6 +144,29 @@ namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
 constexpr int GuestProtGpuReadWrite = 0x30;
+constexpr int GuestProtGpuWrite = 0x20;
+
+// The allocation registry's access bits for a guest protection: the CPU bits. With
+// APS5_IMPORT_GPU_ONLY=1 (read once) a GPU read or write bit counts as well, as the host maps
+// those pages (LinuxProtFromSce: readable for a GPU read, writable for a GPU write). Memory a title
+// maps for the GPU only then joins the readable lease the GPU driver imports from, instead of
+// staying outside every host import and being copied on the CPU by every draw and dispatch that
+// binds it (whose resources can then never be reused).
+bool ImportGpuOnly() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_IMPORT_GPU_ONLY");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool RegistryReadable(int prot) {
+    return (prot & 3) != 0 || (ImportGpuOnly() && (prot & GuestProtGpuReadWrite) != 0);
+}
+
+bool RegistryWritable(int prot) {
+    return (prot & 2) != 0 || (ImportGpuOnly() && (prot & GuestProtGpuWrite) != 0);
+}
 
 #if defined(__linux__)
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
@@ -559,7 +582,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
     ValidateRange(addr, len, PS5_PAGE_SIZE);
     Trace("remap fixed %p+0x%zx prot=0x%x phys=0x%llx", addr, len, prot, static_cast<long long>(physStart));
     const auto nativeProtection = LinuxProtFromSce(prot);
-    mutation.Protect(addr, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.Protect(addr, len, RegistryReadable(prot), RegistryWritable(prot), (prot & GuestProtGpuReadWrite) != 0, [&] {
         const auto address = reinterpret_cast<std::uintptr_t>(addr);
         std::lock_guard lock(g_directLock);
         if (physStart >= 0) {
@@ -852,7 +875,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     void* mapped = MapAligned(*addr, len, PROT_NONE, flags, alignment);
     try {
         AddMapping(reinterpret_cast<std::uintptr_t>(mapped), len, static_cast<std::uint64_t>(physStart), LinuxProtFromSce(prot));
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        mutation.Add(mapped, len, RegistryReadable(prot), RegistryWritable(prot), (prot & GuestProtGpuReadWrite) != 0);
         if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
     } catch (...) {
         EraseMappings(reinterpret_cast<std::uintptr_t>(mapped), reinterpret_cast<std::uintptr_t>(mapped) + len);
@@ -880,7 +903,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment) {
     ReplaceFixedOverlap(mutation, *addr, len, flags);
     void* mapped = MapAligned(*addr, len, LinuxProtFromSce(prot), flags, alignment);
     try {
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+        mutation.Add(mapped, len, RegistryReadable(prot), RegistryWritable(prot), (prot & GuestProtGpuReadWrite) != 0);
         if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
     } catch (...) {
         Unmap(mapped, len);
@@ -913,7 +936,7 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         throw std::system_error(error, std::generic_category(), "map guest shared memory");
     }
     try {
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
+        mutation.Add(mapped, len, RegistryReadable(prot), RegistryWritable(prot), false);
     } catch (...) {
         Unmap(mapped, len);
         throw;
@@ -944,7 +967,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
 #else
         if (::mmap(mapped, len, nativeProtection, MAP_SHARED | MAP_FIXED, object, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map shared memory");
 #endif
-        mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
+        mutation.Add(mapped, len, RegistryReadable(prot), RegistryWritable(prot), false);
     } catch (...) {
         Unmap(mapped, len);
         throw;
@@ -1012,7 +1035,7 @@ int DoMprotect(const void* addr, size_t len, int prot) {
 #else
     mutation.RegisterMainImage();
 #endif
-    mutation.Protect(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
+    mutation.Protect(pointer, bytes, RegistryReadable(prot), RegistryWritable(prot), (prot & GuestProtGpuReadWrite) != 0, [&] {
         if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
     });
     RecordProtection(pointer, bytes, prot);
