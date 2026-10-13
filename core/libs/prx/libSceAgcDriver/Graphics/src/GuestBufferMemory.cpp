@@ -3140,8 +3140,15 @@ void unspillForHostMirror(std::uint64_t base) {
 }
 
 void NoteRecordedStaging(std::size_t bytes) {
+    // Counted only: the caller (a texture's construction) runs under the texture cache's lock, where the
+    // release's destructors must not run; the next lookup releases (ReleaseRecordedStaging).
     if (!heapBudgetEnabled() || bytes == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (auto* recorder = Recorder::Active(); recorder != nullptr) noteRecordedStaging(*recorder, bytes);
+    stagedUnreleased += bytes;
+}
+
+void ReleaseRecordedStaging() {
+    if (!heapBudgetEnabled() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) noteRecordedStaging(*recorder, 0);
 }
 
 void ResetHeapRebalance() {
