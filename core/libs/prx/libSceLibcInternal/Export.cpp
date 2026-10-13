@@ -7,6 +7,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <vector>
+#include <cmath>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -141,4 +142,7 @@ unsigned int APS5_VABI alarm_nid_postfix(unsigned int seconds) {
     return GuestAlarm_nid_no_patch(seconds);
 }
 
+float APS5_VABI fminf_nid_postfix(float x, float y) {
+    return std::fmin(x, y);
+}
 }
