@@ -676,7 +676,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
-                return committed.has_value() ? GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
+                if (!committed.has_value()) return GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
+                const bool fast = GuestMemory::UnchangedCommittedSince(*committed, it->generation);
+                // APS5_PROFILE_DRAW: how often a partially committed texture skips the full compare.
+                static const bool profilePartial = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                if (profilePartial) {
+                    static std::atomic<std::uint64_t> fastHits{0}, slowChecks{0};
+                    const auto fastNow = fast ? fastHits.fetch_add(1) + 1 : fastHits.load();
+                    const auto slowNow = fast ? slowChecks.load() : slowChecks.fetch_add(1) + 1;
+                    if (((fastNow + slowNow) & 0x3fffu) == 0) std::fprintf(stderr, "[partial-texture] write-stamp fast path %llu, full compare %llu\n", static_cast<unsigned long long>(fastNow), static_cast<unsigned long long>(slowNow));
+                }
+                return fast;
             };
             if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
                 it->generation = snapshotGeneration;
