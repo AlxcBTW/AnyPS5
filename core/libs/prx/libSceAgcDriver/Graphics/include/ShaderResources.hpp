@@ -157,6 +157,14 @@ public:
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    struct Relocation {
+        std::shared_ptr<DrawBindings> bindings;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        std::size_t moved = 0;
+    };
+    enum class RelocationRefusal : std::size_t { None, Layout, Written, Empty, Size, Range, Adjustment, Stale, NotImported, Aliased, Pending, Count };
+    std::optional<Relocation> Relocate(const CompiledShader& shader, const Recorder& recorder, RelocationRefusal& refusal) const;
+    static std::size_t GuestBufferBytes(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride);
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -199,7 +207,8 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool addressFreeBuffers = false);
+    static std::uint64_t AddressFreeKeyHash(const CompiledShader& shader, bool writtenToo);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
