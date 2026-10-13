@@ -100,6 +100,7 @@ VkConservativeRasterizationModeEXT decodeConservativeRasterization(const QueueSt
 // Render target index, viewport index and the misc export vector that carries them are accepted but
 // not routed: color targets are single-layer, so layered draws land in layer 0.
 constexpr std::uint32_t LayerExports = (1u << 18u) | (1u << 19u) | (1u << 21u) | (1u << 24u);
+constexpr std::uint32_t ClipCullExports = 0xffffu | (1u << 22u) | (1u << 23u);
 constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 // EXEC_ON_HIER_FAIL / EXEC_ON_NOOP / EXEC_IF_OVERLAPPED (bits 9, 10, 17) only force the pixel shader
 // to run, which it always does here.
@@ -677,6 +678,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     switch (primitive) {
         case 1: Require(result.stages.mesh.has_value(), "point-list vertex rendering requires point-size output support"); result.topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST; break;
         case 2: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST; break;
+        case 3: result.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; break;
         case 7:
         case 17:
             Require(result.stages.path == ShaderPath::Vertex, "rect-list requires vertex routing");
@@ -698,7 +700,9 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
             std::fprintf(stderr, "[gpu] layer/viewport index vertex exports are ignored (PA_CL_VS_OUT_CNTL=0x%08x)\n", read(cx, 0x207));
         }
     }
-    zero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports");
+    zero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports");
+    Require(std::popcount(read(cx, 0x207) & 0xffffu) <= 8, "more than eight clip and cull distances are unsupported");
+    result.paClVsOutCntl = read(cx, 0x207);
     result.samples = decodeSamples(cx);
     decodeSampleLocations(cx, result);
     {
@@ -751,7 +755,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     const auto raster = read(cx, 0x205);
     // Bits 5-10 give the front/back polygon type (2 = filled triangles), which POLY_MODE (bit 3) turns on
     // explicitly; KEEP_TOGETHER_ENABLE (bit 24) only affects primitive distribution across the chip.
-    const bool pointsOrLines = result.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    const bool pointsOrLines = result.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || result.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
     const auto lineOffset = (raster & 0x1800u) != 0 && !pointsOrLines ? 0x2000u : 0u;
     const auto rasterMode = raster & ~0x7u & ~(1u << 24u) & ~0x1800u & ~lineOffset & ~(1u << 19u) & ~(1u << 16u);
     if (rasterMode != 0 && rasterMode != 0x240u && rasterMode != 0x248u) throw std::runtime_error("AGC graphics: " + zeroMessage(0x205, raster, "polygon mode, depth bias or nonstandard rasterization"));
@@ -956,7 +960,8 @@ ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
     if (state.stages.mesh.has_value() || state.stages.tessellation.has_value()) return ShaderRecompiler::RasterPrimitive::Triangle;
     switch (state.topology) {
         case VK_PRIMITIVE_TOPOLOGY_POINT_LIST: return ShaderRecompiler::RasterPrimitive::Point;
-        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST: return ShaderRecompiler::RasterPrimitive::Line;
+        case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+        case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP: return ShaderRecompiler::RasterPrimitive::Line;
         default: return ShaderRecompiler::RasterPrimitive::Triangle;
     }
 }
@@ -1184,7 +1189,8 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
         if (value(queue.userConfig, 0x242, primitive) && (primitive & 0x3fu) != 1 && (primitive & 0x3fu) != 2 && (primitive & 0x3fu) != 3 && (primitive & 0x3fu) != 4 && (primitive & 0x3fu) != 5 && (primitive & 0x3fu) != 6) return "AGC graphics: primitive restart is only supported for point, line and triangle topologies";
         if (value(cx, 0x103, resetIndex) && (resetIndex & 0xffffu) != 0xffffu) return "AGC graphics: primitive restart index other than all ones is unsupported";
     }
-    if (auto reason = nonzero(cx, 0x207, ~LayerExports, "clip distances, layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x207, ~(LayerExports | ClipCullExports), "layer, viewport or auxiliary vertex exports"); !reason.empty()) return reason;
+    if (value(cx, 0x207, word) && std::popcount(word & 0xffffu) > 8) return require(false, "more than eight clip and cull distances are unsupported");
     if (value(cx, 0x200, word)) {
         const auto renderControl = find(cx, 0x000);
         const bool depthClear = renderControl != cx.end() && (renderControl->second & 1u) != 0;

@@ -1594,6 +1594,8 @@ void DepthBoundsBiasTests() {
     queue.context[0x80] = 0;
     queue.userConfig[0x242] = 2;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "polygon mode, depth bias or nonstandard rasterization");
+    queue.userConfig[0x242] = 3;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "polygon mode, depth bias or nonstandard rasterization");
     queue.userConfig[0x242] = 4;
     queue.context[0x205] = 0x00001a4au;
     queue.context[0x2de] = 0x1f0u;
@@ -2246,6 +2248,18 @@ void multisampleTests() {
     pending.NoteFill(0x40000000, 0xff0000, 0);
     clearedCmask.NoteFill(0x50000000, 0x1000, 0);
     Require(TakeMultisampledClear(clearedCmask, pending, halfFloat, clear) && clear.float32[0] == 1.0f && !TakeMultisampledClear(clearedCmask, pending, halfFloat, clear), "a pending CMASK clear and a whole fill did not clear once to the CMASK clear color");
+}
+
+void clipDistanceTests() {
+    auto queue = makeState();
+    queue.context[0x207] = 0x0040000f;
+    Require(AgcDriver::Graphics::DecodeState(queue).paClVsOutCntl == 0x0040000fu, "DecodeState dropped the PA_CL_VS_OUT_CNTL value the validator quotes");
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "four clip distances were rejected by the precheck");
+    queue.context[0x207] = 0x004001ff;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "more than eight clip and cull distances");
+    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("more than eight") != std::string::npos, "nine clip distances passed the precheck");
 }
 
 void DepthClipTests() {
@@ -3356,6 +3370,8 @@ struct ModuleShape {
     bool fragDepth = false;
     std::uint32_t sampleMaskLength = 0;
     std::uint32_t floatControlsWidth = 0;
+    std::uint32_t clipDistanceLength = 0;
+    std::uint32_t cullDistanceLength = 0;
 };
 
 void emit(std::vector<std::uint32_t>& out, spv::Op op, std::initializer_list<std::uint32_t> operands) {
@@ -3455,6 +3471,30 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
         emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInSampleMask});
         extraInterface.push_back(variable);
     }
+    if (shape.clipDistanceLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.clipDistanceLength});
+        emit(declarations, spv::OpTypeArray, {array, floatType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInClipDistance});
+        extraInterface.push_back(variable);
+    }
+    if (shape.cullDistanceLength != 0) {
+        const auto length = id();
+        const auto array = id();
+        const auto pointer = id();
+        const auto variable = id();
+        emit(declarations, spv::OpConstant, {uintType, length, shape.cullDistanceLength});
+        emit(declarations, spv::OpTypeArray, {array, floatType, length});
+        emit(declarations, spv::OpTypePointer, {pointer, spv::StorageClassOutput, array});
+        emit(declarations, spv::OpVariable, {pointer, variable, spv::StorageClassOutput});
+        emit(annotations, spv::OpDecorate, {variable, spv::DecorationBuiltIn, spv::BuiltInCullDistance});
+        extraInterface.push_back(variable);
+    }
     if (shape.perVertex) {
         const auto length = id();
         const auto array = id();
@@ -3524,6 +3564,8 @@ std::vector<std::uint32_t> makeModule(const ModuleShape& shape) {
     emit(words, spv::OpCapability, {spv::CapabilityShader});
     if (shape.sampleId) emit(words, spv::OpCapability, {spv::CapabilitySampleRateShading});
     if (shape.layer) emit(words, spv::OpCapability, {spv::CapabilityGeometry});
+    if (shape.clipDistanceLength != 0) emit(words, spv::OpCapability, {spv::CapabilityClipDistance});
+    if (shape.cullDistanceLength != 0) emit(words, spv::OpCapability, {spv::CapabilityCullDistance});
     if (shape.barycentric) {
         emit(words, spv::OpCapability, {spv::CapabilityFragmentBarycentricKHR});
         const std::string extension = "SPV_KHR_fragment_shader_barycentric";
@@ -4314,6 +4356,23 @@ void aliasedBufferViewTests() {
     }
 }
 
+void LineStripTests() {
+    using namespace AgcDriver::Graphics;
+    auto queue = makeState();
+    queue.context[0x1b3] = 2;
+    queue.context[0x1b4] = 2;
+    queue.userConfig[0x242] = 3;
+    auto state = DecodeState(queue);
+    Require(state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && !state.rectList && !state.primitiveRestart, "primitive type 3 did not decode as a line strip");
+    Require(RasterPrimitiveOf(state) == ShaderRecompiler::RasterPrimitive::Line, "a line strip draw did not get the line primitive class");
+    queue.userConfig[0x24b] = 1;
+    queue.context[0x103] = 0xffffffffu;
+    state = DecodeState(queue);
+    Require(state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && state.primitiveRestart, "primitive restart was lost on a line strip");
+    const auto rejection = DrawRejection(queue, true);
+    Require(rejection.empty(), "the draw precheck rejected an indexed line strip with primitive restart: " + rejection);
+}
+
 void ProvokingVertexTests() {
     using namespace AgcDriver::Graphics;
     constexpr std::uint32_t lastVertex = 1u << 19u;
@@ -4322,7 +4381,7 @@ void ProvokingVertexTests() {
     queue.context[0x1b4] = 2;
     const auto first = DecodeState(queue);
     Require(first.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, "the default provoking vertex is not first");
-    for (const auto primitive : {2u, 4u, 5u, 6u}) {
+    for (const auto primitive : {2u, 3u, 4u, 5u, 6u}) {
         queue.userConfig[0x242] = primitive;
         for (const auto last : {false, true, false}) {
             queue.context[0x205] = 0x240u | (last ? lastVertex : 0u);
@@ -4814,6 +4873,19 @@ void validationTests() {
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, true, false); }, "unsupported device capability 35");
         pixel.spirv = makeModule({.fragment = true, .sampleMaskLength = 2});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported fragment built-in");
+        pixel.spirv = makeModule({.fragment = true});
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 4, .cullDistanceLength = 4});
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, true, true);
+        state.paClVsOutCntl = 0x0040000fu;
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 4});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true); }, "PA_CL_VS_OUT_CNTL=0x0040000f");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, true, false);
+        vertex.spirv = makeModule({.parameterOutput = true, .cullDistanceLength = 4});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, true, false); }, "PA_CL_VS_OUT_CNTL=0x0040000f");
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true);
+        state.paClVsOutCntl = 0;
+        vertex.spirv = makeModule({.parameterOutput = true, .clipDistanceLength = 9});
+        expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, true, true); }, "clip or cull distance");
         vertex.spirv = makeModule({.parameterOutput = true, .sampleId = true});
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "unsupported device capability 35");
         vertex.spirv = makeModule({.parameterOutput = true});
@@ -5376,6 +5448,7 @@ int main(int argc, char** argv) {
         orderedPixelShaderTests();
         stencilRefExportTests();
         aliasedBufferViewTests();
+        LineStripTests();
         ProvokingVertexTests();
         ProvokingVertexRenderPassTests();
         ConservativeRasterizationTests();
@@ -5392,6 +5465,7 @@ int main(int argc, char** argv) {
         uint8x4TargetTests();
         multisampleTests();
         MsaaEnableSingleSampleTests();
+        clipDistanceTests();
         ShaderStageTests();
         NggVertexWorkgroupTests();
         TuningFieldTests();

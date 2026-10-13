@@ -5,6 +5,9 @@
 #include <cstring>
 #include <cstdio>
 #include <limits>
+#include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 
 #ifdef _WIN32
@@ -238,6 +241,9 @@ extern "C" {
 
 GuestTm* APS5_VABI localtime_s_nid_postfix(const int64_t* timer, GuestTm* result);
 GuestTm* APS5_VABI gmtime_s_nid_postfix(const int64_t* timer, GuestTm* result);
+std::size_t APS5_VABI wcsrtombs_nid_postfix(char* destination, const std::uint16_t** source, std::size_t capacity, void* state);
+std::size_t APS5_VABI mbsrtowcs_nid_postfix(std::uint16_t* destination, const char** source, std::size_t capacity, void* state);
+int APS5_VABI ___mb_cur_max_nid_postfix();
 
 void APS5_VABI tzset_nid_postfix(void) {
 #ifdef _WIN32
@@ -392,6 +398,42 @@ char* APS5_VABI ctime_nid_postfix(const int64_t* timer) {
 
 size_t APS5_VABI strftime_nid_postfix(char* str, size_t count, const char* format, const GuestTm* timeptr) {
     return libc_strftime_nid_postfix(str, count, format, timeptr);
+}
+
+size_t APS5_VABI wcsftime_nid_postfix(std::uint16_t* str, size_t count, const std::uint16_t* format, const GuestTm* timeptr) {
+    constexpr int GuestEnomem = 12;
+    constexpr int GuestEinval = 22;
+    constexpr auto Failed = static_cast<std::size_t>(-1);
+    if (format == nullptr) throw std::invalid_argument("wcsftime: null format");
+    if (timeptr == nullptr) throw std::invalid_argument("wcsftime: null time");
+    const std::uint16_t* formatCursor = format;
+    const std::size_t formatLength = wcsrtombs_nid_postfix(nullptr, &formatCursor, 0, nullptr);
+    if (formatLength == Failed) return 0;
+    const std::unique_ptr<char[]> narrowFormat(new (std::nothrow) char[formatLength + 1]);
+    if (!narrowFormat) {
+        errno = GuestEnomem;
+        return 0;
+    }
+    wcsrtombs_nid_postfix(narrowFormat.get(), &formatCursor, formatLength + 1, nullptr);
+    const auto maxCharacterBytes = static_cast<std::size_t>(___mb_cur_max_nid_postfix());
+    if (std::numeric_limits<std::size_t>::max() / maxCharacterBytes <= count) {
+        errno = GuestEinval;
+        return 0;
+    }
+    const std::unique_ptr<char[]> narrow(new (std::nothrow) char[count * maxCharacterBytes]);
+    if (!narrow) {
+        errno = GuestEnomem;
+        return 0;
+    }
+    const int callerError = errno;
+    if (strftime_nid_postfix(narrow.get(), count, narrowFormat.get(), timeptr) == 0) {
+        errno = callerError;
+        return 0;
+    }
+    const char* narrowCursor = narrow.get();
+    const std::size_t length = mbsrtowcs_nid_postfix(str, &narrowCursor, count, nullptr);
+    if (length == static_cast<std::size_t>(-2) || length == Failed || narrowCursor != nullptr) return 0;
+    return length;
 }
 
 // The guest's CLOCKS_PER_SEC is 1000000: clock() reports process CPU time in microseconds.
