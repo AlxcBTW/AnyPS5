@@ -291,6 +291,8 @@ struct VulkanDevice::State {
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
     bool maintenance8 = false;
+    bool nativeFloat16Arithmetic = false;
+    bool float16Fma = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool storageImageWithoutFormat = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
@@ -1174,6 +1176,22 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    const char* nativeHalf = std::getenv("APS5_NATIVE_FLOAT16");
+    state->nativeFloat16Arithmetic = float16Rte && nativeHalf != nullptr && std::string_view(nativeHalf) != "0";
+    VkPhysicalDeviceShaderFmaFeaturesKHR fmaFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    if (state->nativeFloat16Arithmetic && hasExtension(VK_KHR_SHADER_FMA_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fmaFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->float16Fma = fmaFeatures.shaderFmaFloat16 == VK_TRUE;
+    }
+    fmaFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    fmaFeatures.shaderFmaFloat16 = VK_TRUE;
+    if (state->float16Fma) {
+        deviceExtensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+        state->capabilities.push_back(6030);
+        state->spirvExtensions.push_back("SPV_KHR_fma");
+    }
+    APS5_LOG_OUT("Native f16 arithmetic=%d fma=%d", state->nativeFloat16Arithmetic ? 1 : 0, state->float16Fma ? 1 : 0);
     deviceExtensions.push_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
     deviceExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
     state->capabilities.push_back(4448);
@@ -1491,6 +1509,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->maintenance8) {
         maintenance8Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &maintenance8Features;
+    }
+    if (state->float16Fma) {
+        fmaFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &fmaFeatures;
     }
     if (state->nonSeamlessCubeMap) {
         nonSeamlessCubeFeatures.pNext = const_cast<void*>(deviceInfo.pNext);
@@ -3035,6 +3057,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.float64DenormPreserve = state->float64DenormPreserve;
+    target.nativeFloat16Arithmetic = state->nativeFloat16Arithmetic;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.registrationModules = state->graphicsPipelineLibrary;
     target.srgbDecodeFormats = state->srgbDecodeFormats;

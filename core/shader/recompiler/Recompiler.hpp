@@ -188,6 +188,10 @@ inline constexpr std::uint32_t InterpolationFlush32 = 2u;
 inline constexpr std::uint32_t InterpolationFlush16 = 4u;
 inline constexpr std::uint32_t InterpolationRound16Shift = 3u;
 
+inline constexpr std::uint32_t F16x2NanQuiet = 1u;
+inline constexpr std::uint32_t F16x2NanMinMax = 2u;
+inline constexpr std::uint32_t F16x2NanProduct = 4u;
+
 struct GuestContext {
     std::uint32_t waveSize;
     std::uint32_t userDataBaseRegister;
@@ -242,6 +246,7 @@ struct SpirvTarget {
     bool registrationModules = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
+    bool nativeFloat16Arithmetic = false;
 };
 
 struct BindingLayout {

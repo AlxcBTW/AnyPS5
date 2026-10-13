@@ -771,6 +771,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.registrationModules);
     writer.WriteU32(request.target.registrationWordLimit);
     writer.WriteBool(request.target.vertexSubgroups);
+    writer.WriteBool(request.target.nativeFloat16Arithmetic);
     return base64Encode(buffer);
 }
 
@@ -803,6 +804,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 17u) result.request.target.registrationModules = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
     if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
+    if (version >= 20u) result.request.target.nativeFloat16Arithmetic = reader.ReadBool();
     return result;
 }
 
