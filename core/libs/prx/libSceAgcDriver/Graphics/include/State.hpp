@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <vector>
 #include <array>
@@ -58,6 +59,7 @@ struct ColorTarget {
     std::uint64_t arrayAddress = 0;
     std::uint32_t arrayLastSlice = 0;
     std::uint32_t arraySlice = 0;
+    std::uint32_t layers = 1;
     std::uint32_t exportIndex = 0;
     bool uintExport = false;
     std::uint32_t pipeBankXor = 0;
@@ -102,6 +104,8 @@ struct State {
     bool rectList = false;
     bool dualSourceBlend = false;
     VkExtent2D renderExtent;
+    std::uint32_t renderLayers = 1;
+    std::uint32_t layerExports = 0;
     VkPrimitiveTopology topology;
     bool primitiveRestart = false;
     VkViewport viewport;
@@ -134,6 +138,7 @@ ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
+GuestTextureResource SurfaceForTarget(const ColorTarget& color);
 
 struct ColorMetadataPass {
     enum class Mode { EliminateFastClear, DccDecompress, Resolve };
