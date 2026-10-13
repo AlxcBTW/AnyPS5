@@ -11,6 +11,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
 #endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
@@ -53,7 +55,15 @@ std::filesystem::path ShaderCacheDirectory() {
     const char* directory = std::getenv("ANYPS5_SHADER_CACHE_DIR");
     if (directory != nullptr && *directory != '\0') return std::filesystem::path(directory);
     std::error_code error;
+#ifdef __APPLE__
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+    const auto executable = std::filesystem::canonical(buffer.data(), error);
+#else
     const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+#endif
     if (error) return {};
     return executable.parent_path() / "shader_cache";
 #endif

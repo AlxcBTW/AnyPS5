@@ -623,9 +623,12 @@ private:
             return true;
         };
         std::set<std::uint32_t> loopHeaders;
+        std::map<std::uint32_t, std::uint32_t> continueHeaders;
         for (const auto& [label, indices] : blocks) {
             for (const auto index : indices) {
-                if (Opcode(instructions[index]) == spv::OpLoopMerge) loopHeaders.insert(label);
+                if (Opcode(instructions[index]) != spv::OpLoopMerge) continue;
+                loopHeaders.insert(label);
+                continueHeaders.emplace(instructions[index].at(2), label);
             }
         }
         std::map<std::uint32_t, std::vector<std::uint32_t>> edges;
@@ -652,8 +655,8 @@ private:
                     retainMerge = !linearSelection(target, instruction.at(1));
                     if (!retainMerge) instruction.clear();
                 }
-                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ?
-                    Make(spv::OpSwitch, {terminal.at(1), target}) : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
+                const auto replacement = !retainMerge ? Make(spv::OpBranch, {target}) : op == spv::OpSwitch ? Make(spv::OpSwitch, {terminal.at(1), target}) :
+                    header.at(1) >= 0x00010600u ? terminal : Make(spv::OpBranchConditional, {terminal.at(1), target, target});
                 if (terminal != replacement) {
                     terminal = replacement;
                     changed = true;
@@ -680,7 +683,23 @@ private:
             const auto& successors = edges.at(label);
             pending.insert(pending.end(), successors.begin(), successors.end());
         }
+        const auto backEdge = [&](std::uint32_t label) {
+            const auto header = continueHeaders.find(label);
+            return !live.contains(label) && header != continueHeaders.end() && live.contains(header->second) ? header->second : 0u;
+        };
         for (const auto& [label, indices] : blocks) {
+            if (const auto header = backEdge(label)) {
+                const auto branch = Make(spv::OpBranch, {header});
+                if (indices.size() == 2u && instructions[indices.back()] == branch) continue;
+                for (std::size_t index = 1; index < indices.size(); ++index) {
+                    auto& instruction = instructions[indices[index]];
+                    if (const auto result = Result(instruction)) removed.insert(result);
+                    instruction.clear();
+                }
+                instructions[indices.back()] = branch;
+                changed = true;
+                continue;
+            }
             if (!live.contains(label)) {
                 if (indices.size() == 2u && Opcode(instructions[indices.back()]) == spv::OpUnreachable) continue;
                 for (std::size_t index = 1; index < indices.size(); ++index) {
@@ -699,9 +718,10 @@ private:
                 for (std::size_t operand = 3; operand + 1u < instruction.size(); operand += 2u) {
                     const auto parent = instruction[operand + 1u];
                     if (live.contains(parent) && std::ranges::find(edges.at(parent), label) != edges.at(parent).end()) phi.insert(phi.end(), {instruction[operand], parent});
+                    else if (backEdge(parent) == label) phi.insert(phi.end(), {instruction[2], parent});
                 }
                 if (phi.size() == 3u) throw std::runtime_error("reachable prepared phi has no predecessor");
-                if (phi.size() == instruction.size() && phi.size() != 5u) continue;
+                if (phi == instruction && phi.size() != 5u) continue;
                 phi[0] = (static_cast<std::uint32_t>(phi.size()) << 16u) | spv::OpPhi;
                 instruction = phi.size() == 5u ? Make(spv::OpCopyObject, {phi[1], phi[2], phi[3]}) : std::move(phi);
                 changed = true;

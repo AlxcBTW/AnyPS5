@@ -596,7 +596,7 @@ int APS5_VABI setsockopt_nid_postfix(int descriptor, int level, int option,
     if (!socket) return -1;
     const int nativeOption = Option(option);
     if (level != 0xffff || nativeOption == -1) return Fail(42);
-    if (!value || length != sizeof(int)) return Fail(22);
+    if (!value || length < sizeof(int)) return Fail(22);
     return ::setsockopt(socket->value, SOL_SOCKET, nativeOption,
         static_cast<const char*>(value), sizeof(int)) ? Fail(NativeError()) : 0;
 }

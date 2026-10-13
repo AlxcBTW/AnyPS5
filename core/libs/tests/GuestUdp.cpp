@@ -124,6 +124,12 @@ int main() {
     int option = 0;
     std::uint32_t optionSize = sizeof(option);
     Require(getsockopt_nid_postfix(sender, 0xffff, 0x20, &option, &optionSize) == 0 && option != 0);
+    for (const std::int64_t wide : {0, 1}) {
+        Require(setsockopt_nid_postfix(sender, 0xffff, 0x20, &wide, sizeof(wide)) == 0);
+        optionSize = sizeof(option);
+        Require(getsockopt_nid_postfix(sender, 0xffff, 0x20, &option, &optionSize) == 0 && (option != 0) == (wide != 0));
+    }
+    Require(setsockopt_nid_postfix(sender, 0xffff, 0x20, &enabled, 2) == -1 && *__error_nid_postfix() == 22);
     Require(setsockopt_nid_postfix(sender, 0xffff, 12345, &enabled, sizeof(enabled)) == -1);
     Require(*__error_nid_postfix() == 42);
     const int unconnected = socket_nid_postfix(2, 2, 0);
