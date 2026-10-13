@@ -2,6 +2,7 @@
 #include <spirv/unified1/spirv.hpp>
 #undef SPV_ENABLE_UTILITY_CODE
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include <cstdlib>
 #include <algorithm>
 #include <initializer_list>
 #include <map>
@@ -554,7 +555,9 @@ public:
             changed |= propagateCopies();
         }
         removeDeadComputations();
-        removeUnusedFunctions();
+        // Lab switch APS5_EXP_PR5064 (default off).
+        static const bool pruneHelpers = std::getenv("APS5_EXP_PR5064") != nullptr;
+        if (pruneHelpers) removeUnusedFunctions();
         removeUnreachableBlocks();
         removeUnusedConstants();
         orderPhis();

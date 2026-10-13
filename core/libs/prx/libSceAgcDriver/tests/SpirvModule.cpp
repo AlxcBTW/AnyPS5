@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
+#include <cstdlib>
 #include <array>
 #include <cstdio>
 #include <exception>
@@ -374,6 +375,11 @@ void testUnusedHelperFunctions() {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_EXP_PR5064", "1");
+#else
+    setenv("APS5_EXP_PR5064", "1", 1);
+#endif
     testUnusedHelperFunctions();
     testFoldingLeavesNoDeadBlocksOrConstants();
     testIdsBeyondTheBoundAreRejected();
