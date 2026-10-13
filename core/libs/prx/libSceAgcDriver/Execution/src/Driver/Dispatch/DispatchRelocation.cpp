@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
