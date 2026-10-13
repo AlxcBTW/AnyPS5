@@ -392,6 +392,11 @@ char16_t* APS5_VABI wcscpy_nid_postfix(char16_t* dest, const char16_t* src) {
     return dest;
 }
 
+char16_t* APS5_VABI wcscat_nid_postfix(char16_t* dest, const char16_t* src) {
+    std::memcpy(dest + Length(dest), src, (Length(src) + 1) * sizeof(char16_t));
+    return dest;
+}
+
 char16_t* APS5_VABI wcsncpy_nid_postfix(char16_t* dest, const char16_t* src, size_t n) {
     size_t index = 0;
     for (; index < n && src[index] != 0; ++index) dest[index] = src[index];

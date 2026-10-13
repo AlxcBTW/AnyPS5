@@ -13,6 +13,7 @@ std::size_t APS5_VABI wcslen_nid_postfix(const char16_t* s);
 int APS5_VABI wcscmp_nid_postfix(const char16_t* s1, const char16_t* s2);
 int APS5_VABI wcsncmp_nid_postfix(const char16_t* s1, const char16_t* s2, std::size_t n);
 char16_t* APS5_VABI wcscpy_nid_postfix(char16_t* dest, const char16_t* src);
+char16_t* APS5_VABI wcscat_nid_postfix(char16_t* dest, const char16_t* src);
 char16_t* APS5_VABI wcsncpy_nid_postfix(char16_t* dest, const char16_t* src, std::size_t n);
 const char16_t* APS5_VABI wcschr_nid_postfix(const char16_t* s, char16_t c);
 const char16_t* APS5_VABI wcsrchr_nid_postfix(const char16_t* s, char16_t c);
@@ -68,6 +69,14 @@ int main() {
     wmemset_nid_postfix(buffer, 0xaaaa, 8);
     require(wcscpy_nid_postfix(buffer, u"wide") == buffer);
     require(same(buffer, u"wide", 5) && buffer[5] == 0xaaaa);
+
+    char16_t concatenated[8];
+    wmemset_nid_postfix(concatenated, 0xaaaa, 8);
+    concatenated[0] = 0;
+    require(wcscat_nid_postfix(concatenated, u"ab") == concatenated);
+    require(wcscat_nid_postfix(concatenated, u"世") == concatenated);
+    const char16_t expectedConcatenated[] = {u'a', u'b', u'世', 0, 0xaaaa};
+    require(same(concatenated, expectedConcatenated, 5));
 
     wmemset_nid_postfix(buffer, 0xaaaa, 8);
     require(wcsncpy_nid_postfix(buffer, u"ab", 5) == buffer);
