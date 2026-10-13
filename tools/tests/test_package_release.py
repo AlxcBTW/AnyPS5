@@ -42,6 +42,36 @@ class ReleasePackageTests(unittest.TestCase):
         self.addCleanup(patch.stopall)
         patch.object(package_release, "ROOT", self.source, create=True).start()
 
+    def test_windows_runtime_follows_the_configured_compiler_directory(self):
+        runtime = self.root / "custom toolchain" / "bin"
+        runtime.mkdir(parents=True)
+        names = ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
+        for name in names:
+            (runtime / name).write_bytes(name.encode())
+        compiler = runtime / "g++.exe"
+        (self.build / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:STRING=" + compiler.as_posix() + "\n", encoding="utf-8")
+        (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
+        package_release.package("windows", self.build, self.output, "v1")
+        with zipfile.ZipFile(self.output / "prx-windows-v1.zip") as archive:
+            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names)})
+            for name in names:
+                self.assertEqual(archive.read("libs/" + name), name.encode())
+        with tarfile.open(self.output / "prx-windows-v1.tar.gz") as archive:
+            for name in names:
+                self.assertEqual(archive.extractfile("libs/" + name).read(), name.encode())
+        self.assertEqual((self.output / "relinker-v1.exe").read_bytes(), b"Windows executable")
+
+    def test_windows_package_without_configured_compiler_preserves_existing_output(self):
+        (self.build / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:FILEPATH=compiler-NOTFOUND\n", encoding="utf-8")
+        (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
+        self.output.mkdir()
+        previous = self.output / "previous.asset"
+        previous.write_bytes(b"existing output")
+        with self.assertRaisesRegex(RuntimeError, "CMAKE_CXX_COMPILER"):
+            package_release.package("windows", self.build, self.output, "v1")
+        self.assertEqual(list(self.output.iterdir()), [previous])
+        self.assertEqual(previous.read_bytes(), b"existing output")
+
     def test_source_discovery_does_not_depend_on_working_directory(self):
         with working_directory(self.root):
             package_release.package("linux", self.build, self.output, "v1.0")

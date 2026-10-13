@@ -9,6 +9,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def windows_runtime(build):
+    for line in (build / "CMakeCache.txt").read_text(encoding="utf-8").splitlines():
+        if line.startswith("CMAKE_CXX_COMPILER:"):
+            compiler = line.partition("=")[2]
+            if compiler and not compiler.endswith("-NOTFOUND"):
+                return Path(compiler).parent
+    raise RuntimeError(f"CMAKE_CXX_COMPILER is not configured in {build / 'CMakeCache.txt'}")
+
+
 def package(platform, build, output, version):
     if not re.fullmatch(r"v[0-9A-Za-z][0-9A-Za-z._-]*", version) or version.endswith("."):
         raise ValueError(f"Invalid release tag for asset filenames: {version}")
@@ -20,7 +29,7 @@ def package(platform, build, output, version):
     executable = "relinker.exe" if platform == "windows" else "relinker"
     files = [library for library in libraries if library.name in expected]
     if platform == "windows":
-        runtime = Path("C:/winlibs/mingw64/bin")
+        runtime = windows_runtime(build)
         files.extend(runtime / name for name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"))
     binary = build / "core/relinker" / executable
     for file in [*files, binary]:

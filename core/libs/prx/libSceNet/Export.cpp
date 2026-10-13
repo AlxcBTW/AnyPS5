@@ -1160,14 +1160,14 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
             descriptors[index].fd = native_sockets[index]->value;
             if (registered_events[index].events & 1) descriptors[index].events |= POLLRDNORM;
-            if (registered_events[index].events & 4) descriptors[index].events |= POLLWRNORM;
+            if (registered_events[index].events & 2) descriptors[index].events |= POLLWRNORM;
         }
 #else
         std::vector<pollfd> descriptors(registered_events.size());
         for (std::size_t index = 0; index < descriptors.size(); ++index) {
             descriptors[index].fd = native_sockets[index]->value;
             if (registered_events[index].events & 1) descriptors[index].events |= POLLIN;
-            if (registered_events[index].events & 4) descriptors[index].events |= POLLOUT;
+            if (registered_events[index].events & 2) descriptors[index].events |= POLLOUT;
         }
 #endif
         const auto now = std::chrono::steady_clock::now();
@@ -1197,10 +1197,10 @@ int APS5_VABI sceNetEpollWait(int eid, NetEpollEvent* events, int maxevents, int
                 std::uint32_t guest_events = 0;
 #ifdef _WIN32
                 if (native_events & (POLLRDNORM | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLWRNORM) guest_events |= 4;
+                if (native_events & POLLWRNORM) guest_events |= 2;
 #else
                 if (native_events & (POLLIN | POLLPRI)) guest_events |= 1;
-                if (native_events & POLLOUT) guest_events |= 4;
+                if (native_events & POLLOUT) guest_events |= 2;
 #endif
                 if (native_events & POLLERR) guest_events |= 8;
                 if (native_events & POLLHUP) guest_events |= 16;
