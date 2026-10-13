@@ -100,6 +100,7 @@ private:
     static std::size_t dispatchVariants();
     static bool insertCompare();
     static std::size_t dispatchCacheEntries();
+    static std::uint64_t dispatchCacheBytes();
     static std::uint64_t variantBytes(const DispatchVariant& variant);
     void accountVariant(const DispatchVariant& variant, bool added);
     void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);

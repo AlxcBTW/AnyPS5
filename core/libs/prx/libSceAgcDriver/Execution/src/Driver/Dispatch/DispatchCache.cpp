@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <cstdlib>
+#include <limits>
 
 namespace AgcDriver::DriverDetail {
 
@@ -43,6 +44,15 @@ std::size_t Driver::dispatchCacheEntries() {
         return dispatchVariants() > 2 ? std::size_t{8192} : std::size_t{16384};
     }();
     return entries;
+}
+
+std::uint64_t Driver::dispatchCacheBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* text = std::getenv("APS5_DISPATCH_CACHE_MIB");
+        const auto mebibytes = text != nullptr ? std::strtoull(text, nullptr, 10) : 256ull;
+        return mebibytes != 0 && mebibytes < (std::numeric_limits<std::uint64_t>::max() >> 20u) ? mebibytes << 20u : std::numeric_limits<std::uint64_t>::max();
+    }();
+    return bytes;
 }
 
 std::uint64_t Driver::variantBytes(const DispatchVariant& variant) {
