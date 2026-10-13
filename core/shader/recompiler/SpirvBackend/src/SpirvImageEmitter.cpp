@@ -1592,7 +1592,7 @@ void EmitImageOperation(SpirvValueEmitContext& context, const IrValue& value, st
     throw std::logic_error("EmitImageOperation(SpirvValueEmitContext&) is not used: image instructions are emitted per opcode through EmitImage");
 }
 
-void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image) {
+void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageResource& image, const TableSelection& table) {
     const auto irOpcode = inst.Opcode();
     const auto imageInfo = ImageOpcodeInfoOf(irOpcode);
     const auto& mem = ctx.Memory(inst);
@@ -1601,7 +1601,7 @@ void EmitImageMode(SpirvValueEmitContext& ctx, const IrValue& inst, const ImageR
     if (address == nullptr) {
         ctx.Fail(inst, "has no image address");
     }
-    const ImageEmitAccess access{inst, mem, image, *address, TableSlot(ctx, inst, mem, image)};
+    const ImageEmitAccess access{inst, mem, image, *address, table};
     if (imageInfo.access == ImageAccess::Atomic) {
         EmitAtomicOp(ctx, access);
         return;
@@ -1654,7 +1654,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
         } else if (mode.depthBits && memory.dataBits == 16u) {
             ctx.Fail(inst, "depth bits require a 32-bit image result");
         } else {
-            EmitImageMode(ctx, inst, mode);
+            EmitImageMode(ctx, inst, mode, table);
         }
     };
     if (modes.size() == 1u) {
