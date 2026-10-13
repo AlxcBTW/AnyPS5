@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -41,6 +42,9 @@ struct MockDevice {
     std::map<VkBuffer, VkDeviceSize> sizes;
     std::set<VkDeviceMemory> memories;
     std::uint64_t nextAddress = 0x500000000ull;
+    // Allocations still to fail with VK_ERROR_OUT_OF_DEVICE_MEMORY, and frees of memory not allocated.
+    int failAllocations = 0;
+    int doubleFrees = 0;
 };
 
 MockDevice mock;
@@ -126,14 +130,25 @@ VKAPI_ATTR void VKAPI_CALL mockGetBufferMemoryRequirements(VkDevice, VkBuffer bu
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockAllocateMemory(VkDevice, const VkMemoryAllocateInfo*, const VkAllocationCallbacks*, VkDeviceMemory* memory) {
+    if (mock.failAllocations > 0) {
+        --mock.failAllocations;
+        return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    }
     *memory = reinterpret_cast<VkDeviceMemory>(mock.next++);
     mock.memories.insert(*memory);
     return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL mockFreeMemory(VkDevice, VkDeviceMemory memory, const VkAllocationCallbacks*) {
-    mock.memories.erase(memory);
+    if (mock.memories.erase(memory) == 0) ++mock.doubleFrees;
 }
+
+VKAPI_ATTR VkResult VKAPI_CALL mockMapMemory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void** data) {
+    *data = nullptr;
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockUnmapMemory(VkDevice, VkDeviceMemory) {}
 
 VKAPI_ATTR VkResult VKAPI_CALL mockBindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
     return VK_SUCCESS;
@@ -172,6 +187,8 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferMemoryRequirements)},
         {"vkAllocateMemory", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateMemory)},
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(mockFreeMemory)},
+        {"vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(mockMapMemory)},
+        {"vkUnmapMemory", reinterpret_cast<PFN_vkVoidFunction>(mockUnmapMemory)},
         {"vkBindBufferMemory", reinterpret_cast<PFN_vkVoidFunction>(mockBindBufferMemory)},
         {"vkGetBufferDeviceAddressKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetBufferDeviceAddress)},
     };
@@ -333,6 +350,69 @@ void BusyRetireOutlivesALaterBatch() {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+// exp (APS5_EXP_HEAP_BUDGET): an allocation in the import heap that fails while dropped imports
+// still take it frees them once every batch completed and is retried; an import its own hold
+// dropped stays (the hold may still record with a pointer it took before the drop).
+void FailedAllocationFreesDroppedImports() {
+    Heap heap;
+    ActiveRecorder active;
+    auto& recorder = *active.recorder;
+    auto context = mockContext();
+    context.memory.memoryTypeCount = 1;
+    context.memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0};
+    context.memory.memoryHeapCount = 1;
+    context.memory.memoryHeaps[0] = {VkDeviceSize{8} << 30u, 0};
+    SetHeapBudgetExperiment(1);
+    SetHostImportHeap(0);
+    BufferPool pool(context);
+    VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocation.allocationSize = RangeBytes;
+    allocation.memoryTypeIndex = 0;
+    const auto before = RetiredImportBytes();
+    VkBuffer retired = VK_NULL_HANDLE;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::make_shared<int>(0));
+        const auto* taken = HostImportFor(context, heap.Address(), 4096);
+        Expect(taken != nullptr, "the first range was not imported");
+        if (taken == nullptr) return;
+        retired = taken->buffer;
+        heap.Grow();
+        Expect(HostImportFor(context, heap.Address(RangeBytes), 4096) != nullptr, "the grown run was not imported");
+        Expect(Live(retired) && RetiredImportBytes() == before + RangeBytes, "the dropped import is not counted as held");
+        Expect(recorder.OpenKeptBytes() >= RangeBytes, "the dropped import's bytes are not the open batch's kept bytes (Recorder::BoundKeptBytes)");
+        mock.failAllocations = 1;
+        bool failed = false;
+        try {
+            static_cast<void>(pool.AllocateMemory(context, allocation, "vkAllocateMemory test"));
+        } catch (const std::exception&) {
+            failed = true;
+        }
+        Expect(failed && Live(retired), "a failed allocation freed an import its own hold dropped");
+        mock.failAllocations = 0;
+        recorder.Commands();
+        recorder.Submit();
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Expect(Live(retired), "the dropped import was destroyed while a batch of its hold is in flight");
+        mock.failAllocations = 1;
+        const auto memory = pool.AllocateMemory(context, allocation, "vkAllocateMemory test");
+        Expect(memory != VK_NULL_HANDLE && !Live(retired) && RetiredImportBytes() == before, "a failed allocation in a later hold did not free the dropped import and retry");
+        mock.failAllocations = 0;
+        if (memory != VK_NULL_HANDLE) {
+            mockFreeMemory(context.device, memory, nullptr);
+            CountGpuMemory(GpuMemoryKind::HostBuffer, -static_cast<std::int64_t>(RangeBytes));
+        }
+    }
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Sync();
+    }
+    SetHeapBudgetExperiment(0);
+    SetHostImportHeap(UINT32_MAX);
+}
+
 }
 
 int main() {
@@ -346,6 +426,9 @@ int main() {
     try {
         IdleRetireOutlivesTheHold();
         BusyRetireOutlivesALaterBatch();
+        FailedAllocationFreesDroppedImports();
+        // Its recorder and holders are gone now: the freed import's holder did not free it again.
+        Expect(mock.doubleFrees == 0, "a dropped import's memory was freed twice");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

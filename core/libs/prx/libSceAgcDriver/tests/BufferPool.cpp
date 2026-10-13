@@ -558,6 +558,13 @@ void HeapBudget() {
         state = PollHostHeap(context, 5000 * MiB, true);
         Expect(state.allowance == 8110 * MiB - 2500 * MiB - 811 * MiB, "the heap's use without the imports was not taken as the other use");
         Expect(state.otherUse == 2500 * MiB - LiveGpuMemory(GpuMemoryKind::HostBuffer) - LiveGpuMemory(GpuMemoryKind::HostImport) && state.retiredImports == 0, "the heap's use is not split into imports, host buffers and the rest");
+        // Dropped imports still held by their batches (1500 MiB counted beyond the live 2000) are not other
+        // use: the allowance stays where it was without them, and the split names them.
+        CountGpuMemory(GpuMemoryKind::HostImport, static_cast<std::int64_t>(3500 * MiB));
+        mockBudget.heapUsage[1] = (2000 + 1500 + 409 + 300) * MiB;
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(state.allowance == HeapImportAllowance(8110 * MiB, std::max<std::uint64_t>(LiveGpuMemory(GpuMemoryKind::HostBuffer), 709 * MiB), 811 * MiB) && state.retiredImports == 1500 * MiB, "dropped imports still held shrank the allowance");
+        CountGpuMemory(GpuMemoryKind::HostImport, -static_cast<std::int64_t>(3500 * MiB));
         // Free physical memory below the reserve (1 GiB): tight, and no import beyond the live ones;
         // above it, the free memory past the reserve bounds the allowance.
         mockBudget.heapUsage[1] = (2000 + 409 + 300) * MiB;

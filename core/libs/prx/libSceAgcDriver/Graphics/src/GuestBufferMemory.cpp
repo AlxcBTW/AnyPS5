@@ -46,6 +46,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace AgcDriver::Graphics {
 
@@ -200,15 +201,50 @@ void destroyImport(const Context& context, const HostImport& entry) {
 
 using ImportNode = std::map<std::uint64_t, HostImport>::node_type;
 
+bool heapBudgetEnabled();
+
+// The bytes of dropped imports whose Vulkan objects still exist (RetiredImport).
+std::atomic<std::uint64_t> retiredImportBytes{0};
+
+struct RetiredImport;
+
+// exp (APS5_EXP_HEAP_BUDGET): the dropped imports still held, with the GpuMutex hold that dropped each
+// (0: none, KeepThroughHold was not used), so that a failed allocation in their heap can free the ones
+// no recorded work and no pointer of the current hold can use any more (ReclaimRetiredImports).
+struct RetiredLedger {
+    std::mutex mutex;
+    std::unordered_map<RetiredImport*, std::uint64_t> holds;
+};
+
+RetiredLedger& Retired() {
+    static RetiredLedger ledger;
+    return ledger;
+}
+
 // Frees a dropped import's Vulkan objects when it is released. It owns the import's map node, so a
 // HostImport pointer taken before the drop stays valid while the holder lives. Never copied: a copy
 // would destroy the same handles twice (and a temporary would destroy them at once).
 struct RetiredImport {
     RetiredImport(VkDevice device, PFN_vkDestroyBuffer destroyBuffer, PFN_vkFreeMemory freeMemory, ImportNode node)
-        : device(device), destroyBuffer(destroyBuffer), freeMemory(freeMemory), node(std::move(node)) {}
+        : device(device), destroyBuffer(destroyBuffer), freeMemory(freeMemory), node(std::move(node)) {
+        retiredImportBytes.fetch_add(this->node.mapped().bytes, std::memory_order_relaxed);
+    }
     RetiredImport(const RetiredImport&) = delete;
     RetiredImport& operator=(const RetiredImport&) = delete;
     ~RetiredImport() {
+        if (!tracked) {
+            release();
+            return;
+        }
+        auto& ledger = Retired();
+        std::lock_guard lock(ledger.mutex);
+        ledger.holds.erase(this);
+        release();
+    }
+    // Destroys the Vulkan objects once: here, or early under the ledger's mutex (ReclaimRetiredImports).
+    void release() {
+        if (released) return;
+        released = true;
         const auto& entry = node.mapped();
         destroyBuffer(device, entry.buffer, nullptr);
         freeMemory(device, entry.memory, nullptr);
@@ -216,11 +252,15 @@ struct RetiredImport {
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
 #endif
         CountGpuMemory(GpuMemoryKind::HostImport, -static_cast<std::int64_t>(entry.bytes));
+        retiredImportBytes.fetch_sub(entry.bytes, std::memory_order_relaxed);
     }
     VkDevice device;
     PFN_vkDestroyBuffer destroyBuffer;
     PFN_vkFreeMemory freeMemory;
     ImportNode node;
+    // In the ledger (set under its mutex before anyone else can see the holder).
+    bool tracked = false;
+    bool released = false;
 };
 
 const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& lease, std::uint64_t begin, std::uint64_t end);
@@ -241,12 +281,24 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     ++state.epoch;
-    state.liveBytes -= it->second.bytes;
+    const auto bytes = it->second.bytes;
+    state.liveBytes -= bytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return;
-    if (hold) recorder->KeepThroughHold(std::move(holder));
-    else if (!recorder->Idle()) recorder->Keep(std::move(holder));
+    // exp (APS5_EXP_HEAP_BUDGET): the import's bytes count as the batch's kept bytes, so that
+    // Recorder::BoundKeptBytes submits and releases batches holding hundreds of MiB of dropped imports at
+    // the next draw or dispatch rather than when the batches happen to complete; and the ledger knows it.
+    const bool budgeted = heapBudgetEnabled();
+    if (budgeted) {
+        auto& ledger = Retired();
+        std::lock_guard lock(ledger.mutex);
+        holder->tracked = true;
+        ledger.holds.emplace(holder.get(), hold ? GuestMemory::GpuHoldSerial() : 0);
+    }
+    const auto kept = budgeted ? static_cast<std::size_t>(bytes) : 0;
+    if (hold) recorder->KeepThroughHold(std::move(holder), kept);
+    else if (!recorder->Idle()) recorder->Keep(std::move(holder), kept);
 }
 
 const char* bindImport(const Context& context, HostImport& entry, VkExternalMemoryHandleTypeFlagBits handleType, const void* import, std::uint32_t importTypes, bool& allocated, VkResult& failure) {
@@ -1002,16 +1054,22 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || failures.contains(base)) return nullptr;
     const auto configured = configuredImportBudget(state);
-    auto budget = importBudget(context, state);
+    const auto steady = importBudget(context, state);
+    // exp (APS5_EXP_HEAP_BUDGET): what fits now. The allowance leaves out the dropped imports still kept
+    // by their batches; until those are released, they take their part of the heap.
+    const auto pending = heapBudgetEnabled() ? retiredImportBytes.load(std::memory_order_relaxed) : 0;
+    auto budget = steady - std::min(steady, pending);
     // Least recently used imports make room under the configured budget only: past the heap's allowance
     // an evicted import stays in the heap until its batches complete and its range comes back as a mirror.
     if (evict && state.liveBytes + bytes > configured) retireLeastRecent(context, state, lease, state.liveBytes + bytes - configured);
     // exp (APS5_EXP_HEAP_BUDGET): past the heap's allowance a range is given up only for a device-local
     // mirror. A host-visible one would take the same heap and copy the bytes besides (parl0v's run: 4.8 GB
     // of host heap mirrors replacing the imports byte for byte), so without room in device-local memory the
-    // range is imported anyway, up to the configured budget.
+    // range is imported anyway, up to the configured budget. Read-only imports are spilled for what does
+    // not fit beside the live imports once the dropped ones are gone, never for those: each spill is
+    // sized to that shortfall.
     if (heapBudgetEnabled() && budget < configured && state.liveBytes + bytes > budget) {
-        if (!joined) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - budget);
+        if (!joined && state.liveBytes + bytes > steady) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - steady);
         // Writable ranges have device-local mirrors with =2 only.
         const bool deviceMirror = DeviceHeapRoom() >= bytes && (!runWritable(run) || heapBudgetMode.load(std::memory_order_relaxed) >= 2);
         if (state.liveBytes + bytes > budget && !deviceMirror) {
@@ -1545,9 +1603,10 @@ bool deviceMirrorWanted(const Context& context, std::uint64_t address, std::uint
         std::lock_guard lock(heaps.mutex);
         spilled = heaps.spilled.contains(address);
     }
-    // Spilled, tight already, or this mirror would not fit beside the imports (an import of its range
-    // was refused).
-    if ((!spilled && !state.tight && state.imports + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
+    // Spilled, tight already, or this mirror would not fit beside the imports and the dropped ones still
+    // held (an import of its range was refused).
+    const auto pending = retiredImportBytes.load(std::memory_order_relaxed);
+    if ((!spilled && !state.tight && state.imports + pending + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
     return state.deviceBudget > state.deviceUsage + bytes + DeviceHeapReserve(state.deviceBudget);
 }
 
@@ -2690,14 +2749,21 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
         state.usage = reported.heapUsage[heap];
         state.hostBuffers = LiveGpuMemory(GpuMemoryKind::HostBuffer);
         state.headroom = HeapHeadroom(state.budget);
-        // Whether the driver counts imports in the heap's usage is its own business: what is left of
-        // the usage without them (when it holds them) covers its own allocations, the host buffers ours.
-        const auto withoutImports = state.usage >= liveImports ? state.usage - liveImports : state.usage;
-        state.allowance = HeapImportAllowance(state.budget, std::max(state.hostBuffers, withoutImports), state.headroom);
         // What the usage holds besides the live imports: the dropped ones still kept by their batches
         // (counted as host imports until destroyed), the host buffers, and whatever is left.
         const auto counted = LiveGpuMemory(GpuMemoryKind::HostImport);
         state.retiredImports = counted > liveImports ? counted - liveImports : 0;
+        // Whether the driver counts imports in the heap's usage is its own business: what is left of
+        // the usage without them (when it holds them) covers its own allocations, the host buffers ours.
+        // The dropped imports still kept by their batches are not part of that other use: they leave
+        // once their batches complete (sooner under Recorder::BoundKeptBytes or a failed allocation's
+        // ReclaimRetiredImports), and counting them there made every drop shrink the allowance by what
+        // it dropped, so the next import dropped as much again (parl0v's 16 GB run of a36ca25d7: 5.9 GB
+        // of imports dropped within a second, allowance 56 MiB). importRunAt keeps new imports out of
+        // the room they still take.
+        const auto held = std::max(counted, liveImports);
+        const auto withoutImports = state.usage >= held ? state.usage - held : state.usage >= liveImports ? state.usage - liveImports : state.usage;
+        state.allowance = HeapImportAllowance(state.budget, std::max(state.hostBuffers, withoutImports), state.headroom);
         const auto explained = std::max(counted, liveImports) + state.hostBuffers;
         state.otherUse = state.usage > explained ? state.usage - explained : 0;
         state.ramFree = readRamFree();
@@ -2880,6 +2946,50 @@ std::string DescribeImportCensus() {
         static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
         static_cast<unsigned long long>(originals.images), static_cast<unsigned long long>(originals.withOriginal), mib(originals.bytes), mib(originals.validBytes));
     return text;
+}
+
+std::uint64_t RetiredImportBytes() {
+    return retiredImportBytes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ReclaimRetiredImports(const Context& context, std::uint32_t memoryType) {
+    if (!heapBudgetEnabled() || retiredImportBytes.load(std::memory_order_relaxed) == 0 || memoryType >= context.memory.memoryTypeCount) return 0;
+    const auto heap = Heaps().importHeap.load(std::memory_order_relaxed);
+    if (heap == UINT32_MAX || context.memory.memoryTypes[memoryType].heapIndex != heap || !GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return 0;
+    // Not again from an allocation the sync below makes (a completion's).
+    static thread_local bool reclaiming = false;
+    if (reclaiming) return 0;
+    reclaiming = true;
+    struct Done {
+        ~Done() { reclaiming = false; }
+    } done;
+    // Every batch recorded so far completes: none of them reads a dropped import any more. (A sync
+    // inside a resource build is what Recorder::SyncThrough does for an overlapping read as well.)
+    recorder->Sync();
+    const auto current = GuestMemory::GpuHoldSerial();
+    std::uint64_t released = 0;
+    std::uint64_t kept = 0;
+    {
+        auto& ledger = Retired();
+        std::lock_guard lock(ledger.mutex);
+        for (const auto& [import, hold] : ledger.holds) {
+            if (import->released) continue;
+            const auto bytes = import->node.mapped().bytes;
+            // One this hold dropped may still be used through a pointer the hold took before the drop.
+            if (hold != 0 && hold == current) {
+                kept += bytes;
+                continue;
+            }
+            import->release();
+            released += bytes;
+        }
+    }
+    static std::atomic<std::uint64_t> reclaims{0};
+    const auto count = reclaims.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): an allocation failed; synced and freed %llu MiB of dropped imports (%llu MiB dropped in this hold stay; %llu reclaims)\n", heap, static_cast<unsigned long long>(released >> 20u), static_cast<unsigned long long>(kept >> 20u), static_cast<unsigned long long>(count));
+    return released;
 }
 
 std::uint64_t RelieveGpuMemory(const Context& context) {

@@ -90,7 +90,7 @@ public:
     // opened later in the same GpuMutex hold: what the hold recorded or will record with it, even
     // after a Submit or Sync, completes first. A host import retired mid-hold is handed over this
     // way, so a pointer to it that the hold took earlier stays usable (see GuestBufferMemory).
-    void KeepThroughHold(std::shared_ptr<void> object);
+    void KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepBytes(const void* owner, std::size_t bytes);
     std::size_t OpenKeptBytes() const { return open != nullptr ? open->keptBytes : 0; }
     // The lease waiter's release before the guest takes pages back: the deferred kept objects, and

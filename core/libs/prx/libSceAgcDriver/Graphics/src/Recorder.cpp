@@ -2466,13 +2466,14 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
-void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
+void Recorder::KeepThroughHold(std::shared_ptr<void> object, std::size_t bytes) {
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
     if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {
         holdKept.clear();
         holdKeptSerial = hold;
     }
-    Keep(object);
+    // The bytes count once, on the batch open now (BoundKeptBytes).
+    Keep(object, bytes);
     holdKept.push_back(std::move(object));
 }
 

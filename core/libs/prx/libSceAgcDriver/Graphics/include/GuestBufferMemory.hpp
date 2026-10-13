@@ -69,6 +69,12 @@ bool WatchedImportsStampPages(const Context& context);
 bool WatchedImportsStampPages();
 
 std::uint64_t RelieveGpuMemory(const Context& context);
+// exp (APS5_EXP_HEAP_BUDGET): the bytes of dropped host imports whose Vulkan objects still exist (kept by
+// the batches that may read them). ReclaimRetiredImports: an allocation of `memoryType` failed; when the
+// type is in the import heap and this thread holds the GpuMutex, syncs the recorder and frees the dropped
+// imports no pointer of the current hold can still use. Returns the bytes freed (0 without the switch).
+std::uint64_t RetiredImportBytes();
+std::uint64_t ReclaimRetiredImports(const Context& context, std::uint32_t memoryType);
 std::uint64_t HostImportLimit();
 
 // exp (APS5_EXP_HEAP_BUDGET=1, see GuestBufferMemory.cpp): the heap host imports land in, as

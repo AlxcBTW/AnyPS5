@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <atomic>
@@ -129,8 +130,17 @@ VkDeviceMemory BufferPool::AllocateMemory(const Context& context, const VkMemory
             ++attempts;
         }
     }
+    // exp (APS5_EXP_HEAP_BUDGET): dropped host imports kept by unfinished batches may fill the heap.
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+        if (const auto freed = ReclaimRetiredImports(context, allocation.memoryTypeIndex); freed != 0) {
+            reclaimed += freed;
+            memory = VK_NULL_HANDLE;
+            result = AllocateGpuMemory(context, allocation, memory, kind, operation);
+            ++attempts;
+        }
+    }
     if (result == VK_SUCCESS) {
-        if (attempts == 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
+        if (attempts >= 2) std::fprintf(stderr, "[bufferpool] %s recovered: allocation=%llu reclaimed=%llu initialResult=%d attempts=%u\n", operation, static_cast<unsigned long long>(allocation.allocationSize), static_cast<unsigned long long>(reclaimed), static_cast<int>(initialResult), attempts);
         return memory;
     }
     char details[512];
