@@ -57,6 +57,8 @@ int APS5_VABI sceNetResolverAbort(int, int);
 int APS5_VABI sceNetResolverDestroy(int);
 int APS5_VABI sceNetResolverGetError(int, int*);
 int APS5_VABI sceNetCtlGetState(int*);
+int APS5_VABI sceNetCtlGetIfStat(NetCtlIfStat*);
+std::uint64_t NetCtlReadByteCounter_nid_no_patch(const char*);
 int APS5_VABI select_nid_postfix(int, void*, void*, void*, const void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
 int APS5_VABI socket_nid_postfix(int, int, int);
@@ -777,6 +779,34 @@ int main() {
     int state = -1;
     Require(sceNetCtlGetState(&state) == 0);
     Require(state == 0 || state == 3);
+    Require(sceNetCtlGetIfStat(nullptr) == static_cast<int>(0x80412107));
+    {
+        const char* counterPath = "guest_sce_net_byte_counter.txt";
+        std::FILE* counter = std::fopen(counterPath, "w");
+        Require(counter != nullptr);
+        Require(std::fputs("1099511627776", counter) >= 0);
+        Require(std::fclose(counter) == 0);
+        Require(NetCtlReadByteCounter_nid_no_patch(counterPath) == 1099511627776ull);
+        Require(std::remove(counterPath) == 0);
+        bool missing = false;
+        try {
+            NetCtlReadByteCounter_nid_no_patch(counterPath);
+        } catch (const std::runtime_error&) {
+            missing = true;
+        }
+        Require(missing);
+    }
+    NetCtlIfStat first{};
+    first.device = 7;
+    first.reserved[7] = 7;
+    const int statResult = sceNetCtlGetIfStat(&first);
+    Require(statResult == (state == 3 ? 0 : static_cast<int>(0x80412108)));
+    if (statResult == 0) {
+        Require(first.device == 0 && first.reserved[7] == 0);
+        NetCtlIfStat second{};
+        Require(sceNetCtlGetIfStat(&second) == 0);
+        Require(second.tx_bytes >= first.tx_bytes && second.rx_bytes >= first.rx_bytes);
+    }
     if (ipv6Unavailable) {
         std::puts("skipped the IPv6 socket checks, the host has no usable IPv6 loopback");
         return 77;
