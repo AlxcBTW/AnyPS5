@@ -57,6 +57,7 @@ ConvertedExecutable Convert(const Cli::Args& args, const std::string& inputPath,
     options.LazyBinding = args.lazyBinding;
     options.RunPath = args.runPath;
     options.WindowsGui = args.windowsGui;
+    options.WindowsFixedBase = mainExecutable ? args.windowsFixedBase : std::nullopt;
     options.WindowsDiagnostics = args.windowsDiagnostics && mainExecutable;
     options.ExcludedModules = args.excludedSceModules;
     progress.IncludeFile(Io::Utf8Path(input.InputPath));

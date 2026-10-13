@@ -16,11 +16,11 @@ namespace Elfpatcher::Windows {
 
 namespace {
 
-void writeGotStub(std::vector<PeSection>& sections, const std::uint32_t targetRva, const std::uint32_t stubRva) {
+void writeGotStub(std::vector<PeSection>& sections, const std::uint32_t targetRva, const std::uint32_t stubRva, const std::uint64_t imageBase) {
     for (auto& section : sections) {
         if (section.Data.size() < 8 || targetRva < section.Rva || targetRva - section.Rva > section.Data.size() - 8)
             continue;
-        Io::WriteU64(section.Data, targetRva - section.Rva, ImageBase + stubRva);
+        Io::WriteU64(section.Data, targetRva - section.Rva, imageBase + stubRva);
         return;
     }
     throw Domain::RelinkerException("Lazy import GOT slot is not contained in any section", targetRva);
@@ -28,7 +28,9 @@ void writeGotStub(std::vector<PeSection>& sections, const std::uint32_t targetRv
 
 }
 
-WindowsPePatcher::WindowsPePatcher(const bool windowsGui, std::optional<std::vector<std::uint8_t>> icon, std::filesystem::path iconName, std::function<void(std::uint64_t, std::uint64_t)> progress) : progress(std::move(progress)), windowsGui(windowsGui), icon(std::move(icon)), iconName(std::move(iconName)) {
+WindowsPePatcher::WindowsPePatcher(const bool windowsGui, std::optional<std::vector<std::uint8_t>> icon, std::filesystem::path iconName, std::function<void(std::uint64_t, std::uint64_t)> progress, const std::optional<std::uint64_t> fixedBase) : progress(std::move(progress)), windowsGui(windowsGui), icon(std::move(icon)), iconName(std::move(iconName)), fixedBase(fixedBase) {
+    if (fixedBase && (*fixedBase < 0x20000 || *fixedBase > 0x7fffffff0000 || (*fixedBase & 0xffff) != 0))
+        throw Domain::RelinkerException("Invalid fixed Windows guest image base");
 }
 
 const std::string& WindowsPePatcher::GetDiagnostics() const { return diagnostics; }
@@ -37,7 +39,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     const auto report = [&](std::uint64_t completed) { if (progress) progress(completed, 10000); };
     report(0);
     diagnostics.clear();
-    WindowsLoadImage image(sourceElf, originalHeaders);
+    WindowsLoadImage image(sourceElf, originalHeaders, true, fixedBase ? *fixedBase - LoadRva : ImageBase);
     if (originalPltGotVaddr != 0)
         image.GetRva(originalPltGotVaddr, 8);
     report(500);
@@ -94,10 +96,10 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     sections.push_back(std::move(entry.Data));
     sections.push_back(std::move(entry.Code));
     for (const auto& lazyStub : entry.LazyStubs) {
-        writeGotStub(sections, lazyStub.TargetRva, lazyStub.StubRva);
+        writeGotStub(sections, lazyStub.TargetRva, lazyStub.StubRva, image.GetImageBase());
         relocations.BaseRelocations.push_back(lazyStub.TargetRva);
     }
-    auto relocationData = relocationBuilder.BuildBaseRelocations(relocations.BaseRelocations);
+    auto relocationData = fixedBase ? std::vector<std::uint8_t>{} : relocationBuilder.BuildBaseRelocations(relocations.BaseRelocations);
     if (!relocationData.empty()) {
         directories[5] = {nextRva, CheckedRva(relocationData.size())};
         sections.push_back({".reloc", nextRva, SectionRead | 0x02000040u, std::move(relocationData)});
@@ -105,7 +107,7 @@ std::vector<std::uint8_t> WindowsPePatcher::Patch(const std::vector<std::uint8_t
     }
     directories[2] = icon ? WindowsIconResourceBuilder().Build(*icon, iconName, sections, nextRva) : PeDirectory{};
     report(9500);
-    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui);
+    auto result = WindowsPeWriter().Write(sections, entryRva, directories, windowsGui, fixedBase ? std::optional<std::uint64_t>(image.GetImageBase()) : std::nullopt);
     report(10000);
     return result;
 }
