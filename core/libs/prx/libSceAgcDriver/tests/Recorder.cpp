@@ -5055,6 +5055,12 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     context.nullDescriptors = true;
     TextureCache cache(context);
     context.textureCache = &cache;
+    const auto clearTargets = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        ClearMultisampleTargets(context.device);
+    };
     const auto refused = [](const std::function<void()>& access, const std::string& expected, const std::string& what) {
         std::string message;
         try {
@@ -5111,7 +5117,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     }, "a texture read", "a texture read");
     refused([&] { AgcDriver::GuestMemory::Read(address + 3u * 65536u + 256u, texels); }, "a CPU read", "a CPU read in the padding of a later sample plane");
     AgcDriver::GuestMemory::Read(address + 4u * 65536u, texels);
-    ClearMultisampleTargets(context.device);
+    clearTargets();
     target.tileMode = ColorTileMode::RenderTarget;
     {
         std::lock_guard gpu(GpuMutex());
@@ -5122,7 +5128,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     }
     refused([&] { AgcDriver::GuestMemory::Read(address + targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the tiled multisampled target");
     AgcDriver::GuestMemory::Read(address + targetBytes, texels);
-    ClearMultisampleTargets(context.device);
+    clearTargets();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_2_BIT) != 0) {
         target.extent = {128, 64};
         target.surfaceExtent = target.extent;
@@ -5136,7 +5142,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
         }
         refused([&] { AgcDriver::GuestMemory::Read(address + 2u * targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the 2x tile-height padding");
         AgcDriver::GuestMemory::Read(address + 2u * targetBytes, texels);
-        ClearMultisampleTargets(context.device);
+        clearTargets();
     }
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_8_BIT) != 0) {
         target.extent = {64, 32};
@@ -5151,9 +5157,48 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
         }
         refused([&] { AgcDriver::GuestMemory::Read(address + 2u * targetBytes - texels.size(), texels); }, "a CPU read", "a CPU read inside the 8x tile-height padding");
         AgcDriver::GuestMemory::Read(address + 2u * targetBytes, texels);
-        ClearMultisampleTargets(context.device);
+        clearTargets();
     }
     AgcDriver::GuestMemory::Read(address + 256u, texels);
+    target.extent = {side, side};
+    target.surfaceExtent = target.extent;
+    target.samples = 4;
+    VkImageView previous = VK_NULL_HANDLE;
+    for (const bool removeAllocation : {false, true}) {
+        VkImageView view = VK_NULL_HANDLE;
+        {
+            std::lock_guard gpu(GpuMutex());
+            view = MultisampleTargetView(context, target);
+            Require(view != VK_NULL_HANDLE && view != previous, "a remapped allocation reused its retired multisampled image");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Protect(block, bytes, true, true, true, [] {});
+        }
+        refused([&] { RequireNoMultisampleTarget(address, 64u, "a CPU read"); }, "a CPU read", "a read after protection changed");
+        bool failed = false;
+        try {
+            GuestAllocations::Mutation mutation;
+            mutation.Unmap(block, bytes, [](const void*, std::size_t, const void*, bool) { throw std::runtime_error("unmap failed"); });
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        Require(failed, "the failed host unmap did not throw");
+        refused([&] { RequireNoMultisampleTarget(address, 64u, "a CPU read"); }, "a CPU read", "a read after a failed unmap");
+        {
+            GuestAllocations::Mutation mutation;
+            if (removeAllocation) mutation.Remove(block);
+            else mutation.Unmap(block, bytes, [](const void*, std::size_t, const void*, bool) {});
+            mutation.Add(block, bytes, true, true, true);
+        }
+        RequireNoMultisampleTarget(address, bytes, "a texture read");
+        AgcDriver::GuestMemory::Read(address + 256u, texels);
+        previous = view;
+    }
+    clearTargets();
     std::cout << "Multisampled target guest access tests passed\n";
 }
 
