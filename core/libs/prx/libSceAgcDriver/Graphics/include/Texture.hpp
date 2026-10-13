@@ -497,6 +497,11 @@ private:
         DccKeys keys = DccKeys::Uncompressed;
     };
     RefreshProof refreshProof;
+    struct CollectStamp {
+        std::uint64_t epoch = 0;
+        std::uint64_t unwatched = 0;
+    };
+    CollectStamp collectStamp;
     struct ForeignKeyProof {
         std::uint64_t dccAddress = 0;
         DccKeyProof proof;

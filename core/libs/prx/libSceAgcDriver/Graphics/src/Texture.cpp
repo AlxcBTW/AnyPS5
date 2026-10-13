@@ -1821,7 +1821,14 @@ bool StorageTexture::refreshProved() {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    static const bool stampEnabled = std::getenv("APS5_EXP_TEXTURE_COLLECT_STAMP") != nullptr;
+    const auto epoch = stampEnabled ? GuestMemory::ThreadCollectEpoch() : 0;
+    const auto unwatched = epoch != 0 ? GuestMemory::UnwatchSerial() : 0;
+    if (epoch == 0 || collectStamp.epoch != epoch || collectStamp.unwatched != unwatched) {
+        collectStamp = {};
+        if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+        if (epoch != 0) collectStamp = {epoch, unwatched};
+    }
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);

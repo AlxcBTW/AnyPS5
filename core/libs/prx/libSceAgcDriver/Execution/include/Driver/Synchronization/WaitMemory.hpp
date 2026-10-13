@@ -48,6 +48,10 @@ struct EpochBumps {
 
 void PollSleep();
 
+void NoteQueueReceive(std::uint32_t queue);
+
+bool QueueQuietSinceEpoch(std::uint32_t queue);
+
 }
 
 #endif

@@ -1015,10 +1015,19 @@ bool collectMemoEnabled() {
 // thread that never bumps its epoch never match (each collect gets a fresh epoch), as intended.
 // APS5_SHARED_COLLECT_MEMO=1 uses the tracker's shared ring under its mutex instead.
 struct ThreadCollectMemo {
-    std::array<WriteTracker::Memo, 64> entries{};
+    std::array<WriteTracker::Memo, 4096> entries{};
     std::size_t next = 0;
 };
 thread_local ThreadCollectMemo threadCollectMemo;
+
+std::size_t collectMemoSlots() {
+    static const std::size_t slots = [] {
+        const char* value = std::getenv("APS5_EXP_COLLECT_MEMO_SLOTS");
+        const auto parsed = value != nullptr ? std::strtol(value, nullptr, 10) : 64L;
+        return parsed < 1 ? std::size_t{64} : parsed > 4096 ? std::size_t{4096} : static_cast<std::size_t>(parsed);
+    }();
+    return slots;
+}
 
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
@@ -1105,7 +1114,9 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        for (const auto& entry : threadCollectMemo.entries) {
+        const auto slots = collectMemoSlots();
+        for (std::size_t slot = 0; slot < slots; ++slot) {
+            const auto& entry = threadCollectMemo.entries[slot];
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
@@ -1143,7 +1154,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        else threadCollectMemo.entries[threadCollectMemo.next++ % collectMemoSlots()] = {first, stop, epoch, serial};
     }
     return tracker.generation;
 }
@@ -1161,6 +1172,14 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ThreadCollectEpoch() {
+    return collectMemoEnabled() ? threadCollectEpoch : 0;
+}
+
+std::uint64_t UnwatchSerial() {
+    return unwatchSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t CollectEpochBumps() {

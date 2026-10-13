@@ -219,6 +219,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         tail.shaders = shaders;
         tail.serial = stalled.serial;
         tail.received = ++eventSerial;
+        NoteQueueReceive(tail.queue);
     }
     if (APS5_ENABLE_TIMING_LOG) tail.enqueuedAt = tail.dequeuedAt = tail.orderedAt = std::chrono::steady_clock::now();
     timing.Finish();
@@ -264,6 +265,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         submission.serial = accepted + 1;
 
         submission.received = ++eventSerial;
+        NoteQueueReceive(submission.queue);
         if (profile) {
             const auto now = std::chrono::steady_clock::now();
             submission.enqueuedAt = now;
