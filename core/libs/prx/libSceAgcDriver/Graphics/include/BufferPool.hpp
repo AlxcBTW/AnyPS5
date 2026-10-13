@@ -79,6 +79,12 @@ public:
     static void SetHostHeapTight(bool tight);
     static bool HostHeapTight();
     VkDeviceSize TrimHost() noexcept;
+    // The same for the device-local heap: while it is short (PollHostHeap's device figures), a
+    // released device-local allocation of a MiB or more is destroyed instead of retained, and
+    // TrimDevice destroys the ones the device tier retains.
+    static void SetDeviceHeapTight(bool tight);
+    static bool DeviceHeapTight();
+    VkDeviceSize TrimDevice() noexcept;
     std::pair<VkDeviceSize, VkDeviceSize> RetainedBytes();
 
 private:

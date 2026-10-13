@@ -108,6 +108,11 @@ std::uint64_t HeapHeadroom(std::uint64_t heapBudget);
 std::uint64_t RamImportAllowance(std::uint64_t liveImports, std::uint64_t ramFree, std::uint64_t reserve);
 // Overrides the free physical memory PollHostHeap reads (tests; UINT64_MAX: read it again).
 void SetRamFreeOverride(std::uint64_t bytes);
+// The device-local heap's room beyond its reserve (max(512 MiB, an eighth of its budget)) at the last
+// reading (UINT64_MAX without APS5_EXP_HEAP_BUDGET or a reading): what device-local mirrors and unit
+// shadows may still take. Below the reserve the buffer pool keeps no large device-local allocation.
+std::uint64_t DeviceHeapRoom();
+std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget);
 // The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
 std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);
 // Reads the import heap's budget at most every 100 ms (always with `force`); without the switch, the

@@ -550,10 +550,17 @@ std::optional<ShadowDestination> ShadowDestinationFor(const Context& context, co
         const auto firstUnit = static_cast<std::uint64_t>(slabIndex) * SlabUnits();
         const auto units = static_cast<std::uint32_t>(std::min<std::uint64_t>(SlabUnits(), shadow->Units() - firstUnit));
         const auto needed = static_cast<std::uint64_t>(units) * UnitBytes;
+        // exp (APS5_EXP_HEAP_BUDGET): while the device-local heap is short the shadows do not grow;
+        // a new slab replaces the least recently used ones.
+        std::uint64_t budget = BudgetBytes();
+        if (const auto room = DeviceHeapRoom(); room != UINT64_MAX) {
+            std::lock_guard lock(registry.mutex);
+            budget = std::min(budget, std::max(registry.liveBytes + room, needed));
+        }
         for (;;) {
             {
                 std::lock_guard lock(registry.mutex);
-                if (registry.liveBytes + needed <= BudgetBytes()) break;
+                if (registry.liveBytes + needed <= budget) break;
             }
             if (!evictOne(registry)) {
                 Stats().refused.fetch_add(1, std::memory_order_relaxed);

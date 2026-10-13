@@ -785,8 +785,9 @@ struct HeapWatch {
     std::chrono::steady_clock::time_point read{};
     HostHeapState last{};
     bool reported = false;
-    // The tightness the buffer pool was last told (BufferPool::SetHostHeapTight).
+    // The tightness the buffer pool was last told (BufferPool::SetHostHeapTight / SetDeviceHeapTight).
     bool poolTight = false;
+    bool poolDeviceTight = false;
     std::chrono::steady_clock::time_point lastPrint{};
     std::atomic<std::uint64_t> deviceMirrors{0};
     std::atomic<std::uint64_t> deviceBytes{0};
@@ -1522,8 +1523,7 @@ bool deviceMirrorWanted(const Context& context, std::uint64_t address, std::uint
     // Spilled, tight already, or this mirror would not fit beside the imports (an import of its range
     // was refused).
     if ((!spilled && !state.tight && state.imports + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
-    const auto reserve = std::max<std::uint64_t>(std::uint64_t{512} << 20u, state.deviceBudget / 8);
-    return state.deviceBudget > state.deviceUsage + bytes + reserve;
+    return state.deviceBudget > state.deviceUsage + bytes + DeviceHeapReserve(state.deviceBudget);
 }
 
 class RefreshPool {
@@ -2694,24 +2694,46 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
     auto& state = heaps.last;
     state.imports = liveImports;
     state.tight = heapTight(state, liveImports);
-    const bool changed = !heaps.reported || state.tight != heaps.poolTight;
+    const bool deviceTight = state.deviceHeap != UINT32_MAX && state.deviceBudget < state.deviceUsage + DeviceHeapReserve(state.deviceBudget);
+    const bool changed = !heaps.reported || state.tight != heaps.poolTight || deviceTight != heaps.poolDeviceTight;
     std::uint64_t trimmed = 0;
     if (changed) {
         heaps.reported = true;
-        heaps.poolTight = state.tight;
-        BufferPool::SetHostHeapTight(state.tight);
-        trimmed = state.tight && context.bufferPool != nullptr ? context.bufferPool->TrimHost() : 0;
+        if (state.tight != heaps.poolTight) {
+            heaps.poolTight = state.tight;
+            BufferPool::SetHostHeapTight(state.tight);
+            trimmed += state.tight && context.bufferPool != nullptr ? context.bufferPool->TrimHost() : 0;
+        }
+        if (deviceTight != heaps.poolDeviceTight) {
+            heaps.poolDeviceTight = deviceTight;
+            BufferPool::SetDeviceHeapTight(deviceTight);
+            trimmed += deviceTight && context.bufferPool != nullptr ? context.bufferPool->TrimDevice() : 0;
+        }
     }
     // On a change at most every 5 s; with the census also every 10 s regardless.
     const bool first = heaps.lastPrint == std::chrono::steady_clock::time_point{};
     if (first || (changed && now - heaps.lastPrint >= std::chrono::seconds(5)) || (MemoryCensusEnabled() && now - heaps.lastPrint >= std::chrono::seconds(10))) {
         heaps.lastPrint = now;
-        std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %s; budget %llu MiB, usage %llu MiB = imports %llu + retired imports awaiting their batches %llu + host buffers %llu + other %llu MiB; headroom %llu MiB, import allowance %llu MiB; RAM free %llu MiB (reserve %llu); device-local heap %u: %llu of %llu MiB; pool trimmed %llu MiB of host buffers\n", heap, state.tight ? "tight" : "relaxed",
+        std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %s%s; budget %llu MiB, usage %llu MiB = imports %llu + retired imports awaiting their batches %llu + host buffers %llu + other %llu MiB; headroom %llu MiB, import allowance %llu MiB; RAM free %llu MiB (reserve %llu); device-local heap %u: %llu of %llu MiB; pool trimmed %llu MiB\n", heap, state.tight ? "tight" : "relaxed", deviceTight ? ", device-local heap short" : "",
             static_cast<unsigned long long>(state.budget >> 20u), static_cast<unsigned long long>(state.usage >> 20u), static_cast<unsigned long long>(liveImports >> 20u), static_cast<unsigned long long>(state.retiredImports >> 20u), static_cast<unsigned long long>(state.hostBuffers >> 20u), static_cast<unsigned long long>(state.otherUse >> 20u),
             static_cast<unsigned long long>(state.headroom >> 20u), static_cast<unsigned long long>(state.allowance >> 20u), static_cast<unsigned long long>(state.ramFree == UINT64_MAX ? 0 : state.ramFree >> 20u), static_cast<unsigned long long>(state.ramReserve >> 20u),
             state.deviceHeap, static_cast<unsigned long long>(state.deviceUsage >> 20u), static_cast<unsigned long long>(state.deviceBudget >> 20u), static_cast<unsigned long long>(trimmed >> 20u));
     }
     return state;
+}
+
+std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget) {
+    return std::max<std::uint64_t>(std::uint64_t{512} << 20u, deviceBudget / 8);
+}
+
+std::uint64_t DeviceHeapRoom() {
+    if (!heapBudgetEnabled()) return UINT64_MAX;
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    const auto& state = heaps.last;
+    if (state.deviceHeap == UINT32_MAX || state.deviceBudget == 0) return UINT64_MAX;
+    const auto reserve = DeviceHeapReserve(state.deviceBudget);
+    return state.deviceBudget > state.deviceUsage + reserve ? state.deviceBudget - state.deviceUsage - reserve : 0;
 }
 
 std::uint64_t RamImportAllowance(std::uint64_t liveImports, std::uint64_t ramFree, std::uint64_t reserve) {
@@ -2730,14 +2752,19 @@ void SetHostImportHeap(std::uint32_t heap) {
     heaps.last = {};
     heaps.reported = false;
     heaps.poolTight = false;
+    heaps.poolDeviceTight = false;
     heaps.spilled.clear();
     heaps.physical = VK_NULL_HANDLE;
     BufferPool::SetHostHeapTight(false);
+    BufferPool::SetDeviceHeapTight(false);
 }
 
 void SetHeapBudgetExperiment(int mode) {
     heapBudgetMode.store(mode, std::memory_order_relaxed);
-    if (mode <= 0) BufferPool::SetHostHeapTight(false);
+    if (mode <= 0) {
+        BufferPool::SetHostHeapTight(false);
+        BufferPool::SetDeviceHeapTight(false);
+    }
 }
 
 DeviceMirrorStats DeviceMirrorCounters() {

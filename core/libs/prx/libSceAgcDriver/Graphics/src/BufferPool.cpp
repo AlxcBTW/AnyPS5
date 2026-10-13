@@ -29,7 +29,41 @@ bool exactSizes() {
 constexpr VkBufferUsageFlags deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
 std::atomic<bool> hostHeapTight{false};
+std::atomic<bool> deviceHeapTight{false};
 
+}
+
+void BufferPool::SetDeviceHeapTight(bool tight) {
+    deviceHeapTight.store(tight, std::memory_order_relaxed);
+}
+
+bool BufferPool::DeviceHeapTight() {
+    return deviceHeapTight.load(std::memory_order_relaxed);
+}
+
+VkDeviceSize BufferPool::TrimDevice() noexcept {
+    std::vector<BufferAllocation> evicted;
+    VkDeviceSize bytes = 0;
+    try {
+        std::lock_guard lock(mutex);
+        evicted.reserve(deviceTier.slots);
+        for (const auto& [key, slots] : deviceTier.free) {
+            for (const auto& slot : slots) {
+                evicted.push_back(slot.allocation);
+                bytes += slot.allocation.allocationBytes;
+            }
+        }
+        deviceTier.evictions += deviceTier.slots;
+        deviceTier.free.clear();
+        deviceTier.retainedBytes = 0;
+        deviceTier.slots = 0;
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::system_error&) {
+        return 0;
+    }
+    for (const auto& gone : evicted) destroy(gone);
+    return bytes;
 }
 
 void BufferPool::SetHostHeapTight(bool tight) {
@@ -356,8 +390,9 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     try {
         std::lock_guard lock(mutex);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
-        const bool hostHeld = HostHeapTight() && (allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && !allocation.slab && allocation.bytes >= classLimit;
-        if (allocation.allocationBytes > tier.budget || hostHeld) {
+        const bool hostVisible = (allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+        const bool tightHeld = !allocation.slab && allocation.bytes >= classLimit && (hostVisible ? HostHeapTight() : DeviceHeapTight());
+        if (allocation.allocationBytes > tier.budget || tightHeld) {
             evicted.push_back(allocation);
         } else {
             while (tier.slots != 0 && (tier.retainedBytes + allocation.allocationBytes > tier.budget || tier.slots >= maxSlots)) evictOldest(tier, evicted);

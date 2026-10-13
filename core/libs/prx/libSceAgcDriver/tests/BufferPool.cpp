@@ -568,6 +568,21 @@ void HeapBudget() {
         state = PollHostHeap(context, 2000 * MiB, true);
         Expect(!state.tight && state.allowance == 4048 * MiB, "free memory above the reserve does not bound the allowance");
         Expect(RamImportAllowance(100, UINT64_MAX, 1024) == UINT64_MAX && RamImportAllowance(100, 500, 1024) == 100, "unknown or short free memory gives the wrong allowance");
+        // A short device-local heap (less free than its reserve, an eighth of the budget): no large
+        // device-local buffer is retained, and turning short trims the ones held.
+        const auto deviceReserve = DeviceHeapReserve(8188 * MiB);
+        Expect(deviceReserve == 8188 * MiB / 8, "the device-local reserve is not an eighth of the budget");
+        { DeviceBuffer held(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        const auto heldFrees = mock.frees;
+        mockBudget.heapUsage[0] = 8188 * MiB - deviceReserve / 2;
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(BufferPool::DeviceHeapTight() && DeviceHeapRoom() == 0 && mock.frees == heldFrees + 1, "a short device-local heap did not stop retention or trim the retained buffer");
+        const auto shortFrees = mock.frees;
+        { DeviceBuffer large(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
+        Expect(mock.frees == shortFrees + 1, "a large device-local buffer was retained while the device-local heap was short");
+        mockBudget.heapUsage[0] = 4473 * MiB;
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(!BufferPool::DeviceHeapTight() && DeviceHeapRoom() == 8188 * MiB - 4473 * MiB - deviceReserve, "the device-local heap's room is wrong once it has room again");
         SetRamFreeOverride(UINT64_MAX);
         SetHeapBudgetExperiment(0);
         SetHostImportHeap(UINT32_MAX);
