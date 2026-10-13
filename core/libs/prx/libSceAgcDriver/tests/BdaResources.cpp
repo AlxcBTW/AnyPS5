@@ -802,6 +802,7 @@ void spillTests(const Context& base, const BdaTestAccess& access) {
     context.memory.memoryHeaps[1] = {VkDeviceSize{1} << 30u, 0};
     context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x3000});
     context.memoryProperties2 = spillMemoryProperties;
+    SetRamFreeOverride(std::uint64_t{64} << 30u);
     SetHeapBudgetExperiment(1);
     SetHostImportHeap(1);
     const auto registry = [&](std::uint8_t* range, bool add, bool canWrite) {
@@ -842,6 +843,7 @@ void spillTests(const Context& base, const BdaTestAccess& access) {
     }
     SetHeapBudgetExperiment(0);
     SetHostImportHeap(UINT32_MAX);
+    SetRamFreeOverride(UINT64_MAX);
 #ifdef _WIN32
     GuestArena::GuestArenaReset_nid_postfix(block, 2 * bytes);
 #endif
@@ -867,6 +869,7 @@ void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
     deviceMirrorBudget.heapUsage[0] = 0;
     deviceMirrorBudget.heapBudget[1] = VkDeviceSize{1} << 30u;
     deviceMirrorBudget.heapUsage[1] = VkDeviceSize{1} << 30u;
+    SetRamFreeOverride(std::uint64_t{64} << 30u);
     SetHeapBudgetExperiment(1);
     SetHostImportHeap(1);
     Require(PollHostHeap(context, 0, true).tight, "a full host heap is not tight");
@@ -958,6 +961,7 @@ void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {
     sweep();
     SetHeapBudgetExperiment(0);
     SetHostImportHeap(UINT32_MAX);
+    SetRamFreeOverride(UINT64_MAX);
 #ifdef _WIN32
     GuestArena::GuestArenaReset_nid_postfix(block, bytes);
 #endif

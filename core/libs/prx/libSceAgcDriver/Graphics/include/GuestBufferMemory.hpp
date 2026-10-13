@@ -90,9 +90,24 @@ struct HostHeapState {
     std::uint32_t deviceHeap = UINT32_MAX;
     std::uint64_t deviceBudget = 0;
     std::uint64_t deviceUsage = 0;
+    // Imports dropped but still held by unfinished batches (counted as host imports until destroyed):
+    // in the heap's usage, not in `imports`.
+    std::uint64_t retiredImports = 0;
+    // The heap's usage that neither the imports (live or retired) nor the host-visible buffers explain.
+    std::uint64_t otherUse = 0;
+    // Free physical memory and the reserve kept beside it (APS5_HEAP_RAM_RESERVE_MIB, default 1024): a
+    // host-visible allocation has to be resident, so below the reserve no new import is made and the
+    // heap counts as tight (UINT64_MAX: not known).
+    std::uint64_t ramFree = UINT64_MAX;
+    std::uint64_t ramReserve = 0;
 };
 // APS5_HEAP_HEADROOM_MIB, default max(512 MiB, a tenth of the heap's budget).
 std::uint64_t HeapHeadroom(std::uint64_t heapBudget);
+// The import allowance free physical memory leaves: the live imports plus the free memory above the
+// reserve (UINT64_MAX when the free memory is not known).
+std::uint64_t RamImportAllowance(std::uint64_t liveImports, std::uint64_t ramFree, std::uint64_t reserve);
+// Overrides the free physical memory PollHostHeap reads (tests; UINT64_MAX: read it again).
+void SetRamFreeOverride(std::uint64_t bytes);
 // The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
 std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);
 // Reads the import heap's budget at most every 100 ms (always with `force`); without the switch, the

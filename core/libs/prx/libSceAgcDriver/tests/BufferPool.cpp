@@ -516,6 +516,8 @@ void HeapBudget() {
         context.memory.memoryTypes[1].heapIndex = 1;
         context.physical = reinterpret_cast<VkPhysicalDevice>(std::uintptr_t{0x1000});
         context.memoryProperties2 = mockMemoryProperties2;
+        // Plenty of free physical memory unless a case says otherwise (the runner's own would vary).
+        SetRamFreeOverride(std::uint64_t{64} << 30u);
         SetHeapBudgetExperiment(0);
         SetHostImportHeap(1);
         Expect(PollHostHeap(context, 7129 * MiB, true).allowance == UINT64_MAX && budgetReads == 0, "the heap was read without APS5_EXP_HEAP_BUDGET");
@@ -555,6 +557,18 @@ void HeapBudget() {
         mockBudget.heapUsage[1] = (5000 + 2500) * MiB;
         state = PollHostHeap(context, 5000 * MiB, true);
         Expect(state.allowance == 8110 * MiB - 2500 * MiB - 811 * MiB, "the heap's use without the imports was not taken as the other use");
+        Expect(state.otherUse == 2500 * MiB - LiveGpuMemory(GpuMemoryKind::HostBuffer) - LiveGpuMemory(GpuMemoryKind::HostImport) && state.retiredImports == 0, "the heap's use is not split into imports, host buffers and the rest");
+        // Free physical memory below the reserve (1 GiB): tight, and no import beyond the live ones;
+        // above it, the free memory past the reserve bounds the allowance.
+        mockBudget.heapUsage[1] = (2000 + 409 + 300) * MiB;
+        SetRamFreeOverride(512 * MiB);
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(state.tight && state.allowance == 2000 * MiB && state.ramFree == 512 * MiB && state.ramReserve == 1024 * MiB, "free memory below the reserve did not stop new imports");
+        SetRamFreeOverride(3072 * MiB);
+        state = PollHostHeap(context, 2000 * MiB, true);
+        Expect(!state.tight && state.allowance == 4048 * MiB, "free memory above the reserve does not bound the allowance");
+        Expect(RamImportAllowance(100, UINT64_MAX, 1024) == UINT64_MAX && RamImportAllowance(100, 500, 1024) == 100, "unknown or short free memory gives the wrong allowance");
+        SetRamFreeOverride(UINT64_MAX);
         SetHeapBudgetExperiment(0);
         SetHostImportHeap(UINT32_MAX);
         Expect(!BufferPool::HostHeapTight(), "switching the experiment off left the pool tight");

@@ -815,7 +815,29 @@ constexpr std::uint64_t TightSlack = std::uint64_t{64} << 20u;
 
 bool heapTight(const HostHeapState& state, std::uint64_t liveImports) {
     if (state.allowance == UINT64_MAX) return false;
-    return liveImports + TightSlack >= state.allowance || state.usage + state.headroom / 2 >= state.budget;
+    const bool ramShort = state.ramFree != UINT64_MAX && state.ramFree < state.ramReserve;
+    return ramShort || liveImports + TightSlack >= state.allowance || state.usage + state.headroom / 2 >= state.budget;
+}
+
+std::atomic<std::uint64_t> ramFreeOverride{UINT64_MAX};
+
+// Free physical memory (UINT64_MAX: not known).
+std::uint64_t readRamFree() {
+    if (const auto forced = ramFreeOverride.load(std::memory_order_relaxed); forced != UINT64_MAX) return forced;
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) return status.ullAvailPhys;
+#endif
+    return UINT64_MAX;
+}
+
+std::uint64_t HeapRamReserve() {
+    static const std::uint64_t reserve = [] {
+        const char* value = std::getenv("APS5_HEAP_RAM_RESERVE_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 20u;
+    }();
+    return reserve;
 }
 
 std::uint64_t importBudget(const Context& context, const HostImports& state) {
@@ -2647,6 +2669,15 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
         // the usage without them (when it holds them) covers its own allocations, the host buffers ours.
         const auto withoutImports = state.usage >= liveImports ? state.usage - liveImports : state.usage;
         state.allowance = HeapImportAllowance(state.budget, std::max(state.hostBuffers, withoutImports), state.headroom);
+        // What the usage holds besides the live imports: the dropped ones still kept by their batches
+        // (counted as host imports until destroyed), the host buffers, and whatever is left.
+        const auto counted = LiveGpuMemory(GpuMemoryKind::HostImport);
+        state.retiredImports = counted > liveImports ? counted - liveImports : 0;
+        const auto explained = std::max(counted, liveImports) + state.hostBuffers;
+        state.otherUse = state.usage > explained ? state.usage - explained : 0;
+        state.ramFree = readRamFree();
+        state.ramReserve = HeapRamReserve();
+        state.allowance = std::min(state.allowance, RamImportAllowance(liveImports, state.ramFree, state.ramReserve));
         const auto heapCount = std::min<std::uint32_t>(context.memory.memoryHeapCount, VK_MAX_MEMORY_HEAPS);
         for (std::uint32_t index = 0; index < heapCount; ++index) {
             if ((context.memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0 || index == heap) continue;
@@ -2663,20 +2694,33 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
     auto& state = heaps.last;
     state.imports = liveImports;
     state.tight = heapTight(state, liveImports);
-    if (!heaps.reported || state.tight != heaps.poolTight) {
+    const bool changed = !heaps.reported || state.tight != heaps.poolTight;
+    std::uint64_t trimmed = 0;
+    if (changed) {
         heaps.reported = true;
         heaps.poolTight = state.tight;
         BufferPool::SetHostHeapTight(state.tight);
-        const auto trimmed = state.tight && context.bufferPool != nullptr ? context.bufferPool->TrimHost() : 0;
-        const bool first = heaps.lastPrint == std::chrono::steady_clock::time_point{};
-        if (first || now - heaps.lastPrint >= std::chrono::seconds(5)) {
-            heaps.lastPrint = now;
-            std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %s; budget %llu MiB, usage %llu MiB, imports %llu MiB, host buffers %llu MiB, headroom %llu MiB, import allowance %llu MiB; device-local heap %u: %llu of %llu MiB; pool trimmed %llu MiB of host buffers\n", heap, state.tight ? "tight" : "relaxed",
-                static_cast<unsigned long long>(state.budget >> 20u), static_cast<unsigned long long>(state.usage >> 20u), static_cast<unsigned long long>(liveImports >> 20u), static_cast<unsigned long long>(state.hostBuffers >> 20u), static_cast<unsigned long long>(state.headroom >> 20u), static_cast<unsigned long long>(state.allowance >> 20u),
-                state.deviceHeap, static_cast<unsigned long long>(state.deviceUsage >> 20u), static_cast<unsigned long long>(state.deviceBudget >> 20u), static_cast<unsigned long long>(trimmed >> 20u));
-        }
+        trimmed = state.tight && context.bufferPool != nullptr ? context.bufferPool->TrimHost() : 0;
+    }
+    // On a change at most every 5 s; with the census also every 10 s regardless.
+    const bool first = heaps.lastPrint == std::chrono::steady_clock::time_point{};
+    if (first || (changed && now - heaps.lastPrint >= std::chrono::seconds(5)) || (MemoryCensusEnabled() && now - heaps.lastPrint >= std::chrono::seconds(10))) {
+        heaps.lastPrint = now;
+        std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %s; budget %llu MiB, usage %llu MiB = imports %llu + retired imports awaiting their batches %llu + host buffers %llu + other %llu MiB; headroom %llu MiB, import allowance %llu MiB; RAM free %llu MiB (reserve %llu); device-local heap %u: %llu of %llu MiB; pool trimmed %llu MiB of host buffers\n", heap, state.tight ? "tight" : "relaxed",
+            static_cast<unsigned long long>(state.budget >> 20u), static_cast<unsigned long long>(state.usage >> 20u), static_cast<unsigned long long>(liveImports >> 20u), static_cast<unsigned long long>(state.retiredImports >> 20u), static_cast<unsigned long long>(state.hostBuffers >> 20u), static_cast<unsigned long long>(state.otherUse >> 20u),
+            static_cast<unsigned long long>(state.headroom >> 20u), static_cast<unsigned long long>(state.allowance >> 20u), static_cast<unsigned long long>(state.ramFree == UINT64_MAX ? 0 : state.ramFree >> 20u), static_cast<unsigned long long>(state.ramReserve >> 20u),
+            state.deviceHeap, static_cast<unsigned long long>(state.deviceUsage >> 20u), static_cast<unsigned long long>(state.deviceBudget >> 20u), static_cast<unsigned long long>(trimmed >> 20u));
     }
     return state;
+}
+
+std::uint64_t RamImportAllowance(std::uint64_t liveImports, std::uint64_t ramFree, std::uint64_t reserve) {
+    if (ramFree == UINT64_MAX) return UINT64_MAX;
+    return liveImports + (ramFree > reserve ? ramFree - reserve : 0);
+}
+
+void SetRamFreeOverride(std::uint64_t bytes) {
+    ramFreeOverride.store(bytes, std::memory_order_relaxed);
 }
 
 void SetHostImportHeap(std::uint32_t heap) {
