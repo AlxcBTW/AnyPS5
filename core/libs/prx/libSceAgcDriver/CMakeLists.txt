@@ -987,47 +987,11 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         tests/GuestSamplerResource.cpp
         tests/TextureDetiler.cpp
         tests/DepthSurfaceReuse.cpp
-        Graphics/src/Draw.cpp
-        Graphics/src/DepthSurface.cpp
-        Graphics/src/MultisampleTarget.cpp
-        Graphics/src/Pipeline.cpp
-        Graphics/src/PipelineLibrary.cpp
-        Graphics/src/State.cpp
-        Graphics/src/ColorTargetLayout.cpp
-        Graphics/src/ColorTargetTransfer.cpp
-        Graphics/src/Resources.cpp
-        Graphics/src/PlaceholderImages.cpp
-        Graphics/src/ShaderResources.cpp
-        Graphics/src/ShaderAddressResources.cpp
-        Graphics/src/GuestBufferMemory.cpp
-        Graphics/src/BdaResources.cpp
-        Graphics/src/BufferAddress.cpp
-        Graphics/src/ShaderValidation.cpp
-        Graphics/src/GuestTextureResource.cpp
-        Graphics/src/GuestSamplerResource.cpp
-        Graphics/src/TextureFormat.cpp
-        Graphics/src/DccMetadata.cpp
-        Graphics/src/TextureTiling.cpp
-        Graphics/src/TextureDetiler.cpp
-        Graphics/src/Texture.cpp
-        Graphics/src/PassHazards.cpp
-        Graphics/src/UnitShadow.cpp
-        Graphics/src/Sampler.cpp
-        Graphics/src/Recorder.cpp
-        Graphics/src/ParallelCompare.cpp
-        Graphics/src/ShaderInputState.cpp
-        ${agcTextureDetileShaderHeader}
-        ${agcCmaskClearShaderHeader}
-        ${agcMeshArgumentsShaderHeader}
-        ${agcTextureDetileImageShaderHeader}
-        ${agcSampleCounterShaderHeader}
-        ${agcSampleDumpsShaderHeader}
-        Execution/src/GuestMemory.cpp
-        Execution/src/Pm4.cpp
 )
 
 target_include_directories(agc_driver_graphics_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
         ${agcTextureDetileGeneratedRoot}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler/IntermediateRepresentation/include
@@ -1038,7 +1002,7 @@ target_include_directories(agc_driver_graphics_tests PRIVATE
 )
 
 target_link_libraries(agc_driver_graphics_tests PRIVATE
-        shader_recompiler_agc_driver
+        libSceAgcDriver
         libc
         libkernel
 )
@@ -1051,18 +1015,15 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         tests/BdaShader.cpp
         tests/BdaExecution.cpp
         tests/BdaContracts.cpp
-        Execution/src/BdaFeatures.cpp
-        Graphics/src/Resources.cpp
-        Graphics/src/PlaceholderImages.cpp
-        Graphics/src/BufferAddress.cpp
 )
 
 target_include_directories(agc_driver_bda_device_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
         ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
 )
-target_link_libraries(agc_driver_bda_device_tests PRIVATE SDL2-static libc shader_recompiler_agc_driver)
+target_link_libraries(agc_driver_bda_device_tests PRIVATE libSceAgcDriver SDL2-static libc)
 set_target_properties(agc_driver_bda_device_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_bda_device_tests)
 
