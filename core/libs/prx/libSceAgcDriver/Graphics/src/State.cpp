@@ -1102,12 +1102,15 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     if (control == cx.end()) return std::nullopt;
     const auto mode = (control->second >> 4u) & 7u;
     const auto aaConfig = find(cx, 0x2f8);
-    const bool resolve = mode == 3u && aaConfig != cx.end() && (aaConfig->second & 7u) != 0;
+    const bool rasterizerSamples = aaConfig != cx.end() && (aaConfig->second & 7u) != 0;
+    const auto sourceAttrib = find(cx, 0x31d);
+    const bool sourceSamples = sourceAttrib != cx.end() && ((sourceAttrib->second >> 12u) & 7u) != 0;
+    const bool resolve = mode == 3u && (rasterizerSamples || sourceSamples);
     if (mode != 2u && mode != 6u && !resolve) return std::nullopt;
     ColorMetadataPass pass{resolve ? ColorMetadataPass::Mode::Resolve : mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}, std::nullopt};
     Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
     Require(depthPlanesAbsent(cx) || ((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0), "CB metadata pass with depth or stencil work");
-    const auto samples = resolve ? decodeSamples(cx) : 1u;
+    const auto samples = resolve && rasterizerSamples ? decodeSamples(cx) : 1u;
     if (!resolve) zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
     zero(cx, 0x80, ~0u, "window offset");
     const auto viewportControl = read(cx, 0x206);
@@ -1131,7 +1134,7 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     if (resolve) {
         const auto source = DecodeColorBuffer(cx, 0);
         const auto destination = DecodeColorBuffer(cx, 1);
-        Require(source.samples == samples, "CB resolve from a target whose sample count differs from the rasterizer's");
+        Require(samples == 1 || source.samples == samples, "CB resolve from a target whose sample count differs from the rasterizer's");
         Require(destination.samples == 1, "CB resolve into a multisampled target is unsupported");
         Require(destination.cmaskAddress == 0, "CB resolve into a fast-clear color target is unsupported (the resolve does not update its CMASK)");
         Require(source.format == destination.format && source.extent.width == destination.extent.width && source.extent.height == destination.extent.height, "CB resolve between different formats or extents is unsupported");

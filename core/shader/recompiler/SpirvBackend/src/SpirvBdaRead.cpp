@@ -165,7 +165,8 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent)
         state.module.AddFunction(spv::OpCompositeConstruct, values, value, parts[0], parts[1], parts[2], parts[3]);
         return value;
     };
-    const auto read = EmitValueIfElse(state, wide, values, [&] {
+    const auto none = state.module.Constant(spv::OpConstantComposite, values, zero, zero, zero, zero);
+    const auto inPlace = EmitValueOrDefaultIfCondition(state, wide, values, none, [&] {
         std::array<std::uint32_t, 4> loaded{};
         for (std::uint32_t dword = 0; dword < 4u; ++dword) {
             loaded[dword] = EmitValueOrZeroIfCondition(state, isUsed(dword), [&] {
@@ -179,7 +180,8 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent)
             });
         }
         return composite(loaded);
-    }, [&] {
+    });
+    const auto separate = EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, wide), values, none, [&] {
         std::array<std::uint32_t, 4> bytes{};
         for (std::uint32_t dword = 0; dword < 4u; ++dword) {
             bytes[dword] = EmitValueOrZeroIfCondition(state, isUsed(dword), [&] {
@@ -201,6 +203,7 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent)
         }
         return composite(bytes);
     });
+    const auto read = EmitValueIfElse(state, wide, values, [&] { return inPlace; }, [&] { return separate; });
     auto returned = read;
     if (stops) {
         returned = state.module.AllocateId();
