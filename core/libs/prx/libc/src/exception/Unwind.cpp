@@ -64,9 +64,7 @@ void APS5_VABI CursorUnsupported(_Unwind_Context*) {
 template<class Function> std::uintptr_t Slot(Function function) {
     return reinterpret_cast<std::uintptr_t>(function);
 }
-}
 
-namespace LibcUnwind {
 const std::uintptr_t CursorSlots[] = {
     Slot(&CursorUnsupported),
     Slot(&CursorUnsupported),
@@ -84,6 +82,10 @@ const std::uintptr_t CursorSlots[] = {
     Slot(&CursorUnsupported),
     Slot(&CursorUnsupported),
 };
+}
+
+const std::uintptr_t* UnwindCursorSlots_nid_no_patch() {
+    return CursorSlots;
 }
 
 #if defined(__linux__) || defined(_WIN32) || defined(__APPLE__)

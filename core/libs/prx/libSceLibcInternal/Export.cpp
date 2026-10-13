@@ -143,6 +143,12 @@ unsigned int APS5_VABI alarm_nid_postfix(unsigned int seconds) {
 }
 
 float APS5_VABI fminf_nid_postfix(float x, float y) {
-    return std::fmin(x, y);
+    if (std::isnan(x))
+        return y;
+    if (std::isnan(y))
+        return x;
+    if (std::signbit(x) != std::signbit(y))
+        return std::signbit(x) ? x : y;
+    return x < y ? x : y;
 }
 }
