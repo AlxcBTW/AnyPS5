@@ -790,6 +790,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
         moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
         if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
+        if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -837,6 +838,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 for (std::uint32_t target = 0; target < request.context.pixel->targetExportPacking.size(); ++target) constants.push_back({PipelineSpecialization::ExportPackingBase + target, moduleKey[index++]});
                 constants.push_back({PipelineSpecialization::DualSourceBlend, moduleKey[index++]});
                 if (variant.info.info.rasterPrimitive) constants.push_back({PipelineSpecialization::RasterPrimitive, moduleKey[index++]});
+                if (variant.info.info.layerExported) constants.push_back({PipelineSpecialization::LayerExported, moduleKey[index++]});
             }
             if (!artifact.vertexInputPatches.empty()) {
                 for (const auto& input : result.vertexInputs) {
@@ -1038,6 +1040,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
         for (const auto packing : request.context.pixel->targetExportPacking) mix(static_cast<std::uint64_t>(packing));
         mix(request.context.pixel->dualSourceBlend);
         mix(static_cast<std::uint64_t>(request.context.pixel->rasterPrimitive));
+        mix(request.context.pixel->layerExported);
     }
     if (request.context.vertex) {
         const auto& vertex = *request.context.vertex;

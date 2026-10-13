@@ -508,7 +508,11 @@ int APS5_VABI wcscoll_nid_postfix(const char16_t* first, const char16_t* second)
 
 size_t APS5_VABI wcsxfrm_nid_postfix(char16_t* destination, const char16_t* source, size_t count) {
     const size_t length = Length(source);
-    if (length < count) std::memcpy(destination, source, (length + 1) * sizeof(char16_t));
+    if (count != 0) {
+        const size_t copied = length < count ? length : count - 1;
+        std::memcpy(destination, source, copied * sizeof(char16_t));
+        destination[copied] = 0;
+    }
     return length;
 }
 

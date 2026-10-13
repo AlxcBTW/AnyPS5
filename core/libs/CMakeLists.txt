@@ -228,6 +228,10 @@ if(BUILD_TESTING)
     target_link_libraries(guest_offline_imports_tests PRIVATE libSceHttp libSceNpEntitlementAccess libSceRudp libc)
     configure_windows_unwind(guest_offline_imports_tests)
     add_test(NAME guest_offline_imports COMMAND guest_offline_imports_tests)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_shared_strings COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_shared_strings.py $<TARGET_FILE:nid_patcher>)
+    endif()
     if(WIN32)
         set_tests_properties(guest_offline_imports PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceHttp>")

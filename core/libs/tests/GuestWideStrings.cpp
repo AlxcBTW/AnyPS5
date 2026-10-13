@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <climits>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
 
@@ -190,7 +191,33 @@ int main() {
     char16_t transformed[8];
     wmemset_nid_postfix(transformed, 0xaaaa, 8);
     require(wcsxfrm_nid_postfix(transformed, u"wide", 8) == 4 && same(transformed, u"wide", 5) && transformed[5] == 0xaaaa);
+    wmemset_nid_postfix(transformed, 0xaaaa, 8);
     require(wcsxfrm_nid_postfix(transformed, u"much too long", 4) == 13);
+    if (!same(transformed, u"muc", 4)) std::fputs("wcsxfrm did not copy and terminate its truncated result\n", stderr);
+    require(same(transformed, u"muc", 4) && transformed[4] == 0xaaaa);
     require(wcsxfrm_nid_postfix(nullptr, u"abc", 0) == 3);
+    struct TransformCase {
+        const char16_t* source;
+        std::size_t count;
+        std::size_t length;
+        const char16_t* expected;
+        std::size_t written;
+    };
+    for (const TransformCase test : {
+        TransformCase{u"wide", 0, 4, u"", 0},
+        TransformCase{u"wide", 1, 4, u"", 1},
+        TransformCase{u"wide", 4, 4, u"wid", 4},
+        TransformCase{u"wide", 5, 4, u"wide", 5},
+        TransformCase{u"", 0, 0, u"", 0},
+        TransformCase{u"", 1, 0, u"", 1},
+        TransformCase{u"", 8, 0, u"", 1},
+        TransformCase{u"\x7fff\x8000\xffff\xd83d\xde00", 4, 5, u"\x7fff\x8000\xffff", 4},
+        TransformCase{u"\x7fff\x8000\xffff\xd83d\xde00", 6, 5, u"\x7fff\x8000\xffff\xd83d\xde00", 6}
+    }) {
+        wmemset_nid_postfix(transformed, 0xaaaa, 8);
+        require(wcsxfrm_nid_postfix(transformed, test.source, test.count) == test.length);
+        require(same(transformed, test.expected, test.written));
+        for (std::size_t index = test.written; index < 8; ++index) require(transformed[index] == 0xaaaa);
+    }
     return 0;
 }
