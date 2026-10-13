@@ -20,6 +20,8 @@ namespace GuestArena {
 
 class WindowsMappings {
 public:
+    enum class Collection { All, Armed, Fresh };
+
     static WindowsMappings& Get() {
         static WindowsMappings mappings;
         return mappings;
@@ -97,6 +99,7 @@ public:
             const auto base = cursor + done;
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0});
+            remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
         }
     }
@@ -220,12 +223,21 @@ public:
         return true;
     }
 
-    bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+    bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
-        if (clear && !collectable(address, end)) return false;
+        if (collection == Collection::Fresh) {
+            const auto fresh = freshRanges.upper_bound(address);
+            if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
+            for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+                if (it->second.protection != PAGE_NOACCESS) continue;
+                for (auto at = std::max(address, it->first); at < std::min(end, it->first + pageBytes); at += 4096) {
+                    if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
+                }
+            }
+        } else if (clear && !collectable(address, end)) return false;
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -239,7 +251,21 @@ public:
             const auto found = views.find(base);
             if (found != views.end()) {
                 auto& view = found->second;
-                const auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
+                auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
+                if (collection != Collection::All) {
+                    const auto selected = [&](std::uintptr_t at) {
+                        const bool collected = (view.collected & (1u << ((at - base) / 4096))) != 0;
+                        return collection == Collection::Armed ? collected : !collected;
+                    };
+                    while (cursor < stop && !selected(cursor)) cursor = std::min(stop, cursor + 4096);
+                    if (cursor == stop) continue;
+                    for (auto at = cursor + 4096; at < stop; at += 4096) {
+                        if (!selected(at)) {
+                            stop = at;
+                            break;
+                        }
+                    }
+                }
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
                 std::uint8_t settled = 0;
@@ -249,7 +275,7 @@ public:
                     const auto from = std::max(cursor, base + sub * subpageBytes);
                     const auto to = std::min(stop, base + (sub + 1) * subpageBytes);
                     if (from >= to) continue;
-                    if (pinned || view.seen[sub] != view.page->generation[sub]) {
+                    if (collection == Collection::Fresh || pinned || view.seen[sub] != view.page->generation[sub]) {
                         if (*count == capacity) {
                             full = true;
                             break;
@@ -258,6 +284,14 @@ public:
                     }
                     settled |= static_cast<std::uint8_t>(1u << sub);
                     settledEnd = to;
+                }
+                if (clear) {
+                    for (std::size_t sub = 0; sub < subpages; ++sub) {
+                        const auto bit = static_cast<std::uint8_t>(1u << sub);
+                        if ((settled & bit) == 0 || (view.collected & bit) != 0) continue;
+                        view.collected |= bit;
+                        forget(freshRanges, base + sub * subpageBytes, base + (sub + 1) * subpageBytes);
+                    }
                 }
                 if (clear && !pinned && settled != 0) {
                     std::uint8_t untracked = 0;
@@ -292,6 +326,11 @@ public:
                 if (full) return true;
                 cursor = stop;
             } else {
+                if (collection == Collection::Fresh) {
+                    const auto next = views.lower_bound(cursor);
+                    cursor = next == views.end() ? end : std::min(end, next->first);
+                    continue;
+                }
                 const auto memory = query(cursor);
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
@@ -352,28 +391,39 @@ private:
         std::shared_ptr<Section> section;
         std::uint64_t offset;
         std::uint32_t hostWrites;
+        std::uint8_t collected = 0;
     };
-    void forgetClean(std::uintptr_t start, std::uintptr_t end) {
-        auto it = cleanRanges.lower_bound(start);
-        if (it != cleanRanges.begin() && std::prev(it)->second > start) --it;
-        while (it != cleanRanges.end() && it->first < end) {
+    using Ranges = std::map<std::uintptr_t, std::uintptr_t>;
+
+    static void forget(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin() && std::prev(it)->second > start) --it;
+        while (it != ranges.end() && it->first < end) {
             const auto first = it->first;
             const auto last = it->second;
-            it = cleanRanges.erase(it);
-            if (first < start) cleanRanges.emplace(first, start);
-            if (last > end) it = cleanRanges.emplace(end, last).first;
+            it = ranges.erase(it);
+            if (first < start) ranges.emplace(first, start);
+            if (last > end) it = ranges.emplace(end, last).first;
         }
     }
 
-    void rememberClean(std::uintptr_t start, std::uintptr_t end) {
-        auto it = cleanRanges.lower_bound(start);
-        if (it != cleanRanges.begin() && std::prev(it)->second >= start) --it;
-        while (it != cleanRanges.end() && it->first <= end) {
+    static void remember(Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin() && std::prev(it)->second >= start) --it;
+        while (it != ranges.end() && it->first <= end) {
             start = std::min(start, it->first);
             end = std::max(end, it->second);
-            it = cleanRanges.erase(it);
+            it = ranges.erase(it);
         }
-        cleanRanges.emplace(start, end);
+        ranges.emplace(start, end);
+    }
+
+    void forgetClean(std::uintptr_t start, std::uintptr_t end) {
+        forget(cleanRanges, start, end);
+    }
+
+    void rememberClean(std::uintptr_t start, std::uintptr_t end) {
+        remember(cleanRanges, start, end);
     }
 
     void invalidate(SharedPage& page, std::uint8_t mask = allSubpages) {
@@ -475,6 +525,7 @@ private:
                 if (found != views.end()) {
                     std::erase(found->second.page->aliases, cursor);
                     views.erase(found);
+                    forget(freshRanges, cursor, cursor + pageBytes);
                 }
             } else if (memory.Type == MEM_PRIVATE) {
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
@@ -491,7 +542,8 @@ private:
         if (query(address).RegionSize != bytes && !VirtualFree(reinterpret_cast<void*>(address), bytes, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) fail("coalesce guest placeholders");
     }
 
-    std::map<std::uintptr_t, std::uintptr_t> cleanRanges;
+    Ranges cleanRanges;
+    Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::mutex mutex;
