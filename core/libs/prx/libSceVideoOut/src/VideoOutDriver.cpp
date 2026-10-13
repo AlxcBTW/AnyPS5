@@ -619,6 +619,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 }
             }
             padInput.Update();
+            window.UpdateCompileTitle();
             updateDisplayRefreshRate();
             mouseInput.UpdateCapture(!padInput.MouseModeEnabled());
             if (current) {
