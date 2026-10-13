@@ -25,7 +25,7 @@ target_include_directories(nid_patcher PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nid/i
 target_compile_features(nid_patcher PRIVATE cxx_std_20)
 
 if(MINGW)
-    target_link_options(nid_patcher PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_options(nid_patcher PRIVATE -municode -static -static-libgcc -static-libstdc++)
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_FLAGS -fno-asynchronous-unwind-tables)
     check_cxx_source_compiles("#ifdef __USING_SJLJ_EXCEPTIONS__\n#error\n#endif\nint main() { return 0; }" ANYPS5_MINGW_DWARF_EXCEPTIONS)
@@ -192,6 +192,9 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME nid_patcher_macho COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_macho_nids.py $<TARGET_FILE:nid_patcher>)
+        add_test(NAME nid_patcher_native_paths COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_native_paths.py $<TARGET_FILE:nid_patcher>)
+        set_tests_properties(nid_patcher_native_paths PROPERTIES TIMEOUT 20)
     endif()
     add_test_executable(patched_libraries_tests tests/PatchedLibraries.cpp)
     add_dependencies(patched_libraries_tests libs)

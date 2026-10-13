@@ -3,6 +3,7 @@
 #include <nid/PeNidPatcher.hpp>
 #include <nid/MachONidPatcher.hpp>
 #include <nid/NidPatcherUtils.hpp>
+#include <nid/NativePath.hpp>
 #include <bit>
 #include <cstring>
 #include <fstream>
@@ -110,7 +111,7 @@ std::string NormalizeExportName(const std::string& name) {
 
 std::unordered_set<std::string> ReadExportExclusions(const std::string& path) {
     if constexpr (std::endian::native != std::endian::little) throw std::runtime_error("export references require a little-endian host");
-    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    std::ifstream input(Internal::NativePath(path), std::ios::binary | std::ios::ate);
     if (!input) throw std::runtime_error("cannot open export reference: " + path);
     const auto size = input.tellg();
     if (size <= 0) throw std::runtime_error("empty or unreadable export reference: " + path);
