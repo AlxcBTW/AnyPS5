@@ -4294,7 +4294,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             const auto path = capture.Write(directory);
             std::fprintf(stderr, "[compute-capture] %s\n", path.string().c_str());
         }
-        if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
+        if (profile && shader.spirv.size() > 100000) {
+            // exp (never push): hashes of the SPIR-V and of the specialization values, so a large pipeline created
+            // twice shows whether its inputs were identical (then the VkPipelineCache should have served it).
+            std::uint64_t spirvHash = 1469598103934665603ull, specializationHash = 1469598103934665603ull;
+            for (const auto word : shader.spirv) spirvHash = (spirvHash ^ word) * 1099511628211ull;
+            for (const auto& value : shader.specialization) specializationHash = (((specializationHash ^ value.id) * 1099511628211ull) ^ value.value) * 1099511628211ull;
+            std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx, spirv %016llx, specialization %016llx x%zu, flags 0x%x, subgroup %u)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(spirvHash), static_cast<unsigned long long>(specializationHash), shader.specialization.size(), static_cast<unsigned>(pipelineFlags), static_cast<unsigned>(subgroupSize));
+        }
         CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline);
         objects->destroyModule(objects->device, objects->module, nullptr);
         objects->module = VK_NULL_HANDLE;
