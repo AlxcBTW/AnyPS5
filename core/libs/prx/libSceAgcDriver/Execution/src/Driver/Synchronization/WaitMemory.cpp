@@ -19,6 +19,7 @@
 #include <array>
 #include <map>
 #include <optional>
+#include <span>
 
 namespace AgcDriver::DriverDetail {
 
@@ -134,6 +135,8 @@ struct WaitCensus {
             double ms = 0;
             std::uint32_t writerQueue = 0xffffffffu;
             std::uint32_t writerOpcode = 0;
+            std::uint32_t function = 0;
+            std::uint64_t reference = 0;
             std::array<std::uint64_t, static_cast<std::size_t>(WaitEnd::Count)> ends{};
         };
         std::map<std::uint64_t, Address> addresses;
@@ -151,6 +154,16 @@ WaitCensus& Census() {
 bool CensusOn() {
     static const bool on = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return on;
+}
+
+// APS5_WAITMEM_LONG_MS=<ms> (exp, never push): one [waitmem] line per WAIT_REG_MEM that blocked at least that
+// long: address, compare function, reference and mask, the value now, how it ended and its last writer.
+double LongWaitMs() {
+    static const double value = [] {
+        const char* text = std::getenv("APS5_WAITMEM_LONG_MS");
+        return text != nullptr ? std::strtod(text, nullptr) : 0.0;
+    }();
+    return value;
 }
 
 }
@@ -199,11 +212,16 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::uint32_t queue;
         std::uint64_t address;
         std::chrono::steady_clock::time_point begin;
+        std::span<const std::uint32_t> packet;
         WaitEnd end = WaitEnd::Memory;
         bool submitted = false;
         bool slept = false;
         ~CensusWait() {
             if (!on) return;
+            const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u && packet.size() >= 8;
+            const std::uint32_t function = packet.size() > 1 ? packet[1] & 7u : 0u;
+            const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet.size() > 4 ? packet[4] : 0u;
+            const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet.size() > 5 ? packet[5] : 0u;
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
             // The newest write the packet history knows for the awaited dword (a ring the packet loop fills).
             std::uint32_t writerQueue = 0xffffffffu, writerOpcode = 0;
@@ -217,6 +235,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                     break;
                 }
             }
+            if (LongWaitMs() > 0 && ms >= LongWaitMs()) {
+                const std::uint64_t current = wide ? *reinterpret_cast<const volatile std::uint64_t*>(address) : *reinterpret_cast<const volatile std::uint32_t*>(address);
+                AgcDriver::ProfilePrint_nid_no_patch("[waitmem] long wait: queue 0x%x blocked %.1f ms on 0x%llx (function %u, reference 0x%llx, mask 0x%llx, value now 0x%llx), ended by %s; last writer queue 0x%x opcode 0x%x\n", queue, ms, static_cast<unsigned long long>(address), function, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current), WaitEndNames[static_cast<std::size_t>(end)], writerQueue, writerOpcode);
+            }
+            if (!CensusOn()) return;
             auto& census = Census();
             std::lock_guard lock(census.mutex);
             auto& perQueue = census.queues[queue];
@@ -233,6 +256,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 entry.writerQueue = writerQueue;
                 entry.writerOpcode = writerOpcode;
             }
+            entry.function = function;
+            entry.reference = reference;
             const auto now = std::chrono::steady_clock::now();
             if (now - census.reported < std::chrono::seconds(10)) return;
             census.reported = now;
@@ -258,7 +283,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                     for (std::size_t kind = 1; kind < stat.ends.size(); ++kind) {
                         if (stat.ends[kind] > stat.ends[mainEnd]) mainEnd = kind;
                     }
-                    std::snprintf(item, sizeof(item), " 0x%llx x%llu %.0fms (writer queue 0x%x opcode 0x%x; mostly %s)", static_cast<unsigned long long>(top[rank].first), static_cast<unsigned long long>(stat.count), stat.ms, stat.writerQueue, stat.writerOpcode, WaitEndNames[mainEnd]);
+                    std::snprintf(item, sizeof(item), " 0x%llx (function %u, reference 0x%llx) x%llu %.0fms (writer queue 0x%x opcode 0x%x; mostly %s)", static_cast<unsigned long long>(top[rank].first), stat.function, static_cast<unsigned long long>(stat.reference), static_cast<unsigned long long>(stat.count), stat.ms, stat.writerQueue, stat.writerOpcode, WaitEndNames[mainEnd]);
                     tops += item;
                 }
                 AgcDriver::ProfilePrint_nid_no_patch("[waitmem] queue 0x%x (10 s): %llu waits satisfied at entry; %llu blocked %.0f ms by end:%s; %llu made a submit, %llu slept; top addresses:%s\n", waiting, static_cast<unsigned long long>(stats.atEntry), static_cast<unsigned long long>(waits), total, line.c_str(), static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.sleeps), tops.c_str());
@@ -267,7 +292,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             const auto wakes = WaitWake::TakeCounts();
             AgcDriver::ProfilePrint_nid_no_patch("[waitwake] (10 s): WAIT_WAKE %lld: sleeps ended by a label store %llu, ran to the 200 us bound %llu, signals sent to sleepers %llu; landing sleeps on the GPU timeline: ended by a completion %llu, by the bound %llu; EARLY_LABEL_SUBMIT %d: batches submitted early for an awaited label %llu\n", static_cast<long long>(WaitWakeMode()), static_cast<unsigned long long>(wakes.woken), static_cast<unsigned long long>(wakes.timedOut), static_cast<unsigned long long>(wakes.signals), static_cast<unsigned long long>(wakes.gpuCompleted), static_cast<unsigned long long>(wakes.gpuBound), EarlyLabelSubmitOn() ? 1 : 0, static_cast<unsigned long long>(AwaitedLabels::TakeEarlySubmits()));
         }
-    } censusWait{*this, CensusOn(), queue, awaited, std::chrono::steady_clock::now()};
+    } censusWait{*this, CensusOn() || LongWaitMs() > 0, queue, awaited, std::chrono::steady_clock::now(), packet};
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
         censusWait.end = writer != queue ? WaitEnd::StoredOther : WaitEnd::StoredSame;
         if (writer != queue) notePendingWait(packet, queue, received);
