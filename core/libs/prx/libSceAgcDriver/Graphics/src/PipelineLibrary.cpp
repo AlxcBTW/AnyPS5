@@ -149,8 +149,16 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     };
     const std::array<const Key*, 4> partKeys{&keys.vertexInput, &keys.preRasterization, &keys.fragmentShader, &keys.fragmentOutput};
     const Key none;
-    const std::array<const Key*, 4> contextKeys{&none, &keys.preRasterizationLayout, &keys.fragmentLayout, &keys.renderPass};
-    const VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    VkPipelineRenderingCreateInfoKHR shaderRendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    shaderRendering.viewMask = rendering.viewMask;
+    shaderRendering.depthAttachmentFormat = rendering.depthAttachmentFormat;
+    shaderRendering.stencilAttachmentFormat = rendering.stencilAttachmentFormat;
+    const std::array<std::uint32_t, 3> attachments{shaderRendering.viewMask, static_cast<std::uint32_t>(shaderRendering.depthAttachmentFormat), static_cast<std::uint32_t>(shaderRendering.stencilAttachmentFormat)};
+    const auto attachmentBytes = std::as_bytes(std::span(attachments));
+    const Key attachmentKey(attachmentBytes.begin(), attachmentBytes.end());
+    const auto preRasterizationContext = Combined(keys.preRasterizationLayout, attachmentKey);
+    const auto fragmentContext = Combined(keys.fragmentLayout, attachmentKey);
+    const std::array<const Key*, 4> contextKeys{&none, &preRasterizationContext, &fragmentContext, &keys.renderPass};
     VkPipelineDepthStencilStateCreateInfo dynamicDepth{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     static const bool backgroundLinking = std::getenv("APS5_NO_PIPELINE_LTO") == nullptr;
     const bool optimize = backgroundLinking && context.pipelineLinkTimeOptimization;

@@ -779,7 +779,15 @@ int APS5_VABI getsockname_nid_postfix(int descriptor, void* address, std::uint32
     if (socket->family == GuestUnix) return UnnamedAddress(address, length);
     sockaddr_storage native{};
     socklen_t size = sizeof(native);
-    if (::getsockname(socket->value, reinterpret_cast<sockaddr*>(&native), &size)) return Fail(NativeError());
+    if (::getsockname(socket->value, reinterpret_cast<sockaddr*>(&native), &size)) {
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEINVAL) return Fail(NativeError());
+        native = {};
+        native.ss_family = socket->family == 2 ? AF_INET : AF_INET6;
+#else
+        return Fail(NativeError());
+#endif
+    }
     GuestAddress(native, address, length);
     return 0;
 }
