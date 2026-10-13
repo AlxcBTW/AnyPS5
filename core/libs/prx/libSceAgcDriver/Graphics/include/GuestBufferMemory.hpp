@@ -4,6 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +15,28 @@
 namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
+
+// exp (APS5_EXP_BDA_SWEEP_SKIP, never push): the lever's mask (1 = an address-based build notes the
+// space's in-place reads by reference, 2 = a build with regions of its own takes its BDA table ranges
+// from the space's memo, 4 = a build whose writes all land in writable ranges binds the space's own
+// table; bit 8 of the original, the import use stamps, has no counterpart on this branch) and
+// APS5_EXP_BDA_SWEEP_SKIP_VERIFY, both hot (Aps5Hot::Lever); callers read each once per use.
+// SetBdaSweepSkip overrides both (tests); a negative mask returns them to the levers.
+std::int64_t BdaSweepSkip();
+std::int64_t BdaSweepSkipVerify();
+void SetBdaSweepSkip(std::int64_t mask, std::int64_t verify);
+// Counts one per-build walk of the cached address space that was skipped (`what`: 0 = the in-place
+// read notes, 1 = the BDA table ranges) and, when `verify` is positive, runs `same` on every
+// verify-th skip of that kind: false aborts the process ("FATAL: [bda-skip] verify"). Under
+// APS5_PROFILE_DRAW the counts are printed as [bda-skip] every 10 s.
+void NoteSweepSkip(int what, std::int64_t verify, const std::function<bool()>& same);
+struct SweepSkipStats {
+    std::uint64_t readNotes = 0;
+    std::uint64_t readNotesVerified = 0;
+    std::uint64_t tables = 0;
+    std::uint64_t tablesVerified = 0;
+};
+SweepSkipStats SweepSkipCounters();
 
 struct GuestMemorySnapshot {
     std::uint64_t address;
@@ -271,6 +295,16 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // exp (APS5_EXP_BDA_SWEEP_SKIP mask 1, never push): InPlaceReads() in two parts, the cached address
+    // space's (one immutable list, built once per space and shared by all its builds, for
+    // Recorder::NotePendingReadList) followed by this build's own, when their concatenation is
+    // exactly InPlaceReads(): a build that took the space whole. Nothing otherwise: the caller then
+    // notes InPlaceReads().
+    struct SplitReads {
+        std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
+    };
+    std::optional<SplitReads> SplitInPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:

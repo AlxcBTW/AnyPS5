@@ -3657,7 +3657,26 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    // exp (APS5_EXP_BDA_SWEEP_SKIP mask 1, hot, never push): an address-based build that took the
+    // cached space whole notes the space's in-place ranges by reference (one list per space) instead
+    // of copying them into the batch; its own ranges follow as before. The batch answers every read
+    // query as the copied ranges would (Recorder::NotePendingReadList), so a flip flushes nothing.
+    // APS5_EXP_BDA_SWEEP_SKIP_VERIFY=N: every Nth such note also builds InPlaceReads() and aborts
+    // unless it equals the two parts.
+    std::optional<GuestBufferMemory::SplitReads> split;
+    if ((BdaSweepSkip() & 1) != 0) split = guestMemory.SplitInPlaceReads();
+    if (split.has_value()) {
+        NoteSweepSkip(0, BdaSweepSkipVerify(), [&] {
+            auto joined = *split->space;
+            joined.insert(joined.end(), split->own.begin(), split->own.end());
+            return joined == guestMemory.InPlaceReads();
+        });
+        recorder.NotePendingReadList(split->space, kind);
+        recorder.NotePendingReads(split->own, kind);
+    } else {
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (!storageWritten[index]) continue;

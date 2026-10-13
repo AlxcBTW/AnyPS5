@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
+#include "HotLever.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -109,6 +110,9 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    // exp (APS5_EXP_BDA_SWEEP_SKIP): the ranges of `base` served in place by imports, in its order
+    // (the space's part of InPlaceReads), when they form a valid Recorder read list; else null.
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
     mutable std::mutex tableMutex;
     mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
 };
@@ -2499,6 +2503,13 @@ void GuestBufferMemory::AcquireRegistered() {
                 regions = std::move(extras);
                 lease.clear();
                 planSpaceMirrors(*built);
+                {
+                    auto reads = std::make_shared<Recorder::ReadList>();
+                    for (const auto& region : built->base) {
+                        if (region.direct != nullptr) reads->emplace_back(region.begin, region.end);
+                    }
+                    if (Recorder::ValidReadList(*reads)) built->directReads = std::move(reads);
+                }
                 space = std::move(built);
                 spaces.droppedByWaiter.store(false, std::memory_order_relaxed);
                 spaces.current.store(space);
@@ -3929,6 +3940,85 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
         if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
     }
     return result;
+}
+
+namespace {
+
+struct SweepSkipTotals {
+    std::atomic<std::uint64_t> skips[2]{};
+    std::atomic<std::uint64_t> verified[2]{};
+    std::atomic<std::int64_t> lastReport{0};
+    std::atomic<std::int64_t> forcedMask{-1};
+    std::atomic<std::int64_t> forcedVerify{0};
+};
+
+SweepSkipTotals& SweepSkips() {
+    static SweepSkipTotals totals;
+    return totals;
+}
+
+std::int64_t envInteger(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? std::strtoll(value, nullptr, 0) : 0;
+}
+
+}
+
+std::int64_t BdaSweepSkip() {
+    if (const auto forced = SweepSkips().forcedMask.load(std::memory_order_relaxed); forced >= 0) return forced;
+    static const Aps5Hot::Lever lever("APS5_EXP_BDA_SWEEP_SKIP", envInteger("APS5_EXP_BDA_SWEEP_SKIP"));
+    return lever.Value();
+}
+
+std::int64_t BdaSweepSkipVerify() {
+    if (SweepSkips().forcedMask.load(std::memory_order_relaxed) >= 0) return SweepSkips().forcedVerify.load(std::memory_order_relaxed);
+    static const Aps5Hot::Lever lever("APS5_EXP_BDA_SWEEP_SKIP_VERIFY", envInteger("APS5_EXP_BDA_SWEEP_SKIP_VERIFY"));
+    return lever.Value();
+}
+
+void SetBdaSweepSkip(std::int64_t mask, std::int64_t verify) {
+    SweepSkips().forcedVerify.store(verify, std::memory_order_relaxed);
+    SweepSkips().forcedMask.store(mask, std::memory_order_relaxed);
+}
+
+void NoteSweepSkip(int what, std::int64_t verify, const std::function<bool()>& same) {
+    auto& totals = SweepSkips();
+    const auto index = static_cast<std::size_t>(std::clamp(what, 0, 1));
+    const auto number = totals.skips[index].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (verify > 0 && number % static_cast<std::uint64_t>(verify) == 0) {
+        if (!same()) {
+            std::fprintf(stderr, "FATAL: [bda-skip] verify: the %s of skip %llu differ from the full walk's\n", what == 0 ? "in-place read notes" : "BDA table ranges", static_cast<unsigned long long>(number));
+            std::fflush(stderr);
+            std::abort();
+        }
+        totals.verified[index].fetch_add(1, std::memory_order_relaxed);
+    }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = totals.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        totals.lastReport.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10000 || !totals.lastReport.compare_exchange_strong(last, now)) return;
+    const auto counts = SweepSkipCounters();
+    AgcDriver::ProfilePrint_nid_no_patch("[bda-skip] (cumulative) in-place read notes by reference %llu (verified %llu), BDA table ranges from the memo or the space %llu (verified %llu); a verify mismatch aborts\n", static_cast<unsigned long long>(counts.readNotes), static_cast<unsigned long long>(counts.readNotesVerified), static_cast<unsigned long long>(counts.tables), static_cast<unsigned long long>(counts.tablesVerified));
+}
+
+SweepSkipStats SweepSkipCounters() {
+    auto& totals = SweepSkips();
+    return {totals.skips[0].load(std::memory_order_relaxed), totals.verified[0].load(std::memory_order_relaxed), totals.skips[1].load(std::memory_order_relaxed), totals.verified[1].load(std::memory_order_relaxed)};
+}
+
+std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {
+    // InPlaceReads' order: the space's direct regions, then the build's own.
+    if (!uploaded || committed || space == nullptr || space->directReads == nullptr) return std::nullopt;
+    SplitReads split{space->directReads, {}};
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) split.own.emplace_back(region.begin, region.end);
+    }
+    return split;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {

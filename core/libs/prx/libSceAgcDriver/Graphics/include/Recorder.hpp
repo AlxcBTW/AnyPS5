@@ -135,6 +135,17 @@ public:
     static bool ReadTracking();
     void NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind);
     void NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind);
+    // exp (APS5_EXP_BDA_SWEEP_SKIP, never push): NotePendingReads for a shared, immutable list (the
+    // ranges a cached address space reads in place), noted by reference in O(1) instead of range by
+    // range. `ranges` is sorted by begin, disjoint, without empty ranges (ValidReadList). Every query
+    // answers as if the ranges had been noted one by one at this point: the scan keeps the note order
+    // (see readOverlap) and searches a list by bisection. The same list noted again in one batch is
+    // dropped, since an earlier note of it is always found first. With a capture trace or
+    // APS5_FLIP_READ_CHECK the ranges are noted one by one as before.
+    using ReadList = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    void NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind);
+    // Whether `ranges` meets NotePendingReadList's contract (sorted, disjoint, no empty range).
+    static bool ValidReadList(const ReadList& ranges);
     // Whether an unexecuted batch (open, or in flight with its fence unsignaled) reads the range in
     // place. A hit in an in-flight batch whose fence signaled meanwhile is a miss (one status
     // query per hit). `ignoreSignaled` false: every in-flight batch counts, whatever its fence.
@@ -537,6 +548,13 @@ private:
             ReadKind kind;
         };
         std::vector<Read> reads;
+        // Lists noted by reference (NotePendingReadList), each before reads[position] in note order.
+        struct ReadListNote {
+            std::shared_ptr<const ReadList> ranges;
+            std::size_t position;
+            ReadKind kind;
+        };
+        std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         bool submitted = false;
@@ -742,7 +760,9 @@ private:
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     // The first noted read of `batch` overlapping [address, end), or null.
-    static const Batch::Read* readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end);
+    // Every range `batch` notes as read, lists expanded in note order (APS5_FLIP_READ_CHECK).
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;

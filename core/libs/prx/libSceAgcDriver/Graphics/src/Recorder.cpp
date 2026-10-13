@@ -2849,11 +2849,62 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
-const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
-    for (const auto& read : batch.reads) {
-        if (address < read.end && read.begin < end) return &read;
+bool Recorder::ValidReadList(const ReadList& ranges) {
+    for (std::size_t index = 0; index < ranges.size(); ++index) {
+        if (ranges[index].second <= ranges[index].first) return false;
+        if (index != 0 && ranges[index].first < ranges[index - 1].second) return false;
     }
-    return nullptr;
+    return true;
+}
+
+void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
+    if (CaptureTrace::Enabled() || FlipReadCheck()) {
+        NotePendingReads(*ranges, kind);
+        return;
+    }
+    ensureOpen();
+    readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
+    for (const auto& note : open->readLists) {
+        if (note.ranges == ranges && note.kind == kind) return;
+    }
+    open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+}
+
+std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
+    // A list's ranges are disjoint and sorted, so their ends ascend too: the first range ending past
+    // `address` is the only candidate.
+    const auto listOverlaps = [&](const Batch::ReadListNote& note) {
+        const auto& list = *note.ranges;
+        const auto found = std::partition_point(list.begin(), list.end(), [&](const auto& range) { return range.second <= address; });
+        return found != list.end() && found->first < end;
+    };
+    std::size_t next = 0;
+    for (std::size_t index = 0; index < batch.reads.size(); ++index) {
+        for (; next < batch.readLists.size() && batch.readLists[next].position == index; ++next) {
+            if (listOverlaps(batch.readLists[next])) return batch.readLists[next].kind;
+        }
+        const auto& read = batch.reads[index];
+        if (address < read.end && read.begin < end) return read.kind;
+    }
+    for (; next < batch.readLists.size(); ++next) {
+        if (listOverlaps(batch.readLists[next])) return batch.readLists[next].kind;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::notedReads(const Batch& batch) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    std::size_t next = 0;
+    const auto expand = [&](std::size_t position) {
+        for (; next < batch.readLists.size() && batch.readLists[next].position == position; ++next) result.insert(result.end(), batch.readLists[next].ranges->begin(), batch.readLists[next].ranges->end());
+    };
+    for (std::size_t index = 0; index < batch.reads.size(); ++index) {
+        expand(index);
+        result.emplace_back(batch.reads[index].begin, batch.reads[index].end);
+    }
+    expand(batch.reads.size());
+    return result;
 }
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
@@ -2861,20 +2912,20 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
     readQueries.fetch_add(1, std::memory_order_relaxed);
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) {
-            readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        if (const auto kind = readOverlap(*open, address, end)) {
+            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
             return true;
         }
     }
     // Newest first: the batch most likely still running decides without a status query per batch.
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        const auto* read = readOverlap(**it, address, end);
-        if (read == nullptr) continue;
+        const auto kind = readOverlap(**it, address, end);
+        if (!kind.has_value()) continue;
         if (ignoreSignaled && signaled(**it)) {
             readStaleIgnored.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
-        readHits[static_cast<std::size_t>(read->kind)].fetch_add(1, std::memory_order_relaxed);
+        readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
@@ -2884,10 +2935,10 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
     if (bytes == 0) return std::nullopt;
     const auto end = address + bytes;
     if (open != nullptr) {
-        if (const auto* read = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, read->kind, true, false};
+        if (const auto kind = readOverlap(*open, address, end)) return PendingReadInfo{submissions + 1, open->queue, *kind, true, false};
     }
     for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        if (const auto* read = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, read->kind, false, signaled(**it)};
+        if (const auto kind = readOverlap(**it, address, end)) return PendingReadInfo{(*it)->serial, (*it)->queue, *kind, false, signaled(**it)};
     }
     return std::nullopt;
 }
@@ -3195,7 +3246,7 @@ void Recorder::Submit() {
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
-        for (const auto& read : open->reads) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(read.begin, read.end - read.begin));
+        for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
     auto batch = std::move(open);
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
@@ -3717,7 +3768,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         entry.readGeneration = batch->readGeneration;
         entry.reads.clear();
         if (FlipReadCheck()) {
-            for (const auto& read : batch->reads) entry.reads.emplace_back(read.begin, read.end);
+            entry.reads = notedReads(*batch);
         }
     }
     // Completions store GPU results to guest memory; a failing one is reported, the rest still run.
