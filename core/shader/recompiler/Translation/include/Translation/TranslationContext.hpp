@@ -18,6 +18,7 @@ public:
     void TranslateInstruction(const RdnaInstruction& instruction);
     void SetPixelInput(const ShaderPixelInputInfo* info, bool barycentricEnabled) { pixelInput = info; fragmentShaderBarycentricEnabled = barycentricEnabled; }
     void SetFloatMode(const std::optional<ShaderFloatMode>& mode) { floatMode = mode; ieeeMode = mode.has_value() && mode->ieeeMode; }
+    void SetRelaxedFloat(bool relaxed) { relaxedFloat = relaxed; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void SetNativeFloat16Arithmetic(bool arithmetic, bool fma) { nativeFloat16Arithmetic = arithmetic; nativeFloat16Fma = fma; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
@@ -363,6 +364,7 @@ private:
     bool fragmentShaderBarycentricEnabled = false;
     std::optional<ShaderFloatMode> floatMode;
     bool ieeeMode = false;
+    bool relaxedFloat = false;
     bool nativeFloat16 = false;
     bool nativeFloat16Arithmetic = false;
     bool nativeFloat16Fma = false;

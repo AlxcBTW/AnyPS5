@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
+#include <string_view>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
@@ -82,6 +83,14 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 }
 
 namespace {
+
+bool RelaxedFloat() {
+    const char* text = std::getenv("APS5_EXACT_FLOAT");
+    const bool relaxed = text == nullptr || *text == '\0' || std::string_view(text) == "0";
+    static std::once_flag announced;
+    std::call_once(announced, [relaxed] { std::fputs(relaxed ? "[shader] poc/float: f32 denormal flushes, tiny-product flushes and NaN payload propagation are not emulated (APS5_EXACT_FLOAT=1 restores them)\n" : "[shader] poc/float: APS5_EXACT_FLOAT set, f32 emulation exact\n", stderr); });
+    return relaxed;
+}
 
 // The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
 // addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
@@ -181,6 +190,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.relaxedFloat = RelaxedFloat();
     translateOptions.nativeFloat16Arithmetic = request.target.nativeFloat16Arithmetic;
 #if !ANYPS5_ENABLE_SPIRV_TOOLS
     translateOptions.nativeFloat16Fma = request.target.nativeFloat16Arithmetic && std::ranges::find(request.target.supportedCapabilities, 6030u) != request.target.supportedCapabilities.end();
