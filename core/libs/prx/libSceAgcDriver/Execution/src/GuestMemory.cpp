@@ -2,10 +2,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ZeroTable.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/HostCommitLog.hpp"
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -356,19 +358,17 @@ struct PageSpan {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     // Per page: access flags, zero while unknown.
-    std::uint8_t* pages = nullptr;
+    ZeroTable<std::uint8_t> pages;
 
-    // Reserves and commits the table; untouched table pages cost nothing until a guest page is recorded.
-    bool allocate() {
+    bool allocate(const char* owner) {
         if (size == 0) return false;
         const auto count = (size / PageBytes + 8) & ~static_cast<std::size_t>(7);
-#ifdef _WIN32
-        pages = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, count, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-        pages = static_cast<std::uint8_t*>(std::calloc(count, 1));
-#endif
-        if (pages == nullptr) size = 0;
-        return pages != nullptr;
+        if (!pages.Allocate(count)) {
+            size = 0;
+            return false;
+        }
+        HostCommitLog::HostCommitNote_nid_no_patch(owner, pages.Data(), pages.Bytes());
+        return true;
     }
 
     bool covers(std::uintptr_t address) const {
@@ -376,11 +376,15 @@ struct PageSpan {
     }
 
     std::uint8_t load(std::uintptr_t address) const {
-        return std::atomic_ref<const std::uint8_t>(pages[(address - base) / PageBytes]).load(std::memory_order_relaxed);
+        const auto index = (address - base) / PageBytes;
+        if (!pages.Committed(index)) return 0;
+        return std::atomic_ref<const std::uint8_t>(pages.Raw()[index]).load(std::memory_order_relaxed);
     }
 
     void store(std::uintptr_t address, std::uint8_t value) {
-        std::atomic_ref<std::uint8_t>(pages[(address - base) / PageBytes]).store(value, std::memory_order_relaxed);
+        const auto index = (address - base) / PageBytes;
+        if (value == 0 && !pages.Committed(index)) return;
+        std::atomic_ref<std::uint8_t>(pages.At(index)).store(value, std::memory_order_relaxed);
     }
 
     // End of the run of pages equal to `value` that starts at `address`, at most `limit`.
@@ -388,12 +392,18 @@ struct PageSpan {
         auto index = (address - base) / PageBytes;
         const auto stop = std::min<std::uintptr_t>((std::min(limit, base + size) - base + PageBytes - 1) / PageBytes, size / PageBytes);
         const std::uint64_t wide = 0x0101010101010101ull * value;
+        const auto* raw = pages.Raw();
+        std::size_t committedEnd = index;
         while (index < stop) {
-            if (index % 8 == 0 && index + 8 <= stop && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(pages + index)).load(std::memory_order_relaxed) == wide) {
+            if (index >= committedEnd) {
+                if (!pages.Committed(index)) break;
+                committedEnd = ZeroTable<std::uint8_t>::ChunkEnd(index);
+            }
+            if (index % 8 == 0 && index + 8 <= std::min<std::size_t>(stop, committedEnd) && std::atomic_ref<const std::uint64_t>(*reinterpret_cast<const std::uint64_t*>(raw + index)).load(std::memory_order_relaxed) == wide) {
                 index += 8;
                 continue;
             }
-            if (std::atomic_ref<const std::uint8_t>(pages[index]).load(std::memory_order_relaxed) != value) break;
+            if (std::atomic_ref<const std::uint8_t>(raw[index]).load(std::memory_order_relaxed) != value) break;
             ++index;
         }
         return std::min(limit, base + index * PageBytes);
@@ -403,7 +413,13 @@ struct PageSpan {
         if (size == 0 || bytes == 0 || address >= base + size || address + bytes <= base) return;
         const auto first = (std::max(address, base) - base) / PageBytes;
         const auto last = (std::min(address + bytes, base + size) - 1 - base) / PageBytes;
-        for (auto page = first; page <= last; ++page) std::atomic_ref<std::uint8_t>(pages[page]).store(0, std::memory_order_relaxed);
+        for (auto page = first; page <= last;) {
+            const auto stop = std::min<std::size_t>(last + 1, ZeroTable<std::uint8_t>::ChunkEnd(page));
+            if (pages.Committed(page)) {
+                for (; page < stop; ++page) std::atomic_ref<std::uint8_t>(pages.At(page)).store(0, std::memory_order_relaxed);
+            }
+            page = stop;
+        }
     }
 };
 
@@ -469,7 +485,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 void PageStates::initialize() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
-        const bool arenaCached = arena.allocate();
+        const bool arenaCached = arena.allocate("agc-page-states");
         bool imageCached = false;
 #ifdef _WIN32
         // The image extent is the run of regions sharing the module's allocation base, as the registry
@@ -485,7 +501,7 @@ void PageStates::initialize() {
             }
             image.base = start;
             image.size = cursor - start;
-            imageCached = image.allocate();
+            imageCached = image.allocate("agc-image-page-states");
         }
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
@@ -751,13 +767,13 @@ struct WriteTracker {
     std::uintptr_t base = 0;
     std::size_t size = 0;
     // Generation of the last collected write per 64 KiB block of the arena.
-    std::vector<std::uint32_t> blocks;
+    ZeroTable<std::uint32_t> blocks;
     // The same, stamped by collects only (dirty pages = CPU stores), never by MarkWritten: the
     // late label rule asks whether the CPU touched a label's block, and the driver's own GPU label
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
-    std::vector<std::uint32_t> cpuBlocks;
+    ZeroTable<std::uint32_t> cpuBlocks;
     WriteWatchCoverage coverage;
-    std::vector<std::uint32_t> hintBlocks;
+    ZeroTable<std::uint32_t> hintBlocks;
 #else
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
@@ -797,10 +813,11 @@ struct WriteTracker {
         GuestArena::GuestArenaRange_nid_postfix(&base, &size);
         watched = size != 0 && GuestArena::GuestArenaWriteWatched_nid_postfix();
         if (!watched) return;
-        blocks.assign(size / WriteBlockBytes + 1, 0);
-        cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
+        if (!blocks.Allocate(size / WriteBlockBytes + 1) || !cpuBlocks.Allocate(size / WriteBlockBytes + 1) || !hintBlocks.Allocate(size / WriteBlockBytes + 1)) throw std::runtime_error("cannot reserve the guest write tracker tables");
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", blocks.Data(), blocks.Bytes());
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", cpuBlocks.Data(), cpuBlocks.Bytes());
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", hintBlocks.Data(), hintBlocks.Bytes());
         coverage.Initialize(base, size);
-        hintBlocks.assign(size / WriteBlockBytes + 1, 0);
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
@@ -843,21 +860,21 @@ struct WriteTracker {
             if (!coverage.Covers(blockBegin(block), 1)) continue;
             if (!started) ++generation;
             started = true;
-            hintBlocks[block] = generation;
+            hintBlocks.At(block) = generation;
         }
     }
 
     bool hinted(std::uint64_t first, std::uint64_t stop) const {
         if (first >= stop || first < base || stop > base + size) return false;
         for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) {
-            if (hintBlocks[block] == 0 || coverage.Covers(blockBegin(block), 1)) return false;
+            if (hintBlocks.Get(block) == 0 || coverage.Covers(blockBegin(block), 1)) return false;
         }
         return !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
     }
 
     std::uint32_t newestHint(std::uint64_t first, std::uint64_t stop) const {
         std::uint32_t newest = 0;
-        for (auto block = blockOf(first); block <= blockOf(stop - 1); ++block) newest = std::max(newest, hintBlocks[block]);
+        newest = hintBlocks.Max(blockOf(first), blockOf(stop - 1) + 1);
         return newest;
     }
 #endif
@@ -912,7 +929,7 @@ struct WriteTracker {
 
     std::uint32_t stampOf(std::uint64_t block) const {
 #ifdef _WIN32
-        return blocks[block];
+        return blocks.Get(block);
 #else
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->blocks[block % LeafBlocks] : 0;
@@ -957,7 +974,8 @@ struct WriteTracker {
         if (first == last) return stampOf(first) <= since;
         const auto newer = [since](std::uint32_t stamp) { return stamp > since; };
 #ifdef _WIN32
-        return std::none_of(blocks.begin() + first, blocks.begin() + last + 1, newer);
+        static_cast<void>(newer);
+        return blocks.Max(first, last + 1) <= since;
 #else
         while (first <= last) {
             const auto index = first / LeafBlocks;
@@ -974,7 +992,7 @@ struct WriteTracker {
 
     std::uint32_t cpuStampOf(std::uint64_t block) const {
 #ifdef _WIN32
-        return cpuBlocks[block];
+        return cpuBlocks.Get(block);
 #else
         const auto& leaf = leaves[block / LeafBlocks];
         return leaf != nullptr ? leaf->cpuBlocks[block % LeafBlocks] : 0;
@@ -985,8 +1003,8 @@ struct WriteTracker {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
 #ifdef _WIN32
-        if (stored) blocks[block] = stampGeneration;
-        if (cpu) cpuBlocks[block] = stampGeneration;
+        if (stored) blocks.At(block) = stampGeneration;
+        if (cpu) cpuBlocks.At(block) = stampGeneration;
 #else
         auto& leaf = leaves[block / LeafBlocks];
         if (leaf == nullptr) leaf = std::make_unique<Leaf>();
@@ -1471,7 +1489,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
         if (count != 0 && !marked) ++tracker.generation;
         marked = marked || count != 0;
-        for (std::size_t i = 0; i < count; ++i) tracker.hintBlocks[tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i]))] = tracker.generation;
+        for (std::size_t i = 0; i < count; ++i) tracker.hintBlocks.At(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i]))) = tracker.generation;
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
     }

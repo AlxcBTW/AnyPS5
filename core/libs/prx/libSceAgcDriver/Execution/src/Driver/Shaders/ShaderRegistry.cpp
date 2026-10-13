@@ -28,6 +28,10 @@
 #include <stdexcept>
 #include <thread>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
+#ifdef _WIN32
+#include <process.h>
+#include <windows.h>
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -809,9 +813,22 @@ public:
 
 private:
     explicit RegistrationPreparePool(unsigned count) {
+#ifdef _WIN32
+        static const bool committedStacks = std::getenv("APS5_COMMIT_PREPARE_STACKS") != nullptr;
+        if (!committedStacks) {
+            for (unsigned index = 0; index < count; ++index) {
+                const auto thread = _beginthreadex(nullptr, PrepareStackBytes, &RegistrationPreparePool::NativeMain, this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+                if (thread == 0) continue;
+                SetThreadDescription(reinterpret_cast<HANDLE>(thread), L"shader prepare");
+                CloseHandle(reinterpret_cast<HANDLE>(thread));
+                ++threads;
+            }
+            return;
+        }
+#endif
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
-        pthread_attr_setstacksize(&attributes, 64u << 20u);
+        pthread_attr_setstacksize(&attributes, PrepareStackBytes);
         for (unsigned index = 0; index < count; ++index) {
             pthread_t thread;
             if (pthread_create(&thread, &attributes, &RegistrationPreparePool::Main, this) == 0) {
@@ -821,6 +838,13 @@ private:
         }
         pthread_attr_destroy(&attributes);
     }
+
+#ifdef _WIN32
+    static unsigned __stdcall NativeMain(void* argument) {
+        Main(argument);
+        return 0;
+    }
+#endif
 
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
@@ -848,6 +872,7 @@ private:
     std::mutex mutex;
     std::condition_variable ready;
     std::condition_variable idle;
+    static constexpr unsigned PrepareStackBytes = 64u << 20u;
     std::deque<std::function<void()>> tasks;
     unsigned threads = 0;
     unsigned running = 0;
