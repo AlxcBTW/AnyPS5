@@ -216,49 +216,65 @@ void RemapDynamicNeededOffsets(
     }
 }
 
+struct VersionNameField {
+    std::size_t Offset;
+    std::uint32_t Name;
+};
+
+std::vector<VersionNameField> ReadVersionNameFields(const std::vector<std::uint8_t>& elf, const Elf64_Ehdr& ehdr) {
+    using namespace Internal;
+    std::vector<VersionNameField> fields;
+    for (std::uint16_t i = 0u; i < ehdr.e_shnum; ++i) {
+        const auto section = Read<Elf64_Shdr>(elf, static_cast<std::size_t>(ehdr.e_shoff) + i * sizeof(Elf64_Shdr));
+        if (section.sh_type != kShtGnuVerneed || section.sh_size == 0u) continue;
+        if (section.sh_offset > elf.size() || section.sh_size > elf.size() - section.sh_offset)
+            throw std::runtime_error("invalid .gnu.version_r section range");
+        const auto location = [&](std::uint64_t relative, std::size_t size) {
+            if (relative > section.sh_size || size > section.sh_size - relative)
+                throw std::runtime_error(".gnu.version_r record outside section");
+            return static_cast<std::size_t>(section.sh_offset + relative);
+        };
+        const auto advance = [&](std::uint64_t current, std::uint32_t step, std::size_t size) {
+            if (step < size || step > section.sh_size - current)
+                throw std::runtime_error("invalid .gnu.version_r record link");
+            return current + step;
+        };
+        std::uint64_t current = 0u;
+        while (true) {
+            const auto offset = location(current, sizeof(Elf64_Verneed));
+            const auto need = Read<Elf64_Verneed>(elf, offset);
+            if (need.vn_version != 1u) throw std::runtime_error("unsupported .gnu.version_r structure version");
+            fields.push_back({offset + offsetof(Elf64_Verneed, vn_file), need.vn_file});
+            if (need.vn_cnt != 0u) {
+                auto auxiliary = advance(current, need.vn_aux, sizeof(Elf64_Verneed));
+                for (std::uint16_t index = 0u; index < need.vn_cnt; ++index) {
+                    const auto auxOffset = location(auxiliary, sizeof(Elf64_Vernaux));
+                    const auto aux = Read<Elf64_Vernaux>(elf, auxOffset);
+                    fields.push_back({auxOffset + offsetof(Elf64_Vernaux, vna_name), aux.vna_name});
+                    if (index + 1u == need.vn_cnt) {
+                        if (aux.vna_next != 0u) throw std::runtime_error(".gnu.version_r auxiliary count mismatch");
+                    } else {
+                        auxiliary = advance(auxiliary, aux.vna_next, sizeof(Elf64_Vernaux));
+                    }
+                }
+            }
+            if (need.vn_next == 0u) break;
+            current = advance(current, need.vn_next, sizeof(Elf64_Verneed));
+        }
+    }
+    return fields;
+}
+
 void RemapVerneedOffsets(
     std::vector<std::uint8_t>& elf,
     const Elf64_Ehdr& ehdr,
     const std::vector<std::pair<std::uint32_t, std::uint32_t>>& oldToNewOffset
 ) {
     using namespace Internal;
-
-    for (std::uint16_t i = 0u; i < ehdr.e_shnum; ++i) {
-        const std::size_t shOffset = static_cast<std::size_t>(ehdr.e_shoff) + i * sizeof(Elf64_Shdr);
-        const auto shdr = Read<Elf64_Shdr>(elf, shOffset);
-        if (shdr.sh_type != kShtGnuVerneed) continue;
-
-        const std::size_t verneedOffset = static_cast<std::size_t>(shdr.sh_offset);
-        std::size_t entryOffset = verneedOffset;
-
-        while (true) {
-            const auto verneed = Read<Elf64_Verneed>(elf, entryOffset);
-
-            const auto mappedFile = std::find_if(
-                oldToNewOffset.begin(), oldToNewOffset.end(),
-                [&](const auto& entry) { return entry.first == verneed.vn_file; }
-            );
-            if (mappedFile != oldToNewOffset.end())
-                Write(elf, entryOffset + offsetof(Elf64_Verneed, vn_file), mappedFile->second);
-
-            std::size_t auxOffset = entryOffset + verneed.vn_aux;
-            for (std::uint16_t a = 0u; a < verneed.vn_cnt; ++a) {
-                const auto vernaux = Read<Elf64_Vernaux>(elf, auxOffset);
-
-                const auto mappedName = std::find_if(
-                    oldToNewOffset.begin(), oldToNewOffset.end(),
-                    [&](const auto& entry) { return entry.first == vernaux.vna_name; }
-                );
-                if (mappedName != oldToNewOffset.end())
-                    Write(elf, auxOffset + offsetof(Elf64_Vernaux, vna_name), mappedName->second);
-
-                if (vernaux.vna_next == 0u) break;
-                auxOffset += vernaux.vna_next;
-            }
-
-            if (verneed.vn_next == 0u) break;
-            entryOffset += verneed.vn_next;
-        }
+    for (const auto& field : ReadVersionNameFields(elf, ehdr)) {
+        const auto mapped = std::find_if(oldToNewOffset.begin(), oldToNewOffset.end(),
+            [&](const auto& entry) { return entry.first == field.Name; });
+        if (mapped != oldToNewOffset.end()) Write(elf, field.Offset, mapped->second);
     }
 }
 
@@ -287,35 +303,8 @@ std::vector<std::uint32_t> CollectDynamicNameOffsets(const std::vector<std::uint
 }
 
 std::vector<std::uint32_t> CollectVerneedNameOffsets(const std::vector<std::uint8_t>& elf, const Elf64_Ehdr& ehdr) {
-    using namespace Internal;
-
     std::vector<std::uint32_t> offsets;
-
-    for (std::uint16_t i = 0u; i < ehdr.e_shnum; ++i) {
-        const std::size_t shOffset = static_cast<std::size_t>(ehdr.e_shoff) + i * sizeof(Elf64_Shdr);
-        const auto shdr = Read<Elf64_Shdr>(elf, shOffset);
-        if (shdr.sh_type != kShtGnuVerneed) continue;
-
-        std::size_t entryOffset = static_cast<std::size_t>(shdr.sh_offset);
-
-        while (true) {
-            const auto verneed = Read<Elf64_Verneed>(elf, entryOffset);
-            offsets.push_back(verneed.vn_file);
-
-            std::size_t auxOffset = entryOffset + verneed.vn_aux;
-            for (std::uint16_t a = 0u; a < verneed.vn_cnt; ++a) {
-                const auto vernaux = Read<Elf64_Vernaux>(elf, auxOffset);
-                offsets.push_back(vernaux.vna_name);
-
-                if (vernaux.vna_next == 0u) break;
-                auxOffset += vernaux.vna_next;
-            }
-
-            if (verneed.vn_next == 0u) break;
-            entryOffset += verneed.vn_next;
-        }
-    }
-
+    for (const auto& field : ReadVersionNameFields(elf, ehdr)) offsets.push_back(field.Name);
     return offsets;
 }
 

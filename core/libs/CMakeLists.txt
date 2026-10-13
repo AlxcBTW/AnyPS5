@@ -214,6 +214,10 @@ if(BUILD_TESTING)
     target_link_libraries(guest_kernel_sys_tests PRIVATE libkernel_sys libkernel libc)
     configure_windows_unwind(guest_kernel_sys_tests)
     add_test(NAME guest_kernel_sys COMMAND guest_kernel_sys_tests)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME nid_verneed COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/nid/tests/test_verneed.py $<TARGET_FILE:nid_patcher>)
+    endif()
     if(WIN32)
         set_tests_properties(guest_kernel_sys PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel_sys>")
