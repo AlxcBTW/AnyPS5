@@ -1,11 +1,8 @@
-add_executable(relinker
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+option(ANYPS5_RELINKER_CLI "Build the native relinker command line" ON)
+
+add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxElfPatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxGuestModuleWriter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsGuestModuleWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/windows/WindowsGuestStartup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/guest/GuestImageReader.cpp
@@ -33,8 +30,6 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/ByteReader.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/BufferUtils.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/io/src/NativePath.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/Amd64OnlyConverter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/src/InstructionScanner.cpp
@@ -71,29 +66,47 @@ add_executable(relinker
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/analysis/ValidationPolicy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/SysVDynamicSectionBuilder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/CallRegistryWriter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/Conversion.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RelinkerPipeline.cpp
 )
-target_include_directories(relinker PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/include
+target_include_directories(relinker_core PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/domain/include
         ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/include
         ${CMAKE_CURRENT_SOURCE_DIR}/io/include
         ${CMAKE_CURRENT_SOURCE_DIR}/codegen/include
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../libs
 )
 
+target_compile_features(relinker_core PUBLIC cxx_std_20)
+set_target_properties(relinker_core PROPERTIES CXX_EXTENSIONS OFF)
+
+if(BUILD_TESTING)
+    add_test_executable(relinker_conversion_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/ConversionTests.cpp)
+    target_link_libraries(relinker_conversion_tests PRIVATE relinker_core)
+    add_test(NAME relinker_conversion COMMAND relinker_conversion_tests)
+    set_tests_properties(relinker_conversion PROPERTIES TIMEOUT 20)
+endif()
+
+if(NOT ANYPS5_RELINKER_CLI)
+    return()
+endif()
+
+add_executable(relinker
+    ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/elfpatcher/src/linux/LinuxDesktopEntryWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../libs/prx/libkernel/AppMetadata/src/ParamJsonParser.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileReader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/io/src/FileWriter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/NativeModules.cpp)
+target_link_libraries(relinker PRIVATE relinker_core)
+target_include_directories(relinker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cli/include ${CMAKE_CURRENT_SOURCE_DIR}/../libs)
+set_target_properties(relinker PROPERTIES CXX_EXTENSIONS OFF)
+
 if(BUILD_TESTING AND WIN32)
-    get_target_property(windowsAliasTestSources relinker SOURCES)
-    list(REMOVE_ITEM windowsAliasTestSources
-        ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/CliArgs.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/cli/src/Autorun.cpp)
-    add_test_executable(windows_guest_export_alias_tests
-        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp
-        ${windowsAliasTestSources})
-    get_target_property(windowsAliasIncludes relinker INCLUDE_DIRECTORIES)
-    target_include_directories(windows_guest_export_alias_tests PRIVATE ${windowsAliasIncludes})
+    add_test_executable(windows_guest_export_alias_tests ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/WindowsExportAliasTests.cpp)
+    target_link_libraries(windows_guest_export_alias_tests PRIVATE relinker_core)
     add_test(NAME windows_guest_export_aliases COMMAND windows_guest_export_alias_tests)
 endif()
 
