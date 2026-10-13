@@ -8,6 +8,20 @@
 // absolute address and breaks on host addresses outside that range.
 namespace GuestArena {
 
+struct GuestArenaViews {
+    std::uint64_t viewsMapped;
+    std::uint64_t viewsUnmapped;
+    std::uint64_t pagesMapped;
+    std::uint64_t pagesUnmapped;
+    std::uint64_t splits;
+    std::uint64_t livePages;
+    std::uint64_t pendingBytes;
+    std::uint64_t pendingRanges;
+    std::uint64_t touchCommits;
+    std::uint64_t touchCommitBytes;
+    bool coalesced;
+};
+
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);
@@ -42,6 +56,10 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection);
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
+void GuestArenaCommitOnTouch_nid_no_patch(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule);
+bool GuestArenaHandleAccess_nid_no_patch(std::uintptr_t address, std::uint32_t kind);
+bool GuestArenaPending_nid_no_patch(std::uintptr_t address, std::uintptr_t* end, std::uint32_t* protection);
+void GuestArenaViewStatistics_nid_no_patch(GuestArenaViews* statistics);
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);
 void GuestArenaSetSharedBackingWriter_nid_no_patch(SharedBackingWriter writer);
@@ -50,6 +68,7 @@ bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t byt
 #endif
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
+void GuestArenaCommitPending_nid_no_patch(const void* pointer, std::size_t bytes);
 
 }
 

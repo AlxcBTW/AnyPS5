@@ -73,6 +73,7 @@ int APS5_VABI sceKernelMemoryPoolCommit(void*, std::size_t, int, int, int);
 int APS5_VABI sceKernelOpen(const char*, int, std::uint16_t);
 int APS5_VABI sceKernelClose(int);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
+std::int64_t APS5_VABI sceKernelWrite(int, const void*, std::size_t);
 std::int64_t APS5_VABI sceKernelPread(int, void*, std::size_t, std::int64_t);
 int APS5_VABI sceKernelAioInitializeImpl(void*, std::int32_t);
 int APS5_VABI sceKernelAioSubmitReadCommands(KernelAioRwRequest*, std::int32_t, std::int32_t, std::int32_t*);
@@ -1170,6 +1171,87 @@ static void CheckMlock() {
 #endif
 }
 
+#ifdef _WIN32
+static MEMORY_BASIC_INFORMATION HostRegion(const volatile unsigned char* address) {
+    MEMORY_BASIC_INFORMATION memory{};
+    Require(VirtualQuery(const_cast<const unsigned char*>(address), &memory, sizeof(memory)) == sizeof(memory));
+    return memory;
+}
+
+static void CheckFlexibleMemoryCommitsOnTouch() {
+    constexpr std::size_t page = 0x4000;
+    constexpr std::size_t length = page * 16;
+    void* mapped = nullptr;
+    Require(sceKernelMapFlexibleMemory(&mapped, length, 3, 0) == 0 && mapped != nullptr);
+    auto* bytes = static_cast<volatile unsigned char*>(mapped);
+    auto* writable = static_cast<unsigned char*>(mapped);
+    Require(HostRegion(bytes).State == MEM_RESERVE && HostRegion(bytes + length - 1).State == MEM_RESERVE);
+    Require(bytes[page * 3 + 5] == 0);
+    Require(HostRegion(bytes + page * 3).State == MEM_COMMIT && HostRegion(bytes + page * 3).RegionSize == page);
+    Require(HostRegion(bytes + page * 2).State == MEM_RESERVE && HostRegion(bytes + page * 4).State == MEM_RESERVE);
+    bytes[page * 5 + 1] = 9;
+    Require(bytes[page * 5 + 1] == 9 && HostRegion(bytes + page * 5).State == MEM_COMMIT);
+    Require(sceKernelMprotect(writable + page * 8, page * 2, 1) == 0);
+    Require(bytes[page * 9] == 0 && HostRegion(bytes + page * 9).Protect == PAGE_READONLY);
+    Require(sceKernelMprotect(writable + page * 10, page, 0) == 0);
+    std::uintptr_t end = 0;
+    std::uint32_t protection = 0;
+    Require(GuestArena::GuestArenaPending_nid_no_patch(reinterpret_cast<std::uintptr_t>(bytes + page * 10), &end, &protection) && protection == PAGE_NOACCESS && end == reinterpret_cast<std::uintptr_t>(bytes + page * 11));
+    Require(sceKernelMprotect(writable + page * 10, page, 3) == 0);
+    bytes[page * 10] = 4;
+    Require(HostRegion(bytes + page * 10).Protect == PAGE_READWRITE);
+    const auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    const auto written = std::filesystem::path("anyps5-touch-written-" + stamp + ".bin");
+    const int out = sceKernelOpen(written.string().c_str(), SCE_KERNEL_O_WRONLY | SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC, 0644);
+    Require(out >= 0);
+    Require(sceKernelWrite(out, writable + page * 12, page) == static_cast<std::int64_t>(page));
+    Require(sceKernelClose(out) == 0);
+    Require(std::filesystem::file_size(written) == page);
+    const auto source = std::filesystem::path("anyps5-touch-read-" + stamp + ".bin");
+    {
+        std::ofstream stream(source, std::ios::binary);
+        const std::vector<char> seed(page, 0x5a);
+        stream.write(seed.data(), static_cast<std::streamsize>(seed.size()));
+    }
+    const int in = sceKernelOpen(source.string().c_str(), SCE_KERNEL_O_RDONLY, 0);
+    Require(in >= 0);
+    Require(sceKernelRead(in, writable + page * 14 + 7, page) == static_cast<std::int64_t>(page));
+    Require(sceKernelClose(in) == 0);
+    Require(bytes[page * 14 + 7] == 0x5a && bytes[page * 15 + 6] == 0x5a && bytes[page * 15 + 7] == 0);
+    std::filesystem::remove(written);
+    std::filesystem::remove(source);
+    Require(sceKernelMunmap(mapped, length) == 0);
+    void* again = mapped;
+    Require(sceKernelMapFlexibleMemory(&again, length, 3, 0x10) == 0 && again == mapped);
+    Require(HostRegion(bytes + page * 5).State == MEM_RESERVE && bytes[page * 5 + 1] == 0);
+    Require(sceKernelMunmap(again, length) == 0);
+}
+
+static void CheckDirectViewsSplitOnPartialUnmap() {
+    constexpr std::size_t page = 0x4000;
+    std::int64_t phys = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, page * 4, 0, 0, &phys) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapDirectMemory(&mapped, page * 4, 3, 0, phys, 0x200000) == 0);
+    auto* bytes = static_cast<volatile unsigned char*>(mapped);
+    for (std::size_t index = 0; index < 4; ++index) bytes[page * index + 3] = static_cast<unsigned char>(index + 1);
+    GuestArena::GuestArenaViews views{};
+    GuestArena::GuestArenaViewStatistics_nid_no_patch(&views);
+    if (views.coalesced) Require(HostRegion(bytes + page * 3).AllocationBase == mapped);
+    Require(sceKernelMunmap(static_cast<unsigned char*>(mapped) + page, page) == 0);
+    Require(bytes[3] == 1 && bytes[page * 2 + 3] == 3 && bytes[page * 3 + 3] == 4);
+    Require(HostRegion(bytes + page).State == MEM_RESERVE);
+    if (views.coalesced) Require(HostRegion(bytes + page * 3).AllocationBase == static_cast<unsigned char*>(mapped) + page * 2 && HostRegion(bytes).AllocationBase == mapped);
+    bytes[page * 3 + 4] = 9;
+    void* again = nullptr;
+    Require(sceKernelMapDirectMemory(&again, page, 3, 0, phys + page * 3, 0) == 0);
+    Require(static_cast<volatile unsigned char*>(again)[4] == 9);
+    Require(sceKernelMunmap(again, page) == 0);
+    Require(sceKernelMunmap(mapped, page * 4) == 0);
+    Require(sceKernelReleaseDirectMemory(phys, page * 4) == 0);
+}
+#endif
+
 static void CheckSharedDirectMemoryLifecycle() {
     constexpr std::size_t page = 0x4000;
     std::int64_t phys = 0;
@@ -2152,6 +2234,10 @@ int main() {
     CheckHintInsideReservation();
     CheckNoOverwriteRefusesLiveMapping();
     CheckMlock();
+#ifdef _WIN32
+    CheckFlexibleMemoryCommitsOnTouch();
+    CheckDirectViewsSplitOnPartialUnmap();
+#endif
     CheckSharedDirectMemoryLifecycle();
     CheckGetDirectMemoryType();
     CheckMtypeprotect();

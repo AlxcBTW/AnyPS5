@@ -367,6 +367,7 @@ size_t APS5_VABI fwrite_nid_postfix(const void* buffer, size_t size, size_t coun
     auto* handle = GetNativeStream(stream);
     if (size == 0 || count == 0) return 0;
     if (!buffer) throw std::runtime_error("fwrite: null buffer");
+    if (count <= std::numeric_limits<std::size_t>::max() / size) GuestArena::GuestArenaCommitPending_nid_no_patch(buffer, size * count);
     const auto result = std::fwrite(buffer, size, count, handle);
     stream->SyncStatus();
     return result;

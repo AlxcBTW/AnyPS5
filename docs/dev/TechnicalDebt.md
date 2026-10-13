@@ -15,6 +15,9 @@ Entries about one library or component are in [debt](debt/), one file per librar
 
 - Windows direct-memory backing reserves a paging-file section and commits each mapped guest page before setting its protection. Committed physical contents remain in the section across unmap/remap and are released when the backing and its remaining views are destroyed; commitment is not recovered merely by unmapping a page. Linux retains its existing backing. Peak gameplay memory and Windows versions other than the tested host remain unverified.
 
+- Windows anonymous and flexible guest memory is reserved when mapped and committed 16 KiB at a time on its first access (`APS5_EAGER_GUEST_COMMIT=1` commits at map time as before). The kernel cannot fault such pages in, so host code that hands untouched guest memory to a system call commits it first: file and socket transfers, host imports, `mlock`, signal stacks and registered fiber or context stacks. A system call on untouched guest memory outside these paths fails with an access error.
+- Windows maps each run of shared guest memory as views of at most 2 MiB instead of one view per 16 KiB page (`APS5_PAGE_VIEWS=1` restores per-page views). Unmapping or remapping part of a view unmaps the whole view and maps its remaining parts again; a guest access in that window waits for the remap, a host write opened with `HostWrite` delays it, but a system call that reads the remaining part at that moment fails.
+
 ### Silent stubs
 
 Throughout the project, every function at every stage either **does exactly what it's supposed to or throws an exception**. Everywhere... except:

@@ -112,6 +112,13 @@ private:
     }
 
     static void commit(void* pointer, std::size_t bytes) {
+#ifdef _WIN32
+        static const bool onTouch = std::getenv("APS5_LAZY_HEAP_COMMIT") != nullptr;
+        if (onTouch) {
+            GuestArena::GuestArenaCommitOnTouch_nid_no_patch(pointer, bytes, ReadWriteProtection, LargeGranuleBytes);
+            return;
+        }
+#endif
         GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, ReadWriteProtection, bytes);
     }
 

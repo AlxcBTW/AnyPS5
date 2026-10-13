@@ -59,6 +59,7 @@ static int NativeWrite(int fd, const void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelWrite: nbytes exceeds platform limit");
     }
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buf, n);
     const auto shared = File::WriteSharedMemory_nid_no_patch(fd, buf, n);
     if (shared != -2) return static_cast<int>(shared);
     const int result = ::_write(fd, buf, static_cast<unsigned int>(n));

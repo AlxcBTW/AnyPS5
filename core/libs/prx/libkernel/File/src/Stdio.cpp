@@ -173,6 +173,7 @@ std::int64_t NativePositioned_nid_no_patch(int descriptor, void* buf, std::size_
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<DWORD>::max())) {
         throw std::runtime_error("NativePositioned: nbytes exceeds platform limit");
     }
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buf, nbytes);
     if (write) {
         const auto result = File::PwriteSharedMemory_nid_no_patch(descriptor, buf, nbytes, offset);
         if (result != -2) return result;
@@ -208,6 +209,7 @@ static std::int64_t NativeTransfer(int descriptor, void* buf, std::size_t nbytes
     if (nbytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("NativeTransfer: nbytes exceeds platform limit");
     }
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buf, nbytes);
     if (write) {
         const auto result = File::WriteSharedMemory_nid_no_patch(descriptor, buf, nbytes);
         if (result != -2) return result;

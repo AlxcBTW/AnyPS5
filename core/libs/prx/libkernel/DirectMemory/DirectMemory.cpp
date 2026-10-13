@@ -63,7 +63,7 @@ struct KernelArena {
 };
 
 static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
-    GuestArena::GuestArenaCommit_nid_postfix(addr, len, winProt, PS5_PAGE_SIZE);
+    GuestArena::GuestArenaCommitOnTouch_nid_no_patch(addr, len, winProt, PS5_PAGE_SIZE);
 }
 
 static void* mmap_aligned(size_t len, int prot, size_t alignment, std::uintptr_t hint = 0) {
@@ -127,11 +127,13 @@ static int mprotect(void* addr, size_t len, int prot) {
         if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory))
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualQuery failed");
         const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+        std::uintptr_t pendingEnd = 0;
+        std::uint32_t pendingProtection = 0;
         if (memory.State == MEM_COMMIT) {
             DWORD old;
             if (!VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, WinProtFromPosix(prot), &old))
                 throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualProtect failed");
-        } else if (prot != PROT_NONE) {
+        } else if (prot != PROT_NONE && !GuestArena::GuestArenaPending_nid_no_patch(cursor, &pendingEnd, &pendingProtection)) {
             throw std::runtime_error("mprotect of uncommitted memory outside the guest arena");
         }
         cursor = regionEnd;

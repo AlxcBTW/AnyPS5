@@ -862,6 +862,7 @@ std::int64_t APS5_VABI send_nid_postfix(int descriptor, const void* buffer, std:
     if ((flags & ~GuestNoSignal) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buffer, length);
     const auto result = ::send(socket->value, static_cast<const char*>(buffer), static_cast<int>(length), NativeSendFlags(flags));
     return result < 0 ? Fail(SendError(socket->type)) : result;
 }
@@ -955,6 +956,7 @@ std::int64_t APS5_VABI sendto_nid_postfix(int descriptor, const void* buffer, st
     if ((flags & ~GuestNoSignal) != 0) return Fail(45);
     if (length > INT_MAX) return Fail(40);
     if (!buffer && length) return Fail(14);
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buffer, length);
     int result;
     if (!address) {
         if (addressLength != 0) return Fail(22);
@@ -1108,6 +1110,7 @@ static bool SendfileIovecs(const GuestIovec* iov, int count) {
 }
 static int SendAll(const Socket& socket, const void* data, std::uint64_t length, std::int64_t& sent) {
     if (!data && length) return 14;
+    GuestArena::GuestArenaCommitPending_nid_no_patch(data, length);
     const char* bytes = static_cast<const char*>(data);
     while (length) {
         const auto result = ::send(socket.value, bytes, static_cast<int>(std::min<std::uint64_t>(length, INT_MAX)), NativeSendFlags(GuestNoSignal));

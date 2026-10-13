@@ -19,9 +19,9 @@ void Require(bool condition, const char* message) {
 
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
-    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    if (!Mappings::Get().HandleWrite(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
-    ++faults;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    if (!Mappings::Get().HandleAccess(record->ExceptionInformation[1], static_cast<std::uint32_t>(record->ExceptionInformation[0]))) return EXCEPTION_CONTINUE_SEARCH;
+    if (record->ExceptionInformation[0] == 1) ++faults;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -172,6 +172,66 @@ void CheckPrivate() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+MEMORY_BASIC_INFORMATION Query(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info), "query failed");
+    return info;
+}
+
+void CheckSplitViewsKeepTracking() {
+    Region region;
+    const bool coalesced = Mappings::Get().Coalesced();
+    if (coalesced) Require(Query(region.first + Small * 15).AllocationBase == region.first, "a mapping was not one view");
+    Require(region.Collect(Collection::All) == Pages(0, 16), "initial collect failed");
+    Require(region.Protection(2) == PAGE_READONLY && region.Protection(13) == PAGE_READONLY, "collect did not arm the view");
+    region.Write(2, 6);
+    Require(region.Protection(2) == PAGE_READWRITE && region.Protection(3) == PAGE_READONLY, "a write opened more than its page");
+    Mappings::Get().Reset(region.first + 16384, 16384);
+    Require(Query(region.first + 16384).State == MEM_RESERVE, "the reset page is still mapped");
+    if (coalesced) {
+        Require(Query(region.first).AllocationBase == region.first && Query(region.first + 32768).AllocationBase == region.first + 32768, "the view was not split at the reset page");
+        Require(Query(region.first + Small * 15).AllocationBase == region.first + 32768, "the tail is not one view");
+    }
+    Require(region.first[Small * 2] == 6 && region.alias[Small * 9] == 0, "split views lost their contents");
+    Require(region.Protection(2) == PAGE_READWRITE && region.Protection(3) == PAGE_READONLY && region.Protection(12) == PAGE_READONLY, "split views lost their armed pages");
+    region.Write(12, 7);
+    Require(region.Collect(Collection::All, 8, 8) == Pages(12, 13), "a write after the split was missed");
+    Require(region.Collect(Collection::All, 0, 4) == Pages(2, 3), "a write before the split was missed");
+    Require(region.alias[Small * 12] == 7, "the split view is not the shared page");
+}
+
+void CheckCommitOnTouch() {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t page = 16384;
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(memory != nullptr, "private reservation failed");
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    Require(mappings.Commit(memory, Bytes, PAGE_READWRITE, page, true, true).size() == 1, "untouched memory was not reported as new");
+    Require(mappings.Commit(memory, Bytes, PAGE_READWRITE, page, true, true).empty(), "untouched memory was reported twice");
+    Require(Query(memory).State == MEM_RESERVE && Query(memory + Bytes - 1).State == MEM_RESERVE, "commit on touch committed memory");
+    std::array<void*, 32> pages{};
+    std::size_t count = pages.size();
+    Require(mappings.Collect(address, Bytes, pages.data(), &count, true) && count == 0, "untouched memory reported writes");
+    static_cast<volatile unsigned char*>(memory)[page + 5] = 1;
+    Require(Query(memory + page).State == MEM_COMMIT && Query(memory + page).RegionSize == page, "a write did not commit its page");
+    Require(Query(memory).State == MEM_RESERVE && Query(memory + page * 2).State == MEM_RESERVE, "a write committed its neighbours");
+    count = pages.size();
+    Require(mappings.Collect(address, Bytes, pages.data(), &count, true) && count == 1 && pages[0] == memory + page, "the first write was not watched");
+    Require(static_cast<volatile unsigned char*>(memory)[page * 3 + 9] == 0 && Query(memory + page * 3).State == MEM_COMMIT, "a read did not commit zero memory");
+    mappings.SetProtection(address + page * 2, page, PAGE_NOACCESS);
+    std::uintptr_t end = 0;
+    std::uint32_t protection = 0;
+    Require(mappings.Pending(address + page * 2, &end, &protection) && protection == PAGE_NOACCESS && end == address + page * 3, "protection of untouched memory was lost");
+    Require(!mappings.HandleAccess(address + page * 2, 0), "inaccessible untouched memory was committed");
+    mappings.CommitPending(address, Bytes);
+    Require(Query(memory).State == MEM_COMMIT && Query(memory + page * 2).State == MEM_RESERVE, "pending commits ignored the protection");
+    Require(mappings.BeginHostWrite(address + page * 2, page), "a host write was refused");
+    mappings.EndHostWrite(address + page * 2, page);
+    mappings.Reset(memory, Bytes);
+    Require(!mappings.Pending(address + page * 2, &end, &protection), "reset kept untouched memory");
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 void CheckConcurrentWrites() {
     Region region;
     std::atomic<bool> start{false};
@@ -198,6 +258,8 @@ int main() {
         CheckPinsAndHostWrites();
         CheckFailureAndHoles();
         CheckPrivate();
+        CheckSplitViewsKeepTracking();
+        CheckCommitOnTouch();
         CheckConcurrentWrites();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {

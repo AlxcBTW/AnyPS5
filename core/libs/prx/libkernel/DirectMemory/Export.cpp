@@ -4,6 +4,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #ifdef _WIN32
@@ -500,6 +501,7 @@ bool PageRange(void* address, std::uint64_t length, std::uintptr_t& start, std::
 std::mutex g_workingSetLock;
 
 bool HostRangeAccessible(std::uintptr_t start, std::uintptr_t end) {
+    if (start < end) GuestArena::GuestArenaCommitPending_nid_no_patch(reinterpret_cast<const void*>(start), end - start);
     for (auto cursor = start; cursor < end;) {
         MEMORY_BASIC_INFORMATION region{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &region, sizeof(region)) != sizeof(region)) return false;

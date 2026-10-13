@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #ifndef _WIN32
 #include <cerrno>
 #include <fstream>
@@ -367,6 +368,31 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
     }
 }
 
+void GuestArenaCommitOnTouch_nid_no_patch(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
+    static const bool eager = std::getenv("APS5_EAGER_GUEST_COMMIT") != nullptr;
+    if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
+    const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched(), !eager);
+    if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
+        for (const auto& [address, size] : created) callback(address, size, generation);
+    }
+}
+
+bool GuestArenaHandleAccess_nid_no_patch(std::uintptr_t address, std::uint32_t kind) {
+    if (!Arena::Get().Contains(reinterpret_cast<const void*>(address), 1)) return false;
+    return WindowsMappings::Get().HandleAccess(address, kind);
+}
+
+bool GuestArenaPending_nid_no_patch(std::uintptr_t address, std::uintptr_t* end, std::uint32_t* protection) {
+    if (!Arena::Get().Contains(reinterpret_cast<const void*>(address), 1)) return false;
+    return WindowsMappings::Get().Pending(address, end, protection);
+}
+
+void GuestArenaViewStatistics_nid_no_patch(GuestArenaViews* statistics) {
+    const auto snapshot = WindowsMappings::Get().Snapshot();
+    *statistics = GuestArenaViews{snapshot.viewsMapped, snapshot.viewsUnmapped, snapshot.pagesMapped, snapshot.pagesUnmapped, snapshot.splits, snapshot.livePages, snapshot.pendingBytes, snapshot.pendingRanges, snapshot.touchCommits, snapshot.touchCommitBytes, WindowsMappings::Get().Coalesced()};
+}
+
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
     WindowsMappings::Get().Reset(pointer, bytes);
@@ -385,6 +411,19 @@ void GuestArenaUnmapAlias_nid_postfix(void* alias) {
     WindowsMappings::Get().UnmapAlias(alias);
 }
 #endif
+
+void GuestArenaCommitPending_nid_no_patch(const void* pointer, std::size_t bytes) {
+#ifdef _WIN32
+    auto& arena = Arena::Get();
+    if (!arena.Available() || bytes == 0) return;
+    const auto start = std::max(reinterpret_cast<std::uintptr_t>(pointer), arena.Base());
+    const auto stop = std::min(reinterpret_cast<std::uintptr_t>(pointer) + bytes, arena.Base() + arena.Size());
+    if (start < stop) WindowsMappings::Get().CommitPending(start, stop - start);
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+#endif
+}
 
 #if defined(__linux__)
 namespace {

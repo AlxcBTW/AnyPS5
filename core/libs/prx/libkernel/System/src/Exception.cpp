@@ -2,6 +2,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include <array>
@@ -206,6 +207,7 @@ void Deliver(GuestExceptionHandler handler, int signum, CONTEXT& context) {
 }
 
 bool StackWritable(DWORD64 low, DWORD64 high) {
+    if (low < high) GuestArena::GuestArenaCommitPending_nid_no_patch(reinterpret_cast<const void*>(low), static_cast<std::size_t>(high - low));
     for (DWORD64 address = low; address < high;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info)) return false;

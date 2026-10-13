@@ -536,13 +536,21 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 std::fprintf(stderr, "[query] 0x%llx range 0x%zx: base 0x%llx size 0x%llx state 0x%lx protect 0x%lx type 0x%lx %.0f us gen %llu from +0x%llx\n", static_cast<unsigned long long>(cursor), bytes, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), memory.State, memory.Protect, memory.Type, us, static_cast<unsigned long long>(GuestAllocations::GuestAllocationsGeneration_nid_postfix()), ModuleOffset(__builtin_return_address(0)));
             }
         }
-        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
-        const auto regionEnd = base + memory.RegionSize;
+        auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
         GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        std::uintptr_t pendingEnd = 0;
+        std::uint32_t pendingProtection = 0;
+        const bool pending = memory.State == MEM_RESERVE && GuestArena::GuestArenaPending_nid_no_patch(cursor, &pendingEnd, &pendingProtection);
+        if (pending) {
+            base = cursor;
+            regionEnd = std::min(regionEnd, pendingEnd);
+            logicalProtection = pendingProtection;
+        }
         const auto protection = logicalProtection & 0xffu;
-        const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+        const bool committed = pending ? (pendingProtection & (PAGE_GUARD | PAGE_NOACCESS)) == 0 : memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
         pages.record(base, regionEnd, readable, writable, generation);

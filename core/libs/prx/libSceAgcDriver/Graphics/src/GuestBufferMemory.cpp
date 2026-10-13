@@ -903,6 +903,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     bool writable = true;
     bool readOnly = true;
     MEMORY_BASIC_INFORMATION refused{};
+    GuestArena::GuestArenaCommitPending_nid_no_patch(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes));
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {

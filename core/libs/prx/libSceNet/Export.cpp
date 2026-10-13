@@ -828,6 +828,7 @@ int64_t APS5_VABI sceNetSend(int s, const void* buf, size_t len, int flags) {
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buf, len);
     const int result = ::send(socket.native->value, static_cast<const char*>(buf), static_cast<int>(len), NATIVE_SEND_FLAGS);
     return result >= 0 ? result : fail(native_error());
 }
@@ -843,6 +844,7 @@ int64_t APS5_VABI sceNetSendto(int s, const void* buf, size_t len, int flags, co
         if (it == g_socks.end()) return fail(NET_EBADF);
         socket = it->second;
     }
+    GuestArena::GuestArenaCommitPending_nid_no_patch(buf, len);
     int result;
     if (!to) {
         if (tolen != 0) return fail(NET_EINVAL);
