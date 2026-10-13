@@ -348,7 +348,7 @@ public:
                     flushClean();
                     return false;
                 }
-                const bool pinned = view.page->pins != 0;
+                const bool pinned = view.page->pins != 0 || noViewArming();
                 if (pinned || view.seen != view.page->generation) {
                     const auto needed = (stop - cursor + 4095) / 4096;
                     if (needed > capacity - *count) {
@@ -497,6 +497,18 @@ private:
         std::vector<std::uintptr_t> aliases;
         std::uint32_t pins = 0;
     };
+    // exp (APS5_EXP_NO_VIEW_ARMING=1): no shared view page is ever armed; every page of a view is pinned in
+    // effect, and every collect reports it as written. Arming makes a guest write to a view page fault once
+    // per collect, and Windows resumes that fault by pushing an exception frame below the faulting thread's
+    // rsp, over the SysV red zone of a frameless guest leaf (AlxcBTW/AnyPS5#44: the boot crash at
+    // app+0x52156c0, inside the Wwise/rpmalloc range that --frame-red-zone cannot frame).
+    static bool noViewArming() {
+        static const bool off = [] {
+            const char* value = std::getenv("APS5_EXP_NO_VIEW_ARMING");
+            return value != nullptr && std::strcmp(value, "0") != 0;
+        }();
+        return off;
+    }
     struct Section {
         HANDLE handle;
         explicit Section(HANDLE handle) : handle(handle) {}
