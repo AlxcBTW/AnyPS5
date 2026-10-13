@@ -117,9 +117,18 @@ void Fill(std::uint32_t* words, std::uint32_t seed) {
     for (std::uint32_t i = 0; i < Threads; ++i) words[i] = seed * 0x10001u + i * 7u + 1u;
 }
 
+struct CachedTemplatesRelease {
+    AgcDriver::VulkanDevice& device;
+    ~CachedTemplatesRelease() {
+        device.WaitIdle();
+        AgcDriver::Graphics::SharedResourceCache().Clear();
+    }
+};
+
 int ExecuteTests(AgcDriver::VulkanDevice& device) {
     const GuestBlock ring;
     const GuestBlock outputs;
+    const CachedTemplatesRelease release{device};
     for (std::uint32_t slot = 0; slot < Slots; ++slot) Fill(ring.Words(slot * SlotBytes), slot);
     Copies copies(device);
     const auto clear = [&] { std::memset(outputs.Words(0), 0xcd, SlotBytes); };
