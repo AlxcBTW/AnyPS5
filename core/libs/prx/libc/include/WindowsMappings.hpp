@@ -34,6 +34,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         std::lock_guard lock(mutex);
+        collectableRanges.clear();
         const auto end = reinterpret_cast<std::uintptr_t>(address) + bytes;
         for (auto cursor = reinterpret_cast<std::uintptr_t>(address); cursor < end;) {
             const auto memory = query(cursor);
@@ -76,6 +77,7 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection) {
         std::lock_guard lock(mutex);
+        collectableRanges.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
         HANDLE duplicate = nullptr;
@@ -106,6 +108,7 @@ public:
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
+        collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
@@ -362,6 +365,8 @@ public:
 
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        const auto proven = collectableRanges.upper_bound(address);
+        if (proven != collectableRanges.begin() && std::prev(proven)->second >= end) return true;
         auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
@@ -374,6 +379,7 @@ private:
             if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
             cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
         }
+        remember(collectableRanges, address, end);
         return true;
     }
 
@@ -518,6 +524,7 @@ private:
     }
 
     void reset(std::uintptr_t address, std::size_t bytes) {
+        collectableRanges.clear();
         const auto end = address + bytes;
         forgetClean(address, end);
         for (auto cursor = address; cursor < end;) {
@@ -558,6 +565,7 @@ private:
     }
 
     Ranges cleanRanges;
+    Ranges collectableRanges;
     Ranges freshRanges;
     void* mapAliasRuns(std::uintptr_t address, std::size_t bytes) {
         auto* reserved = allocate(GetCurrentProcess(), nullptr, bytes, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
