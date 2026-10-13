@@ -945,26 +945,6 @@ std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, st
     return Unary(state, spv::OpBitcast, TypeF32(state), resultBits);
 }
 
-std::uint32_t EmitFlushF32DenormToSignedZero(SpirvEmitterState& state, std::uint32_t value) {
-    const auto bits = state.module.AllocateId();
-    const auto absBits = state.module.AllocateId();
-    const auto signBits = state.module.AllocateId();
-    const auto nonZero = state.module.AllocateId();
-    const auto subnormal = state.module.AllocateId();
-    const auto flush = state.module.AllocateId();
-    const auto selected = state.module.AllocateId();
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
-    state.module.AddFunction(spv::OpBitwiseAnd, TypeU32(state), absBits, bits, ConstantU32(state, 0x7fffffffu));
-    state.module.AddFunction(spv::OpBitwiseAnd, TypeU32(state), signBits, bits, ConstantU32(state, 0x80000000u));
-    state.module.AddFunction(spv::OpINotEqual, TypeBool(state), nonZero, absBits, ConstantU32(state, 0u));
-    state.module.AddFunction(spv::OpULessThan, TypeBool(state), subnormal, absBits, ConstantU32(state, 0x00800000u));
-    state.module.AddFunction(spv::OpLogicalAnd, TypeBool(state), flush, nonZero, subnormal);
-    state.module.AddFunction(spv::OpSelect, TypeU32(state), selected, flush, signBits, bits);
-    state.module.AddFunction(spv::OpBitcast, TypeF32(state), result, selected);
-    return result;
-}
-
 std::uint32_t EmitTrigCycleF32(SpirvEmitterState& state, std::uint32_t src, bool preserveSignedZero) {
     const auto rounded = state.module.AllocateId();
     const auto reduced = state.module.AllocateId();
