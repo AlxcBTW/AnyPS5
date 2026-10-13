@@ -872,23 +872,29 @@ void spillTests(const Context& base, const BdaTestAccess& access) {
 
 // exp (APS5_EXP_HEAP_BUDGET=2): live imports that the allowance no longer covers (the heap's other use grew)
 // move to device-local mirrors at the next build, which serve their bytes and the CPU's later stores; an
-// import a command packet synchronizes through, or one a shader wrote, stays.
+// import a command packet synchronizes through (or near one), or one a shader wrote, stays. A moved range
+// comes back as an import when the device-local heap runs short while the host heap has room, or when a
+// sync target turns up in it.
 void demoteTests(const Context& base, const BdaTestAccess& access) {
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
         std::cout << "guest arena unavailable or not write-watched: demotions not tested\n";
         return;
     }
     constexpr std::size_t bytes = 65536;
-    void* block = GuestArena::GuestArenaAllocate_nid_postfix(5 * bytes, bytes);
-#ifdef _WIN32
-    GuestArena::GuestArenaCommit_nid_postfix(block, 5 * bytes, PAGE_READWRITE, 5 * bytes);
-#endif
-    std::memset(block, 0x33, 5 * bytes);
-    // Three allocations, apart so that each is an import of its own (adjacent ones import as one run):
-    // one a WAIT_REG_MEM waits in, one a shader writes, one neither.
+    // Three allocations, apart so that each is an import of its own (adjacent ones import as one run): one
+    // a WAIT_REG_MEM waits in, one a shader writes, and one neither, beyond the sync targets' neighbourhood.
+    constexpr std::size_t plainOffset = std::size_t{20} << 20u;
+    constexpr std::size_t span = plainOffset + bytes;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(span, bytes);
     auto* synced = static_cast<std::uint8_t*>(block);
     auto* written = synced + 2 * bytes;
-    auto* plain = written + 2 * bytes;
+    auto* plain = synced + plainOffset;
+    for (auto* range : {synced, written, plain}) {
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(range, bytes, PAGE_READWRITE, bytes);
+#endif
+        std::memset(range, 0x33, bytes);
+    }
     const auto syncedAddress = reinterpret_cast<std::uintptr_t>(synced);
     const auto writtenAddress = reinterpret_cast<std::uintptr_t>(written);
     const auto plainAddress = reinterpret_cast<std::uintptr_t>(plain);
@@ -927,14 +933,20 @@ void demoteTests(const Context& base, const BdaTestAccess& access) {
         leased.WriteBack();
         return device;
     };
+    // The heap's budget and use as a build will see them.
+    const auto heapIs = [&](VkDeviceSize grow, VkDeviceSize shrink, VkDeviceSize deviceUsage) {
+        spillHostGrow = grow;
+        spillHostShrink = shrink;
+        spillDeviceUsage = deviceUsage;
+        static_cast<void>(PollHostHeap(context, 0, true));
+        ResetHeapRebalance();
+    };
     registry(true);
     static_cast<void>(build(writtenAddress));
     Require(HostImportCovers(context, syncedAddress, 16) && HostImportCovers(context, writtenAddress, 16) && HostImportCovers(context, plainAddress, 16), "the writable ranges were not imported while they fit the host heap");
     NoteSyncTarget(syncedAddress + 16);
     // The heap's other use grows by 192 KiB: its allowance (224 KiB) falls to 32 KiB, below the live imports.
-    spillHostGrow = 0;
-    spillHostShrink = bytes;
-    static_cast<void>(PollHostHeap(context, 0, true));
+    heapIs(0, bytes, 0);
     const auto before = DeviceMirrorCounters();
     const auto mirrored = build();
     const auto after = DeviceMirrorCounters();
@@ -944,6 +956,19 @@ void demoteTests(const Context& base, const BdaTestAccess& access) {
     Require(after.mirrors == before.mirrors + 1 && mirrored != 0 && access.addressBytes(mirrored)[5] == std::byte{0x33}, "the given-up writable range was not mirrored in device-local memory");
     plain[5] = 0x44;
     Require(build() == mirrored && access.addressBytes(mirrored)[5] == std::byte{0x44} && !HostImportCovers(context, plainAddress, 16), "the demoted range was imported again or its mirror missed a CPU write");
+    // The device-local heap runs short while the host heap has room again: the range comes back.
+    heapIs(4 * bytes, 0, VkDeviceSize{8} << 30u);
+    const auto beforeDevice = DeviceMirrorCounters();
+    static_cast<void>(build());
+    Require(HostImportCovers(context, plainAddress, 16) && DeviceMirrorCounters().devicePromotions == beforeDevice.devicePromotions + 1, "a range given up for a mirror did not come back as an import while the device-local heap was short");
+    // Given up again; then a command packet sync target turns up in it: it comes back past the allowance.
+    heapIs(0, bytes, 0);
+    static_cast<void>(build());
+    Require(!HostImportCovers(context, plainAddress, 16), "the range was not given up again");
+    const auto beforeSync = DeviceMirrorCounters();
+    NoteSyncTarget(plainAddress + 32);
+    static_cast<void>(build());
+    Require(HostImportCovers(context, plainAddress, 16) && DeviceMirrorCounters().syncPromotions == beforeSync.syncPromotions + 1, "a range a command packet sync target turned up in did not come back as an import");
     registry(false);
     {
         GuestBufferMemory leased(context);
@@ -951,14 +976,16 @@ void demoteTests(const Context& base, const BdaTestAccess& access) {
         leased.Upload(true);
         leased.WriteBack();
     }
+    spillHostGrow = 0;
     spillHostShrink = 0;
+    spillDeviceUsage = 0;
     SetHeapBudgetExperiment(0);
     SetHostImportHeap(UINT32_MAX);
     SetRamFreeOverride(UINT64_MAX);
 #ifdef _WIN32
-    GuestArena::GuestArenaReset_nid_postfix(block, 5 * bytes);
+    GuestArena::GuestArenaReset_nid_postfix(block, span);
 #endif
-    GuestArena::GuestArenaRelease_nid_postfix(block, 5 * bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(block, span);
 }
 
 void deviceMirrorTests(const Context& base, const BdaTestAccess& access) {

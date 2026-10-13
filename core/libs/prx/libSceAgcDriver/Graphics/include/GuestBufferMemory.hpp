@@ -126,6 +126,11 @@ void SetRamFreeOverride(std::uint64_t bytes);
 // reading (UINT64_MAX without APS5_EXP_HEAP_BUDGET or a reading): what device-local mirrors and unit
 // shadows may still take. Below the reserve the buffer pool keeps no large device-local allocation.
 std::uint64_t DeviceHeapRoom();
+// The device-local bytes mirrors may still take: up to 85 % of that heap's budget at the last reading
+// (UINT64_MAX without APS5_EXP_HEAP_BUDGET or a reading). ResetHeapRebalance (tests): the next build
+// may move imports to mirrors or back at once.
+std::uint64_t MirrorDeviceRoom();
+void ResetHeapRebalance();
 std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget);
 // The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
 std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);
@@ -160,6 +165,11 @@ struct DeviceMirrorStats {
     // Host-visible readback buffers of writable device-local mirrors alive now, and at most.
     std::uint64_t readbackLive = 0;
     std::uint64_t readbackPeak = 0;
+    // Ranges given up for mirrors that came back as imports: a command packet sync target turned up in
+    // them, or the device-local heap ran short while the host heap had room.
+    std::uint64_t syncPromotions = 0;
+    std::uint64_t devicePromotions = 0;
+    std::uint64_t devicePromotedBytes = 0;
 };
 DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the

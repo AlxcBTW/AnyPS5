@@ -864,7 +864,22 @@ struct HeapWatch {
     // Host-visible readback buffers of writable device-local mirrors alive, and their peak.
     std::atomic<std::uint64_t> readbackLive{0};
     std::atomic<std::uint64_t> readbackPeak{0};
+    // Ranges given up for mirrors that came back as imports: a sync target turned up in them, or the
+    // device-local heap ran short.
+    std::atomic<std::uint64_t> syncPromotions{0};
+    std::atomic<std::uint64_t> devicePromotions{0};
+    std::atomic<std::uint64_t> devicePromotedBytes{0};
 };
+
+// exp (APS5_EXP_HEAP_BUDGET): the device-local bytes mirrors may still take: up to 85 % of that heap's
+// budget at `heap`'s reading (UINT64_MAX without one), so that textures, storage images and the driver
+// keep the rest (parl0v's run of 2aad7b15a died on a 128 MiB device-local allocation with heap 0 at
+// 7,795 of 7,189 MiB, 1.95 GB of it mirrors).
+std::uint64_t mirrorDeviceRoom(const HostHeapState& heap) {
+    if (heap.deviceHeap == UINT32_MAX || heap.deviceBudget == 0) return UINT64_MAX;
+    const auto ceiling = heap.deviceBudget / 20 * 17;
+    return ceiling > heap.deviceUsage ? ceiling - heap.deviceUsage : 0;
+}
 
 void countLive(std::atomic<std::uint64_t>& live, std::atomic<std::uint64_t>& peak, std::uint64_t bytes) {
     const auto now = live.fetch_add(bytes, std::memory_order_relaxed) + bytes;
@@ -1009,11 +1024,31 @@ SyncTargets& Targets() {
 // (descriptor-bound or through the BDA table) and that holds no address a command packet waited on or
 // wrote (labels, EOP, WRITE_DATA, COPY_DATA, DMA_DATA); a releasable one (a write-watched heap mirror,
 // no CPU shadow of the range). `awaited` is locked.
+// Command packet sync targets within this distance of an import keep it imported as well: label and
+// fence words come in pools of neighbouring allocations, and a target first used after its range moved
+// is read and written through guest memory while the GPU uses the mirror (parl0v's 16 GB run of
+// 2aad7b15a: 516 targets first seen inside moved ranges). `targets` is locked.
+constexpr std::uint64_t SyncNeighbourhood = std::uint64_t{16} << 20u;
+
+bool nearSyncTarget(const HostImport& entry, const SyncTargets& targets) {
+    const auto low = entry.base > SyncNeighbourhood ? entry.base - SyncNeighbourhood : 0;
+    const auto found = targets.addresses.lower_bound(low);
+    return found != targets.addresses.end() && *found < entry.base + entry.bytes + SyncNeighbourhood;
+}
+
 bool demotableWritable(const HostImport& entry, const SyncTargets& awaited) {
     if (std::atomic_ref<bool>(entry.gpuWritten).load(std::memory_order_relaxed) || entry.bdaWritten) return false;
     if (!std::all_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->releasable; })) return false;
-    const auto found = awaited.addresses.lower_bound(entry.base);
-    return found == awaited.addresses.end() || *found >= entry.base + entry.bytes;
+    return !nearSyncTarget(entry, awaited);
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): whether a command packet sync target lies in the run (it is then imported
+// past the allowance, up to the configured budget: its words must stay coherent).
+bool runHoldsSyncTarget(const ImportRun& run) {
+    auto& targets = Targets();
+    std::lock_guard lock(targets.mutex);
+    const auto found = targets.addresses.lower_bound(run.base);
+    return found != targets.addresses.end() && *found < run.base + run.bytes;
 }
 
 // The GPU wrote the import (a write-back of a range bound to it in place).
@@ -1044,7 +1079,7 @@ Spill spillImports(const Context& context, HostImports& state, const GuestAlloca
             if (entry.joined || pointerHeld(state, entry) || entry.bytes > cap) continue;
             if (run != nullptr && entry.base < run->base + run->bytes && run->base < entry.base + entry.bytes) continue;
             const bool readOnly = std::none_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; });
-            if (!readOnly && (!writable || !demotableWritable(entry, awaited))) continue;
+            if (readOnly ? nearSyncTarget(entry, awaited) : (!writable || !demotableWritable(entry, awaited))) continue;
             victims.push_back({it, readOnly});
         }
     }
@@ -1090,7 +1125,7 @@ void spillReadOnly(const Context& context, HostImports& state, const GuestAlloca
     if (!runWritable(run)) return;
     const auto heap = PollHostHeap(context, state.liveBytes);
     // The spilled ranges' mirrors go to device-local memory, which must have room for them.
-    const auto room = DeviceHeapRoom();
+    const auto room = MirrorDeviceRoom();
     if (room < needed) return;
     const auto cap = std::min(std::max<std::uint64_t>(heap.headroom / 2, needed), room);
     const auto spill = spillImports(context, state, lease, &run, needed, cap, false);
@@ -1106,13 +1141,69 @@ void spillReadOnly(const Context& context, HostImports& state, const GuestAlloca
 // memory has room for their mirrors, and the last attempt to move them is old enough (100 ms after one
 // that moved something, 2 s after one that could not). An address space hit then rebuilds instead, so
 // that demoteForHeap runs before the build takes any import.
-bool demotionDue(const Context& context, const HostImports& state) {
-    if (!heapBudgetEnabled()) return false;
+// exp (APS5_EXP_HEAP_BUDGET): what moving imports to device-local mirrors (demote) or back (promote)
+// would do now. Demote: live imports past the host heap's allowance while mirrors have device-local room
+// (MirrorDeviceRoom: up to 85 % of that heap). Promote: the device-local heap short (less free than its
+// reserve, an eighth: 87.5 % used) while the host heap's allowance has room for a range given up, the
+// band between the two keeping them from undoing each other.
+enum class Rebalance { None, Demote, Promote };
+
+Rebalance rebalanceWanted(const Context& context, const HostImports& state) {
+    if (!heapBudgetEnabled()) return Rebalance::None;
     const auto heap = PollHostHeap(context, state.liveBytes);
-    if (heap.allowance == UINT64_MAX || state.liveBytes <= heap.allowance || DeviceHeapRoom() == 0) return false;
+    if (heap.allowance == UINT64_MAX) return Rebalance::None;
     auto& heaps = Heaps();
     std::lock_guard lock(heaps.mutex);
-    return std::chrono::steady_clock::now() >= heaps.nextDemotion;
+    if (std::chrono::steady_clock::now() < heaps.nextDemotion) return Rebalance::None;
+    const auto& last = heaps.last;
+    const bool deviceShort = last.deviceHeap != UINT32_MAX && last.deviceBudget < last.deviceUsage + DeviceHeapReserve(last.deviceBudget);
+    if (deviceShort && !heaps.spilled.empty()) {
+        const auto held = state.liveBytes + retiredImportBytes.load(std::memory_order_relaxed);
+        if (heap.allowance > held) return Rebalance::Promote;
+    }
+    if (state.liveBytes > heap.allowance && mirrorDeviceRoom(last) != 0) return Rebalance::Demote;
+    return Rebalance::None;
+}
+
+// An address space hit rebuilds instead while a rebalance is due, so that it runs before the build
+// takes any import.
+bool demotionDue(const Context& context, const HostImports& state) {
+    return rebalanceWanted(context, state) != Rebalance::None;
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): while the device-local heap is short, ranges given up for device-local
+// mirrors come back as imports, as many as half the host allowance's room takes, the largest first: the
+// build imports them and releases their mirrors (releaseImportedMirrors). parl0v's run of 2aad7b15a died
+// on a 128 MiB device-local allocation with heap 0 at 7,795 of 7,189 MiB (1.95 GB of mirrors) while
+// heap 1 had ~600 MiB of room.
+void promoteForDevice(const Context& context, HostImports& state) {
+    const auto heap = PollHostHeap(context, state.liveBytes);
+    const auto held = state.liveBytes + retiredImportBytes.load(std::memory_order_relaxed);
+    const auto room = heap.allowance > held ? (heap.allowance - held) / 2 : 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> promoted;
+    std::uint64_t promotedBytes = 0;
+    auto& heaps = Heaps();
+    {
+        std::lock_guard lock(heaps.mutex);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> candidates(heaps.spilled.begin(), heaps.spilled.end());
+        std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) { return left.second > right.second; });
+        for (const auto& [base, bytes] : candidates) {
+            if (promotedBytes + bytes > room) continue;
+            promotedBytes += bytes;
+            promoted.emplace_back(base, bytes);
+            heaps.spilled.erase(base);
+        }
+        heaps.nextDemotion = std::chrono::steady_clock::now() + std::chrono::milliseconds(promoted.empty() ? 2000 : 1000);
+    }
+    for (const auto& [base, bytes] : promoted) state.failed.erase(base);
+    if (!promoted.empty()) ++state.epoch;
+    heaps.devicePromotions.fetch_add(promoted.size(), std::memory_order_relaxed);
+    heaps.devicePromotedBytes.fetch_add(promotedBytes, std::memory_order_relaxed);
+    static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
+    if (std::chrono::steady_clock::now() - lastReport > (promoted.empty() ? std::chrono::seconds(10) : std::chrono::seconds(1))) {
+        lastReport = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): device-local heap %u short (%llu of %llu MiB); %llu ranges (%llu MiB) given up for mirrors come back as imports (room %llu MiB); %llu (%llu MiB) so far\n", heap.heap, heap.deviceHeap, static_cast<unsigned long long>(heap.deviceUsage >> 20u), static_cast<unsigned long long>(heap.deviceBudget >> 20u), static_cast<unsigned long long>(promoted.size()), static_cast<unsigned long long>(promotedBytes >> 20u), static_cast<unsigned long long>(room >> 20u), static_cast<unsigned long long>(heaps.devicePromotions.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heaps.devicePromotedBytes.load(std::memory_order_relaxed) >> 20u));
+    }
 }
 
 // exp (APS5_EXP_HEAP_BUDGET): live imports past the heap's allowance go to device-local mirrors while
@@ -1123,10 +1214,12 @@ bool demotionDue(const Context& context, const HostImports& state) {
 // larger) and never more than the device-local room. Called at an address space rebuild before the build
 // takes any import, so none is held.
 void demoteForHeap(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
-    if (!demotionDue(context, state)) return;
+    const auto wanted = rebalanceWanted(context, state);
+    if (wanted == Rebalance::Promote) promoteForDevice(context, state);
+    if (wanted != Rebalance::Demote) return;
     const auto heap = PollHostHeap(context, state.liveBytes);
     const auto needed = state.liveBytes - heap.allowance + TightSlack;
-    const auto cap = std::min(std::max<std::uint64_t>(heap.headroom / 2, needed), DeviceHeapRoom());
+    const auto cap = std::min(std::max<std::uint64_t>(heap.headroom / 2, needed), MirrorDeviceRoom());
     const auto live = state.liveBytes;
     const auto spill = spillImports(context, state, lease, nullptr, needed, cap, heapBudgetMode.load(std::memory_order_relaxed) >= 2);
     auto& heaps = Heaps();
@@ -1180,6 +1273,9 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     // by their batches; until those are released, they take their part of the heap.
     const auto pending = heapBudgetEnabled() ? retiredImportBytes.load(std::memory_order_relaxed) : 0;
     auto budget = steady - std::min(steady, pending);
+    // exp (APS5_EXP_HEAP_BUDGET): a run a command packet synchronizes through is imported even past the
+    // allowance (up to the configured budget): its words must stay coherent.
+    if (heapBudgetEnabled() && budget < configured && state.liveBytes + bytes > budget && runHoldsSyncTarget(run)) budget = configured;
     // Least recently used imports make room under the configured budget only: past the heap's allowance
     // an evicted import stays in the heap until its batches complete and its range comes back as a mirror.
     if (evict && state.liveBytes + bytes > configured) retireLeastRecent(context, state, lease, state.liveBytes + bytes - configured);
@@ -1192,7 +1288,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     if (heapBudgetEnabled() && budget < configured && state.liveBytes + bytes > budget) {
         if (!joined && state.liveBytes + bytes > steady) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - steady);
         // Writable ranges have device-local mirrors with =2 only.
-        const bool deviceMirror = DeviceHeapRoom() >= bytes && (!runWritable(run) || heapBudgetMode.load(std::memory_order_relaxed) >= 2);
+        const bool deviceMirror = MirrorDeviceRoom() >= bytes && (!runWritable(run) || heapBudgetMode.load(std::memory_order_relaxed) >= 2);
         if (state.liveBytes + bytes > budget && !deviceMirror) {
             budget = configured;
             static std::atomic<std::uint64_t> overAllowance{0};
@@ -1753,7 +1849,7 @@ bool deviceMirrorWanted(const Context& context, std::uint64_t address, std::uint
     // held (an import of its range was refused).
     const auto pending = retiredImportBytes.load(std::memory_order_relaxed);
     if ((!spilled && !state.tight && state.imports + pending + bytes + TightSlack < state.allowance) || state.deviceHeap == UINT32_MAX) return false;
-    return state.deviceBudget > state.deviceUsage + bytes + DeviceHeapReserve(state.deviceBudget);
+    return mirrorDeviceRoom(state) >= bytes;
 }
 
 class RefreshPool {
@@ -2963,6 +3059,19 @@ std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget) {
     return std::max<std::uint64_t>(std::uint64_t{512} << 20u, deviceBudget / 8);
 }
 
+std::uint64_t MirrorDeviceRoom() {
+    if (!heapBudgetEnabled()) return UINT64_MAX;
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    return mirrorDeviceRoom(heaps.last);
+}
+
+void ResetHeapRebalance() {
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    heaps.nextDemotion = {};
+}
+
 std::uint64_t DeviceHeapRoom() {
     if (!heapBudgetEnabled()) return UINT64_MAX;
     auto& heaps = Heaps();
@@ -2989,14 +3098,29 @@ void NoteSyncTarget(std::uint64_t address) {
         std::lock_guard lock(awaited.mutex);
         if (!awaited.addresses.insert(address).second) return;
     }
-    // A target in a range already given up (it was first used after the range moved): its readers now see
-    // the mirror's write-back once a batch completed, not the GPU's stores as they land. Said once per address.
+    // A target in a range already given up (it was first used after the range moved): the range comes
+    // back as an import at the next build (it now holds a sync target, so past the allowance if need be),
+    // and its mirror goes then.
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
     auto& heaps = Heaps();
-    std::lock_guard lock(heaps.mutex);
-    auto found = heaps.spilled.upper_bound(address);
-    if (found == heaps.spilled.begin() || address >= std::prev(found)->first + std::prev(found)->second) return;
-    --found;
-    std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): command packet sync target 0x%llx lies in the range 0x%llx+0x%llx given up for a device-local mirror\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(found->first), static_cast<unsigned long long>(found->second));
+    {
+        std::lock_guard lock(heaps.mutex);
+        auto found = heaps.spilled.upper_bound(address);
+        if (found == heaps.spilled.begin() || address >= std::prev(found)->first + std::prev(found)->second) return;
+        --found;
+        base = found->first;
+        bytes = found->second;
+        heaps.spilled.erase(found);
+    }
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        state.failed.erase(base);
+        ++state.epoch;
+    }
+    const auto promoted = heaps.syncPromotions.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): command packet sync target 0x%llx lies in the range 0x%llx+0x%llx given up for a device-local mirror; it comes back as an import (%llu ranges so far)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(promoted));
 }
 
 std::string DescribeGuestBacking(std::uint64_t address) {
@@ -3063,6 +3187,9 @@ DeviceMirrorStats DeviceMirrorCounters() {
     stats.stagingSyncs = heaps.stagingSyncs.load(std::memory_order_relaxed);
     stats.readbackLive = heaps.readbackLive.load(std::memory_order_relaxed);
     stats.readbackPeak = heaps.readbackPeak.load(std::memory_order_relaxed);
+    stats.syncPromotions = heaps.syncPromotions.load(std::memory_order_relaxed);
+    stats.devicePromotions = heaps.devicePromotions.load(std::memory_order_relaxed);
+    stats.devicePromotedBytes = heaps.devicePromotedBytes.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -3146,12 +3273,12 @@ std::string DescribeImportCensus() {
     const auto made = DeviceMirrorCounters();
     const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
     char text[1700];
-    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance; back as imports: %llu for sync targets, %llu (%llu MiB) for device-local room), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
         static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(gpuWritten.count), mib(gpuWritten.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
         static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
         static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes),
         static_cast<unsigned long long>(deviceMirrors.count), mib(deviceMirrors.bytes), static_cast<unsigned long long>(made.mirrors), mib(made.uploadedBytes), static_cast<unsigned long long>(made.uploads), mib(made.stagingBytes), mib(made.stagingPeak), static_cast<unsigned long long>(made.stagingSyncs), static_cast<unsigned long long>(made.readbacks), mib(made.readbackLive), mib(made.readbackPeak),
-        static_cast<unsigned long long>(made.spills), mib(made.spilledBytes), mib(made.spilledWritableBytes), static_cast<unsigned long long>(made.demotions),
+        static_cast<unsigned long long>(made.spills), mib(made.spilledBytes), mib(made.spilledWritableBytes), static_cast<unsigned long long>(made.demotions), static_cast<unsigned long long>(made.syncPromotions), static_cast<unsigned long long>(made.devicePromotions), mib(made.devicePromotedBytes),
         static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
         static_cast<unsigned long long>(originals.images), static_cast<unsigned long long>(originals.withOriginal), mib(originals.bytes), mib(originals.validBytes));
     return text;
