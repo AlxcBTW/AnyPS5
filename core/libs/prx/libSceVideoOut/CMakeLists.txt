@@ -5,6 +5,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Output.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/VideoOutDriver.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/DisplayWindow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/CompileTitle.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/PadInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/MouseInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
@@ -165,4 +166,12 @@ if(BUILD_TESTING)
         set_tests_properties(guest_buffer_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(video_out_compile_title_tests tests/CompileTitle.cpp src/CompileTitle.cpp)
+    target_include_directories(video_out_compile_title_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(video_out_compile_title_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(video_out_compile_title_tests)
+    add_test(NAME video_out_compile_title COMMAND video_out_compile_title_tests)
 endif()

@@ -1,11 +1,14 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CompileProgress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceVideoOut/include/CompileTitle.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "Decoder/Png.hpp"
 #include "SDL_vulkan.h"
 #include <cstdio>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -66,6 +69,7 @@ void DisplayWindow::create(std::uint32_t sourceWidth, std::uint32_t sourceHeight
     SDL_SetWindowMinimumSize(window, static_cast<int>(DisplayWindowMinimumWidth), static_cast<int>(DisplayWindowMinimumHeight));
     applyAppIcon(window);
     installSubclass();
+    lastPresentMs = AgcDriver::CompileClockMs();
 }
 
 void DisplayWindow::updateAspectRatio(std::uint32_t sourceWidth, std::uint32_t sourceHeight) {
@@ -122,6 +126,27 @@ void DisplayWindow::UpdateTitle() {
     char text[160];
     std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
     SDL_SetWindowTitle(window, text);
+    lastPresentMs = AgcDriver::CompileClockMs();
+    compileTitleShown = false;
+}
+
+void DisplayWindow::UpdateCompileTitle() {
+    static const bool disabled = std::getenv("APS5_NO_COMPILE_TITLE") != nullptr;
+    if (disabled || window == nullptr) return;
+    static const AppTitle title = GetAppTitle_nid_postfix();
+    const auto progress = AgcDriver::CompileSnapshot_nid_postfix();
+    const auto now = AgcDriver::CompileClockMs();
+    const CompileTitleInput input{now, lastPresentMs, progress.completed, progress.active, progress.lastBeginMs, progress.lastEndMs, progress.lastDurationMs};
+    if (!CompileTitleVisible(input)) {
+        if (!compileTitleShown) return;
+        SDL_SetWindowTitle(window, title.value);
+        compileTitleShown = false;
+        return;
+    }
+    if (compileTitleShown && now - lastCompileTitleMs < CompileTitleIntervalMs) return;
+    SDL_SetWindowTitle(window, FormatCompileTitle(title.value, input).c_str());
+    lastCompileTitleMs = now;
+    compileTitleShown = true;
 }
 
 void DisplayWindow::installSubclass() {
