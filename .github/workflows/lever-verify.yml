@@ -22,19 +22,35 @@ env:
 jobs:
   linux:
     if: github.repository == 'AlxcBTW/AnyPS5'
-    runs-on: ${{ vars.LEVER_LINUX_RUNNER || 'ubuntu-latest' }}
+    # LEVER_LINUX_RUNNER is a JSON list of Namespace runner labels; without it the job runs on GitHub.
+    runs-on: ${{ vars.LEVER_LINUX_RUNNER && fromJSON(vars.LEVER_LINUX_RUNNER) || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
           submodules: true
+      # Namespace: ccache lives on the runner's cache volume (no upload or download), and the privileged
+      # container lets the write-watch tests use userfaultfd.
+      - name: Keep ccache on the Namespace cache volume
+        if: startsWith(runner.name, 'nsc-')
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          path: ~/.ccache
       - uses: hendrikmuhs/ccache-action@v1.2.24
+        if: ${{ !startsWith(runner.name, 'nsc-') }}
         with:
           key: linux
           evict-old-files: job
       - name: Install lavapipe and the SDL audio and XRandR development files
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev
+      - name: Prepare the Namespace runner
+        if: startsWith(runner.name, 'nsc-')
+        run: |
+          sudo sysctl -w vm.unprivileged_userfaultfd=1
+          sudo apt-get install -y --no-install-recommends ccache ninja-build
+          echo "CCACHE_DIR=$HOME/.ccache" >> "$GITHUB_ENV"
+          CCACHE_DIR=$HOME/.ccache ccache -M 15G -z
       - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
@@ -45,6 +61,9 @@ jobs:
           ANYPS5_REQUIRE_VULKAN: 1
           GALLIUM_OVERRIDE_CPU_CAPS: avx
       - run: python3 tools/check_skips.py build/ctest.xml
+      - name: ccache statistics
+        if: startsWith(runner.name, 'nsc-') && !cancelled()
+        run: ccache -s
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
         shell: bash
