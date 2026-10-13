@@ -447,6 +447,16 @@ std::int32_t APS5_VABI sceKernelGetLibkernelTextLocation_nid_postfix(void** addr
     return 0;
 }
 
+std::int32_t APS5_VABI sceKernelInternalMemoryGetModuleSegmentInfo_nid_postfix(InternalSegmentInfo* result) {
+    if (!result) throw std::invalid_argument("sceKernelInternalMemoryGetModuleSegmentInfo: result is null");
+    void* address = nullptr;
+    std::size_t size = 0;
+    const auto status = sceKernelGetLibkernelTextLocation_nid_postfix(&address, &size);
+    if (status != 0) return status;
+    *result = {reinterpret_cast<std::uintptr_t>(address), size};
+    return 0;
+}
+
 std::uint64_t GuestImageSegmentBytes_nid_no_patch() {
     return GuestSegmentBytes();
 }

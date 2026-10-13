@@ -59,6 +59,7 @@ int APS5_VABI rand_nid_postfix();
 void APS5_VABI srand_nid_postfix(unsigned int);
 int APS5_VABI rand_r_nid_postfix(unsigned int*);
 float APS5_VABI log10f_nid_postfix(float);
+float APS5_VABI powf_nid_postfix(float, float);
 double APS5_VABI log1p_nid_postfix(double);
 float APS5_VABI log1pf_nid_postfix(float);
 double APS5_VABI expm1_nid_postfix(double);
@@ -196,6 +197,10 @@ static void CheckExp2Errno() {
     Require(errno == 0);
     Require(std::isinf(result) && result > 0);
     Require(std::fetestexcept(FE_OVERFLOW | FE_INEXACT) == (FE_OVERFLOW | FE_INEXACT));
+}
+
+static void CheckPowfSpecialValue() {
+    Require(std::bit_cast<std::uint32_t>(powf_nid_postfix(1.0f, std::bit_cast<float>(0x7f800001u))) == 0x3f800000u);
 }
 
 static void CheckLongDouble() {
@@ -788,6 +793,7 @@ int main() {
     Require(negativeDenominator.quot == -3 && negativeDenominator.rem == 1);
     const auto minimum = div_nid_postfix(std::numeric_limits<int>::min(), 10);
     Require(minimum.quot == -214748364 && minimum.rem == -8);
+    CheckPowfSpecialValue();
     Require(abs_nid_postfix(0) == 0);
     Require(abs_nid_postfix(42) == 42);
     Require(abs_nid_postfix(-42) == 42);

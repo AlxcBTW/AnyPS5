@@ -475,7 +475,7 @@ bool Texture::CanDepthCopyFrom(const StorageTexture& source, const GuestTextureR
     return geometry.imageDepth == 1 && source.ImageDepth() == 1 && source.ImageLayers() >= geometry.imageLayers && source.Descriptor().mipCount >= descriptor.mipCount;
 }
 
-Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), depthCopy(true) {
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag) : context(context), storageSource(source), perUseCopy(PerUseCopy::RefreshedOnReuse) {
     try {
         Require(source != nullptr && CanDepthCopyFrom(*source, descriptor), "storage image cannot serve a depth copy of the sampled texture");
         const auto colorFormat = ResolveTextureFormat(descriptor.format);
@@ -535,7 +535,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
 }
 
 bool Texture::RefreshDepthCopy() {
-    if (!depthCopy || storageSource == nullptr) return false;
+    if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;
     std::uint64_t linearBytes = 0;
     for (std::uint32_t level = 0; level < copyLevels; ++level) linearBytes += static_cast<std::uint64_t>(std::max(copyWidth >> level, 1u)) * std::max(copyHeight >> level, 1u) * copyElementBytes * copyLayers;
@@ -660,17 +660,22 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
     }
 }
 
-Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components) : context(context) {
+Texture::Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components, VkImageViewType viewType) : context(context) {
     layout = VK_IMAGE_LAYOUT_GENERAL;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     viewInfo.image = depthImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = depthFormat;
     viewFormat = depthFormat;
     viewInfo.components = components;
-    viewInfo.subresourceRange = {aspect, 0, 1, 0, 1};
+    viewInfo.subresourceRange = {aspect, 0, 1, 0, viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : VK_REMAINING_ARRAY_LAYERS};
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth plane");
     viewRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
+    if (viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) return;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.subresourceRange.layerCount = 1;
+    Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &firstLayerView), "vkCreateImageView depth plane first layer");
+    firstLayerRange = {viewInfo.viewType, viewInfo.subresourceRange.levelCount, viewInfo.subresourceRange.layerCount};
 }
 
 Texture::~Texture() {
@@ -1887,10 +1892,13 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     comparedGuestBytes = {};
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
+    std::vector<bool> selected(trackedLayers, true);
+    if (layers != nullptr) selected = *layers;
+    for (const auto& [begin, end] : unitRuns(selected)) GuestMemory::FlushGpuWrites(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (layers != nullptr && !(*layers)[layer]) continue;
+        if (!selected[layer]) continue;
         const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-        GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+        GuestMemory::ReadCommittedUnsynced(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
     }
     originalValid = originalValid || complete;
 }

@@ -2,9 +2,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <io.h>
 #else
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <time.h>
 #include <netinet/in.h>
@@ -19,6 +21,7 @@
 #include "prx/libkernel/Socket/include/SocketRuntime.hpp"
 #include "prx/libkernel/File/include/DescriptorControl.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include <algorithm>
@@ -322,6 +325,67 @@ std::shared_ptr<Socket> Find(int descriptor) {
     const auto found = sockets.find(descriptor);
     return found != sockets.end() ? found->second : nullptr;
 }
+constexpr short GuestPollReadable = 0x1 | 0x40;
+constexpr short GuestPollWritable = 0x4;
+constexpr short GuestPollHangUp = 0x10;
+constexpr short GuestPollError = 0x8;
+[[noreturn]] void ThrowReadEndWritable(int descriptor) {
+    throw std::runtime_error("poll: POLLOUT on the read end of pipe descriptor " + std::to_string(descriptor) + " is not supported");
+}
+#ifdef _WIN32
+struct PipeIoStatus {
+    void* status;
+    ULONG_PTR information;
+};
+struct PipeLocalInformation {
+    ULONG type;
+    ULONG configuration;
+    ULONG maximumInstances;
+    ULONG currentInstances;
+    ULONG inboundQuota;
+    ULONG readDataAvailable;
+    ULONG outboundQuota;
+    ULONG writeQuotaAvailable;
+    ULONG state;
+    ULONG end;
+};
+using QueryInformationFile = LONG(NTAPI*)(HANDLE, PipeIoStatus*, void*, ULONG, int);
+constexpr int FileAccessInformationClass = 8;
+constexpr int FilePipeLocalInformationClass = 24;
+constexpr ULONG PipeClosingState = 4;
+constexpr ULONG PipeAtomicBytes = 512;
+bool PipeReadiness(int descriptor, short events, short& revents) {
+    const auto handle = reinterpret_cast<HANDLE>(::_get_osfhandle(descriptor));
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_PIPE) return false;
+    static const auto query = reinterpret_cast<QueryInformationFile>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationFile")));
+    if (!query) throw std::runtime_error("poll: NtQueryInformationFile is unavailable");
+    PipeIoStatus status{};
+    ACCESS_MASK access = 0;
+    PipeLocalInformation pipe{};
+    if (query(handle, &status, &access, sizeof(access), FileAccessInformationClass) < 0 ||
+        query(handle, &status, &pipe, sizeof(pipe), FilePipeLocalInformationClass) < 0)
+        throw std::runtime_error("poll: querying pipe descriptor " + std::to_string(descriptor) + " failed");
+    if ((events & GuestPollWritable) && !(access & FILE_WRITE_DATA)) ThrowReadEndWritable(descriptor);
+    const bool closed = pipe.state == PipeClosingState;
+    revents = 0;
+    if ((access & FILE_READ_DATA) && pipe.readDataAvailable > 0)
+        revents = static_cast<short>(revents | (events & GuestPollReadable));
+    if ((access & FILE_WRITE_DATA) && !closed && pipe.writeQuotaAvailable >= PipeAtomicBytes)
+        revents = static_cast<short>(revents | (events & GuestPollWritable));
+    if (closed) revents = static_cast<short>(revents | (events & GuestPollReadable) | GuestPollHangUp);
+    return true;
+}
+#else
+bool IsPipe(int descriptor, short events) {
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0 || !S_ISFIFO(status.st_mode)) return false;
+    const int flags = ::fcntl(descriptor, F_GETFL);
+    if (flags < 0) throw std::runtime_error("poll: querying pipe descriptor " + std::to_string(descriptor) + " failed");
+    if ((events & GuestPollWritable) && (flags & O_ACCMODE) == O_RDONLY) ThrowReadEndWritable(descriptor);
+    return true;
+}
+#endif
 }
 
 int GuestSockets::Duplicate(int descriptor) {
@@ -974,6 +1038,7 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
     std::vector<std::shared_ptr<Socket>> held;
     std::vector<NativePollDescriptor> native;
     std::vector<std::uint32_t> owners;
+    std::vector<std::uint32_t> pipes;
     int ready = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         auto& entry = descriptors[i];
@@ -981,8 +1046,22 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         if (entry.descriptor < 0) continue;
         if ((entry.events & ~GuestPollAccepted) != 0)
             throw std::runtime_error("poll: unsupported event flags " + std::to_string(entry.events));
-        if (entry.descriptor < GuestSockets::FirstDescriptor)
-            throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is not a socket");
+        if (entry.descriptor < GuestSockets::FirstDescriptor) {
+            if (!DescriptorIsOpen_nid_no_patch(entry.descriptor)) {
+                entry.revents = GuestPollInvalid;
+                ++ready;
+                continue;
+            }
+#ifdef _WIN32
+            short revents = 0;
+            if (!PipeReadiness(entry.descriptor, entry.events, revents))
+#else
+            if (!IsPipe(entry.descriptor, entry.events))
+#endif
+                throw std::runtime_error("poll: descriptor " + std::to_string(entry.descriptor) + " is neither a socket nor a pipe");
+            pipes.push_back(i);
+            continue;
+        }
         auto socket = Find(entry.descriptor);
         if (!socket) {
             entry.revents = GuestPollInvalid;
@@ -1000,29 +1079,76 @@ int APS5_VABI poll_nid_postfix(GuestPollDescriptor* descriptors, std::uint32_t c
         owners.push_back(i);
         held.push_back(std::move(socket));
     }
-    if (native.empty()) {
+#ifndef _WIN32
+    const std::size_t socketCount = native.size();
+    for (const auto index : pipes) {
+        NativePollDescriptor request{};
+        request.fd = descriptors[index].descriptor;
+        for (const auto& flag : RequestFlags)
+            if (descriptors[index].events & flag.guest) request.events = static_cast<short>(request.events | flag.native);
+        native.push_back(request);
+        owners.push_back(index);
+    }
+#endif
+    if (native.empty() && pipes.empty()) {
         if (ready || timeout == 0) return ready;
-        if (timeout < 0) throw std::runtime_error("poll: an infinite wait without sockets never returns");
+        if (timeout < 0) throw std::runtime_error("poll: an infinite wait without sockets or pipes never returns");
         std::this_thread::sleep_for(std::chrono::milliseconds(timeout));
         return 0;
     }
-    const int wait = ready ? 0 : timeout;
-#ifdef _WIN32
-    const int result = WSAPoll(native.data(), static_cast<ULONG>(native.size()), wait);
-#else
-    const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), wait);
-#endif
-    if (result < 0) return Fail(NativeError());
-    for (std::size_t i = 0; i < native.size(); ++i) {
+    const auto collect = [&](std::size_t i, bool pipe) {
         auto& entry = descriptors[owners[i]];
         for (const auto& flag : RequestFlags)
             if ((entry.events & flag.guest) && (native[i].revents & flag.native))
                 entry.revents = static_cast<short>(entry.revents | flag.guest);
         for (const auto& flag : StatusFlags)
             if (native[i].revents & flag.native) entry.revents = static_cast<short>(entry.revents | flag.guest);
+        if (pipe && (entry.revents & GuestPollError)) entry.revents = static_cast<short>((entry.revents & ~GuestPollError) | GuestPollHangUp);
+        if (pipe && (entry.revents & GuestPollHangUp))
+            entry.revents = static_cast<short>((entry.revents & ~GuestPollWritable) | (entry.events & GuestPollReadable));
         if (entry.revents) ++ready;
+    };
+#ifdef _WIN32
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout < 0 ? 0 : timeout);
+    for (;;) {
+        int pipeReady = 0;
+        for (const auto index : pipes) {
+            auto& entry = descriptors[index];
+            PipeReadiness(entry.descriptor, entry.events, entry.revents);
+            if (entry.revents) ++pipeReady;
+        }
+        int slice = 0;
+        if (!ready && !pipeReady) {
+            if (pipes.empty()) slice = timeout;
+            else if (timeout < 0) slice = 1;
+            else {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+                slice = static_cast<int>(std::clamp<long long>(left, 0, 1));
+            }
+        }
+        if (!native.empty()) {
+            for (auto& request : native) request.revents = 0;
+            if (WSAPoll(native.data(), static_cast<ULONG>(native.size()), slice) < 0) return Fail(NativeError());
+        } else if (slice > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+        }
+        int socketReady = 0;
+        for (const auto& request : native)
+            if (request.revents) ++socketReady;
+        const bool expired = timeout >= 0 && std::chrono::steady_clock::now() >= deadline;
+        if (ready || pipeReady || socketReady || expired || pipes.empty()) {
+            ready += pipeReady;
+            for (std::size_t i = 0; i < native.size(); ++i) collect(i, false);
+            return ready;
+        }
     }
+#else
+    const int wait = ready ? 0 : timeout;
+    const int result = ::poll(native.data(), static_cast<nfds_t>(native.size()), wait);
+    if (result < 0) return Fail(NativeError());
+    for (std::size_t i = 0; i < native.size(); ++i) collect(i, i >= socketCount);
     return ready;
+#endif
 }
 }
 

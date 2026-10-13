@@ -1846,18 +1846,34 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
     std::memcpy(destination.data(), source, destination.size());
 }
 
-void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
-    if (destination.empty()) return;
-    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
-    FlushGpuWrites(address, destination.size());
-    const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+namespace {
+
+void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
         std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
         return;
     }
     std::memset(destination.data(), 0, destination.size());
     for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+}
+
+}
+
+void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
+    if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
+    FlushGpuWrites(address, destination.size());
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    copyCommitted(address, destination);
+}
+
+void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
+    if (destination.empty()) return;
+    if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    copyCommitted(address, destination);
 }
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {

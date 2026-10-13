@@ -143,6 +143,7 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
+                        case StageInputKind::RasterPrimitive:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
                                 return Fail("typed pixel scalar input is invalid");
                             }
@@ -385,6 +386,9 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::DispatchThreadLimit:
                     info.dispatchThreadLimit = true;
+                    break;
+                case StageInputKind::RasterPrimitive:
+                    info.rasterPrimitive = true;
                     break;
                 case StageInputKind::PackedAncillary:
                 case StageInputKind::Parameter:

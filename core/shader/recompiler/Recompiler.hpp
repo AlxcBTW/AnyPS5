@@ -113,6 +113,13 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm10_11_11
 };
 
+enum class RasterPrimitive : std::uint8_t {
+    Point,
+    Line,
+    Triangle,
+    Rectangle
+};
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -142,6 +149,7 @@ struct ShaderPixelStageInfo {
     bool dualSourceBlend;
     bool alphaToCoverage;
     bool stencilRefExportEnable;
+    RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
 };
 
 struct ShaderVertexBufferResource {

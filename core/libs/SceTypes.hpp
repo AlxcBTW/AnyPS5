@@ -280,6 +280,12 @@ struct ModuleInfoForUnwind {
     std::uint64_t seg0_size;
 };
 
+struct InternalSegmentInfo {
+    std::uint64_t address;
+    std::uint64_t size;
+};
+static_assert(sizeof(InternalSegmentInfo) == 0x10);
+
 struct MallocReplace {
     std::uint64_t size = sizeof(MallocReplace);
     void* malloc_initialize = nullptr;

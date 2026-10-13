@@ -296,7 +296,10 @@ void APS5_VABI sincos_nid_postfix(double x, double* sinp, double* cosp) {
 
 float APS5_VABI atanf_nid_postfix(float x) { return std::atan(x); }
 double APS5_VABI atan2_nid_postfix(double y, double x) { return std::atan2(y, x); }
-float APS5_VABI powf_nid_postfix(float base, float exp) { return std::pow(base, exp); }
+float APS5_VABI powf_nid_postfix(float base, float exp) {
+    if (base == 1.0f) return 1.0f;
+    return std::pow(base, exp);
+}
 double APS5_VABI pow_nid_postfix(double base, double exp) { return std::pow(base, exp); }
 float APS5_VABI __powisf2_nid_postfix(float base, int exponent) {
     const bool reciprocal = exponent < 0;

@@ -1807,15 +1807,26 @@ void verifyPixelRequestSerialization() {
     minimal.shader = {ShaderStage::Fragment, 0x30000u, code, 0, {}};
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
+    minimal.context.pixel->rasterPrimitive = RasterPrimitive::Rectangle;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRIAAAA=", "new requests did not use serialization version 18");
+    require(requestPrefix(encoded, 8u) == "NVNQQRMAAAA=", "new requests did not use serialization version 19");
+    require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle, "the pixel primitive class did not round-trip");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 19u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage or stencil reference export flag was accepted");
+    for (std::size_t bytes = 0; bytes < 20u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag or primitive class was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRMAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRQAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
+    static constexpr std::string_view version18Request{
+        "NVNQQRIAAAAFAAADAAAAAAABAAAAAAAAAAAAgb8AAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAB0gQAAAE="};
+    const auto version18 = serializer.Deserialize(version18Request);
+    require(version18.request.context.pixel.has_value() && version18.request.context.pixel->rasterPrimitive == RasterPrimitive::Triangle, "a version 18 request read a primitive class");
+    require(version18.request.target.registrationModules && version18.request.target.registrationWordLimit == 1234u && version18.request.target.vertexSubgroups, "a version 18 request trailer was misread");
 }
 
 void verifyLegacyPixelRequests() {
@@ -1904,6 +1915,7 @@ void verifyLegacyPixelRequests() {
         require(!pixel.dualSourceBlend, "a legacy request enabled dual-source blending");
         require(!pixel.alphaToCoverage, "a legacy request enabled alpha-to-coverage");
         require(!pixel.stencilRefExportEnable, "a legacy request exported a stencil reference");
+        require(pixel.rasterPrimitive == RasterPrimitive::Triangle, "a legacy request drew something other than triangles");
         require(pixel.inputAddr == 2u && pixel.hasPerspectiveCenterVgpr && pixel.targetOutputMode[0] == 9u, "legacy pixel layout was misread");
         require(pixel.conservativeZExport == (version >= 7u ? ConservativeZExport::GreaterThanZ : ConservativeZExport::AnyZ), "legacy conservative Z layout was misread");
         require(!pixel.orderedPixelShader, "a legacy request became a primitive-ordered pixel shader");

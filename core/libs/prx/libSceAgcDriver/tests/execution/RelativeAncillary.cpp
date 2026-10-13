@@ -135,9 +135,10 @@ int main() {
                 Draw(*device, code, 1u, waveSize, modifier == 0xff00e402u ? std::byte{255} : std::byte{0});
                 Draw(*device, code, 8u, waveSize, std::byte{0});
             }
-            const std::array<std::uint32_t, 5> unsupported{0xbefc0300u, 0x7e028700u, 0xf800180fu, 0x01010101u, 0xbf810000u};
-            Draw(*device, unsupported, 0u, waveSize, std::byte{0}, true);
-            Draw(*device, unsupported, 4u, waveSize, std::byte{0}, true, true);
+            const std::array<std::uint32_t, 6> whole{0xbefc0300u, 0x7e028700u, 0x7e020d01u, 0xf800180fu, 0x01010101u, 0xbf810000u};
+            std::cerr << "whole word\n";
+            Draw(*device, whole, 0u, waveSize, std::byte{255});
+            Draw(*device, whole, 4u, waveSize, std::byte{255}, false, true);
         }
         std::cout << "relative ancillary GPU readback tests passed\n";
         return 0;

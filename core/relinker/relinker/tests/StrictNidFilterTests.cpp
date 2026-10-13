@@ -98,6 +98,22 @@ void fallthroughAfterZeroPadding() {
     require(AnalyzeStrictReachability(input).ImportSlots.contains(0x2000), "Zero padding after a region's last jump dropped its fall-through edge");
 }
 
+void addressSizeOverrideImport() {
+    auto input = fixture();
+    input.Text.assign(32, 0);
+    input.TextVaddr = 0x100001000ull;
+    input.Entries = {input.TextVaddr};
+    input.ImportSlots = {0x2000, 0x100002000ull};
+    emit(input, 0, {0x67, 0xFF, 0x15, 0xF9, 0x0F, 0x00, 0x00, 0xC3});
+    require(AnalyzeStrictReachability(input).ImportSlots == std::set<std::uint64_t>{0x2000}, "EIP-relative import was not resolved with 32-bit address wrapping");
+    input.Text.assign(32, 0);
+    emit(input, 0, {0x67, 0x48, 0x8B, 0x05, 0xF8, 0x0F, 0x00, 0x00, 0xC3});
+    require(AnalyzeStrictReachability(input).ImportSlots == std::set<std::uint64_t>{0x2000}, "REX.W EIP-relative load did not resolve its import");
+    input.Text.assign(32, 0);
+    emit(input, 0, {0xFF, 0x15, 0xFA, 0x0F, 0x00, 0x00, 0xC3});
+    require(AnalyzeStrictReachability(input).ImportSlots == std::set<std::uint64_t>{0x100002000ull}, "RIP-relative import lost its full 64-bit address");
+}
+
 void callbackAndRelocationRoots() {
     auto input = fixture();
     ripOperand(input, 0, {0x48, 0x8D, 0x3D}, 0x1020);
@@ -294,8 +310,10 @@ std::vector<std::uint8_t> elfFixture(const StrictReachabilityInput& input) {
     bytes[6] = 1;
     write<std::uint16_t>(bytes, 16, 3);
     write<std::uint16_t>(bytes, 18, 62);
+    write<std::uint32_t>(bytes, 20, 1);
     write<std::uint64_t>(bytes, 24, input.Entries.at(0));
     write<std::uint64_t>(bytes, 32, 64);
+    write<std::uint16_t>(bytes, 52, 64);
     write<std::uint16_t>(bytes, 54, 56);
     write<std::uint16_t>(bytes, 56, 2);
     write<std::uint32_t>(bytes, 64, 1);
@@ -612,6 +630,7 @@ int main() {
         ud1DeadTail();
         conditionalTailCall();
         fallthroughAfterZeroPadding();
+        addressSizeOverrideImport();
         callbackAndRelocationRoots();
         registerImportCall();
         mergedJumpTable();

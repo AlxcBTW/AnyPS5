@@ -20,6 +20,7 @@ constexpr std::uint32_t FormatR32Uint = 20;
 constexpr std::uint32_t FormatR32Float = 22;
 constexpr std::uint32_t FormatR11G11B10Float = 36;
 constexpr std::uint32_t FormatR8G8B8A8Unorm = 56;
+constexpr std::uint32_t TileStandard64KB = 0x9;
 constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t TileRenderTarget64KB = 0x1b;
 constexpr std::uint32_t Type2D = 9;
@@ -181,6 +182,16 @@ void TestD16StencilFallback(const Context& context) {
     Require(lookup(without, {d16s8Stencil, FormatR8Uint, 256, 256}) != nullptr, "an 8-bit view of the stencil plane of a D16 surface stored as D24 must sample it");
     Require(HostDepthBiasConstant(without, VK_FORMAT_D16_UNORM_S8_UINT, 2.0f) == 512.0f, "a 16-bit depth bias must be scaled by 256 for D24 storage");
     Require(HostDepthBiasConstant(without, VK_FORMAT_D32_SFLOAT_S8_UINT, 2.0f) == 2.0f, "a D32 depth bias must not be scaled");
+    const auto refused = [&](const View& view) {
+        try {
+            lookup(without, view);
+        } catch (const std::runtime_error& error) {
+            return std::string_view(error.what()).find("a depth plane that the device stores in another depth format is not implemented") != std::string_view::npos;
+        }
+        return false;
+    };
+    Require(refused({d16s8, FormatR16Unorm, 256, 256, TileDepth64KB, Type2DArray, 1}), "two slices of a D16 surface stored as D24 must be refused, as the plane copy would read the wider image as 16-bit texels");
+    Require(refused({d16s8, FormatR16Uint, 256, 256, TileStandard64KB}), "an R16_UINT view of a D16 surface stored as D24 must be refused");
     ClearDepthSurfaces(without.device);
 
     static int onlyTag = 0;

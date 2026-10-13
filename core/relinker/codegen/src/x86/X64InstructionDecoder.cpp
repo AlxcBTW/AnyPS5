@@ -369,6 +369,8 @@ DecodedInstructionInfo X64InstructionDecoder::DecodeInstruction(
             b == PrefixOperandSize || b == PrefixAddressSize) {
             if (b >= PrefixSegFs && b <= PrefixSegGs)
                 info.SegmentPrefix = b;
+            if (b == PrefixAddressSize)
+                info.AddressSize32 = true;
             info.RexPrefix = 0;
             ++pos;
             continue;

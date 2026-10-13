@@ -88,6 +88,10 @@ ElfHeader ElfReader::ReadHeader() const {
         throw RelinkerException("Expected little-endian ELF64 version 1");
     if (_readU16At(0x12) != 62)
         throw RelinkerException("Expected an x86-64 ELF");
+    if (_readU32At(0x14) != 1)
+        throw RelinkerException("Unsupported ELF object version: expected 1", 0x14);
+    if (_readU16At(0x34) != 64)
+        throw RelinkerException("Invalid ELF header size: expected 64 bytes", 0x34);
 
     ElfHeader header{};
     header.Machine = _readU16At(0x12);

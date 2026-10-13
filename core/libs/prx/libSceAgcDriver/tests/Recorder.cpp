@@ -4628,6 +4628,8 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     }
     std::array<std::byte, 64> texels{};
     refused([&] { AgcDriver::GuestMemory::Read(address + 256u, texels); }, "a CPU read", "a CPU read");
+    refused([&] { AgcDriver::GuestMemory::ReadCommitted(address + 256u, texels); }, "a CPU read", "a committed CPU read");
+    refused([&] { AgcDriver::GuestMemory::ReadCommittedUnsynced(address + 256u, texels); }, "a CPU read", "a committed CPU read without the flush hook");
     refused([&] { RequireNoMultisampleTarget(address, 64u, "a DMA copy"); }, "a DMA copy", "a DMA copy");
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;

@@ -116,6 +116,28 @@ static void CheckReleaseFlexibleMemory() {
     Require(sceKernelMunmap(again, length) == 0);
 }
 
+static void CheckFlexibleMappingIgnoresFlag8000() {
+    constexpr std::size_t length = 0x10000;
+    std::size_t before = 0;
+    std::size_t available = 0;
+    Require(sceKernelAvailableFlexibleMemorySize(&before) == 0);
+    void* mapped = nullptr;
+    Require(sceKernelMapFlexibleMemory(&mapped, length, 3, 0x8000) == 0 && mapped != nullptr);
+    static_cast<volatile unsigned char*>(mapped)[length - 1] = 1;
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before - length);
+    Require(sceKernelMunmap(mapped, length) == 0);
+    void* again = mapped;
+    Require(sceKernelMapFlexibleMemory(&again, length, 3, 0x8090) == 0 && again == mapped);
+    Require(static_cast<volatile unsigned char*>(again)[length - 1] == 0);
+    Require(sceKernelMunmap(again, length) == 0);
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
+    bool rejected = false;
+    void* unknown = nullptr;
+    try { sceKernelMapFlexibleMemory(&unknown, length, 3, 0x20000); } catch (const std::exception&) { rejected = true; }
+    Require(rejected && unknown == nullptr);
+    Require(sceKernelAvailableFlexibleMemorySize(&available) == 0 && available == before);
+}
+
 static void CheckPageTableStats() {
     int cpuTotal = -1, cpuAvailable = -1, gpuTotal = -1, gpuAvailable = -1;
     Require(sceKernelGetPageTableStats(&cpuTotal, &cpuAvailable, &gpuTotal, &gpuAvailable) == 0);
@@ -1902,6 +1924,7 @@ int main() {
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();
+    CheckFlexibleMappingIgnoresFlag8000();
     CheckSceKernelMmap();
     CheckInternalMemoryAvailableSize();
     CheckVirtualQueryPartialMunmap();

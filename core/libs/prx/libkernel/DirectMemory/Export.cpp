@@ -188,7 +188,8 @@ int APS5_VABI sceKernelMapDirectMemory2(void** addr, size_t len, int type, int p
 }
 
 int APS5_VABI sceKernelMapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags) {
- return _mapFlexible(addr_in_out, len, prot, flags);
+ constexpr int IgnoredHeapFlag = 0x8000;
+ return _mapFlexible(addr_in_out, len, prot, flags & ~IgnoredHeapFlag);
 }
 
 int APS5_VABI sceKernelSetVirtualRangeName(const void* addr, uint64_t len, const char* name);
