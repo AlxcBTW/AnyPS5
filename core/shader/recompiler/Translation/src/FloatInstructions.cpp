@@ -375,6 +375,10 @@ bool TranslationContext::float16Ternary(const RdnaInstruction& inst, IrOpcode op
         writeF16(inst.destination, fmaF16RoundedToOdd(IrF32(*args[0]), IrF32(*args[1]), IrF32(*args[2])), {args[0], args[1], args[2]});
         return true;
     }
+    if (mix && nativeFloat16Arithmetic && nativeFloat16Fma && (!floatMode.has_value() || ((floatMode->floatMode >> 2u) & 3u) == 0u)) {
+        writeF16(inst.destination, IrF32(ir.Emit(IrOpcode::FPMixF16, IrType::F32, {args[0], args[1], args[2]})), {args[0], args[1], args[2]});
+        return true;
+    }
     if (mix) {
         const std::uint32_t rounding = floatMode.has_value() ? ((floatMode->floatMode >> 2u) & 3u) << InterpolationRound16Shift : 0u;
         writeF16(inst.destination, IrF32(ir.Emit(IrOpcode::FPInterpolateF16, IrType::F32, {args[0], args[1], args[2], &ir.Constant(rounding)})), {args[0], args[1], args[2]});

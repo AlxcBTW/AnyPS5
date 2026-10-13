@@ -1259,10 +1259,11 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->nativeFloat16Arithmetic && hasExtension(VK_KHR_SHADER_FMA_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fmaFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
-        state->float16Fma = fmaFeatures.shaderFmaFloat16 == VK_TRUE;
+        state->float16Fma = fmaFeatures.shaderFmaFloat16 == VK_TRUE && fmaFeatures.shaderFmaFloat32 == VK_TRUE;
     }
     fmaFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
     fmaFeatures.shaderFmaFloat16 = VK_TRUE;
+    fmaFeatures.shaderFmaFloat32 = VK_TRUE;
     if (state->float16Fma) {
         deviceExtensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
         state->capabilities.push_back(6030);

@@ -856,6 +856,25 @@ std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0,
     return CallInterpolate(state, arg0, arg1, arg2, true, mode->ImmediateU32());
 }
 
+std::uint32_t EmitFPMixF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    state.module.EmitCapability(6030u);
+    state.module.EmitExtension("SPV_KHR_fma");
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto fused = state.module.AllocateId();
+    state.module.AddFunction(static_cast<spv::Op>(4427), TypeF32(state), fused, arg0, arg1, arg2);
+    const auto bits = Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpBitcast, u32, fused), ConstantU32(state, 0x7fffffffu));
+    const auto exponent = Binary(state, spv::OpShiftRightLogical, u32, bits, ConstantU32(state, 23u));
+    const auto mantissa = Binary(state, spv::OpBitwiseOr, u32, Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x007fffffu)), ConstantU32(state, 0x00800000u));
+    const auto subnormal = Select(state, u32, Binary(state, spv::OpULessThan, boolean, exponent, ConstantU32(state, 95u)), ConstantU32(state, 31u), Binary(state, spv::OpISub, u32, ConstantU32(state, 125u), exponent));
+    const auto shift = Select(state, u32, Binary(state, spv::OpUGreaterThanEqual, boolean, exponent, ConstantU32(state, 113u)), ConstantU32(state, 12u), subnormal);
+    const auto half = Binary(state, spv::OpShiftLeftLogical, u32, ConstantU32(state, 1u), shift);
+    const auto below = Binary(state, spv::OpBitwiseAnd, u32, mantissa, Binary(state, spv::OpISub, u32, Binary(state, spv::OpShiftLeftLogical, u32, half, ConstantU32(state, 1u)), ConstantU32(state, 1u)));
+    auto slow = Binary(state, spv::OpIEqual, boolean, below, half);
+    for (const auto input : {arg0, arg1, arg2}) slow = Binary(state, spv::OpLogicalOr, boolean, slow, NonFinite32(state, Unary(state, spv::OpBitcast, u32, input)));
+    return EmitValueOrDefaultIfCondition(state, slow, TypeF32(state), fused, [&] { return Interpolate(state, arg0, arg1, arg2, true, 0u); });
+}
+
 std::uint32_t EmitConvertF32F64(SpirvEmitterState& state, std::uint32_t arg0) {
     const auto converted = Unary(state, spv::OpBitcast, TypeU32(state), Unary(state, spv::OpFConvert, TypeF32(state), ToF64(state, arg0)));
     const auto cls = Classify(state, arg0);
