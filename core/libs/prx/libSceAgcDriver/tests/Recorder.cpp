@@ -1408,6 +1408,16 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+// The draw snapshot tests copy read-only draw inputs, which the in-place draw bindings (the
+// default, ShaderResources::DrawInPlace) no longer copy: they run with the switch off.
+struct DrawSnapshotsOn {
+    const bool previous = ShaderResources::DrawInPlace();
+    DrawSnapshotsOn() { ShaderResources::SetDrawInPlace(false); }
+    ~DrawSnapshotsOn() { ShaderResources::SetDrawInPlace(previous); }
+    DrawSnapshotsOn(const DrawSnapshotsOn&) = delete;
+    DrawSnapshotsOn& operator=(const DrawSnapshotsOn&) = delete;
+};
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -1467,6 +1477,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     }
     std::weak_ptr<ShaderResources::DrawBindings> snapshotLifetime;
     {
+        const DrawSnapshotsOn snapshotsOn;
         auto snapshotContext = context;
         DescriptorCache cache(snapshotContext);
         snapshotContext.descriptorCache = &cache;
@@ -1502,6 +1513,49 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
+    {
+        // In place (DrawInPlace, the default): an unmoved read-only input keeps the template's
+        // in-place descriptor (no set, no copy); a moved one is rebound through the import serving
+        // its new range and noted as read; a moved one no import serves, or one whose import offset
+        // breaks the template's adjustment, is still copied; with the switch off every one is copied.
+        const bool previous = ShaderResources::DrawInPlace();
+        ShaderResources::SetDrawInPlace(true);
+        auto inPlaceContext = context;
+        DescriptorCache cache(inPlaceContext);
+        inPlaceContext.descriptorCache = &cache;
+        Recorder inPlaceRecorder(inPlaceContext);
+        inPlaceRecorder.Activate();
+        ShaderResources resources(inPlaceContext, compute);
+        ShaderResources::DrawBindingCounts counts;
+        // The import table is current (PrepareDrawBindings does not reconcile a stale one).
+        Require(HostImportFor(context, address, bytes) != nullptr, "the test block lost its host import");
+        Require(resources.PrepareDrawBindings(inPlaceRecorder, {}, &counts) == nullptr && counts.kept == 1 && counts.snapshots == 0, "an unmoved read-only draw input was copied although draws bind in place");
+        const ShaderResources::MovedBuffer moved{0, element + 8192, elementBytes, {}};
+        counts = {};
+        const auto rebound = resources.PrepareDrawBindings(inPlaceRecorder, std::span(&moved, 1), &counts);
+        Require(rebound != nullptr && rebound->snapshots.empty() && rebound->reads.size() == 1 && rebound->reads[0].first == element + 8192 && rebound->reads[0].second == element + 8192 + elementBytes && counts.rebound == 1, "a moved read-only draw input was not bound in place");
+        Require(rebound->allocation.set != VK_NULL_HANDLE, "a moved draw input bound in place has no set of its own");
+        Require(inPlaceRecorder.PendingReadOverlaps(element + 8192, 16) && !inPlaceRecorder.PendingReadOverlaps(element + 8192 + elementBytes, 16), "the in-place read of a moved draw input was not noted");
+        std::vector<std::uint32_t> outside(elementBytes / 4u + 4u, 0x5a5a5a5au);
+        const auto outsideAddress = (reinterpret_cast<std::uint64_t>(outside.data()) + 15u) & ~std::uint64_t{15};
+        const ShaderResources::MovedBuffer unimported{0, outsideAddress, elementBytes, {}};
+        counts = {};
+        const auto copied = resources.PrepareDrawBindings(inPlaceRecorder, std::span(&unimported, 1), &counts);
+        Require(copied != nullptr && copied->snapshots.size() == 1 && copied->reads.empty() && counts.refused[static_cast<std::size_t>(ShaderResources::InPlaceRefusal::NotImported)] == 1, "a moved draw input outside every import was not copied");
+        const auto align = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+        if (align > 4) {
+            const ShaderResources::MovedBuffer shifted{0, element + 8192 + 4, elementBytes, {}};
+            counts = {};
+            const auto misaligned = resources.PrepareDrawBindings(inPlaceRecorder, std::span(&shifted, 1), &counts);
+            Require(misaligned != nullptr && misaligned->snapshots.size() == 1 && misaligned->reads.empty() && counts.refused[static_cast<std::size_t>(ShaderResources::InPlaceRefusal::Adjustment)] == 1, "a moved draw input off the template's offset adjustment was bound in place");
+        }
+        ShaderResources::SetDrawInPlace(false);
+        counts = {};
+        const auto off = resources.PrepareDrawBindings(inPlaceRecorder, {}, &counts);
+        Require(off != nullptr && off->snapshots.size() == 1 && counts.kept == 0 && counts.snapshots == 1, "draws kept binding in place after the switch went off");
+        ShaderResources::SetDrawInPlace(previous);
+        inPlaceRecorder.Sync();
+    }
     recorder.Activate();
     {
         GuestAllocations::Mutation mutation;
@@ -1585,6 +1639,7 @@ void readWrittenStagingTests(const Device& device, Recorder& recorder) {
 }
 
 void misalignedRegionTests(const Device& device, Recorder& recorder) {
+    const DrawSnapshotsOn snapshotsOn;
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     constexpr std::size_t bytes = 65536;
@@ -1672,6 +1727,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
 }
 
 void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
+    const DrawSnapshotsOn snapshotsOn;
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (context.hostImportAlignment == 0) {
@@ -1847,6 +1903,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
 }
 
 void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
+    const DrawSnapshotsOn snapshotsOn;
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
@@ -1939,6 +1996,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
 }
 
 void drawSnapshotPatchTests(const Device& device) {
+    const DrawSnapshotsOn snapshotsOn;
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
     std::unique_lock gpu(GpuMutex());
@@ -2046,6 +2104,7 @@ void drawSnapshotPatchTests(const Device& device) {
 }
 
 void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
+    const DrawSnapshotsOn snapshotsOn;
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     const char* previous = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");

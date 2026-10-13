@@ -3806,13 +3806,55 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
-std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+namespace {
+// -1 until first asked: APS5_NO_DRAW_INPLACE=1 turns the in-place draw bindings off.
+std::atomic<int> drawInPlace{-1};
+}
+
+bool ShaderResources::DrawInPlace() {
+    auto enabled = drawInPlace.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        const char* value = std::getenv("APS5_NO_DRAW_INPLACE");
+        enabled = value != nullptr && std::strcmp(value, "0") != 0 ? 0 : 1;
+        drawInPlace.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
+}
+
+void ShaderResources::SetDrawInPlace(bool enabled) {
+    drawInPlace.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, DrawBindingCounts* counts) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = MaxDrawSnapshotBytes();
+    const bool inPlace = DrawInPlace();
+    const auto align = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
     std::vector<std::size_t> selected;
+    // In place (DrawInPlace): the moved buffers rebound through the import serving their new range,
+    // by allocation index.
+    std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> rebinds;
+    // Why a moved buffer cannot be read in place where it now lies (the checks Relocate makes for a
+    // dispatch): no current import serves the range (a stale import table is not reconciled here: a
+    // reconcile could retire an import the template's set still names), the import offset breaks
+    // the template's offset adjustment, the view exceeds the device's range, the template writes the
+    // range, or a CPU-completed writer (a copied buffer's write-back, a completion label) still has
+    // to land on it, which the GPU would not see.
+    const auto refusal = [&](std::uint64_t address, std::uint64_t begin, std::size_t bytes, std::uint32_t adjustment, const HostImport*& import) -> std::optional<InPlaceRefusal> {
+        import = HostImportServing(context, begin, bytes);
+        if (import == nullptr) return HostImportsIdentity(context).device == VK_NULL_HANDLE ? InPlaceRefusal::Stale : InPlaceRefusal::NotImported;
+        if ((address - import->base) % align != adjustment) return InPlaceRefusal::Adjustment;
+        if (bytes > context.limits.maxStorageBufferRange) return InPlaceRefusal::Range;
+        if (guestMemory.WritesOverlap(begin, bytes)) return InPlaceRefusal::Aliased;
+        const auto copied = [&](const std::shared_ptr<ShaderResources>& writer) { return writer != nullptr && writer->WritesOverlap(begin, bytes); };
+        const auto drawWriters = DrawCopiedWriters();
+        const bool cpuWriter = (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), copied)) || std::any_of(drawWriters->begin(), drawWriters->end(), copied) || (Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(begin, bytes));
+        if (cpuWriter) return InPlaceRefusal::Pending;
+        return std::nullopt;
+    };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -3835,9 +3877,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            // The template's descriptor reads it in place already (its range is among the
+            // template's in-place reads, which MarkGpuWrites notes for the batch).
+            if (inPlace) {
+                if (counts != nullptr) ++counts->kept;
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (inPlace && override != moved.end()) {
+            const HostImport* import = nullptr;
+            const auto refused = refusal(address, begin, bytes, item.adjustment, import);
+            if (!refused) {
+                rebinds.push_back({index, {import->buffer, begin - import->base, bytes}});
+                result->reads.emplace_back(begin, begin + bytes);
+                if (counts != nullptr) ++counts->rebound;
+                continue;
+            }
+            if (counts != nullptr) ++counts->refused[static_cast<std::size_t>(*refused)];
+        }
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
@@ -3850,9 +3909,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         selected.push_back(index);
         result->snapshots.push_back({begin, std::move(buffer)});
         totalSnapshotBytes += bytes;
+        if (counts != nullptr) {
+            ++counts->snapshots;
+            counts->snapshotBytes += bytes;
+        }
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty()) return {};
+    if (selected.empty() && rebinds.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
     for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
@@ -3877,6 +3940,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
         write.pBufferInfo = buffers.data() + offset;
         for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto rebind = std::find_if(rebinds.begin(), rebinds.end(), [&](const auto& entry) { return entry.first == binding.allocations[element]; });
+            if (rebind != rebinds.end()) {
+                buffers[offset + element] = rebind->second;
+                continue;
+            }
             const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
             if (snapshotIndex == selected.size()) continue;
             const auto& snapshot = result->snapshots[snapshotIndex];
@@ -3884,6 +3952,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // The moved ranges read in place: a CPU store into one (the copy HLE) waits for this batch.
+    if (!result->reads.empty()) recorder.NotePendingReads(result->reads, Recorder::ReadKind::DrawInput);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;

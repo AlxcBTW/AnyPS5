@@ -310,6 +310,82 @@ inline std::vector<std::uint32_t> MeshRestartTable(std::span<const std::byte> in
     return starts;
 }
 
+// The scans below give exactly HighestDrawIndex's and MeshRestartTable's results in loops the
+// compiler vectorizes (no optional and no branch per index): a draw's in-place index buffer has no
+// write generation under compare-mode host imports, so it is scanned on every draw.
+template <typename Index>
+std::optional<std::uint32_t> HighestDrawIndexOf(const std::byte* data, std::size_t count, bool skipRestart) {
+    constexpr Index restartIndex = std::numeric_limits<Index>::max();
+    Index highest = 0;
+    if (!skipRestart) {
+        for (std::size_t position = 0; position < count; ++position) {
+            Index value;
+            std::memcpy(&value, data + position * sizeof(Index), sizeof(Index));
+            highest = value > highest ? value : highest;
+        }
+        if (count == 0) return std::nullopt;
+        return highest;
+    }
+    // A restart index counts as 0 toward the maximum; `kept` is nonzero once any index is not one.
+    Index kept = 0;
+    for (std::size_t position = 0; position < count; ++position) {
+        Index value;
+        std::memcpy(&value, data + position * sizeof(Index), sizeof(Index));
+        const Index counted = value == restartIndex ? Index{0} : value;
+        highest = counted > highest ? counted : highest;
+        kept = static_cast<Index>(kept | (value ^ restartIndex));
+    }
+    if (kept == 0) return std::nullopt;
+    return highest;
+}
+
+inline std::optional<std::uint32_t> HighestDrawIndexFast(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
+    Require(indexSize == 2 || indexSize == 4, "unsupported index size");
+    if (indexSize == 2) return HighestDrawIndexOf<std::uint16_t>(indices.data(), indices.size() / 2u, skipRestart);
+    return HighestDrawIndexOf<std::uint32_t>(indices.data(), indices.size() / 4u, skipRestart);
+}
+
+// Whether a draw over these indices draws anything: HighestDrawIndex(...).has_value() without the
+// maximum, stopping at the first index that is not a restart.
+inline bool AnyDrawIndex(std::span<const std::byte> indices, std::uint32_t indexSize, bool skipRestart) {
+    Require(indexSize == 2 || indexSize == 4, "unsupported index size");
+    const auto count = indices.size() / indexSize;
+    if (!skipRestart) return count != 0;
+    for (std::size_t position = 0; position < count; ++position) {
+        std::uint32_t index = 0;
+        if (indexSize == 2) {
+            std::uint16_t value = 0;
+            std::memcpy(&value, indices.data() + position * 2u, sizeof(value));
+            if (value != 0xffffu) return true;
+        } else {
+            std::memcpy(&index, indices.data() + position * 4u, sizeof(index));
+            if (index != 0xffffffffu) return true;
+        }
+    }
+    return false;
+}
+
+template <typename Index>
+std::size_t RestartIndicesOf(const std::byte* data, std::size_t count) {
+    constexpr Index restartIndex = std::numeric_limits<Index>::max();
+    std::size_t restarts = 0;
+    for (std::size_t position = 0; position < count; ++position) {
+        Index value;
+        std::memcpy(&value, data + position * sizeof(Index), sizeof(Index));
+        restarts += value == restartIndex ? 1u : 0u;
+    }
+    return restarts;
+}
+
+// MeshRestartTable's result; a strip without a restart index (the table is then empty) is told by
+// one vectorized pass instead of filling a table of every position first.
+inline std::vector<std::uint32_t> MeshRestartTableFast(std::span<const std::byte> indices, std::uint32_t indexSize) {
+    Require(indexSize == 2 || indexSize == 4, "unsupported index size");
+    const auto restarts = indexSize == 2 ? RestartIndicesOf<std::uint16_t>(indices.data(), indices.size() / 2u) : RestartIndicesOf<std::uint32_t>(indices.data(), indices.size() / 4u);
+    if (restarts == 0) return {};
+    return MeshRestartTable(indices, indexSize);
+}
+
 inline std::vector<std::size_t> SoloZeroPaddedFetchIndices(const std::vector<VertexFetch>& fetches, const std::vector<std::size_t>& fetchValid) {
     Require(fetchValid.size() == fetches.size(), "fetch validity does not match the fetch count");
     std::vector<std::size_t> solo;

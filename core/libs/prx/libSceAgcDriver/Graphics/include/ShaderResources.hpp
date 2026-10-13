@@ -146,6 +146,9 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        // The moved read-only buffers this set binds in place through their host imports, as guest
+        // ranges (DrawInPlace): the draw notes them as in-place reads like the template's own.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -154,7 +157,24 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // What PrepareDrawBindings did with the read-only guest buffers of one draw (the [draw-vertex]
+    // line's binding counts). A moved buffer that cannot be bound in place is copied, by reason.
+    enum class InPlaceRefusal : std::size_t { NotImported, Stale, Adjustment, Range, Aliased, Pending, Count };
+    struct DrawBindingCounts {
+        std::size_t kept = 0;
+        std::size_t rebound = 0;
+        std::size_t snapshots = 0;
+        std::size_t snapshotBytes = 0;
+        std::array<std::size_t, static_cast<std::size_t>(InPlaceRefusal::Count)> refused{};
+    };
+    // A draw binds its read-only guest buffers in place through their host imports, as a dispatch
+    // does: an unmoved one keeps the template's in-place descriptor and a moved one is rebound
+    // through the import serving its new range. Only a buffer no current import serves (or one
+    // with a CPU-completed writer over it) is still copied into a per-draw snapshot.
+    // APS5_NO_DRAW_INPLACE=1 (read once) copies every one as before. Tests set it directly.
+    static bool DrawInPlace();
+    static void SetDrawInPlace(bool enabled);
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, DrawBindingCounts* counts = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     struct Relocation {
         std::shared_ptr<DrawBindings> bindings;
