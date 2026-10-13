@@ -118,6 +118,7 @@ struct State {
     std::uint32_t samples = 1;
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
