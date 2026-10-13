@@ -369,6 +369,14 @@ void testControls() {
     check(sceVideoOutGetEventId(&vrrStatus) == VIDEO_OUT_EVENT_VRR_STATUS, "VRR status event id rejected");
     check(sceVideoOutVrrPegToFixedRate(handle, 0, 0) == 0, "VRR peg on an open handle failed");
     check(sceVideoOutVrrUnpegFromFixedRate(handle) == 0, "VRR unpeg on an open handle failed");
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "VRR status unsubscription failed");
+    {
+        std::lock_guard lock(cfg->mutex);
+        check(cfg->vrrStatusEvents.empty(), "VRR status unsubscription did not clear registration");
+    }
+    check(sceVideoOutDeleteVrrActiveStatusEvent(queue, handle) == 0, "duplicate VRR status unsubscription failed");
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(0, handle); });
+    expectFailure([&] { sceVideoOutDeleteVrrActiveStatusEvent(queue, -1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 1, 0); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0, 1); });
     expectFailure([&] { sceVideoOutVrrPegToFixedRate(handle, 0x100000000ull, 0); });
