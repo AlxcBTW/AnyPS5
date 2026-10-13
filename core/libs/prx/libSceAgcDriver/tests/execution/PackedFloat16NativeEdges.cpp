@@ -17,7 +17,8 @@ using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t GroupThreads = 256;
-constexpr std::uint32_t Results = 16;
+constexpr std::uint32_t Results = 20;
+constexpr std::uint32_t Stride = 32;
 
 constexpr std::array<std::uint16_t, 24> Edges{
     0x0000u, 0x8000u, 0x0001u, 0x8001u, 0x03ffu, 0x83ffu, 0x0400u, 0x8400u,
@@ -29,7 +30,7 @@ constexpr std::uint32_t EdgeRows = Edges.size() * Edges.size() * Edges.size();
 constexpr std::uint32_t Rows = (EdgeRows + RandomRows + GroupThreads - 1u) / GroupThreads * GroupThreads;
 
 alignas(256) std::array<std::uint32_t, Rows * 4u> Input{};
-alignas(256) std::array<std::uint32_t, Rows * Results> Output{};
+alignas(256) std::array<std::uint32_t, Rows * Stride> Output{};
 
 struct PackedOp {
     const char* name;
@@ -43,7 +44,7 @@ struct PackedOp {
     std::uint32_t src1 = 0x105u;
 };
 
-constexpr std::uint32_t PkFma = 0x0e, PkAdd = 0x0f, PkMul = 0x10, PkMin = 0x11, PkMax = 0x12;
+constexpr std::uint32_t PkFma = 0x0e, PkAdd = 0x0f, PkMul = 0x10, PkMin = 0x11, PkMax = 0x12, MixLo = 0x21, MixHi = 0x22;
 
 const std::array<PackedOp, Results> Ops{{
     {"v_pk_add_f16", PkAdd, 0, 7, 0, 0, false, false},
@@ -62,6 +63,10 @@ const std::array<PackedOp, Results> Ops{{
     {"v_pk_fma_f16 op_sel:[1,1,1] op_sel_hi:[0,0,0]", PkFma, 7, 0, 0, 0, false, true},
     {"v_pk_add_f16 v4, 1.0", PkAdd, 0, 7, 0, 0, false, false, 0xf2u},
     {"v_pk_mul_f16 op_sel:[1,1] op_sel_hi:[1,1]", PkMul, 3, 7, 0, 0, false, false},
+    {"v_fma_mixlo_f16 (f32 sources)", MixLo, 0, 0, 0, 0, false, true},
+    {"v_fma_mixhi_f16 (f32 sources)", MixHi, 0, 0, 0, 0, false, true},
+    {"v_fma_mixlo_f16 op_sel_hi:[0,1,0]", MixLo, 0, 2, 0, 0, false, true},
+    {"v_fma_mixlo_f16 op_sel:[0,1,1] op_sel_hi:[0,1,1] clamp", MixLo, 6, 6, 0, 0, true, true},
 }};
 
 std::vector<std::uint32_t> Program() {
@@ -69,10 +74,11 @@ std::vector<std::uint32_t> Program() {
         0x8f098808u,
         0x4a020009u,
         0x34040284u,
-        0x34060286u,
+        0x34060287u,
         0xe0381000u, 0x80000402u,
         0xbf8c3f70u,
     };
+    for (std::uint32_t index = 0; index < Results; ++index) code.push_back(0x7e000280u | ((10u + index) << 17u));
     for (std::uint32_t index = 0; index < Results; ++index) {
         const auto& op = Ops[index];
         const std::uint32_t src2 = op.ternary ? 0x106u : 0x80u;
@@ -179,8 +185,9 @@ int main() {
             const auto actual = Run(*device, code, mode, true);
             for (std::size_t slot = 0; slot < expected.size(); ++slot) {
                 if (expected[slot] == actual[slot]) continue;
-                const auto row = static_cast<std::uint32_t>(slot / Results);
-                const auto& op = Ops[slot % Results];
+                const auto row = static_cast<std::uint32_t>(slot / Stride);
+                if (slot % Stride >= Results) continue;
+                const auto& op = Ops[slot % Stride];
                 throw std::runtime_error("native packed f16, " + name + ": " + op.name + " with a=" + Hex(Input[row * 4u]) + " b=" + Hex(Input[row * 4u + 1u]) + " c=" + Hex(Input[row * 4u + 2u]) +
                     " gives " + Hex(actual[slot]) + ", the f32 lowering " + Hex(expected[slot]));
             }
@@ -189,7 +196,7 @@ int main() {
         Require(sawNative, "f16 edge test: the program wrote no results");
         const std::uint32_t tieRow = 10u * Edges.size() * Edges.size() + 11u * Edges.size() + 22u;
         const auto lowering = Run(*device, code, std::nullopt, true);
-        Require((lowering[tieRow * Results + 2u] & 0xffffu) == 0x3c01u, "v_pk_fma_f16 (1 + 2^-10) * (1 - 2^-11) + 9 * 2^-24 is not rounded once: " + Hex(lowering[tieRow * Results + 2u]));
+        Require((lowering[tieRow * Stride + 2u] & 0xffffu) == 0x3c01u, "v_pk_fma_f16 (1 + 2^-10) * (1 - 2^-11) + 9 * 2^-24 is not rounded once: " + Hex(lowering[tieRow * Stride + 2u]));
         std::puts("native packed f16 edge tests passed");
         return 0;
     } catch (const std::exception& error) {
