@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include <array>
 #include <cstdio>
 #include <optional>
 #include <stdexcept>
@@ -123,6 +124,58 @@ void testDrawKey() {
     compare(drawKey(5, shaderKey(true, true, data), 0x1000), std::nullopt, "movable draw keys leave data words out");
 }
 
+std::array<std::uint32_t, 4> bufferWords(std::uint64_t address, std::uint32_t stride, std::uint32_t records, std::uint32_t format) {
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), records, format};
+}
+
+struct AddressFreeShader {
+    ShaderRecompiler::RecompileResult program;
+    Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+
+    AddressFreeShader(std::array<std::uint32_t, 4> readOnly, std::array<std::uint32_t, 4> written) {
+        program.variantId = 0x1234;
+        ShaderRecompiler::DescriptorBinding binding{ShaderRecompiler::DescriptorKind::StorageBuffer, DescriptorRole::GuestBuffers, 0, 3, 2, {}};
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), readOnly.begin(), readOnly.end());
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), written.begin(), written.end());
+        binding.bufferWritten = {false, true};
+        program.bindings.push_back(binding);
+        ShaderRecompiler::DescriptorBinding data{ShaderRecompiler::DescriptorKind::StorageBuffer, DescriptorRole::ShaderData, 0, 4, 1, {40, 41, 42, 43}};
+        program.bindings.push_back(data);
+    }
+
+    std::vector<std::uint32_t> key(bool addressFree) const { return ShaderResources::ContentKey(shader, false, false, addressFree); }
+};
+
+void testAddressFreeKey() {
+    constexpr std::uint64_t Ring = 0x10'2000'0000ull;
+    constexpr std::uint64_t Output = 0x10'3000'0000ull;
+    const AddressFreeShader base(bufferWords(Ring, 16, 4096, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu));
+    const auto same = [&](const AddressFreeShader& other, bool addressFree, const char* message) { check(base.key(addressFree) == other.key(addressFree), message); };
+    const auto differs = [&](const AddressFreeShader& other, bool addressFree, const char* message) { check(base.key(addressFree) != other.key(addressFree), message); };
+    const AddressFreeShader moved(bufferWords(Ring + 0x40100, 16, 4096, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu));
+    same(moved, true, "a read-only buffer that moved changed the address-free key");
+    differs(moved, false, "a read-only buffer that moved kept the keyed address");
+    const AddressFreeShader movedHigh(bufferWords(Ring + (3ull << 32u), 16, 4096, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu));
+    same(movedHigh, true, "the high address bits of a read-only buffer stayed in the key");
+    const AddressFreeShader writtenMoved(bufferWords(Ring, 16, 4096, 0x31016facu), bufferWords(Output + 0x100, 0, 256, 0x31016facu));
+    differs(writtenMoved, true, "a written buffer that moved kept the key");
+    check(ShaderResources::AddressFreeKeyHash(base.shader, true) == ShaderResources::AddressFreeKeyHash(writtenMoved.shader, true), "the written-too census key kept the written address");
+    check(ShaderResources::AddressFreeKeyHash(base.shader, false) != ShaderResources::AddressFreeKeyHash(writtenMoved.shader, false), "the read-only census key lost the written address");
+    differs(AddressFreeShader(bufferWords(Ring, 16, 2048, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu)), true, "a read-only size change kept the key");
+    differs(AddressFreeShader(bufferWords(Ring, 32, 4096, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu)), true, "a read-only stride change kept the key");
+    differs(AddressFreeShader(bufferWords(Ring, 16, 4096, 0x31016fadu), bufferWords(Output, 0, 256, 0x31016facu)), true, "a read-only format change kept the key");
+    differs(AddressFreeShader(bufferWords(0, 16, 4096, 0x31016facu), bufferWords(Output, 0, 256, 0x31016facu)), true, "a null read-only buffer met the key of a bound one");
+    auto data = moved;
+    data.program.bindings[1].guestDescriptor[0] += 1;
+    data.shader.program = &data.program;
+    same(data, true, "shader data words entered a template key");
+    ContentKeyDiff diff;
+    check(ShaderResources::DiffContentKeys(base.key(true), writtenMoved.key(true), false, diff), "address-free keys were not comparable");
+    expectOnly(diff, ContentKeyComponent::BufferWord0, "a moved written buffer is charged to V# word 0");
+    check(ShaderResources::DiffContentKeys(base.key(true), movedHigh.key(true), false, diff), "address-free keys with moved high bits were not comparable");
+    expectOnly(diff, std::nullopt, "moved high address bits of a read-only buffer were charged");
+}
+
 }
 
 int main() {
@@ -130,6 +183,7 @@ int main() {
         testDispatchKey();
         testDispatchKeyWithDevice();
         testDrawKey();
+        testAddressFreeKey();
         std::puts("Key miss attribution passed");
         return 0;
     } catch (const std::exception& error) {
