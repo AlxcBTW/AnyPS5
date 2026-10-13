@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostCommitLog.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -54,6 +55,7 @@ public:
             if (void* cached = _large.Take(blockBytes)) return cached;
             void* raw = GuestArena::GuestArenaAllocate_nid_postfix(blockBytes, PageBytes);
             commit(raw, blockBytes);
+            HostCommitLog::HostCommitNote_nid_no_patch("guest-heap", raw, blockBytes);
             return raw;
         }
         auto& sizeClass = _classes[classIndex(total)];
@@ -67,6 +69,7 @@ public:
         if (sizeClass.bump == nullptr || sizeClass.bytes > static_cast<std::size_t>(sizeClass.bumpEnd - sizeClass.bump)) {
             auto* span = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(SpanBytes, PageBytes));
             commit(span, SpanBytes);
+            HostCommitLog::HostCommitNote_nid_no_patch("guest-heap", span, SpanBytes);
             sizeClass.bump = span;
             sizeClass.bumpEnd = span + SpanBytes;
         }
@@ -139,6 +142,7 @@ private:
             void* raw = entry->raw;
             _cachedBytes -= entry->bytes;
             _order.erase(entry);
+            HostCommitLog::HostCommitNote_nid_no_patch("guest-heap", raw, bytes);
             return raw;
         }
 
@@ -146,6 +150,7 @@ private:
             std::lock_guard lock(_lock);
             _order.push_back({raw, bytes});
             _bySize[bytes].push_back(std::prev(_order.end()));
+            HostCommitLog::HostCommitNote_nid_no_patch("guest-heap-cache", raw, bytes);
             _cachedBytes += bytes;
             while (_cachedBytes > budget() && !_order.empty()) {
                 const auto oldest = _order.front();
@@ -172,6 +177,7 @@ private:
         }
 
         static void release(void* raw, std::size_t bytes) {
+            HostCommitLog::HostCommitForget_nid_no_patch(raw, bytes);
             GuestArena::GuestArenaReset_nid_postfix(raw, bytes);
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(raw), bytes);
             GuestArena::GuestArenaRelease_nid_postfix(raw, bytes);
