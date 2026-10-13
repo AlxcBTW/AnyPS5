@@ -192,10 +192,7 @@ extern "C" {
 
 int APS5_VABI sceSystemServiceLoadExec(const char* path, const char* const* arguments) {
     if (!path || !*path) return SYSTEM_SERVICE_ERROR_PARAMETER;
-    if (std::strcmp(path, "exit") == 0) {
-        LibcRunShutdown_nid_postfix();
-        std::exit(0);
-    }
+    if (std::strcmp(path, "exit") == 0) LibcExit_nid_no_patch(0);
     auto launch = PrepareLaunch(path, arguments);
     LibcRunShutdown_nid_postfix();
     std::fflush(nullptr);
