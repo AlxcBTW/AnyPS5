@@ -1,9 +1,5 @@
 # libkernel technical debt
 
-### Build
-
-- winpthreads initializes a statically initialized rwlock on its first lock and fails a concurrent first lock with `EINVAL`, which `std::shared_mutex` and `std::shared_timed_mutex` ignore, so that lock does not exclude. Guest rwlocks ([Pthread.hpp](../../../core/libs/prx/libkernel/Pthread/include/Pthread.hpp)) and the host `std::shared_mutex` objects in [Recompiler.cpp](../../../core/shader/recompiler/Recompiler.cpp) are locked once when created. A new host `std::shared_mutex` used on Windows needs the same.
-
 ### Silent stubs
 
 - [scePthreadMutexattrSetprotocol](../../../core/libs/prx/libkernel/Pthread/src/Mutex.cpp) (libkernel) - accepts 0 to 2 as a PS5 (firmware 13.60) does and returns `EINVAL` otherwise, but the protocol is not stored or applied: priority inheritance and protection are not modelled. On the console a null or uninitialized mutex attribute returns `EINVAL` from the SCE attribute calls, `scePthreadMutexInit` takes an uninitialized attribute as the default one, and a destroyed mutex returns `EINVAL` from `scePthreadMutexDestroy`; a null mutex pointer crashed the payload and still throws
