@@ -384,6 +384,23 @@ int main() {
         Require(rename_nid_postfix(name(targetFile).c_str(), name(targetFile).c_str()) == 0);
         Require(rename_nid_postfix(name(sourceDirectory).c_str(), name(emptyDirectory).c_str()) == 0);
         Require(!std::filesystem::exists(sourceDirectory) && std::filesystem::is_directory(emptyDirectory / "child"));
+        for (const bool kernel : {false, true}) {
+            const auto incoming = name(area / "incoming.txt");
+            const auto occupied = name(area / "occupied.txt");
+            const auto replace = [&] { return kernel ? sceKernelRename(incoming.c_str(), occupied.c_str()) : rename_nid_postfix(incoming.c_str(), occupied.c_str()); };
+            const auto contents = [&] { std::ifstream stream(occupied); std::string text; std::getline(stream, text); return text; };
+            { std::ofstream stream(incoming); stream << "incoming"; }
+            { std::ofstream stream(occupied); stream << "occupied"; }
+            const int occupiedDescriptor = sceKernelOpen(occupied.c_str(), 2, 0);
+            Require(occupiedDescriptor >= 0 && replace() == 0 && !std::filesystem::exists(incoming) && contents() == "incoming");
+            char occupiedBytes[8]{};
+            Require(read_nid_postfix(occupiedDescriptor, occupiedBytes, sizeof(occupiedBytes)) == sizeof(occupiedBytes) && std::memcmp(occupiedBytes, "occupied", 8) == 0);
+            Require(sceKernelClose(occupiedDescriptor) == 0 && contents() == "incoming");
+            { std::ofstream stream(incoming); stream << "replaced"; }
+            Require(sceKernelChmod_nid_postfix(occupied.c_str(), 0400) == 0);
+            Require(replace() == 0 && !std::filesystem::exists(incoming) && contents() == "replaced");
+            Require(remove_nid_postfix(occupied.c_str()) == 0);
+        }
 #ifndef _WIN32
         const auto dangling = area / "dangling";
         std::filesystem::create_symlink(area / "nonexistent", dangling);

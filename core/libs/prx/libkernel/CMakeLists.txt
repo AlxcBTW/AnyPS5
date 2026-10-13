@@ -1001,6 +1001,7 @@ if(BUILD_TESTING)
     add_test(NAME guest_poll COMMAND guest_poll_tests)
     set_tests_properties(guest_poll PROPERTIES TIMEOUT 20)
     if(WIN32)
+        target_link_libraries(guest_poll_tests PRIVATE ws2_32)
         set_tests_properties(guest_poll PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
