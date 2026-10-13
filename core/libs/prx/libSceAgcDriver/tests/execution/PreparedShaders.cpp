@@ -729,8 +729,10 @@ int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_EXP_PR4856", "1");
+        _putenv_s("APS5_EXP_PR5115", "1");
 #else
         setenv("APS5_EXP_PR4856", "1", 1);
+        setenv("APS5_EXP_PR5115", "1", 1);
 #endif
         Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--indirect" || std::string_view(argv[1]) == "--fail-before-registration" || std::string_view(argv[1]) == "--deferred" || std::string_view(argv[1]) == "--deferred-undecodable" || std::string_view(argv[1]) == "--registered-workgroup")), "invalid test arguments");
         if (argc == 2 && std::string_view(argv[1]) == "--registered-workgroup") {

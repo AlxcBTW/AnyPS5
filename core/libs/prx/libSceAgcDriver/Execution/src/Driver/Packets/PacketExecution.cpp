@@ -347,7 +347,8 @@ void Driver::execute(const Submission& submission) {
                 if (opcode == 0x49 || opcode == 0x37) {
                     if (const auto label = Pm4::DecodeLabelWrite(packet)) noteLabelStore(label->address, label->Bytes(), ++eventSerial, submission.queue);
                 }
-                if (opcode == 0x76 || opcode == 0x63) {
+                static const bool prewarmOnShReg = std::getenv("APS5_EXP_PR5115") != nullptr; // lab switch, default off
+                if (prewarmOnShReg && (opcode == 0x76 || opcode == 0x63)) {
                     checkDeferredShadersOnShRegWrite(opcode, packet, cursor, submission, device.Load(), queue);
                 }
             }
