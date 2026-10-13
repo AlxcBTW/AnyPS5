@@ -125,9 +125,9 @@ static int SetTimes(HANDLE handle, const KernelTimeval* times) {
     }
     return SetFileTime(handle, nullptr, &access, &modified) ? 0 : File::WindowsFileTime::Failure(GetLastError());
 }
-static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times) {
+static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times, bool followLink = true) {
     const auto handle = CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | (followLink ? 0 : FILE_FLAG_OPEN_REPARSE_POINT), nullptr);
     if (handle == INVALID_HANDLE_VALUE) return File::WindowsFileTime::Failure(GetLastError());
     const int result = SetTimes(handle, times);
     CloseHandle(handle);
@@ -256,11 +256,11 @@ static int NativeFtruncate(int descriptor, std::int64_t length) {
 static int NativeTruncate(const std::filesystem::path& path, std::int64_t length) {
     return ::truncate(path.c_str(), static_cast<off_t>(length)) == 0 ? 0 : errno;
 }
-static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times) {
-    if (times == nullptr) return ::utimes(path.c_str(), nullptr);
+static int NativeUtimes(const std::filesystem::path& path, const KernelTimeval* times, bool followLink = true) {
+    if (times == nullptr) return followLink ? ::utimes(path.c_str(), nullptr) : ::lutimes(path.c_str(), nullptr);
     struct timeval values[2]{{static_cast<time_t>(times[0].tv_sec), static_cast<suseconds_t>(times[0].tv_usec)},
         {static_cast<time_t>(times[1].tv_sec), static_cast<suseconds_t>(times[1].tv_usec)}};
-    return ::utimes(path.c_str(), values);
+    return followLink ? ::utimes(path.c_str(), values) : ::lutimes(path.c_str(), values);
 }
 static int NativeFutimes(int descriptor, const KernelTimeval* times) {
     if (times == nullptr) return ::futimes(descriptor, nullptr);
@@ -1212,6 +1212,19 @@ int APS5_VABI sceKernelUtimes_nid_postfix(const char* path, const KernelTimeval*
 int APS5_VABI utimes_nid_postfix(const char* path, const KernelTimeval* times) {
     if (const int error = PathError(path)) return PosixFailure(error);
     return PosixResult(sceKernelUtimes_nid_postfix(path, times));
+}
+
+int APS5_VABI lutimes_nid_postfix(const char* path, const KernelTimeval* times) {
+    if (const int error = PathError(path)) return PosixFailure(error);
+    if (times != nullptr) {
+        for (int i = 0; i < 2; ++i) {
+            if (times[i].tv_usec < 0 || times[i].tv_usec >= 1000000) return PosixFailure(GUEST_EINVAL);
+        }
+    }
+    std::filesystem::path native;
+    if (const int error = ResolvePathError_nid_no_patch(path, native)) return PosixFailure(error);
+    if (NativeUtimes(native, times, false) != 0) return PosixResult(SceErrorFromErrno(errno));
+    return 0;
 }
 
 int APS5_VABI sceKernelFutimes(int d, const KernelTimeval* times) {
