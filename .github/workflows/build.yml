@@ -103,7 +103,7 @@ jobs:
             }
             const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number, per_page: 100 });
             const paths = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
-            const touches = (...prefixes) => manual || files.length >= 3000 ||
+            const touches = (...prefixes) => files.length >= 3000 ||
               paths.some((path) => prefixes.some((prefix) => prefix.endsWith('/') ? path.startsWith(prefix) : path === prefix));
             const workflow = '.github/workflows/build.yml';
             const libc = 'core/libs/prx/libc/';
@@ -304,7 +304,7 @@ jobs:
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           evict-old-files: job
       - shell: cmd
-        run: cmake -S . -B build %CONFIGURE%
+        run: cmake -S . -B build %CONFIGURE% "-DANYPS5_AGC_EXECUTION_TESTS=F64FmaSubnormals;RegistrationPrepareShutdown"
       - name: Check that every test executable is registered with ctest
         shell: cmd
         run: python tools/check_test_registration.py build
