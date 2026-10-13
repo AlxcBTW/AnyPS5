@@ -23,6 +23,10 @@ std::uint64_t ResidentBytes(std::uint64_t address, std::uint64_t bytes);
 // CPU-side copies of guest bytes the driver keeps (counted always, printed by the census).
 enum class HostCopyKind : std::uint8_t { StorageOriginal, StorageBaseline, MirrorShadow, Count };
 void CountHostCopy(HostCopyKind kind, std::int64_t bytes);
+// APS5_EXP_MEMORY_CENSUS: host-visible Buffers alive by use (vertex/index data, indirect arguments, storage,
+// upload staging, readbacks, other), with peaks, for the [hostmem] lines.
+void CountHostBufferUse(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, std::uint64_t bytes, bool alive);
+std::string DescribeHostBufferUses();
 
 class Buffer {
 public:

@@ -407,6 +407,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
             if (batch) batch->SubmitAndWait();
             else ++Profile().recordedUploads;
+            // exp (APS5_EXP_HEAP_BUDGET): the staging counts toward the recorder's bound (NoteRecordedStaging).
+            if (!batch) NoteRecordedStaging(static_cast<std::size_t>(guestBytes));
             if (profile) Profile().gpu += timer.lap();
             if (dump) {
                 static std::mutex dumpMutex;

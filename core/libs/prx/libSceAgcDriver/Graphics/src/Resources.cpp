@@ -239,6 +239,7 @@ void sampleCensus(MemoryCensus& census, bool print) {
         heapText.c_str(), static_cast<long long>(hostVisibleBytes(counts) / static_cast<std::int64_t>(MiB)), static_cast<long long>(census.peakHostVisible.load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)), static_cast<long long>(deviceLocalBytes(counts) / static_cast<std::int64_t>(MiB)), static_cast<long long>(census.peakDeviceLocal.load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
         static_cast<unsigned long long>(census.imports.load(std::memory_order_relaxed)), static_cast<unsigned long long>(census.importedBytes.load(std::memory_order_relaxed) / MiB), static_cast<unsigned long long>(census.residentBytes.load(std::memory_order_relaxed) / MiB));
     const auto& copies = HostCopies();
+    std::fprintf(stderr, "[hostmem] host-visible buffers by use: %s\n", DescribeHostBufferUses().c_str());
     std::fprintf(stderr, "[hostmem] gpumem: %s; CPU copies of guest bytes: storage-image originals %lld MiB, baselines %lld MiB, mirror shadows %lld MiB\n", describeGpuMemory().c_str(),
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageOriginal)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageBaseline)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
@@ -396,6 +397,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             }
         }
         ready = true;
+        CountHostBufferUse(this->usage, properties, allocationBytes, true);
         return;
     }
     try {
@@ -433,6 +435,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             initializeAddress(usage);
             mapping = slot.mapping;
             ready = true;
+            CountHostBufferUse(this->usage, properties, allocationBytes, true);
             return;
         }
         memory = cache->AllocateMemory(context, allocation, "vkAllocateMemory buffer");
@@ -440,6 +443,7 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
         ready = true;
+        CountHostBufferUse(this->usage, properties, allocationBytes, true);
     } catch (...) {
         release();
         throw;
@@ -447,7 +451,58 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
 }
 
 Buffer::~Buffer() {
+    if (ready) CountHostBufferUse(usage, properties, allocationBytes, false);
     release();
+}
+
+namespace {
+
+// APS5_EXP_MEMORY_CENSUS: the host-visible Buffers alive, by what their usage says they are for (the first
+// that applies): vertex or index data (draw snapshots and inputs), indirect arguments, storage (bound
+// copies of guest buffers, mirrors), transfer source (upload staging), transfer destination (readbacks).
+enum HostBufferUse : std::size_t { HostDrawData, HostIndirect, HostStorage, HostStaging, HostReadback, HostOtherUse, HostUseCount };
+
+std::array<std::atomic<std::int64_t>, HostUseCount>& HostBufferUses() {
+    static std::array<std::atomic<std::int64_t>, HostUseCount> uses{};
+    return uses;
+}
+
+std::array<std::atomic<std::int64_t>, HostUseCount>& HostBufferUsePeaks() {
+    static std::array<std::atomic<std::int64_t>, HostUseCount> peaks{};
+    return peaks;
+}
+
+HostBufferUse hostBufferUse(VkBufferUsageFlags usage) {
+    if ((usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT)) != 0) return HostDrawData;
+    if ((usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0) return HostIndirect;
+    if ((usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) != 0) return HostStorage;
+    if ((usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) return HostStaging;
+    if ((usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) != 0) return HostReadback;
+    return HostOtherUse;
+}
+
+}
+
+void CountHostBufferUse(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, std::uint64_t bytes, bool alive) {
+    if (!MemoryCensusEnabled() || (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0) return;
+    const auto use = hostBufferUse(usage);
+    const auto signedBytes = static_cast<std::int64_t>(bytes);
+    const auto now = HostBufferUses()[use].fetch_add(alive ? signedBytes : -signedBytes, std::memory_order_relaxed) + (alive ? signedBytes : -signedBytes);
+    auto& peak = HostBufferUsePeaks()[use];
+    auto seen = peak.load(std::memory_order_relaxed);
+    while (now > seen && !peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+    }
+}
+
+std::string DescribeHostBufferUses() {
+    static constexpr const char* names[HostUseCount] = {"vertex/index data", "indirect arguments", "storage", "upload staging", "readbacks", "other"};
+    std::string text;
+    for (std::size_t use = 0; use < HostUseCount; ++use) {
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s%s %lld MiB (peak %lld)", use == 0 ? "" : ", ", names[use], static_cast<long long>(HostBufferUses()[use].load(std::memory_order_relaxed) >> 20), static_cast<long long>(HostBufferUsePeaks()[use].load(std::memory_order_relaxed) >> 20));
+        text += item;
+    }
+    return text;
 }
 
 void Buffer::release() noexcept {

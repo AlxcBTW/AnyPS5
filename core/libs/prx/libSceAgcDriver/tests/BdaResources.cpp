@@ -956,8 +956,14 @@ void demoteTests(const Context& base, const BdaTestAccess& access) {
     Require(after.mirrors == before.mirrors + 1 && mirrored != 0 && access.addressBytes(mirrored)[5] == std::byte{0x33}, "the given-up writable range was not mirrored in device-local memory");
     plain[5] = 0x44;
     Require(build() == mirrored && access.addressBytes(mirrored)[5] == std::byte{0x44} && !HostImportCovers(context, plainAddress, 16), "the demoted range was imported again or its mirror missed a CPU write");
-    // The device-local heap runs short while the host heap has room again: the range comes back.
-    heapIs(4 * bytes, 0, VkDeviceSize{8} << 30u);
+    // Both heaps short: nothing moves either way.
+    heapIs(0, bytes, VkDeviceSize{8} << 30u);
+    const auto beforeBoth = DeviceMirrorCounters();
+    static_cast<void>(build());
+    Require(!HostImportCovers(context, plainAddress, 16) && DeviceMirrorCounters().devicePromotions == beforeBoth.devicePromotions && DeviceMirrorCounters().demotions == beforeBoth.demotions, "imports moved while both heaps were short");
+    // The device-local heap runs short while the host heap has room again (1 GiB more, so that it is not
+    // tight either): the range comes back.
+    heapIs(VkDeviceSize{1} << 30u, 0, VkDeviceSize{8} << 30u);
     const auto beforeDevice = DeviceMirrorCounters();
     static_cast<void>(build());
     Require(HostImportCovers(context, plainAddress, 16) && DeviceMirrorCounters().devicePromotions == beforeDevice.devicePromotions + 1, "a range given up for a mirror did not come back as an import while the device-local heap was short");

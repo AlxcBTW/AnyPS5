@@ -138,6 +138,9 @@ struct DevicePressure {
     std::uint64_t reading = 0;
 };
 DevicePressure DeviceHeapPressure();
+// exp (APS5_EXP_HEAP_BUDGET): `bytes` of host-visible staging were recorded into the open batch; past 128 MiB
+// since the last release the recorder syncs and releases them (Recorder::SyncReleasing). GpuMutex held only.
+void NoteRecordedStaging(std::size_t bytes);
 std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget);
 // The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
 std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);

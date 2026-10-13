@@ -855,8 +855,10 @@ struct HeapWatch {
     // Writable imports among them (=2), and the imports demoteForHeap moved.
     std::atomic<std::uint64_t> spilledWritableBytes{0};
     std::atomic<std::uint64_t> demotions{0};
-    // When demotionDue may next say yes (under `mutex`).
+    // When demotionDue may next say yes, and when imports last moved each way (under `mutex`).
     std::chrono::steady_clock::time_point nextDemotion{};
+    std::chrono::steady_clock::time_point lastDemotion{};
+    std::chrono::steady_clock::time_point lastPromotion{};
     // Device-local mirrors' staging chunks alive (DeviceUpload), their peak, and the syncs that bounded them.
     std::atomic<std::uint64_t> stagingBytes{0};
     std::atomic<std::uint64_t> stagingPeak{0};
@@ -1150,20 +1152,31 @@ void spillReadOnly(const Context& context, HostImports& state, const GuestAlloca
 // band between the two keeping them from undoing each other.
 enum class Rebalance { None, Demote, Promote };
 
+// The import bytes the host heap really has room for at `heap`'s reading: the allowance less the live
+// imports, the dropped ones still held and TightSlack, at most a quarter of the headroom per step.
+std::uint64_t promotionRoom(const HostHeapState& heap, std::uint64_t liveImports) {
+    if (heap.allowance == UINT64_MAX) return 0;
+    const auto held = liveImports + retiredImportBytes.load(std::memory_order_relaxed) + TightSlack;
+    return heap.allowance > held ? std::min(heap.allowance - held, heap.headroom / 4) : 0;
+}
+
 Rebalance rebalanceWanted(const Context& context, const HostImports& state) {
     if (!heapBudgetEnabled()) return Rebalance::None;
     const auto heap = PollHostHeap(context, state.liveBytes);
     if (heap.allowance == UINT64_MAX) return Rebalance::None;
     auto& heaps = Heaps();
     std::lock_guard lock(heaps.mutex);
-    if (std::chrono::steady_clock::now() < heaps.nextDemotion) return Rebalance::None;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < heaps.nextDemotion) return Rebalance::None;
     const auto& last = heaps.last;
     const bool deviceShort = last.deviceHeap != UINT32_MAX && last.deviceBudget < last.deviceUsage + DeviceHeapReserve(last.deviceBudget);
-    if (deviceShort && !heaps.spilled.empty()) {
-        const auto held = state.liveBytes + retiredImportBytes.load(std::memory_order_relaxed);
-        if (heap.allowance > held) return Rebalance::Promote;
+    // Each direction waits 10 s after the other moved, and neither moves while both heaps are short (the
+    // excess must then shrink instead: texture caches, the pool): parl0v's run of 6c0964d59 brought 1.6 GB
+    // back as imports for a short heap 0 and pushed heap 1 over (the heaps squeezed each other).
+    if (deviceShort && !heaps.spilled.empty() && !heap.tight && now - heaps.lastDemotion >= std::chrono::seconds(10)) {
+        if (promotionRoom(heap, state.liveBytes) != 0) return Rebalance::Promote;
     }
-    if (state.liveBytes > heap.allowance && mirrorDeviceRoom(last) != 0) return Rebalance::Demote;
+    if (state.liveBytes > heap.allowance && mirrorDeviceRoom(last) != 0 && now - heaps.lastPromotion >= std::chrono::seconds(10)) return Rebalance::Demote;
     return Rebalance::None;
 }
 
@@ -1180,8 +1193,7 @@ bool demotionDue(const Context& context, const HostImports& state) {
 // heap 1 had ~600 MiB of room.
 void promoteForDevice(const Context& context, HostImports& state) {
     const auto heap = PollHostHeap(context, state.liveBytes);
-    const auto held = state.liveBytes + retiredImportBytes.load(std::memory_order_relaxed);
-    const auto room = heap.allowance > held ? (heap.allowance - held) / 2 : 0;
+    const auto room = promotionRoom(heap, state.liveBytes);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> promoted;
     std::uint64_t promotedBytes = 0;
     auto& heaps = Heaps();
@@ -1196,6 +1208,7 @@ void promoteForDevice(const Context& context, HostImports& state) {
             heaps.spilled.erase(base);
         }
         heaps.nextDemotion = std::chrono::steady_clock::now() + std::chrono::milliseconds(promoted.empty() ? 2000 : 1000);
+        if (!promoted.empty()) heaps.lastPromotion = std::chrono::steady_clock::now();
     }
     for (const auto& [base, bytes] : promoted) state.failed.erase(base);
     if (!promoted.empty()) ++state.epoch;
@@ -1221,13 +1234,17 @@ void demoteForHeap(const Context& context, HostImports& state, const GuestAlloca
     if (wanted != Rebalance::Demote) return;
     const auto heap = PollHostHeap(context, state.liveBytes);
     const auto needed = state.liveBytes - heap.allowance + TightSlack;
-    const auto cap = std::min(std::max<std::uint64_t>(heap.headroom / 2, needed), MirrorDeviceRoom());
+    // At most a quarter of the headroom per step: what a step drops stays in the heap until the hold that
+    // dropped it ends (KeepThroughHold), and that hold goes on to allocate (parl0v's run of 6c0964d59 failed
+    // a 16 MiB allocation in the hold that had just dropped 457 MiB).
+    const auto cap = std::min({std::max<std::uint64_t>(heap.headroom / 4, std::uint64_t{64} << 20u), needed, MirrorDeviceRoom()});
     const auto live = state.liveBytes;
     const auto spill = spillImports(context, state, lease, nullptr, needed, cap, heapBudgetMode.load(std::memory_order_relaxed) >= 2);
     auto& heaps = Heaps();
     {
         std::lock_guard lock(heaps.mutex);
         heaps.nextDemotion = std::chrono::steady_clock::now() + (spill.count != 0 ? std::chrono::milliseconds(100) : std::chrono::milliseconds(2000));
+        if (spill.count != 0) heaps.lastDemotion = std::chrono::steady_clock::now();
     }
     heaps.demotions.fetch_add(spill.count, std::memory_order_relaxed);
     // Every move (at most one line a second), and an attempt that moved nothing every 10 s.
@@ -1672,6 +1689,23 @@ struct StagingChunk {
 // Staging bytes recorded into the recorder's batches since the last SyncReleasing (under the GpuMutex).
 std::size_t stagedUnreleased = 0;
 
+// exp (APS5_EXP_HEAP_BUDGET): `bytes` of host-visible staging were recorded into the open batch (a device-local
+// mirror's upload, a texture's): once 128 MiB have been since the last release, the recorder syncs and
+// releases the finished batches' kept objects at once (Recorder::SyncReleasing), so staging cannot pile up
+// in the host heap behind unfinished batches and the hold's unlock. parl0v's 16 GB run of 6c0964d59: host
+// buffers rose from 254 to 1,118 MiB within one heap reading while textures evicted from the shrunk caches
+// were made again, each through a staging buffer of its guest bytes. Needs the GpuMutex (else nothing).
+constexpr std::size_t StagingBound = std::size_t{128} << 20u;
+
+void noteRecordedStaging(Recorder& recorder, std::size_t bytes) {
+    stagedUnreleased += bytes;
+    if (stagedUnreleased < StagingBound) return;
+    Recorder::CountSync(4);
+    recorder.SyncReleasing();
+    stagedUnreleased = 0;
+    Heaps().stagingSyncs.fetch_add(1, std::memory_order_relaxed);
+}
+
 class DeviceUpload {
 public:
     explicit DeviceUpload(const Context& context) : context(context) {}
@@ -1744,12 +1778,10 @@ private:
         }
         auto* recorder = GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        const std::size_t chunk = recorder != nullptr && staging != nullptr ? staging->buffer.Bytes().size() : 0;
         if (recorder != nullptr) {
             commands = recorder->Commands();
-            if (staging != nullptr) {
-                recorder->Keep(staging, used);
-                stagedUnreleased += staging->buffer.Bytes().size();
-            }
+            if (staging != nullptr) recorder->Keep(staging, used);
         } else {
             if (batch == nullptr) batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
@@ -1778,12 +1810,7 @@ private:
         used = 0;
         // Across uploads: the finished batches' staging is released here rather than at the hold's end
         // (one address space rebuild may make hundreds of mirrors within one hold).
-        if (recorder != nullptr && stagedUnreleased >= StagedInFlight) {
-            Recorder::CountSync(4);
-            recorder->SyncReleasing();
-            stagedUnreleased = 0;
-            heaps.stagingSyncs.fetch_add(1, std::memory_order_relaxed);
-        }
+        if (recorder != nullptr && chunk != 0) noteRecordedStaging(*recorder, chunk);
         if (recorder == nullptr && batch != nullptr && kept.size() * ChunkBytes >= StagedInFlight) {
             batch->SubmitAndWait();
             batch.reset();
@@ -3079,10 +3106,17 @@ DevicePressure DeviceHeapPressure() {
     return {wanted > last.deviceBudget ? wanted - last.deviceBudget : 0, heaps.readings};
 }
 
+void NoteRecordedStaging(std::size_t bytes) {
+    if (!heapBudgetEnabled() || bytes == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) noteRecordedStaging(*recorder, bytes);
+}
+
 void ResetHeapRebalance() {
     auto& heaps = Heaps();
     std::lock_guard lock(heaps.mutex);
     heaps.nextDemotion = {};
+    heaps.lastDemotion = {};
+    heaps.lastPromotion = {};
 }
 
 std::uint64_t DeviceHeapRoom() {
@@ -3169,6 +3203,8 @@ void SetHostImportHeap(std::uint32_t heap) {
     heaps.poolDeviceTight = false;
     heaps.spilled.clear();
     heaps.nextDemotion = {};
+    heaps.lastDemotion = {};
+    heaps.lastPromotion = {};
     heaps.physical = VK_NULL_HANDLE;
     BufferPool::SetHostHeapTight(false);
     BufferPool::SetDeviceHeapTight(false);
@@ -3226,9 +3262,27 @@ std::string DescribeImportCensus() {
     Kind writable, readOnly, written, gpuWritten, releasable, joined, largest[4];
     std::uint64_t largestBase[4]{};
     bool largestWritable[4]{};
+    // Dropped imports still allocated: those in the ledger (APS5_EXP_HEAP_BUDGET), all of them, and those
+    // parked for a replaced device (kept until ClearHostImports for it).
+    Kind parked;
+    std::uint64_t ledgerBytes = 0;
+    {
+        auto& ledger = Retired();
+        std::lock_guard lock(ledger.mutex);
+        for (const auto& [import, hold] : ledger.holds) {
+            if (!import->released) ledgerBytes += import->node.mapped().bytes;
+        }
+    }
     {
         auto& state = Imports();
         std::lock_guard lock(state.mutex);
+        for (const auto& [device, imports] : state.parked) {
+            for (const auto& import : imports) {
+                if (import == nullptr || import->released) continue;
+                ++parked.count;
+                parked.bytes += import->node.mapped().bytes;
+            }
+        }
         for (const auto& [base, entry] : state.imports) {
             const bool canWrite = std::all_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; });
             auto& access = canWrite ? writable : readOnly;
@@ -3285,8 +3339,9 @@ std::string DescribeImportCensus() {
     const auto originals = StorageOriginalCensus();
     const auto made = DeviceMirrorCounters();
     const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
-    char text[1700];
-    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance; back as imports: %llu for sync targets, %llu (%llu MiB) for device-local room), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+    char text[2000];
+    std::snprintf(text, sizeof(text), "imports: dropped and still allocated %llu MiB (%llu MiB in the ledger, %llu parked for a replaced device, %llu MiB); CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance; back as imports: %llu for sync targets, %llu (%llu MiB) for device-local room), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+        mib(retiredImportBytes.load(std::memory_order_relaxed)), mib(ledgerBytes), static_cast<unsigned long long>(parked.count), mib(parked.bytes),
         static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(gpuWritten.count), mib(gpuWritten.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
         static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
         static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes),
