@@ -1,4 +1,5 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
+#include <cstdlib>
 #include "Optimization/DenormalFlushEliminator.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -83,6 +84,11 @@ bool run(const char* name, const std::function<bool()>& test) {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv_s("APS5_EXP_PR5086", "1");
+#else
+    setenv("APS5_EXP_PR5086", "1", 1);
+#endif
     bool passed = true;
 
     passed &= run("a flush of a flushed value is removed and the first flush stays", [] {

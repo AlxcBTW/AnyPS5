@@ -1,5 +1,6 @@
 #include "Optimization/DenormalFlushEliminator.hpp"
 #include <cstdint>
+#include <cstdlib>
 #include <unordered_map>
 
 namespace ShaderRecompiler {
@@ -17,6 +18,11 @@ const IrValue* maskedOperand(const IrValue* value, IrOpcode opcode, std::uint32_
     if (isImmediate(rhs, bits)) return lhs;
     if (isImmediate(lhs, bits)) return rhs;
     return nullptr;
+}
+
+bool lab5086() {
+    static const bool enabled = std::getenv("APS5_EXP_PR5086") != nullptr;
+    return enabled;
 }
 
 bool setsExponentBit(const IrValue& value) {
@@ -60,18 +66,20 @@ private:
             case IrOpcode::ConvertF32S32:
             case IrOpcode::ConvertF32U32:
             case IrOpcode::ConvertF32F16:
+                return true;
             case IrOpcode::FPFloor32:
             case IrOpcode::FPCeil32:
             case IrOpcode::FPTrunc32:
             case IrOpcode::FPRoundEven32:
             case IrOpcode::FPSqrt:
             case IrOpcode::FPRecipSqrt32:
-                return true;
+                return lab5086();
             case IrOpcode::FPMin32:
             case IrOpcode::FPMax32:
             case IrOpcode::FPMinTri32:
             case IrOpcode::FPMaxTri32:
             case IrOpcode::FPMedTri32:
+                if (!lab5086()) return false;
                 for (std::size_t index = 0; index < value.ArgumentCount(); ++index) {
                     if (!Contains(value.Argument(index))) return false;
                 }
@@ -86,11 +94,11 @@ private:
                 if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseXor32, 0x80000000u)) return Contains(operand);
                 return false;
             case IrOpcode::BitwiseAnd32:
-                if (maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x80000000u) != nullptr) return true;
+                if (lab5086() && maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x80000000u) != nullptr) return true;
                 if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x7fffffffu)) return Contains(operand);
                 return false;
             case IrOpcode::BitwiseOr32:
-                return setsExponentBit(value);
+                return lab5086() && setsExponentBit(value);
             case IrOpcode::SelectU32:
             case IrOpcode::SelectF32:
                 return Contains(value.Argument(1)) && Contains(value.Argument(2));
