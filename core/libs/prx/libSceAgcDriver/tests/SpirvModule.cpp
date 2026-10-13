@@ -306,6 +306,7 @@ void testUnusedHelperFunctions() {
             words.insert(words.end(), operands);
         };
         emit(spv::OpCapability, {spv::CapabilityShader});
+        emit(spv::OpCapability, {spv::CapabilityLinkage});
         emit(spv::OpMemoryModel, {spv::AddressingModelLogical, spv::MemoryModelGLSL450});
         if (entryPoints) {
             emit(spv::OpEntryPoint, {spv::ExecutionModelGLCompute, 10u, 0x6e69616du, 0u});
@@ -317,6 +318,7 @@ void testUnusedHelperFunctions() {
         emit(spv::OpDecorationGroup, {64u});
         emit(spv::OpDecorate, {64u, spv::DecorationRelaxedPrecision});
         emit(spv::OpGroupDecorate, {64u, 62u});
+        emit(spv::OpDecorate, {70u, spv::DecorationLinkageAttributes, 0x6f707865u, 0x64657472u, 0u, spv::LinkageTypeExport});
         emit(spv::OpTypeVoid, {1u});
         emit(spv::OpTypeFunction, {2u, 1u});
         emit(spv::OpTypeInt, {3u, 32u, 0u});
@@ -351,6 +353,7 @@ void testUnusedHelperFunctions() {
         function(34u, 35u, 0u);
         function(40u, 41u, 42u);
         function(42u, 43u, 0u);
+        function(70u, 71u, 0u);
         emit(spv::OpFunction, {1u, 60u, spv::FunctionControlMaskNone, 2u});
         emit(spv::OpLabel, {61u});
         emit(spv::OpLoad, {3u, 62u, 9u});
@@ -364,10 +367,10 @@ void testUnusedHelperFunctions() {
         return result;
     };
     const auto specialized = SpecializeSpirv(module(true));
-    check(functions(specialized) == std::set<std::uint32_t>({10u, 20u, 22u, 40u, 42u, 60u}), "unused helpers survived a folded-away call or referenced helper chains were removed");
+    check(functions(specialized) == std::set<std::uint32_t>({10u, 20u, 22u, 40u, 42u, 60u, 70u}), "unused helpers survived a folded-away call or referenced helper chains were removed");
     for (std::size_t index = 5; index < specialized.size(); index += specialized[index] >> 16u) check((specialized[index] & 0xffffu) != spv::OpName || specialized[index + 1u] != 32u, "removed helper kept a dangling name");
     check(SpecializeSpirv(specialized) == specialized, "unused helper removal is not stable");
-    check(functions(SpecializeSpirv(module(false))).size() == 8u, "module without entry points lost a helper");
+    check(functions(SpecializeSpirv(module(false))).size() == 9u, "module without entry points lost a helper");
 }
 
 int main() {

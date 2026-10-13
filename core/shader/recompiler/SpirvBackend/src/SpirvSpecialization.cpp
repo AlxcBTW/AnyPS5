@@ -856,6 +856,10 @@ private:
             const auto op = Opcode(instruction);
             if (op == spv::OpFunction) current = Result(instruction);
             if (op == spv::OpEntryPoint) hasEntryPoint = true;
+            if (current == 0 && instruction.size() > 2u && ((op == spv::OpDecorate && instruction[2] == spv::DecorationLinkageAttributes) || op == spv::OpDecorateString)) {
+                moduleReferences.insert(instruction[1]);
+                if (functions.contains(instruction[1])) pending.push_back(instruction[1]);
+            }
             std::uint32_t switchLiteralWords = 1u;
             if (op == spv::OpSwitch && instruction.size() > 1u) {
                 const auto selectorType = resultTypes.find(instruction[1]);
