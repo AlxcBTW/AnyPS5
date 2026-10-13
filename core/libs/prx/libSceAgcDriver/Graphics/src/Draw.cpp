@@ -356,7 +356,16 @@ constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawP
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled"};
 
 // What became of one draw, for the totals.
+// The parts of the vertex phase (prepareDrawInputs) for the [draw-vertex] line: the index buffer's
+// import check, its copy, its highest index, the zero-fetch clamp's re-read, the mesh strip restart
+// table, the vertex input layout and the vertex buffer imports and copies.
+enum VertexPart : std::size_t { VertexIndexImport, VertexIndexCopy, VertexIndexRange, VertexClamp, VertexRestart, VertexLayout, VertexCopies, VertexPartCount };
+constexpr std::array<const char*, VertexPartCount> VertexPartNames{"index import", "index copy", "highest index", "zero-fetch clamp", "restart table", "layout", "vertex buffers"};
+
 struct DrawOutcome {
+    // The vertex phase split by VertexPart, and whether the zero-fetch clamp re-read the indices.
+    std::array<double, VertexPartCount> vertexUs{};
+    bool clamped = false;
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
     bool waited = false;
@@ -403,6 +412,8 @@ constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "templa
 
 struct DrawProfile {
     std::mutex mutex;
+    std::array<double, VertexPartCount> vertexUs{};
+    std::uint64_t clamps = 0;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
     std::uint64_t fullScissorLookups = 0;
@@ -487,6 +498,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         drawUs += us[i];
     }
     profile.maxDrawUs = std::max(profile.maxDrawUs, drawUs);
+    for (std::size_t i = 0; i < VertexPartCount; ++i) profile.vertexUs[i] += outcome.vertexUs[i];
+    if (outcome.clamped) ++profile.clamps;
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
@@ -569,6 +582,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     std::fprintf(stderr, "%s\n", line);
     std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    {
+        char parts[512];
+        int m = std::snprintf(parts, sizeof(parts), "[draw-vertex] vertex phase by part (10 s, ms):");
+        for (std::size_t i = 0; i < VertexPartCount && m > 0 && static_cast<std::size_t>(m) < sizeof(parts); ++i) m += std::snprintf(parts + m, sizeof(parts) - static_cast<std::size_t>(m), " %s %.1f", VertexPartNames[i], profile.vertexUs[i] / 1000.0);
+        std::fprintf(stderr, "%s; zero-fetch clamps %llu\n", parts, static_cast<unsigned long long>(profile.clamps));
+    }
+    profile.vertexUs.fill(0);
+    profile.clamps = 0;
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -1067,6 +1088,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     ValidateViewport(context, state.viewport);
     ValidateDepthBounds(context, state);
     timer.phase(PhaseValidate);
+    // Profile only: the vertex phase split for the [draw-vertex] line.
+    auto partStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto part = [&](VertexPart which) {
+        if (!timer.profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        outcome.vertexUs[which] += std::chrono::duration<double, std::micro>(now - partStart).count();
+        partStart = now;
+    };
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {
         const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1074,9 +1103,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        part(VertexIndexImport);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
         else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        part(VertexIndexCopy);
         std::optional<std::uint32_t> highest;
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
@@ -1088,6 +1119,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else if (copy.derived != 0) {
             highest = copy.derived - 1u;
         }
+        part(VertexIndexRange);
         if (!highest) {
             inputs.nothing = true;
             return inputs;
@@ -1104,12 +1136,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 import = nullptr;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
+                outcome.clamped = true;
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
                 }
             }
         }
+        part(VertexClamp);
         Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         Require(!fanGeometry || !state.primitiveRestart || *highest != (draw.indexSize == 2 ? 0xffffu : 0xffffffffu), "primitive restart in a triangle fan geometry draw is unsupported");
         inputs.maxIndex = *highest;
@@ -1125,12 +1159,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
+        part(VertexRestart);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     const auto& attributes = shaders.front().program->vertexAttributes;
     // Validates the vertex descriptors; the layout also keys and builds the pipeline.
     if (recipe != nullptr) inputs.vertexInput = recipe->vertexInput;
     else inputs.vertexInput = BuildVertexInputLayout(context, attributes);
+    part(VertexLayout);
     inputs.vertexOffsets.assign(attributes.size(), 0);
     // An indexed draw's vertex offset moves every fetch: the copy must reach the last one.
     if (draw.indexed) {
@@ -1217,6 +1253,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
     }
+    part(VertexCopies);
     timer.phase(PhaseVertex);
     return inputs;
 }
