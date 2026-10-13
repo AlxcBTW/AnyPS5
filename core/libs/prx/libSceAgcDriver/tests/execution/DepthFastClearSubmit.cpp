@@ -11,6 +11,7 @@
 #endif
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace {
@@ -110,6 +112,10 @@ void DispatchFill(const GuestBlock& code, const GuestBlock& htile, std::uint32_t
     });
 }
 
+// FillKernel behind an s_nop: the same stores of user[4..7], from a kernel no fill matcher takes,
+// so only the bind-time HTILE read can see the clear it writes.
+constexpr std::array<std::uint32_t, 10> UnknownFillKernel{0xbf800000u, 0xd7460004u, 0x04010c08u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0xe01c2000u, 0x80000004u, 0xbf810000u};
+
 bool StoresFills(AgcDriver::VulkanDevice& device, const GuestBlock& probe) {
     std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
     std::array<std::uint32_t, 4> pattern{};
@@ -144,6 +150,56 @@ void DispatchFillClearsDepth(AgcDriver::VulkanDevice& device, const Shaders& sha
     Require(Draw(device, shaders, surface, {}) == 0u, "the depth written after the compute fill clear was lost");
 }
 
+// A title kernel that decodes the depth through HTILE after drawing (the Nanite depth export of
+// PPSA25344, Unreal Engine 5) takes a tile with ZMask 0 as holding the clear value and skips its depth,
+// so after a fast clear and a draw the words must read expanded over the whole metadata.
+void DrawAfterFastClearExpandsHtile(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    for (const bool stencil : {false, true}) {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), stencil ? NewBlock().Address() : 0, htile.Address(), stencil, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        DmaFill(htile, HtileFillBytes, stencil ? 0xf0u : 0u);
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a fast clear through the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)");
+        std::vector<std::uint32_t> words(HtileFillBytes / 4u);
+        AgcDriver::GuestMemory::Read(htile.Address(), std::as_writable_bytes(std::span(words)), 4);
+        const auto expanded = stencil ? 0xfffff3ffu : 0xfffc000fu;
+        for (const auto word : words) Require(word == expanded, stencil ? "a draw after a depth and stencil fast clear left HTILE words other than expanded (0xfffff3ff)" : "a draw after a depth fast clear left HTILE words other than expanded (0xfffc000f): a kernel decoding the depth through ZMask 0 reads the clear value, not the drawn depth");
+        Require(Draw(device, shaders, surface, {}) == 0u, "the depth drawn after the fast clear was cleared again");
+    }
+}
+
+// An unrecognized kernel clears the HTILE on two frames in a row: the bind after each one reads the
+// words written since the store-back of the frame before, and takes the clear both times.
+void UnknownKernelClearsTwice(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    const auto& htile = NewBlock();
+    auto& code = NewBlock();
+    std::memcpy(code.Data(), UnknownFillKernel.data(), sizeof(UnknownFillKernel));
+    const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+    for (const char* frame : {"first", "second"}) {
+        DispatchFill(code, htile, HtileFillBytes);
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, std::string("the ") + frame + " clear an unrecognized kernel wrote into the HTILE was not taken");
+        Require(Draw(device, shaders, surface, {}) == 0u, std::string("the depth written after the ") + frame + " kernel clear was lost");
+    }
+}
+
+// Slice 1 of a depth array decodes to slice 0's HTILE address: its bind neither takes nor stores back
+// slice 0's words, and slice 0's own bind still does.
+void SliceKeepsSliceZeroHtile(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    auto& htile = NewBlock();
+    const Surface first{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT, 0};
+    const Surface second{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT, 1};
+    Require(Draw(device, shaders, first, {.depthWrite = true}) == Covered, "slice 0 was not cleared to DB_DEPTH_CLEAR (1.0)");
+    Require(Draw(device, shaders, second, {.depthWrite = true}) == Covered, "slice 1 was not cleared to DB_DEPTH_CLEAR (1.0)");
+    std::memset(htile.Data(), 0, HtileFillBytes);
+    AgcDriver::GuestMemory::MarkWritten(htile.Address(), HtileFillBytes);
+    Require(Draw(device, shaders, second, {}) == 0u, "slice 1 took the clear in slice 0's HTILE words");
+    const auto* words = reinterpret_cast<const std::uint32_t*>(htile.Data());
+    Require(std::all_of(words, words + HtileFillBytes / 4u, [](std::uint32_t word) { return word == 0u; }), "a bind of slice 1 stored back slice 0's HTILE");
+    Require(Draw(device, shaders, first, {.depthWrite = true}) == Covered, "slice 0 did not take the clear in its HTILE words");
+    Require(std::all_of(words, words + HtileFillBytes / 4u, [](std::uint32_t word) { return word == 0xfffc000fu; }), "slice 0's bind did not store its cleared HTILE back as expanded");
+}
+
 void DepthOnlyFillKeepsStencil(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
     const auto& htile = NewBlock();
     const Surface surface{NewBlock().Address(), NewBlock().Address(), htile.Address(), true, VK_FORMAT_D32_SFLOAT_S8_UINT};
@@ -167,8 +223,13 @@ int main() {
         const auto shaders = Compile(*device);
         DmaFillClearsDepth(*device, shaders);
         DepthOnlyFillKeepsStencil(*device, shaders);
+        DrawAfterFastClearExpandsHtile(*device, shaders);
         const bool computeRan = StoresFills(*device, NewBlock());
-        if (computeRan) DispatchFillClearsDepth(*device, shaders);
+        SliceKeepsSliceZeroHtile(*device, shaders);
+        if (computeRan) {
+            DispatchFillClearsDepth(*device, shaders);
+            UnknownKernelClearsTwice(*device, shaders);
+        }
         else std::printf("compute fill not run: the device does not store fills into imported guest memory\n");
         LibcRunShutdown_nid_postfix();
         std::puts(computeRan ? "depth fast clear submit tests passed" : "depth fast clear submit tests passed without the compute fill");
