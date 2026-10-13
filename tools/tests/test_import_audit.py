@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import os
 import struct
 import sys
 import tempfile
@@ -421,7 +422,7 @@ class ImportAuditTests(unittest.TestCase):
         registry = work.root / "game.json"
         write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
         output = work.root / "hard-link.json"
-        output.hardlink_to(registry)
+        os.link(registry, output)
         before = registry.read_bytes()
         code, out, err = work.run(registry, "--json", str(output))
         self.assertEqual((code, out), (2, ""))

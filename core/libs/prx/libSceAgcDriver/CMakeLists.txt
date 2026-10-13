@@ -1058,6 +1058,35 @@ target_link_libraries(agc_driver_graphics_tests PRIVATE
 set_target_properties(agc_driver_graphics_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_graphics_tests)
 
+foreach(agcVertexRangeShader IN ITEMS VertexRange.vert VertexRangeProducer.frag)
+    string(REPLACE "." "_" agcVertexRangeName "${agcVertexRangeShader}")
+    string(TOUPPER "${agcVertexRangeName}_SPV" agcVertexRangeSymbol)
+    set(agcVertexRangeSpv ${agcTestShaderGeneratedRoot}/${agcVertexRangeName}.spv)
+    set(agcVertexRangeHeader ${agcTestShaderGeneratedRoot}/${agcVertexRangeName}_spv.h)
+    add_custom_command(
+            OUTPUT "${agcVertexRangeHeader}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+            COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcVertexRangeSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/${agcVertexRangeShader}"
+            COMMAND ${CMAKE_COMMAND} -DINPUT=${agcVertexRangeSpv} -DOUTPUT=${agcVertexRangeHeader}
+            -DSYMBOL=${agcVertexRangeSymbol} -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/${agcVertexRangeShader}" glslang-standalone
+            VERBATIM
+    )
+    list(APPEND agcVertexRangeHeaders ${agcVertexRangeHeader})
+endforeach()
+
+target_sources(agc_driver_recorder_tests PRIVATE ${agcVertexRangeHeaders})
+
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_vertex_target_range_copied COMMAND agc_driver_recorder_tests --vertex-target-range-copied)
+    add_test(NAME agc_driver_vertex_target_range_imported COMMAND agc_driver_recorder_tests --vertex-target-range-imported)
+    set_tests_properties(agc_driver_vertex_target_range_copied agc_driver_vertex_target_range_imported PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_driver_vertex_target_range_copied agc_driver_vertex_target_range_imported PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         tests/BdaDevice.cpp
         tests/BdaShader.cpp

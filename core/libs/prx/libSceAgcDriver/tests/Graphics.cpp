@@ -5015,6 +5015,7 @@ void validationTests() {
         vertex.vertexAttributes[0].components = 2;
         expectFailure([&] { AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false); }, "metadata disagrees");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 2, 1) == 80, "incorrect strided vertex range");
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 64, "vertex range includes records before the first vertex");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 3, 1) == 112, "an index past the records still spans its fetch");
         {
             auto wider = attribute;
@@ -5037,6 +5038,7 @@ void validationTests() {
             Require(AgcDriver::Graphics::ClampDrawIndices(std::as_writable_bytes(std::span(narrow)), 2, false, 4u) == 4u && narrow[0] == 4u && narrow[1] == 1u, "clamping 16-bit indices failed");
         }
         attribute.fetchIndex = 1;
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 2, 7) == 224, "instance range includes records before the first instance");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 48, "instance attributes used the vertex index");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2, 1) == 80, "first instance was ignored");
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 2, 2) == 112, "a first instance past the records still spans its fetch");
@@ -5054,6 +5056,7 @@ void validationTests() {
         attribute.resource.fields[1] = 0;
         attribute.resource.fields[2] = 16;
         Require(AgcDriver::Graphics::VertexBufferReadSize(attribute, 100, 2) == 16, "zero stride must repeat one value");
+        Require(AgcDriver::Graphics::VertexBufferReadOffset(attribute, 100, 7) == 0, "zero-stride input skipped its repeated value");
         attribute.resource.fields[2] = 8;
         expectFailure([&] { AgcDriver::Graphics::VertexBufferReadSize(attribute, 0, 1); }, "byte range");
         Require(!AgcDriver::Graphics::VertexFetchOutOfRange(attribute), "a structured zero-stride fetch was treated as out of range");
