@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -112,6 +113,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     auto& outcomes = waitOutcomes();
     const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
     const std::size_t awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+    Graphics::NoteSyncTarget(awaited);
+    // exp (APS5_EXP_HEAP_BUDGET / APS5_EXP_MEMORY_CENSUS): a wait that lasts 10 s while other work goes on (the
+    // timeout report below fires only when nothing completes) names what backs its target, once per address.
+    static const bool longWaitReports = std::getenv("APS5_EXP_HEAP_BUDGET") != nullptr || std::getenv("APS5_EXP_MEMORY_CENSUS") != nullptr;
+    const auto waitBegan = std::chrono::steady_clock::now();
+    bool longReported = false;
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)));
@@ -346,6 +353,17 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         CheckFailure();
         if (pollService(!spinning)) return;
         noteAwaitingTitle(queue, awaited);
+        if (longWaitReports && !longReported && (polls & 255u) == 0 && std::chrono::steady_clock::now() - waitBegan > std::chrono::seconds(10)) {
+            longReported = true;
+            static std::mutex longMutex;
+            static std::set<std::uint64_t> longReportedAt;
+            bool first = false;
+            {
+                const std::lock_guard lock(longMutex);
+                first = longReportedAt.insert(awaited).second;
+            }
+            if (first) std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM at 0x%llx has waited 10 s while other work ran (function %u, words 0x%x 0x%x, value now 0x%x); the address is %s\n", queue, static_cast<unsigned long long>(awaited), packet[1] & 7u, packet[4], packet[5], *reinterpret_cast<const volatile std::uint32_t*>(awaited), Graphics::DescribeGuestBacking(awaited).c_str());
+        }
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {

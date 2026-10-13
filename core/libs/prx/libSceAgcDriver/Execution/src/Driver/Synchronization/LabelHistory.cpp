@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
@@ -59,6 +60,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
         kind = "DMA_DATA";
     }
     if (kind == nullptr) return;
+    Graphics::NoteSyncTarget(target);
     if (std::string_view(kind) != "WAIT_REG_MEM") {
         static std::mutex historyMutex;
         std::lock_guard lock(historyMutex);

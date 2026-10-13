@@ -40,6 +40,9 @@ struct HostImport {
     mutable std::uint64_t lastUse = 0;
     // APS5_EXP_MEMORY_CENSUS: a store through the BDA table landed in it (NoteBdaWritten).
     mutable bool bdaWritten = false;
+    // APS5_EXP_HEAP_BUDGET / APS5_EXP_MEMORY_CENSUS: a shader wrote it in place (a write-back of a range bound to
+    // it); read and set through std::atomic_ref.
+    mutable bool gpuWritten = false;
     // The memory type the import was allocated with (UINT32_MAX: not known).
     std::uint32_t memoryType = UINT32_MAX;
 };
@@ -74,6 +77,11 @@ std::uint64_t RelieveGpuMemory(const Context& context);
 // type is in the import heap and this thread holds the GpuMutex, syncs the recorder and frees the dropped
 // imports no pointer of the current hold can still use. Returns the bytes freed (0 without the switch).
 std::uint64_t RetiredImportBytes();
+// exp (APS5_EXP_HEAP_BUDGET): a command packet waits on or writes `address` (WAIT_REG_MEM, RELEASE_MEM, WRITE_DATA,
+// COPY_DATA, DMA_DATA): an import holding one is never given up for a device-local mirror.
+// DescribeGuestBacking: what backs `address` for the GPU (diagnostics).
+void NoteSyncTarget(std::uint64_t address);
+std::string DescribeGuestBacking(std::uint64_t address);
 std::uint64_t ReclaimRetiredImports(const Context& context, std::uint32_t memoryType);
 std::uint64_t HostImportLimit();
 
@@ -149,6 +157,9 @@ struct DeviceMirrorStats {
     std::uint64_t stagingBytes = 0;
     std::uint64_t stagingPeak = 0;
     std::uint64_t stagingSyncs = 0;
+    // Host-visible readback buffers of writable device-local mirrors alive now, and at most.
+    std::uint64_t readbackLive = 0;
+    std::uint64_t readbackPeak = 0;
 };
 DeviceMirrorStats DeviceMirrorCounters();
 // APS5_EXP_MEMORY_CENSUS: marks the imports [address, address + bytes) overlaps as written through the

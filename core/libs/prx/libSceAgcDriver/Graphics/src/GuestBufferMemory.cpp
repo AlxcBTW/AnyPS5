@@ -849,7 +849,7 @@ struct HeapWatch {
     std::atomic<std::uint64_t> readbackBytes{0};
     // Read-only imports given up for writable ones (spillReadOnly), by base: their mirrors go to
     // device-local memory whatever the heap's state (under `mutex`).
-    std::set<std::uint64_t> spilled;
+    std::map<std::uint64_t, std::uint64_t> spilled;
     std::atomic<std::uint64_t> spills{0};
     std::atomic<std::uint64_t> spilledBytes{0};
     // Writable imports among them (=2), and the imports demoteForHeap moved.
@@ -861,7 +861,17 @@ struct HeapWatch {
     std::atomic<std::uint64_t> stagingBytes{0};
     std::atomic<std::uint64_t> stagingPeak{0};
     std::atomic<std::uint64_t> stagingSyncs{0};
+    // Host-visible readback buffers of writable device-local mirrors alive, and their peak.
+    std::atomic<std::uint64_t> readbackLive{0};
+    std::atomic<std::uint64_t> readbackPeak{0};
 };
+
+void countLive(std::atomic<std::uint64_t>& live, std::atomic<std::uint64_t>& peak, std::uint64_t bytes) {
+    const auto now = live.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    auto seen = peak.load(std::memory_order_relaxed);
+    while (now > seen && !peak.compare_exchange_weak(seen, now, std::memory_order_relaxed)) {
+    }
+}
 
 HeapWatch& Heaps() {
     static HeapWatch heaps;
@@ -978,6 +988,39 @@ struct Spill {
     std::uint64_t writableBytes = 0;
 };
 
+// exp (APS5_EXP_HEAP_BUDGET): the guest addresses command packets synchronize through (NoteSyncTarget): the
+// targets of WAIT_REG_MEM waits and of the words the command processor writes (RELEASE_MEM / EOP labels,
+// WRITE_DATA, COPY_DATA, DMA_DATA).
+struct SyncTargets {
+    std::mutex mutex;
+    std::set<std::uint64_t> addresses;
+};
+
+SyncTargets& Targets() {
+    static SyncTargets awaited;
+    return awaited;
+}
+
+// exp (APS5_EXP_HEAP_BUDGET=2): whether a writable import may become a device-local mirror. Its stores
+// would then reach guest memory only through the mirror's write-back once their batch completed, not
+// while the GPU runs as through the import, and every written range costs host-visible readbacks of it
+// before and after the work (parl0v's 16 GB run of 8562944ed: host buffers back at 1,232 MiB, and one
+// queue waited 345 s on a WAIT_REG_MEM). So only an import no shader has written since it was made
+// (descriptor-bound or through the BDA table) and that holds no address a command packet waited on or
+// wrote (labels, EOP, WRITE_DATA, COPY_DATA, DMA_DATA); a releasable one (a write-watched heap mirror,
+// no CPU shadow of the range). `awaited` is locked.
+bool demotableWritable(const HostImport& entry, const SyncTargets& awaited) {
+    if (std::atomic_ref<bool>(entry.gpuWritten).load(std::memory_order_relaxed) || entry.bdaWritten) return false;
+    if (!std::all_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->releasable; })) return false;
+    const auto found = awaited.addresses.lower_bound(entry.base);
+    return found == awaited.addresses.end() || *found >= entry.base + entry.bytes;
+}
+
+// The GPU wrote the import (a write-back of a range bound to it in place).
+void noteGpuWritten(const HostImport* import) {
+    if (import != nullptr && (heapBudgetEnabled() || MemoryCensusEnabled())) std::atomic_ref<bool>(import->gpuWritten).store(true, std::memory_order_relaxed);
+}
+
 // exp (APS5_EXP_HEAP_BUDGET): gives up imports no build holds for device-local mirrors (spilled: kept
 // out of the imports, see deviceMirrorWanted), read-only ones first, then the largest, up to `cap` bytes
 // and until `needed` is covered. Read-only imports always qualify: no store through any table reaches a
@@ -993,13 +1036,17 @@ Spill spillImports(const Context& context, HostImports& state, const GuestAlloca
         bool readOnly;
     };
     std::vector<Victim> victims;
-    for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
-        const auto& entry = it->second;
-        if (entry.joined || pointerHeld(state, entry) || entry.bytes > cap) continue;
-        if (run != nullptr && entry.base < run->base + run->bytes && run->base < entry.base + entry.bytes) continue;
-        const bool readOnly = std::none_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; });
-        if (!readOnly && (!writable || entry.bdaWritten || !std::all_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->releasable; }))) continue;
-        victims.push_back({it, readOnly});
+    {
+        auto& awaited = Targets();
+        std::lock_guard awaitedLock(awaited.mutex);
+        for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
+            const auto& entry = it->second;
+            if (entry.joined || pointerHeld(state, entry) || entry.bytes > cap) continue;
+            if (run != nullptr && entry.base < run->base + run->bytes && run->base < entry.base + entry.bytes) continue;
+            const bool readOnly = std::none_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->writable; });
+            if (!readOnly && (!writable || !demotableWritable(entry, awaited))) continue;
+            victims.push_back({it, readOnly});
+        }
     }
     std::sort(victims.begin(), victims.end(), [](const Victim& left, const Victim& right) {
         if (left.readOnly != right.readOnly) return left.readOnly;
@@ -1021,7 +1068,7 @@ Spill spillImports(const Context& context, HostImports& state, const GuestAlloca
         const auto victimBytes = victim.it->second.bytes;
         {
             std::lock_guard lock(heaps.mutex);
-            heaps.spilled.insert(victimBase);
+            heaps.spilled.emplace(victimBase, victimBytes);
         }
         state.failed.insert(victimBase);
         retireImport(context.device, state, victim.it, lease);
@@ -1088,10 +1135,11 @@ void demoteForHeap(const Context& context, HostImports& state, const GuestAlloca
         heaps.nextDemotion = std::chrono::steady_clock::now() + (spill.count != 0 ? std::chrono::milliseconds(100) : std::chrono::milliseconds(2000));
     }
     heaps.demotions.fetch_add(spill.count, std::memory_order_relaxed);
+    // Every move (at most one line a second), and an attempt that moved nothing every 10 s.
     static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
-    if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(5)) {
+    if (std::chrono::steady_clock::now() - lastReport > (spill.count != 0 ? std::chrono::seconds(1) : std::chrono::seconds(10))) {
         lastReport = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): %llu MiB of live imports past the allowance of %llu MiB; %llu imports (%llu MiB, %llu MiB writable) go to device-local mirrors (cap %llu MiB); %llu (%llu MiB) so far\n", static_cast<unsigned long long>(live >> 20u), static_cast<unsigned long long>(heap.allowance >> 20u), static_cast<unsigned long long>(spill.count), static_cast<unsigned long long>(spill.bytes >> 20u), static_cast<unsigned long long>(spill.writableBytes >> 20u), static_cast<unsigned long long>(cap >> 20u), static_cast<unsigned long long>(heaps.demotions.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heaps.spilledBytes.load(std::memory_order_relaxed) >> 20u));
+        std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): %llu MiB of live imports past the allowance of %llu MiB; %llu imports (%llu MiB, %llu MiB writable) go to device-local mirrors (cap %llu MiB); %llu (%llu MiB) so far\n", heap.heap, static_cast<unsigned long long>(live >> 20u), static_cast<unsigned long long>(heap.allowance >> 20u), static_cast<unsigned long long>(spill.count), static_cast<unsigned long long>(spill.bytes >> 20u), static_cast<unsigned long long>(spill.writableBytes >> 20u), static_cast<unsigned long long>(cap >> 20u), static_cast<unsigned long long>(heaps.demotions.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heaps.spilledBytes.load(std::memory_order_relaxed) >> 20u));
     }
 }
 
@@ -2934,6 +2982,46 @@ void SetRamFreeOverride(std::uint64_t bytes) {
     ramFreeOverride.store(bytes, std::memory_order_relaxed);
 }
 
+void NoteSyncTarget(std::uint64_t address) {
+    if (!heapBudgetEnabled()) return;
+    auto& awaited = Targets();
+    {
+        std::lock_guard lock(awaited.mutex);
+        if (!awaited.addresses.insert(address).second) return;
+    }
+    // A target in a range already given up (it was first used after the range moved): its readers now see
+    // the mirror's write-back once a batch completed, not the GPU's stores as they land. Said once per address.
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    auto found = heaps.spilled.upper_bound(address);
+    if (found == heaps.spilled.begin() || address >= std::prev(found)->first + std::prev(found)->second) return;
+    --found;
+    std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): command packet sync target 0x%llx lies in the range 0x%llx+0x%llx given up for a device-local mirror\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(found->first), static_cast<unsigned long long>(found->second));
+}
+
+std::string DescribeGuestBacking(std::uint64_t address) {
+    char text[256];
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        auto it = state.imports.upper_bound(address);
+        if (it != state.imports.begin() && address < std::prev(it)->second.base + std::prev(it)->second.bytes) {
+            const auto& entry = std::prev(it)->second;
+            std::snprintf(text, sizeof(text), "imported 0x%llx+0x%llx (written by shaders %d, through the BDA table %d)", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), std::atomic_ref<bool>(entry.gpuWritten).load(std::memory_order_relaxed) ? 1 : 0, entry.bdaWritten ? 1 : 0);
+            return text;
+        }
+    }
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    auto found = heaps.spilled.upper_bound(address);
+    if (found != heaps.spilled.begin() && address < std::prev(found)->first + std::prev(found)->second) {
+        --found;
+        std::snprintf(text, sizeof(text), "given up for a device-local mirror 0x%llx+0x%llx", static_cast<unsigned long long>(found->first), static_cast<unsigned long long>(found->second));
+        return text;
+    }
+    return "not imported";
+}
+
 void SetHostImportHeap(std::uint32_t heap) {
     auto& heaps = Heaps();
     heaps.importHeap.store(heap, std::memory_order_relaxed);
@@ -2973,6 +3061,8 @@ DeviceMirrorStats DeviceMirrorCounters() {
     stats.stagingBytes = heaps.stagingBytes.load(std::memory_order_relaxed);
     stats.stagingPeak = heaps.stagingPeak.load(std::memory_order_relaxed);
     stats.stagingSyncs = heaps.stagingSyncs.load(std::memory_order_relaxed);
+    stats.readbackLive = heaps.readbackLive.load(std::memory_order_relaxed);
+    stats.readbackPeak = heaps.readbackPeak.load(std::memory_order_relaxed);
     return stats;
 }
 
@@ -2993,7 +3083,7 @@ std::string DescribeImportCensus() {
         std::uint64_t count = 0;
         std::uint64_t bytes = 0;
     };
-    Kind writable, readOnly, written, releasable, joined, largest[4];
+    Kind writable, readOnly, written, gpuWritten, releasable, joined, largest[4];
     std::uint64_t largestBase[4]{};
     bool largestWritable[4]{};
     {
@@ -3007,6 +3097,10 @@ std::string DescribeImportCensus() {
             if (entry.bdaWritten) {
                 ++written.count;
                 written.bytes += entry.bytes;
+            }
+            if (std::atomic_ref<bool>(entry.gpuWritten).load(std::memory_order_relaxed)) {
+                ++gpuWritten.count;
+                gpuWritten.bytes += entry.bytes;
             }
             if (std::any_of(entry.ranges.begin(), entry.ranges.end(), [](const auto& range) { return range->releasable; })) {
                 ++releasable.count;
@@ -3052,11 +3146,11 @@ std::string DescribeImportCensus() {
     const auto made = DeviceMirrorCounters();
     const auto mib = [](std::uint64_t bytes) { return static_cast<unsigned long long>(bytes >> 20u); };
     char text[1700];
-    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
-        static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
+    std::snprintf(text, sizeof(text), "imports: CPU-writable %llu (%llu MiB), read-only %llu (%llu MiB); BDA-written %llu (%llu MiB); written by shaders %llu (%llu MiB); releasable %llu (%llu MiB); joined %llu (%llu MiB); largest 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s, 0x%llx %llu MiB%s; mirrors: heap %llu (%llu MiB), image %llu (%llu MiB), of them device-local %llu (%llu MiB; made %llu, %llu MiB uploaded in %llu copies through staging of %llu MiB live, peak %llu MiB, %llu bounding syncs; %llu readbacks into buffers of %llu MiB live, peak %llu MiB; %llu imports spilled, %llu MiB, %llu MiB writable, %llu of them past the allowance), CPU shadows %llu (%llu MiB); storage images %llu, %llu with a CPU copy of their guest bytes (%llu MiB, %llu MiB of them current)",
+        static_cast<unsigned long long>(writable.count), mib(writable.bytes), static_cast<unsigned long long>(readOnly.count), mib(readOnly.bytes), static_cast<unsigned long long>(written.count), mib(written.bytes), static_cast<unsigned long long>(gpuWritten.count), mib(gpuWritten.bytes), static_cast<unsigned long long>(releasable.count), mib(releasable.bytes), static_cast<unsigned long long>(joined.count), mib(joined.bytes),
         static_cast<unsigned long long>(largestBase[0]), mib(largest[0].bytes), largestWritable[0] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[1]), mib(largest[1].bytes), largestWritable[1] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[2]), mib(largest[2].bytes), largestWritable[2] ? " rw" : " ro", static_cast<unsigned long long>(largestBase[3]), mib(largest[3].bytes), largestWritable[3] ? " rw" : " ro",
         static_cast<unsigned long long>(heapMirrors.count), mib(heapMirrors.bytes), static_cast<unsigned long long>(imageMirrors.count), mib(imageMirrors.bytes),
-        static_cast<unsigned long long>(deviceMirrors.count), mib(deviceMirrors.bytes), static_cast<unsigned long long>(made.mirrors), mib(made.uploadedBytes), static_cast<unsigned long long>(made.uploads), mib(made.stagingBytes), mib(made.stagingPeak), static_cast<unsigned long long>(made.stagingSyncs), static_cast<unsigned long long>(made.readbacks),
+        static_cast<unsigned long long>(deviceMirrors.count), mib(deviceMirrors.bytes), static_cast<unsigned long long>(made.mirrors), mib(made.uploadedBytes), static_cast<unsigned long long>(made.uploads), mib(made.stagingBytes), mib(made.stagingPeak), static_cast<unsigned long long>(made.stagingSyncs), static_cast<unsigned long long>(made.readbacks), mib(made.readbackLive), mib(made.readbackPeak),
         static_cast<unsigned long long>(made.spills), mib(made.spilledBytes), mib(made.spilledWritableBytes), static_cast<unsigned long long>(made.demotions),
         static_cast<unsigned long long>(shadowed.count), mib(shadowed.bytes),
         static_cast<unsigned long long>(originals.images), static_cast<unsigned long long>(originals.withOriginal), mib(originals.bytes), mib(originals.validBytes));
@@ -3080,15 +3174,18 @@ std::uint64_t ReclaimRetiredImports(const Context& context, std::uint32_t memory
     struct Done {
         ~Done() { reclaiming = false; }
     } done;
+    const auto before = retiredImportBytes.load(std::memory_order_relaxed);
     // Every batch recorded so far completes: none of them reads a dropped import any more. (A sync
     // inside a resource build is what Recorder::SyncThrough does for an overlapping read as well.)
     recorder->Sync();
     const auto current = GuestMemory::GpuHoldSerial();
     std::uint64_t released = 0;
     std::uint64_t kept = 0;
+    std::uint64_t entries = 0;
     {
         auto& ledger = Retired();
         std::lock_guard lock(ledger.mutex);
+        entries = ledger.holds.size();
         for (const auto& [import, hold] : ledger.holds) {
             if (import->released) continue;
             const auto bytes = import->node.mapped().bytes;
@@ -3103,8 +3200,19 @@ std::uint64_t ReclaimRetiredImports(const Context& context, std::uint32_t memory
     }
     static std::atomic<std::uint64_t> reclaims{0};
     const auto count = reclaims.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (count <= 8 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): an allocation failed; synced and freed %llu MiB of dropped imports (%llu MiB dropped in this hold stay; %llu reclaims)\n", heap, static_cast<unsigned long long>(released >> 20u), static_cast<unsigned long long>(kept >> 20u), static_cast<unsigned long long>(count));
-    return released;
+    // What went away in all, the sync's own releases included.
+    const auto after = retiredImportBytes.load(std::memory_order_relaxed);
+    const auto freed = before > after ? before - after : 0;
+    // The live imports at the last heap reading (the import lock may be this thread's already).
+    std::uint64_t live = 0;
+    {
+        auto& heaps = Heaps();
+        std::lock_guard lock(heaps.mutex);
+        live = heaps.last.imports;
+    }
+    const auto counted = LiveGpuMemory(GpuMemoryKind::HostImport);
+    if (count <= 8 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import heap %u (APS5_EXP_HEAP_BUDGET): an allocation failed; synced and freed %llu KiB of dropped imports (%llu KiB by the ledger of %llu entries, %llu KiB dropped in this hold stay; %llu KiB still held, %llu KiB of imports counted beyond the live ones; %llu reclaims)\n", heap, static_cast<unsigned long long>(freed >> 10u), static_cast<unsigned long long>(released >> 10u), static_cast<unsigned long long>(entries), static_cast<unsigned long long>(kept >> 10u), static_cast<unsigned long long>(after >> 10u), static_cast<unsigned long long>(counted > live ? (counted - live) >> 10u : 0), static_cast<unsigned long long>(count));
+    return freed;
 }
 
 std::uint64_t RelieveGpuMemory(const Context& context) {
@@ -4606,6 +4714,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+        noteGpuWritten(region.direct);
     }
 }
 
@@ -4697,7 +4806,16 @@ void GuestBufferMemory::takeHeapReferences() {
 }
 
 std::shared_ptr<Buffer> GuestBufferMemory::readMirror(const ImageMirror& mirror, std::uint64_t begin, std::size_t length, bool wait) {
-    auto readback = std::make_shared<Buffer>(context, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    // Counted while alive (the census): a Buffer that keeps the count, handed out as a plain Buffer.
+    struct Counted {
+        Counted(const Context& context, std::size_t length) : buffer(context, length, VK_BUFFER_USAGE_TRANSFER_DST_BIT) { countLive(Heaps().readbackLive, Heaps().readbackPeak, buffer.Bytes().size()); }
+        Counted(const Counted&) = delete;
+        Counted& operator=(const Counted&) = delete;
+        ~Counted() { Heaps().readbackLive.fetch_sub(buffer.Bytes().size(), std::memory_order_relaxed); }
+        Buffer buffer;
+    };
+    auto counted = std::make_shared<Counted>(context, length);
+    std::shared_ptr<Buffer> readback(counted, &counted->buffer);
     auto* recorder = !wait && GuestMemory::GpuMutex().HeldByThisThread() ? Recorder::Active() : nullptr;
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -4735,6 +4853,7 @@ void GuestBufferMemory::WriteBack() {
         if (region.direct != nullptr) {
             // The GPU wrote imported guest memory directly; page write watching did not see it.
             GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
+            noteGpuWritten(region.direct);
             continue;
         }
         if (region.mirror != nullptr) {
