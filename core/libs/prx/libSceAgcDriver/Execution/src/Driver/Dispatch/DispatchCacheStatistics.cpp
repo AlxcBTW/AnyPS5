@@ -67,6 +67,15 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
         dataRanks += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
+    std::string words;
+    for (std::size_t i = 0; i < counters.missWords.size(); ++i) {
+        if (counters.missWords[i] == 0) continue;
+        char text[32];
+        std::snprintf(text, sizeof(text), " u%zu x%llu", i, count(counters.missWords[i]));
+        words += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-keymiss] no entry (10 s): %llu (%llu under a content key): first sight %llu, same user words as the identity's previous lookup %llu, only pointer words changed %llu, only V# base bits changed %llu, pointer words and V# base bits %llu, other user words %llu; changed user words:%s\n", count(counters.absent), count(counters.missContentKey), count(counters.missFirstSight), count(counters.missSameUser), count(counters.missPointers), count(counters.missAddresses), count(counters.missPointersAddresses), count(counters.missValues), words.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-content] %s (10 s): %llu lookups under a content key (%zu shapes, %llu learned), %llu relocated hits (%llu with moved user words, %llu with moved walked V# bases), refused %llu by user words, %llu by V# fields; inserts: %llu profiles (%.2f pointer words, %.2f relocatable V#s each), %llu with nothing to relocate; %llu hits verified\n", contentKeys() ? "on" : "off (APS5_NO_DISPATCH_CONTENT_KEY)", count(counters.contentLookups), dispatchShapes.size(), count(counters.shapesLearned), count(counters.relocatedHits), count(counters.relocatedPointers), count(counters.relocatedAddresses), count(counters.refusedUser), count(counters.refusedFields), count(counters.profilesBuilt), counters.profilesBuilt + counters.profilesEmpty != 0 ? static_cast<double>(counters.profilePointerWords) / static_cast<double>(counters.profilesBuilt + counters.profilesEmpty) : 0.0, counters.profilesBuilt + counters.profilesEmpty != 0 ? static_cast<double>(counters.profileBuffers) / static_cast<double>(counters.profilesBuilt + counters.profilesEmpty) : 0.0, count(counters.profilesEmpty), count(counters.dataVerified));
     counters = EntryCounters{};
 }
 

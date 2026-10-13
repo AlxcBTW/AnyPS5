@@ -209,6 +209,36 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    // The dispatch identity (the key without the user words): a content key replaces the user
+    // words' address bits with the words behind the pointers once the identity has a shape.
+    std::uint64_t identity = 0x9e3779b97f4a7c15ull;
+    const auto mixIdentity = [&](std::uint64_t value) {
+        identity ^= value;
+        identity *= 0x100000001b3ull;
+    };
+    mixIdentity(address);
+    mixIdentity(packet[4] & 0x8000u);
+    for (const auto threads : compute.partialThreads) mixIdentity(threads);
+    mixIdentity(userData.size());
+    if (keyHygiene) {
+        for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+            const auto found = queue.shader.find(offset);
+            mixIdentity(found == queue.shader.end() ? (1ull << 32u) : found->second);
+        }
+    } else {
+        for (const auto& [offset, value] : queue.shader) {
+            if (offset >= 0x240 && offset < 0x240 + userCount) continue;
+            mixIdentity(offset);
+            mixIdentity(value);
+        }
+    }
+    mixIdentity(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    bool contentKey = false;
+    if (contentKeys() && !noDispatchCache) {
+        const auto content = dispatchContentKey(identity, userData, contentKey);
+        if (contentKey) key = content;
+    }
+    bool relocatedHit = false;
     if (fromAhead && key != ahead.key) {
         fromAhead = false;
         ++groupStats.keyMismatches;
@@ -224,6 +254,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         liveWords = std::move(ahead.liveWords);
         capture = std::move(ahead.capture);
         dataHit = ahead.dataHit;
+        relocatedHit = ahead.relocatedHit;
         cached = ahead.cached;
         validated = ahead.validated;
         ++groupStats.adopted;
@@ -232,7 +263,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, identity, userData, contentKey, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, relocatedHit, cached, validated, missedEntry, missedDiffering);
+        if (relocatedHit && verifyContentHits() != 0) {
+            static std::atomic<std::uint64_t> relocatedSeen{0};
+            if (relocatedSeen.fetch_add(1, std::memory_order_relaxed) % verifyContentHits() == 0) verifyRelocatedHit(snapshot, codeOffset, request, memory, address, captured, *compiledResult);
+        }
     }
     timing.Mark("lookup_cache");
     if (cached) {
@@ -282,7 +317,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, identity, userData, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -297,9 +332,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         parked.attachVariant = attachVariant;
         parked.shaderMemory = shaderMemory;
         parked.captured = captured;
-        parked.liveWords = liveWords;
+        // Moved, not copied: the captured regions of a data or relocated hit point into these words.
+        parked.liveWords = std::move(liveWords);
         parked.capture = capture;
         parked.dataHit = dataHit;
+        parked.relocatedHit = relocatedHit;
         parked.cached = cached;
         parked.validated = validated;
         parked.resolvedAt = std::chrono::steady_clock::now();
@@ -307,7 +344,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (cached) ++groupStats.resolvedHits;
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && dataHit && !relocatedHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatch(queue, packet, submission, indirectArguments);
@@ -352,14 +389,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    // A relocated hit binds other addresses than the variant's recipe was built for (its template,
+    // push bytes and pre-sync surfaces): it takes the ordinary path and attaches no recipe.
     std::shared_ptr<RecipeHit> recipeHit;
-    if (cached && keepVariant != nullptr && !stampValidate()) {
+    if (cached && keepVariant != nullptr && !stampValidate() && !relocatedHit) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || relocatedHit ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 

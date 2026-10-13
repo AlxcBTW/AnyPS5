@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 
@@ -10,7 +12,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     return compiled.poisonedSrtReads == 0u;
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint64_t identity, std::span<const std::uint32_t> userData, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -28,6 +30,19 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             fresh->words.resize(offset + count);
             std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
         }
+        // The user words the walk only read through (candidates for relative runs) and the
+        // inline V#s among the user words, for the content key and [dispatch-keymiss].
+        const std::uint64_t userWords = userData.size() >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << userData.size()) - 1;
+        const std::uint64_t pointerCandidates = capture != nullptr ? capture->userDataUse.asBase & ~capture->userDataUse.asValue & userWords : 0;
+        std::shared_ptr<RelocationProfile> relocation;
+        if (contentKeys() && capture != nullptr && compiledResult != nullptr) {
+            relocation = std::make_shared<RelocationProfile>();
+            relocation->userData.assign(userData.begin(), userData.end());
+            // Same words, runs split where they stop or start being relative to a user word.
+            if (pointerCandidates != 0) relocation->pointerWords = SplitRelativeRuns(srtRegions, capture->userDataUse, pointerCandidates, fresh->runs, fresh->runBases, fresh->words);
+            FindBufferFields(fresh->runs, fresh->words, userData, capture->snapshot.buffers, capture->snapshot.flattenedSrt, *compiledResult, *relocation);
+            relocation->forwarded = compiledResult->shaderDataUserWords;
+        }
 
         DataWordPositionCounts dataCounts;
         if (dataHits() && !stampValidate() && capture != nullptr && !capture->readTrace.leaves.empty()) {
@@ -37,6 +52,19 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dataCounts = DataWordPositions(fresh->runs, capture->readTrace.leaves, capture->readTrace.otherReads, fresh->words, compiledResult->bindings[b].guestDescriptor, fresh->dataPositions, fresh->dataSlots);
                 break;
             }
+        }
+        std::shared_ptr<const DispatchShape> shape;
+        if (relocation != nullptr && !relocation->Empty()) {
+            // A masked compare reports the data positions' live words too (the data hits).
+            auto& positions = relocation->maskPositions;
+            positions.insert(positions.end(), fresh->dataPositions.begin(), fresh->dataPositions.end());
+            std::sort(positions.begin(), positions.end());
+            positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+            auto learned = std::make_shared<DispatchShape>(ShapeOf(*relocation, fresh->runs, fresh->runBases));
+            if (!learned->userMasks.empty()) shape = std::move(learned);
+            fresh->relocation = relocation;
+        } else {
+            fresh->runBases.clear();
         }
         bool stable = true;
         if (stampValidate()) {
@@ -67,6 +95,28 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         }
         std::lock_guard cacheLock(dispatchCacheMutex);
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
+        if (relocation != nullptr) {
+            ++(relocation->Empty() ? entryCounters.profilesEmpty : entryCounters.profilesBuilt);
+            entryCounters.profilePointerWords += static_cast<std::uint64_t>(std::popcount(relocation->pointerWords));
+            entryCounters.profileBuffers += relocation->relocatableBuffers;
+        }
+        // The first shape of an identity stays: a content key must not change under its entries.
+        if (shape != nullptr && dispatchShapes.size() < 65536 && dispatchShapes.try_emplace(identity, shape).second) ++entryCounters.shapesLearned;
+        if (profile) {
+            // [dispatch-keymiss]: what a later miss of this identity can blame (the words the walk
+            // only read through, and the base bits of V#s copied from the user words).
+            auto& known = keyMissMemory[identity];
+            known.pointerWords = pointerCandidates;
+            known.userMasks.assign(userData.size(), 0u);
+            for (const auto& value : capture != nullptr ? std::span<const ShaderRecompiler::DescriptorValue>(capture->snapshot.buffers) : std::span<const ShaderRecompiler::DescriptorValue>{}) {
+                if (value.dwordCount != 4u) continue;
+                for (std::size_t i = 0; i + 4 <= userData.size(); ++i) {
+                    if (userData[i] != value.dwords[0] || userData[i + 1] != value.dwords[1] || userData[i + 2] != value.dwords[2] || userData[i + 3] != value.dwords[3]) continue;
+                    known.userMasks[i] |= BufferBaseLowMask;
+                    known.userMasks[i + 1] |= BufferBaseHighMask;
+                }
+            }
+        }
         if (stable) {
             ++entryCounters.inserts;
             entryCounters.runsInserted += fresh->runs.size();

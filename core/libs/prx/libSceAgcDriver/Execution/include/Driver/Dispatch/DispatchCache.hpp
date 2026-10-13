@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include <algorithm>
@@ -44,6 +45,10 @@ struct DispatchVariant {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
+    // Address-free entries (DispatchRelocation.hpp): what of the stored words only carries an
+    // address; null keeps every word exact (APS5_NO_DISPATCH_CONTENT_KEY=1, or nothing to relocate).
+    std::shared_ptr<const RelocationProfile> relocation;
+
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
@@ -75,7 +80,27 @@ struct EntryCounters {
     std::set<std::size_t> differingPositions;
     std::size_t differingFirstPosition = std::numeric_limits<std::size_t>::max(), differingLastPosition = 0;
     std::map<std::uint64_t, std::uint64_t> differingByProgram;
+
+    // [dispatch-keymiss]: why a lookup found no entry, against the previous lookup of the same
+    // dispatch identity (program, registers, shader): first sight, the same user data (evicted,
+    // or under a content key other words behind the pointers), only pointer words, only V#
+    // address bits, both, or other user words; and which user words changed.
+    std::uint64_t missFirstSight = 0, missSameUser = 0, missPointers = 0, missAddresses = 0, missPointersAddresses = 0, missValues = 0, missContentKey = 0;
+    std::array<std::uint64_t, 32> missWords{};
+
+    // [dispatch-content]: lookups under a content key, relocated hits (moved pointer words, moved
+    // V# bases), relocated variants refused by their user words or V# fields, profiles built at
+    // insert (pointer words and relocatable V#s per profile), shapes learned.
+    std::uint64_t contentLookups = 0, relocatedHits = 0, relocatedPointers = 0, relocatedAddresses = 0, refusedUser = 0, refusedFields = 0;
+    std::uint64_t profilesBuilt = 0, profilesEmpty = 0, profilePointerWords = 0, profileBuffers = 0, shapesLearned = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+// The previous lookup of a dispatch identity, for [dispatch-keymiss].
+struct KeyMissMemory {
+    std::vector<std::uint32_t> userData;
+    std::uint64_t pointerWords = 0;
+    std::vector<std::uint32_t> userMasks;
 };
 
 struct DataMask {
