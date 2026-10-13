@@ -21,6 +21,9 @@ public:
     Framebuffer& operator=(const Framebuffer&) = delete;
     VkFramebuffer Handle() const { return framebuffer; }
     std::span<const VkImageView> Views() const { return views; }
+    // Layers the render pass covers (the framebuffer's, or VkRenderingInfo::layerCount when
+    // rendering without a render pass).
+    std::uint32_t Layers() const { return layers; }
     // Forgets the handle without destroying it (the device it belongs to is already gone).
     void Abandon() noexcept;
 
@@ -28,6 +31,7 @@ private:
     Context context;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     std::vector<VkImageView> views;
+    std::uint32_t layers = 1;
 };
 
 // The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
