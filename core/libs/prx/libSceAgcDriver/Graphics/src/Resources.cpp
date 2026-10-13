@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -143,6 +144,52 @@ std::array<std::atomic<std::int64_t>, static_cast<std::size_t>(HostCopyKind::Cou
     return bytes;
 }
 
+// Where the process's private commit lies: inside the guest arena (the title's private mappings and
+// heaps), in the C runtime's heaps (the driver's and recompiler's own allocations), elsewhere (driver
+// mappings, the tracker tables, stacks). A walk of the address space, so only every printed sample.
+struct PrivateSplit {
+    std::uint64_t arena = 0;
+    std::uint64_t outside = 0;
+    std::uint64_t heaps = 0;
+    std::uint32_t heapCount = 0;
+};
+
+PrivateSplit privateSplit() {
+    PrivateSplit split;
+#ifdef _WIN32
+    std::uintptr_t arenaBase = 0;
+    std::size_t arenaBytes = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    const auto arenaEnd = arenaBase + arenaBytes;
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    auto cursor = reinterpret_cast<std::uintptr_t>(system.lpMinimumApplicationAddress);
+    const auto last = reinterpret_cast<std::uintptr_t>(system.lpMaximumApplicationAddress);
+    while (cursor < last) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) != sizeof(info)) break;
+        const auto begin = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+        const auto end = begin + info.RegionSize;
+        if (end <= cursor) break;
+        if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+            const auto inside = arenaBytes != 0 && begin < arenaEnd && arenaBase < end ? std::min(end, arenaEnd) - std::max(begin, arenaBase) : 0;
+            split.arena += inside;
+            split.outside += (end - begin) - inside;
+        }
+        cursor = end;
+    }
+    HANDLE handles[256];
+    const auto count = std::min<DWORD>(GetProcessHeaps(256, handles), 256);
+    for (DWORD index = 0; index < count; ++index) {
+        HEAP_SUMMARY summary{};
+        summary.cb = sizeof(summary);
+        if (HeapSummary(handles[index], 0, &summary)) split.heaps += summary.cbCommitted;
+    }
+    split.heapCount = count;
+#endif
+    return split;
+}
+
 void sampleCensus(MemoryCensus& census, bool print) {
     std::lock_guard lock(census.mutex);
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
@@ -197,6 +244,8 @@ void sampleCensus(MemoryCensus& census, bool print) {
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::StorageBaseline)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)),
         static_cast<long long>(copies[static_cast<std::size_t>(HostCopyKind::MirrorShadow)].load(std::memory_order_relaxed) / static_cast<std::int64_t>(MiB)));
     std::fprintf(stderr, "[hostmem] %s\n", DescribeImportCensus().c_str());
+    const auto split = privateSplit();
+    std::fprintf(stderr, "[hostmem] private commit by region: guest arena %llu MiB, outside it %llu MiB (C heaps %llu MiB committed in %u heaps, the rest %llu MiB)\n", static_cast<unsigned long long>(split.arena / MiB), static_cast<unsigned long long>(split.outside / MiB), static_cast<unsigned long long>(split.heaps / MiB), split.heapCount, static_cast<unsigned long long>((split.outside > split.heaps ? split.outside - split.heaps : 0) / MiB));
 }
 
 void startCensus(const Context& context) {
