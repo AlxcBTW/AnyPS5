@@ -3737,6 +3737,30 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty()) return CachedTable{space->serial, &space->ranges};
     if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
+    // exp (APS5_EXP_BDA_SWEEP_SKIP mask 4, hot: read once per build here): AddressRanges() splits only
+    // the ranges WITHOUT write permission around the written intervals. When no written interval
+    // overlaps such a range of the space (every write lands in a writable import, or in no range), the
+    // result is the space's own ranges, so the build binds the space's table by its serial: no merge,
+    // no per-writes key, no hash or compare, and no new table per distinct set of writes.
+    if ((BdaSweepSkip() & 4) != 0) {
+        const auto& ranges = space->ranges;
+        const bool inWritable = std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
+            // The space's ranges are sorted and disjoint: the first one ending past the write's start.
+            auto at = std::partition_point(ranges.begin(), ranges.end(), [&](const auto& range) { return range.end <= written.first; });
+            for (; at != ranges.end() && at->begin < written.second; ++at) {
+                if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0) return false;
+            }
+            return true;
+        });
+        if (inWritable) {
+            NoteSweepSkip(1, BdaSweepSkipVerify(), [&] {
+                const auto full = AddressRanges();
+                return full.size() == ranges.size() && (full.empty() || std::memcmp(full.data(), ranges.data(), full.size() * sizeof(full.front())) == 0);
+            });
+            // As for a build without writes: the ranges live in the space this build holds.
+            return CachedTable{space->serial, &space->ranges};
+        }
+    }
     std::lock_guard lock(space->tableMutex);
     const auto found = space->writeTables.find(writes);
     if (found != space->writeTables.end()) {
