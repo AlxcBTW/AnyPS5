@@ -247,12 +247,14 @@ jobs:
       - name: Install lavapipe and the SDL audio and XRandR development files
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev
       - id: mesa
-        run: echo "version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "version=$(dpkg-query -W -f='${Version}' mesa-vulkan-drivers)" >> "$GITHUB_OUTPUT"
+          echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v6
         with:
           path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ github.sha }}
-          restore-keys: mesa-${{ steps.mesa.outputs.version }}-
+          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
+          restore-keys: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-
       - run: cmake -S . -B build $CONFIGURE -DANYPS5_ENABLE_SPIRV_TOOLS=ON
       - name: Check that every test executable is registered with ctest
         run: python3 tools/check_test_registration.py build
@@ -267,7 +269,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .mesa-shader-cache
-          key: mesa-${{ steps.mesa.outputs.version }}-${{ github.sha }}
+          key: mesa-${{ steps.mesa.outputs.version }}-${{ steps.mesa.outputs.cpu }}-${{ github.sha }}
       - run: python3 tools/check_skips.py build/ctest.xml
       - name: Report tests slower than 30 s
         if: ${{ !cancelled() }}
