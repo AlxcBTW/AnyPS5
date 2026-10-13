@@ -42,10 +42,25 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         if (!labelPacket && packetFlush) submit = true;
         if (now - *pending >= labelFlushDeadline()) submit = pendingDue = true;
     }
+    // exp (APS5_EXP_EARLY_LABEL_SUBMIT, never push): another queue lands a wait on a label that is still held
+    // back here (this worker's deferred queue, or the open batch), so it is recorded and submitted now instead
+    // of at the label flush deadline. Same commands in the same order; only the submission moves earlier.
+    bool earlyQueued = false, earlyOpen = false;
+    if ((queued || pending.has_value()) && EarlyLabelSubmitOn() && AwaitedLabels::ActiveExcept(queue) != 0) {
+        for (const auto& label : deferred.labels) {
+            earlyQueued = AwaitedLabels::AnyExcept(queue, [&](std::uint64_t address, std::size_t bytes) { return label.address < address + bytes && address < label.address + label.size; });
+            if (earlyQueued) break;
+        }
+        if (!earlyQueued && pending.has_value()) earlyOpen = AwaitedLabels::AnyExcept(queue, [](std::uint64_t address, std::size_t bytes) { return Graphics::Recorder::SnapshotWriteOverlaps(address, bytes); });
+        if (earlyQueued) {
+            record = true;
+            recordAtLock = false;
+        }
+    }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
     const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
-    if (!submit && !record && !capped && !reap) {
+    if (!submit && !record && !capped && !reap && !earlyOpen) {
         if (recordAtLock) ++recordTriesSkipped;
         return;
     }
@@ -53,7 +68,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
 
     if (record) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-    else if (submit || capped) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+    else if (submit || capped || earlyOpen) GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
 
     bool outright = needsRecord;
     if (LabelBatchSubmit()) {
@@ -64,10 +79,10 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     } else if (deferredDue || (queue == 0 && (capped || (submit && (!selfLocking || pendingDue))))) {
         outright = true;
     }
-    if (outright) {
+    if (outright || earlyQueued) {
         gpuLock.lock();
     } else if (!gpuLock.try_lock()) {
-        ++triesFailed[record ? TryLabel : submit || capped ? TryFlush : TryReap];
+        ++triesFailed[record ? TryLabel : submit || capped || earlyOpen ? TryFlush : TryReap];
         if (selfLocking && record) ++packetLockDeferred;
         else if (selfLocking && submit) ++packetSubmitDeferred;
         return;
@@ -79,7 +94,11 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
         if ((!labelPacket && packetFlush) || deferredDue) submit = true;
     }
     if (localDevice == nullptr) return;
-    if (submit || capped) {
+    const bool earlyNow = (earlyQueued || earlyOpen) && AwaitedLabels::AnyExcept(queue, [&](std::uint64_t address, std::size_t bytes) { return localDevice->OpenWriteOverlaps(address, bytes); });
+    if (earlyNow) {
+        localDevice->SubmitRecorded(queue == 0);
+        AwaitedLabels::NoteEarlySubmit();
+    } else if (submit || capped) {
 
         if (!Graphics::Recorder::PendingLabelSince().has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
         localDevice->SubmitRecorded(queue == 0);

@@ -18,6 +18,7 @@
 #include <vector>
 #include <array>
 #include <map>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
 
@@ -74,6 +75,9 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
     std::copy(packet.begin(), packet.end(), wait.words.begin());
     wait.count = packet.size();
     wait.received = received;
+    // exp (APS5_EXP_EARLY_LABEL_SUBMIT): this queue will land the wait before its next guest read, so the
+    // label's writer should not leave it in an open batch until then.
+    if (EarlyLabelSubmitOn()) wait.awaited = AwaitedLabels::Register(queue, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), Pm4::WaitAwaitedBytes(packet));
     waits.push_back(wait);
 }
 
@@ -99,6 +103,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         stats.waitedMs += ms;
         stats.maxMs = std::max(stats.maxMs, ms);
     }
+    for (const auto& wait : waits) AwaitedLabels::Unregister(wait.awaited);
     waits.clear();
     if (profile && std::chrono::steady_clock::now() - stats.reported > std::chrono::seconds(10)) {
         AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu had to wait for the GPU: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats.lands), static_cast<unsigned long long>(stats.waited), stats.waitedMs, stats.maxMs);
@@ -259,6 +264,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 AgcDriver::ProfilePrint_nid_no_patch("[waitmem] queue 0x%x (10 s): %llu waits satisfied at entry; %llu blocked %.0f ms by end:%s; %llu made a submit, %llu slept; top addresses:%s\n", waiting, static_cast<unsigned long long>(stats.atEntry), static_cast<unsigned long long>(waits), total, line.c_str(), static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.sleeps), tops.c_str());
                 stats = WaitCensus::PerQueue{};
             }
+            const auto wakes = WaitWake::TakeCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[waitwake] (10 s): WAIT_WAKE %d: sleeps ended by a label store %llu, ran to the 200 us bound %llu, signals sent to sleepers %llu; EARLY_LABEL_SUBMIT %d: batches submitted early for an awaited label %llu\n", WaitWakeOn() ? 1 : 0, static_cast<unsigned long long>(wakes.woken), static_cast<unsigned long long>(wakes.timedOut), static_cast<unsigned long long>(wakes.signals), EarlyLabelSubmitOn() ? 1 : 0, static_cast<unsigned long long>(AwaitedLabels::TakeEarlySubmits()));
         }
     } censusWait{*this, CensusOn(), queue, awaited, std::chrono::steady_clock::now()};
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
@@ -454,12 +461,18 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::uint32_t queue;
         ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
+    std::optional<AwaitedLabels::Scope> awaitedScope;
+    if (requireMemory && EarlyLabelSubmitOn()) awaitedScope.emplace(queue, awaited, awaitedBytes);
+    const bool wakeOn = WaitWakeOn();
+    std::uint64_t wakeSeen = 0;
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
+        // Read before this round's checks: a store noted after them bumps it, so the sleep below cannot miss it.
+        if (wakeOn) wakeSeen = WaitWake::Generation();
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             censusWait.end = writer != queue ? WaitEnd::StoredOther : WaitEnd::StoredSame;
             if (writer != queue) notePendingWait(packet, queue, received);
@@ -473,7 +486,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
         } else if (pauseSpin || polls >= 4000) {
             censusWait.slept = true;
-            PollSleep();
+            if (wakeOn) WaitWake::Sleep(wakeSeen, std::chrono::microseconds(200));
+            else PollSleep();
         } else {
             std::this_thread::yield();
         }

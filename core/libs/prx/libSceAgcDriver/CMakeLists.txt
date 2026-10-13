@@ -160,6 +160,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitWake.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
@@ -313,6 +314,17 @@ if(BUILD_TESTING)
     set_tests_properties(agc_performance_trace PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(agc_performance_trace PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(agc_wait_wake_tests tests/WaitWake.cpp Execution/src/Driver/Synchronization/WaitWake.cpp)
+    target_include_directories(agc_wait_wake_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_wait_wake_tests PRIVATE libc)
+    configure_windows_unwind(agc_wait_wake_tests)
+    add_test(NAME agc_wait_wake COMMAND agc_wait_wake_tests)
+    set_tests_properties(agc_wait_wake PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_wait_wake PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
