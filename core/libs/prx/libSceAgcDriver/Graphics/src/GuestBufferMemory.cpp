@@ -841,9 +841,14 @@ std::uint64_t HeapRamReserve() {
     return reserve;
 }
 
-std::uint64_t importBudget(const Context& context, const HostImports& state) {
+// APS5_HOST_IMPORT_MIB (default max(6 GiB, RAM / 2)), or less after a relief.
+std::uint64_t configuredImportBudget(const HostImports& state) {
     const auto limit = state.limit.load(std::memory_order_relaxed);
-    const auto configured = limit != 0 ? std::min(configuredBudget(), limit) : configuredBudget();
+    return limit != 0 ? std::min(configuredBudget(), limit) : configuredBudget();
+}
+
+std::uint64_t importBudget(const Context& context, const HostImports& state) {
+    const auto configured = configuredImportBudget(state);
     if (!heapBudgetEnabled()) return configured;
     return std::min(configured, PollHostHeap(context, state.liveBytes).allowance);
 }
@@ -915,7 +920,10 @@ bool runWritable(const ImportRun& run) {
 void spillReadOnly(const Context& context, HostImports& state, const GuestAllocations::Lease& lease, const ImportRun& run, std::uint64_t needed) {
     if (!runWritable(run)) return;
     const auto heap = PollHostHeap(context, state.liveBytes);
-    const auto cap = std::max<std::uint64_t>(heap.headroom / 2, needed);
+    // The spilled ranges' mirrors go to device-local memory, which must have room for them.
+    const auto room = DeviceHeapRoom();
+    if (room < needed) return;
+    const auto cap = std::min(std::max<std::uint64_t>(heap.headroom / 2, needed), room);
     std::vector<std::map<std::uint64_t, HostImport>::iterator> victims;
     for (auto it = state.imports.begin(); it != state.imports.end(); ++it) {
         const auto& entry = it->second;
@@ -993,9 +1001,26 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     if (auto it = state.imports.lower_bound(base); it != state.imports.begin() && std::prev(it)->second.base + std::prev(it)->second.bytes > base) retireImport(context.device, state, std::prev(it), lease);
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || failures.contains(base)) return nullptr;
-    const auto budget = importBudget(context, state);
-    if (evict && state.liveBytes + bytes > budget) retireLeastRecent(context, state, lease, state.liveBytes + bytes - budget);
-    if (heapBudgetEnabled() && !joined && state.liveBytes + bytes > budget) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - budget);
+    const auto configured = configuredImportBudget(state);
+    auto budget = importBudget(context, state);
+    // Least recently used imports make room under the configured budget only: past the heap's allowance
+    // an evicted import stays in the heap until its batches complete and its range comes back as a mirror.
+    if (evict && state.liveBytes + bytes > configured) retireLeastRecent(context, state, lease, state.liveBytes + bytes - configured);
+    // exp (APS5_EXP_HEAP_BUDGET): past the heap's allowance a range is given up only for a device-local
+    // mirror. A host-visible one would take the same heap and copy the bytes besides (parl0v's run: 4.8 GB
+    // of host heap mirrors replacing the imports byte for byte), so without room in device-local memory the
+    // range is imported anyway, up to the configured budget.
+    if (heapBudgetEnabled() && budget < configured && state.liveBytes + bytes > budget) {
+        if (!joined) spillReadOnly(context, state, lease, run, state.liveBytes + bytes - budget);
+        // Writable ranges have device-local mirrors with =2 only.
+        const bool deviceMirror = DeviceHeapRoom() >= bytes && (!runWritable(run) || heapBudgetMode.load(std::memory_order_relaxed) >= 2);
+        if (state.liveBytes + bytes > budget && !deviceMirror) {
+            budget = configured;
+            static std::atomic<std::uint64_t> overAllowance{0};
+            const auto count = overAllowance.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import heap (APS5_EXP_HEAP_BUDGET): 0x%llx+0x%llx imported past the allowance: no device-local mirror for it (no room, or writable without =2; %llu so far)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(count));
+        }
+    }
     const auto live = state.liveBytes;
     if (live + bytes > budget) {
         // A refused import turns every later use of the range into CPU copies, so say so.

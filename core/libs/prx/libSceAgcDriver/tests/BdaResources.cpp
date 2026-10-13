@@ -750,13 +750,15 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
 
 // A host heap whose import allowance stays 96 KiB whatever the host buffers hold: its budget is the
 // 512 MiB headroom, 96 KiB and the host buffers; its usage the imports and the host buffers.
+VkDeviceSize spillDeviceUsage = 0;
+
 VKAPI_ATTR void VKAPI_CALL spillMemoryProperties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties2* properties) {
     for (auto* next = static_cast<VkBaseOutStructure*>(properties->pNext); next != nullptr; next = next->pNext) {
         if (next->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT) continue;
         auto* budget = reinterpret_cast<VkPhysicalDeviceMemoryBudgetPropertiesEXT*>(next);
         const auto host = LiveGpuMemory(GpuMemoryKind::HostBuffer);
         budget->heapBudget[0] = VkDeviceSize{8} << 30u;
-        budget->heapUsage[0] = 0;
+        budget->heapUsage[0] = spillDeviceUsage;
         budget->heapBudget[1] = (VkDeviceSize{512} << 20u) + 96 * 1024 + host;
         budget->heapUsage[1] = LiveGpuMemory(GpuMemoryKind::HostImport) + host;
     }
@@ -824,6 +826,20 @@ void spillTests(const Context& base, const BdaTestAccess& access) {
     registry(readOnly, true, false);
     static_cast<void>(build());
     Require(HostImportCovers(context, high, 16), "the read-only range was not imported while it fit the host heap");
+    // No room in device-local memory: nothing is spilled, and the writable range is imported past the
+    // allowance rather than mirrored in the same host heap.
+    spillDeviceUsage = VkDeviceSize{8} << 30u;
+    static_cast<void>(PollHostHeap(context, 0, true));
+    const auto full = DeviceMirrorCounters();
+    const auto mirrorsFull = MirrorCounters();
+    registry(writable, true, true);
+    static_cast<void>(build());
+    Require(HostImportCovers(context, low, 16) && HostImportCovers(context, high, 16), "without device-local room a range past the allowance was not imported");
+    Require(DeviceMirrorCounters().spills == full.spills && MirrorCounters().heapMirrors == mirrorsFull.heapMirrors, "without device-local room a range was spilled or mirrored");
+    registry(writable, false, true);
+    static_cast<void>(build());
+    spillDeviceUsage = 0;
+    static_cast<void>(PollHostHeap(context, 0, true));
     const auto before = DeviceMirrorCounters();
     registry(writable, true, true);
     const auto mirrored = build();
