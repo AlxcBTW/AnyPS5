@@ -865,8 +865,8 @@ private:
             }
             std::uint32_t switchLiteralWords = 1u;
             if (op == spv::OpSwitch && instruction.size() > 1u) {
-                const auto selectorType = resultTypes.find(instruction[1]);
-                if (selectorType != resultTypes.end() && types.contains(selectorType->second) && types.at(selectorType->second).width == 64u) switchLiteralWords = 2u;
+                const auto* selectorType = resultTypes.find(instruction[1]);
+                if (selectorType != nullptr && types.contains(*selectorType) && types.at(*selectorType).width == 64u) switchLiteralWords = 2u;
             }
             VisitIdOperands(instruction, switchLiteralWords, [&](std::size_t index) {
                 const auto id = instruction[index];
