@@ -35,6 +35,9 @@ int APS5_VABI abs_nid_postfix(int);
 double APS5_VABI trunc_nid_postfix(double);
 double APS5_VABI ceil_nid_postfix(double);
 double APS5_VABI floor_nid_postfix(double);
+float APS5_VABI truncf_nid_postfix(float);
+float APS5_VABI ceilf_nid_postfix(float);
+float APS5_VABI floorf_nid_postfix(float);
 double APS5_VABI nearbyint_nid_postfix(double);
 double APS5_VABI fma_nid_postfix(double, double, double);
 long double APS5_VABI acosl_nid_postfix(long double);
@@ -98,6 +101,8 @@ int APS5_VABI __isnormal_nid_postfix(double);
 int APS5_VABI __isnormalf_nid_postfix(float);
 int APS5_VABI __isinff_nid_postfix(float);
 int APS5_VABI __isinf_nid_postfix(double);
+int APS5_VABI isnan_nid_postfix(double);
+int APS5_VABI isinf_nid_postfix(double);
 std::lldiv_t APS5_VABI lldiv_nid_postfix(long long, long long);
 std::lldiv_t APS5_VABI ldiv_nid_postfix(std::int64_t, std::int64_t);
 float APS5_VABI nanf_nid_postfix(const char*);
@@ -671,6 +676,26 @@ static void CheckMissingClassificationExports() {
     Require(__signbitl_nid_postfix(negativeNan) == 1);
 }
 
+static void CheckFloatMathExports() {
+    Require(ceilf_nid_postfix(2.25f) == 3.f && ceilf_nid_postfix(-2.25f) == -2.f);
+    Require(floorf_nid_postfix(2.75f) == 2.f && floorf_nid_postfix(-2.25f) == -3.f);
+    Require(truncf_nid_postfix(2.75f) == 2.f && truncf_nid_postfix(-2.75f) == -2.f);
+    Require(ceilf_nid_postfix(2.f) == 2.f && floorf_nid_postfix(-2.f) == -2.f && truncf_nid_postfix(2.f) == 2.f);
+    Require(std::bit_cast<std::uint32_t>(ceilf_nid_postfix(-0.f)) == 0x80000000u);
+    Require(std::bit_cast<std::uint32_t>(floorf_nid_postfix(-0.f)) == 0x80000000u);
+    Require(std::bit_cast<std::uint32_t>(truncf_nid_postfix(-0.f)) == 0x80000000u);
+    Require(ceilf_nid_postfix(std::numeric_limits<float>::infinity()) == std::numeric_limits<float>::infinity());
+    Require(floorf_nid_postfix(-std::numeric_limits<float>::infinity()) == -std::numeric_limits<float>::infinity());
+    Require(std::isnan(ceilf_nid_postfix(std::numeric_limits<float>::quiet_NaN())));
+
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const double infinity = std::numeric_limits<double>::infinity();
+    Require(isnan_nid_postfix(nan) == 1 && isnan_nid_postfix(infinity) == 0 && isnan_nid_postfix(0.0) == 0);
+    Require(isnan_nid_postfix(-nan) == 1 && isnan_nid_postfix(-1.0) == 0);
+    Require(isinf_nid_postfix(infinity) == 1 && isinf_nid_postfix(-infinity) == 1);
+    Require(isinf_nid_postfix(nan) == 0 && isinf_nid_postfix(1.0) == 0);
+}
+
 static void CheckDoubleRounding(double value, std::int64_t expected, bool invalid) {
     for (const bool useLlround : {false, true}) {
         std::feclearexcept(FE_ALL_EXCEPT);
@@ -737,6 +762,7 @@ int main() {
     CheckFloatClassification();
     CheckNoConversionIsPositiveZero();
     CheckMissingClassificationExports();
+    CheckFloatMathExports();
     CheckIntegerConversions();
     CheckExtendedMath();
     Require(atof_nid_postfix(" -12.5tail") == -12.5);
