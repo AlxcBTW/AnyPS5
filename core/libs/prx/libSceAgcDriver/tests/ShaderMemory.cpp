@@ -3451,7 +3451,7 @@ void verifyLegacyPixelRequests() {
         require(!pixel.orderedPixelShader, "a legacy request became a primitive-ordered pixel shader");
         require(request.shader.stage == ShaderStage::Fragment && request.shader.code.size() == 1u && request.shader.code[0] == 0xbf810000u && !request.context.vertex.has_value() && request.context.memory.empty(), "legacy guest context was misaligned");
         require(request.target.vulkanVersion == 0x00401000u && request.target.spirvVersion == 0x00010300u && request.target.subgroupSize == 64u && request.layout.firstBinding == 11u && request.layout.pushConstantSizeBytes == 128u, "legacy target or binding layout was misaligned");
-        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock && !request.target.float64DenormPreserve && !request.target.registrationModules && !request.target.float16DenormPreserve, "legacy request trailer was misread");
+        require(request.useCache == (version == 1u) && request.target.nonConstantImageOffsets == (version >= 6u) && request.target.srgbDecodeFormats == 0u && !request.target.narrowSubgroupClock && !request.target.float64DenormPreserve && !request.target.registrationModules && !request.target.float16DenormPreserve && !request.target.nativeFloat16Arithmetic, "legacy request trailer was misread");
         const auto upgraded = serializer.Deserialize(serializer.Serialize(request));
         require(upgraded.request.context.pixel->targetExportMapping == pixel.targetExportMapping && RecompileCacheKey::ContextHash(upgraded.request) == RecompileCacheKey::ContextHash(request), "upgrading a legacy capture changed its pixel mapping");
     }
@@ -3708,6 +3708,64 @@ void verifyComputedTexelOffsets() {
         const auto [constantMask, constantGather] = sampleOperands(recompile(constant, offsets));
         require((constantMask & spv::ImageOperandsConstOffsetMask) != 0u && (constantMask & spv::ImageOperandsOffsetMask) == 0u && !constantGather, "texel offsets: a constant offset is not a ConstOffset operand");
     }
+}
+
+void verifyNativeFloat16Arithmetic() {
+    using namespace ShaderRecompiler;
+    static std::array<std::uint32_t, 64> buffer{};
+    const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(buffer.data()));
+    const std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>((base >> 32u) & 0xffffu), 256u, 0xfacu};
+    const std::array<std::uint32_t, 5> capabilities{1u, spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve, 6030u};
+    const std::vector<std::uint32_t> code{0xe0300000u, 0x80000200u, 0xbf8c3f70u, 0x64060502u, 0xcc0e4004u, 0x1c0a0502u, 0xe0700004u, 0x80000300u, 0xe0700008u, 0x80000400u, 0xbf810000u};
+    struct Shape {
+        std::size_t conversions = 0;
+        std::size_t halfAdds = 0;
+        std::size_t fusedHalves = 0;
+    };
+    const auto shape = [&](bool native) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x30000u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.context.floatMode = ShaderFloatMode{0xf0u, true, false, false};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.supportedCapabilities = capabilities;
+        request.target.nativeFloat16Arithmetic = native;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        AgcDriver::ShaderMemory memory({});
+        static_cast<void>(memory.Capture(request));
+        request.context.memory = memory.Regions();
+        const auto words = Recompile(request).spirv;
+        std::vector<std::uint32_t> halves;
+        std::vector<std::uint32_t> halfVectors;
+        Shape result;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            require(count != 0 && count <= words.size() - cursor, "native f16 arithmetic: truncated SPIR-V instruction");
+            const auto op = words[cursor] & 0xffffu;
+            if (op == spv::OpTypeFloat && words[cursor + 2] == 16u) halves.push_back(words[cursor + 1]);
+            if (op == spv::OpTypeVector && words[cursor + 3] == 2u && std::ranges::find(halves, words[cursor + 2]) != halves.end()) halfVectors.push_back(words[cursor + 1]);
+            if (op == spv::OpFConvert) ++result.conversions;
+            if (op == spv::OpFAdd && std::ranges::find(halfVectors, words[cursor + 1]) != halfVectors.end()) ++result.halfAdds;
+            if (op == 4427u) ++result.fusedHalves;
+            cursor += count;
+        }
+        return result;
+    };
+    const auto lowered = shape(false);
+    const auto native = shape(true);
+    require(lowered.conversions != 0u && lowered.fusedHalves == 0u, "native f16 arithmetic: the f32 lowering changed without the flag");
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    require(native.halfAdds != 0u && native.fusedHalves == 0u, "native f16 arithmetic: v_add_f16 is not an f16 OpFAdd, or OpFmaKHR reached the bundled SPIRV-Tools");
+#else
+    require(native.conversions == 0u, "native f16 arithmetic: v_add_f16 or v_pk_fma_f16 still converts through f32");
+    require(native.halfAdds != 0u && native.fusedHalves == 1u, "native f16 arithmetic: v_add_f16 is not an f16 OpFAdd or v_pk_fma_f16 is not one OpFmaKHR");
+#endif
 }
 
 void verifyShaderClockScopes() {
@@ -5194,6 +5252,7 @@ int main(int argc, char** argv) {
         verifyF16PixelParameterSlots();
         verifyComputedTexelOffsets();
         verifyShaderClockScopes();
+        verifyNativeFloat16Arithmetic();
         verifyInt64AtomicCapabilities();
         verifySpecializedBufferAtomicBindings();
         verifyCoherentBufferAccesses();
@@ -5327,6 +5386,9 @@ int main(int argc, char** argv) {
         auto float16Denormals = uncached;
         float16Denormals.target.float16DenormPreserve = true;
         require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(float16Denormals)).request.target.float16DenormPreserve, "f16 denormal preservation was lost in serialization");
+        auto nativeHalf = uncached;
+        nativeHalf.target.nativeFloat16Arithmetic = true;
+        require(RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(nativeHalf)).request.target.nativeFloat16Arithmetic, "native f16 arithmetic was lost in serialization");
         auto changedLayout = request;
         changedLayout.layout.pushConstantSizeBytes = 64;
         require(!Recompile(changedLayout).cacheHit, "binding layout change reused an incompatible variant");

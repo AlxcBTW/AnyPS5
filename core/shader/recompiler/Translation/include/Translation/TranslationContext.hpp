@@ -6,6 +6,7 @@
 #include <array>
 #include <cstdint>
 #include <initializer_list>
+#include <span>
 #include <utility>
 
 namespace ShaderRecompiler {
@@ -25,6 +26,7 @@ public:
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
+    void SetNativeFloat16Arithmetic(bool arithmetic, bool fma) { nativeFloat16Arithmetic = arithmetic; nativeFloat16Fma = fma; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
     void TranslateCodeTableLoad(const RdnaInstruction& instruction, const ControlFlowGraph::CodeTableLoad& table);
     void TranslateUnlinkedCall(const RdnaInstruction& instruction);
@@ -64,6 +66,14 @@ private:
     IrF32 clampF16Overflow(IrF32 value, std::initializer_list<IrValue*> sources);
     void rejectHalfOrDoubleOutputModifier(const RdnaOperand& operand) const;
     IrU32 clampF16Bits(const RdnaOperand& operand, IrU32 bits);
+    bool nativeFloat16Op(IrOpcode opcode) const;
+    IrU32 packedF16Source(const RdnaOperand& operand);
+    IrU32 laneMask16(IrU32 signBits);
+    IrU32 selectLanes16(IrU32 mask, IrU32 chosen, IrU32 other);
+    IrU32 clampF16PairBits(const RdnaOperand& operand, IrU32 bits);
+    bool packedFloat16Native(const RdnaInstruction& inst, IrOpcode opcode, bool accumulator, bool quietSnan);
+    IrU32 clampF16OverflowBits(IrU32 bits, std::span<const IrU32> sources);
+    void nativeFloat16Result(const RdnaInstruction& inst, IrOpcode opcode, std::span<const IrU32> sources);
     void writeOperand(const RdnaOperand& operand, IrValue* value);
     IrU32 packHalf2x16(IrF32 low, IrF32 high);
     void write16Bits(const RdnaOperand& operand, IrU32 value);
@@ -368,6 +378,8 @@ private:
     RoundingState rounding;
     bool ieeeMode = false;
     bool nativeFloat16 = false;
+    bool nativeFloat16Arithmetic = false;
+    bool nativeFloat16Fma = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;

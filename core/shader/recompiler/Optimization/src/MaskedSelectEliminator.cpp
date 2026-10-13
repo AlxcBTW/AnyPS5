@@ -63,6 +63,12 @@ bool isLaneLocal(IrOpcode opcode) {
         case IrOpcode::CompositeExtractU32x3:
         case IrOpcode::CompositeExtractU32x4:
         case IrOpcode::PackHalf2x16:
+        case IrOpcode::F16x2Add:
+        case IrOpcode::F16x2Mul:
+        case IrOpcode::F16x2Fma:
+        case IrOpcode::F16x2Min:
+        case IrOpcode::F16x2Max:
+        case IrOpcode::F16x2Nan:
         case IrOpcode::PackFloat2x16Rtz:
         case IrOpcode::FPAdd16x2:
         case IrOpcode::FPMul16x2:

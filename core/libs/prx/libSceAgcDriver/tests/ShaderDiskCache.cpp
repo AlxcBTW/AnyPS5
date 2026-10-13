@@ -618,6 +618,7 @@ void verifyKeySensitivity() {
     changes("the narrow subgroup clock", [](SampleRequest& sample) { sample.request.target.narrowSubgroupClock = true; });
     changes("f64 denormal preservation", [](SampleRequest& sample) { sample.request.target.float64DenormPreserve = true; });
     changes("f16 denormal preservation", [](SampleRequest& sample) { sample.request.target.float16DenormPreserve = true; });
+    changes("native f16 arithmetic", [](SampleRequest& sample) { sample.request.target.nativeFloat16Arithmetic = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
     changes("the invocation limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupInvocations = 512; });
     changes("the shared memory limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSharedMemoryBytes = 32768; });

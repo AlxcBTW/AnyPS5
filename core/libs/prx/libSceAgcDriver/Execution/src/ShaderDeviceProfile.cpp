@@ -32,6 +32,7 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     const auto* clock = findFeatures<VkPhysicalDeviceShaderClockFeaturesKHR>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_CLOCK_FEATURES_KHR);
     const auto* drawParameters = findFeatures<VkPhysicalDeviceShaderDrawParametersFeatures>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES);
     const auto* maintenance8 = findFeatures<VkPhysicalDeviceMaintenance8FeaturesKHR>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR);
+    const auto* fma = findFeatures<VkPhysicalDeviceShaderFmaFeaturesKHR>(deviceInfo.pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR);
     Require(target.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version, "shader device profile has an incompatible BDA ABI");
     Require(bda != nullptr && bda->bufferDeviceAddress == VK_TRUE && core.shaderInt64 == VK_TRUE, "shader runtime requires enabled bufferDeviceAddress and shaderInt64");
     Require(bytes != nullptr && bytes->storageBuffer8BitAccess == VK_TRUE, "shader runtime requires enabled storageBuffer8BitAccess");
@@ -66,11 +67,13 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     checkFeature(spv::CapabilityFragmentBarycentricKHR, barycentricEnabled, "fragmentShaderBarycentric");
     checkFeature(spv::CapabilityMeshShadingEXT, meshEnabled, "meshShader");
     checkFeature(spv::CapabilityDrawParameters, drawParameters != nullptr && drawParameters->shaderDrawParameters == VK_TRUE, "shaderDrawParameters");
+    checkFeature(static_cast<spv::Capability>(6030), fma != nullptr && fma->shaderFmaFloat16 == VK_TRUE, "shaderFmaFloat16");
     checkFeature(spv::CapabilityShaderClockKHR, clock != nullptr && clock->shaderSubgroupClock == VK_TRUE && clock->shaderDeviceClock == VK_TRUE, "shader clock");
     Require(!target.fragmentShaderBarycentricEnabled || barycentricEnabled, "shader device profile exposes disabled barycentrics");
     Require(!target.mesh || meshEnabled, "shader device profile exposes disabled mesh shaders");
     Require(!target.nonConstantImageOffsets || (maintenance8 != nullptr && maintenance8->maintenance8 == VK_TRUE), "shader device profile exposes disabled maintenance8");
     Require(!target.tessellation || core.tessellationShader == VK_TRUE, "shader device profile exposes disabled tessellation");
+    Require(!target.nativeFloat16Arithmetic || (hasCapability(spv::CapabilityFloat16) && hasCapability(spv::CapabilityRoundingModeRTE) && hasCapability(spv::CapabilityDenormPreserve)), "shader device profile exposes native f16 arithmetic without 16-bit RTE and preserved denormals");
     for (const auto extension : target.supportedExtensions) extensions.emplace_back(extension);
     std::ranges::sort(extensions);
     extensions.erase(std::unique(extensions.begin(), extensions.end()), extensions.end());
