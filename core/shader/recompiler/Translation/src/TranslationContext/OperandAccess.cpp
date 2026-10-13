@@ -342,6 +342,7 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
+    if (relaxedFloat) return result;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* bits = &ir.BitCastU32(*result);
     bits = &ir.Select(isNan(*bits), ir.Constant(0xffc00000u), *bits);
@@ -356,6 +357,7 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 }
 
 IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
+    if (relaxedFloat) return ir.ConstantBool(false);
     IrValue& lhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*lhs), ir.Constant(0x7fffffffu));
     IrValue& rhsMagnitude = ir.BitwiseAnd(ir.BitCastU32(*rhs), ir.Constant(0x7fffffffu));
     const auto infZero = [&](IrValue& inf, IrValue& zero) -> IrValue& { return ir.LogicalAnd(ir.IEqual(inf, ir.Constant(0x7f800000u)), ir.IEqual(zero, ir.Constant(0u))); };

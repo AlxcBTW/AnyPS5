@@ -24,6 +24,7 @@ bool roundsProductSeparately(const RdnaInstruction& inst) {
 }
 
 std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& inst) const {
+    if (relaxedFloat) return 0u;
     std::uint32_t flush = 0u;
     switch (inst.op) {
     case RdnaOpcode::VAddF32:

@@ -25,6 +25,7 @@ public:
         rounding = RoundingState{static_cast<std::uint8_t>(mode.has_value() ? mode->floatMode & ModeRoundBits : 0u), 0u};
     }
     void SetEntryRounding(const RoundingState& state) { setRounding(state); }
+    void SetRelaxedFloat(bool relaxed) { relaxedFloat = relaxed; }
     void SetNativeFloat16(bool enabled) { nativeFloat16 = enabled; }
     void SetNativeFloat16Arithmetic(bool arithmetic, bool fma) { nativeFloat16Arithmetic = arithmetic; nativeFloat16Fma = fma; }
     void AddBranchCondition(const BasicBlock& source, BlockInfo& info);
@@ -377,6 +378,7 @@ private:
     std::optional<ShaderFloatMode> declaredFloatMode;
     RoundingState rounding;
     bool ieeeMode = false;
+    bool relaxedFloat = false;
     bool nativeFloat16 = false;
     bool nativeFloat16Arithmetic = false;
     bool nativeFloat16Fma = false;

@@ -35,6 +35,7 @@ struct TranslateOptions {
     bool fragmentShaderBarycentricEnabled = false;
     bool nativeFloat16 = false;
     std::optional<ShaderFloatMode> floatMode;
+    bool relaxedFloat = false;
     bool nativeFloat16Arithmetic = false;
     bool nativeFloat16Fma = false;
     ShaderStageInputInfo inputInfo;

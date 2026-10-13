@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include "CacheKey.hpp"
+#include "ShaderSwitches.hpp"
 #include "CompiledVariant.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
@@ -83,6 +84,18 @@ ShaderStageKind toShaderStageKind(ShaderStage stage) {
 }
 
 namespace {
+
+// APS5_RELAXED_FLOAT=1: the translator reads and writes f32 operands without the guest's denormal flush,
+// skips the tiny-product flush of mul, mad and fma, and lets the host pick the NaN of add, sub, mul, mad
+// and fma. Legacy mul/mad zero rules, min/max NaN and zero rules, unary specials, f16 and f64 stay exact.
+bool RelaxedFloat() {
+    static const bool relaxed = [] {
+        const bool enabled = SwitchEnabled("APS5_RELAXED_FLOAT");
+        if (enabled) std::fputs("[shader] relaxed float: f32 denormal flushes, tiny-product flushes and NaN payload propagation are not emulated\n", stderr);
+        return enabled;
+    }();
+    return relaxed;
+}
 
 // The host subgroup width wave64 programs are laid out for. Debug aid: APS5_SINGLE_LANE=<hex code
 // addresses, comma separated, or "all"> keeps the listed programs at one guest lane per invocation.
@@ -210,6 +223,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.relaxedFloat = RelaxedFloat();
     translateOptions.nativeFloat16Arithmetic = request.target.nativeFloat16Arithmetic;
 #if !ANYPS5_ENABLE_SPIRV_TOOLS
     translateOptions.nativeFloat16Fma = request.target.nativeFloat16Arithmetic && std::ranges::find(request.target.supportedCapabilities, 6030u) != request.target.supportedCapabilities.end();

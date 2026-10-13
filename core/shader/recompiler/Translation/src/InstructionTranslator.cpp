@@ -530,6 +530,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         TranslationContext context(program, *blocks[typedIndex], vectorLimit);
         context.SetPixelInput(options.inputInfo.pixel, options.fragmentShaderBarycentricEnabled);
         context.SetFloatMode(options.floatMode);
+        context.SetRelaxedFloat(options.relaxedFloat);
         context.SetNativeFloat16(options.nativeFloat16);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
         context.SetNativeFloat16Arithmetic(options.nativeFloat16Arithmetic, options.nativeFloat16Fma);
