@@ -250,6 +250,7 @@ public:
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
+        auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
@@ -260,7 +261,7 @@ public:
                 }
             }
             const auto base = cursor & ~(pageBytes - 1);
-            const auto found = views.find(base);
+            const auto found = viewAt(base, position);
             if (found != views.end()) {
                 auto& view = found->second;
                 auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
@@ -361,9 +362,10 @@ public:
 
 private:
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        auto position = views.lower_bound(address & ~(pageBytes - 1));
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
-            if (const auto found = views.find(base); found != views.end()) {
+            if (const auto found = viewAt(base, position); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS) return false;
                 cursor = std::min(end, base + pageBytes);
                 continue;
@@ -594,6 +596,16 @@ private:
     }
 
     std::map<std::uintptr_t, View> views;
+
+    using Views = std::map<std::uintptr_t, View>;
+
+    Views::iterator viewAt(std::uintptr_t base, Views::iterator& position) {
+        if (position != views.end() && position->first < base) {
+            ++position;
+            if (position != views.end() && position->first < base) position = views.lower_bound(base);
+        }
+        return position != views.end() && position->first == base ? position : views.end();
+    }
     std::map<std::pair<std::uintptr_t, std::uint64_t>, std::weak_ptr<SharedPage>> physical;
     std::map<std::uintptr_t, std::size_t> splitAliases;
     std::mutex mutex;
