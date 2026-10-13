@@ -66,6 +66,13 @@ public:
     void SettleShaderPreparations(std::span<const Shader* const> stages);
     static void FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, const DrawProgram& program, Pm4::DrawParameters& parameters);
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
+    // The CPU-side reason ClassifyIndirectDraw gives whatever the front stage compiles to (its
+    // checks that read only the stages, the packet and the device), or none. Needs the packet's
+    // draw index SGPR resolved.
+    static std::optional<Graphics::IndirectDrawPath> IndirectCpuBeforeCapture(const Graphics::ShaderStages& stages, bool rectList, const Pm4::DrawParameters& drawParameters, const VulkanDevice::IndirectDrawSupport& support);
+    // Whether the CPU-side indirect loop draws `arguments`: a record without vertices or instances,
+    // or an indexed one starting past the bound index range, draws nothing.
+    static bool IndirectRecordDraws(const Pm4::DrawArguments& arguments, const Pm4::DrawParameters& drawParameters);
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request);
     DrawEntryCounters DrawCacheCounters();
     struct DispatchCacheFootprint {
@@ -170,6 +177,7 @@ private:
     static void recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads);
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey);
     static bool drawPrecheck();
+    static bool emptyIndirectSkip();
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);

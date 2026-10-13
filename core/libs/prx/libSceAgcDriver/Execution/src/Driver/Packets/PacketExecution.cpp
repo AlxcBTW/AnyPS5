@@ -361,6 +361,8 @@ void Driver::execute(const Submission& submission) {
                         throw std::runtime_error(rejected);
                     } else if (verdict == DrawVerdict::Nothing) {
                         countSkip(Graphics::DrawSkip::Nothing);
+                    } else if (verdict == DrawVerdict::EmptyIndirect) {
+                        countSkip(Graphics::DrawSkip::EmptyIndirect);
                     } else if (traceDraws) {
                         std::fprintf(stderr, "[draw] target 0x%llx mask 0x%x ok\n",static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e));
                     }
