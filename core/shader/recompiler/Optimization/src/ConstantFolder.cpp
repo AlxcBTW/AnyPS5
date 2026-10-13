@@ -483,10 +483,6 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
                 replaceWith(value, builder.Constant(static_cast<std::uint32_t>(operand.ImmediateU16())));
                 return true;
             }
-            if (operand.Opcode() == IrOpcode::ConvertU16U32) {
-                replaceWith(value, *operand.Argument(0));
-                return true;
-            }
             return false;
         }
         case IrOpcode::ConvertU8U32: {
@@ -501,10 +497,6 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
             auto& operand = resolveArg(value, 0);
             if (isImmediate(operand, IrType::U8)) {
                 replaceWith(value, builder.Constant(static_cast<std::uint32_t>(operand.ImmediateU8())));
-                return true;
-            }
-            if (operand.Opcode() == IrOpcode::ConvertU8U32) {
-                replaceWith(value, *operand.Argument(0));
                 return true;
             }
             return false;

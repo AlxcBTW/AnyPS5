@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <chrono>
 #include <algorithm>
+#include <numeric>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -630,6 +631,18 @@ bool sameRun(const Entry& entry, const ImportRun& run) {
         if (entry.ranges[index].owner_before(run.ranges[index]) || run.ranges[index].owner_before(entry.ranges[index])) return false;
     }
     return true;
+}
+
+bool wouldRetireImport(const HostImports& state, const ImportRun& run) {
+    if (run.ranges.empty()) return false;
+    const auto next = state.imports.lower_bound(run.base);
+    if (next != state.imports.end()) {
+        if (next->first == run.base && sameRun(next->second, run)) return false;
+        if (next->first < run.base + run.bytes) return true;
+    }
+    if (next == state.imports.begin()) return false;
+    const auto& previous = std::prev(next)->second;
+    return previous.base + previous.bytes > run.base;
 }
 
 bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
@@ -2026,6 +2039,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
         const auto range = mapped.lock();
         if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
         try {
+            if (!GuestMemory::GpuMutex().HeldByThisThread() && wouldRetireImport(state, importRun(current, range->address))) return false;
             if (importAllocation(context, state, range->address, current) == nullptr && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) state.failed.erase(importRun(current, range->address).base);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[gpu] import of GPU memory mapped at 0x%llx+0x%zx failed: %s\n", static_cast<unsigned long long>(range->address), range->bytes, error.what());
@@ -2727,7 +2741,9 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
-    std::sort(regions.begin(), regions.end(), [](const Region& left, const Region& right) { return left.begin < right.begin; });
+    std::vector<std::uint32_t> order(regions.size());
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(), [&](std::uint32_t left, std::uint32_t right) { return regions[left].begin < regions[right].begin; });
     // Merged regions stay sparse when either part covered uncommitted pages.
     const auto mergeBacked = [](Region& into, const Region& from) {
         if (!into.sparse && !from.sparse) return;
@@ -2745,7 +2761,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         if (!into.sparse) into.backed.clear();
     };
     std::vector<Region> merged;
-    for (auto& region : regions) {
+    merged.reserve(regions.size());
+    for (const auto index : order) {
+        auto& region = regions[index];
         if (!merged.empty() && region.begin < merged.back().end) {
             auto& previous = merged.back();
             if (previous.mirror != nullptr || region.mirror != nullptr) {
@@ -3125,17 +3143,16 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         } else {
             // `uploaded` holds the backed pieces back to back.
             const auto target = region.buffer->Bytes().first(static_cast<std::size_t>(allocated));
-            const bool zeroGaps = region.bufferEnd != 0;
             std::size_t cursor = 0;
             for (const auto& [first, last] : region.backed) {
                 const auto at = static_cast<std::size_t>(first - region.begin);
-                if (zeroGaps && at > cursor) std::memset(target.data() + cursor, 0, at - cursor);
+                if (at > cursor) std::memset(target.data() + cursor, 0, at - cursor);
                 const auto piece = target.subspan(at, static_cast<std::size_t>(last - first));
                 GuestMemory::Read(first, piece);
                 if (written) region.uploaded.insert(region.uploaded.end(), piece.begin(), piece.end());
                 cursor = at + piece.size();
             }
-            if (zeroGaps && cursor < target.size()) std::memset(target.data() + cursor, 0, target.size() - cursor);
+            if (cursor < target.size()) std::memset(target.data() + cursor, 0, target.size() - cursor);
         }
     }
     else std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());

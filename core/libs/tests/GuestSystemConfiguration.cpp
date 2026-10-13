@@ -86,6 +86,26 @@ static void CheckPhysicalMemorySysctl() {
     Require(sysctl_nid_postfix(mib, 2, &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
     Require(sysctlbyname_nid_postfix("hw.physmem", &value, &length, &value, sizeof(value)) == -1 && *__error_nid_postfix() == 1);
 }
+#if defined(__x86_64__) || defined(__i386__)
+static void CheckModelSysctl() {
+    const int mib[] = {6, 2};
+    *__error_nid_postfix() = 13;
+    std::size_t length = 0;
+    Require(sysctl_nid_postfix(mib, 2, nullptr, &length, nullptr, 0) == 0 && length > 1);
+    const std::size_t size = length;
+    char model[128] = {};
+    length = sizeof(model);
+    Require(sysctlbyname_nid_postfix("hw.model", model, &length, nullptr, 0) == 0 && length == size);
+    Require(std::strlen(model) + 1 == size && model[0] != ' ');
+    Require(*__error_nid_postfix() == 13);
+    char truncated[4] = {};
+    length = sizeof(truncated);
+    Require(sysctl_nid_postfix(mib, 2, truncated, &length, nullptr, 0) == -1 && *__error_nid_postfix() == 12);
+    Require(length == sizeof(truncated) && std::memcmp(truncated, model, sizeof(truncated)) == 0);
+    length = sizeof(model);
+    Require(sysctlbyname_nid_postfix("hw.model", model, &length, model, size) == -1 && *__error_nid_postfix() == 1);
+}
+#endif
 static void CheckMachdepCachelineSizeSysctl() {
     *__error_nid_postfix() = 13;
     int value = 0x5a5a5a5a;
@@ -232,6 +252,9 @@ static void CheckArandomSysctl() {
 int main() {
     CheckProcessorCountSysctl();
     CheckPhysicalMemorySysctl();
+#if defined(__x86_64__) || defined(__i386__)
+    CheckModelSysctl();
+#endif
     CheckMachdepCachelineSizeSysctl();
     CheckPathnameSysctl();
     CheckSystemSwVersion();
