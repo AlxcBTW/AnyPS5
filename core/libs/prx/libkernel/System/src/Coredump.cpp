@@ -13,9 +13,13 @@ static std::atomic<uint64_t> g_coredumpContext{0};
 
 static constexpr int SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER = static_cast<int>(0x81180003u);
 
-static int attachOutsideCoredumpHandler(const char* function, const void* mem, size_t size) {
+static void requireRegionOutsideHandler(const char* function, const void* mem, size_t size) {
     if (mem == nullptr || size == 0 || size > UINTPTR_MAX - reinterpret_cast<uintptr_t>(mem))
         throw std::runtime_error(std::string(function) + ": null, empty or wrapping region outside the core dump handler");
+}
+
+static int attachOutsideCoredumpHandler(const char* function, const void* mem, size_t size) {
+    requireRegionOutsideHandler(function, mem, size);
     return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
@@ -61,9 +65,17 @@ int APS5_VABI sceCoredumpSetUserDataType(void) {
     return 0;
 }
 
-int APS5_VABI sceCoredumpDebugTextOut(void) {
-    NotImplemented_nid_no_patch("dei8oUx6DbU");
-    return 0;
+void APS5_VABI sceCoredumpDebugTextOut(const char* str, int len) {
+    if (len < 0 || (str == nullptr && len != 0))
+        throw std::runtime_error(std::string(__func__) + ": null text or negative length");
+    if (len == 0) return;
+    const int shown = str[len - 1] == '\n' ? len - 1 : len;
+    std::fprintf(stderr, "[coredump] %.*s\n", shown, str);
+}
+
+int64_t APS5_VABI sceCoredumpWriteUserData(const void* data, size_t size) {
+    requireRegionOutsideHandler(__func__, data, size);
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpGetStopInfoCpu(void) {
