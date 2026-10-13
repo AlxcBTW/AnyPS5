@@ -110,6 +110,16 @@ int APS5_VABI sceNpAuthPollAsync(int req_id, int* result) {
  return NP_POLL_ASYNC_FINISHED;
 }
 
+int APS5_VABI sceNpAuthSetTimeout(int req_id, int resolve_retry, uint32_t resolve_timeout, uint32_t connect_timeout, uint32_t send_timeout, uint32_t receive_timeout) {
+ (void)resolve_retry;
+ (void)resolve_timeout;
+ (void)connect_timeout;
+ (void)send_timeout;
+ (void)receive_timeout;
+ std::lock_guard lock(g_requestMutex);
+ return g_requests.contains(req_id) ? 0 : ORBIS_NP_AUTH_ERROR_REQUEST_NOT_FOUND;
+}
+
 int APS5_VABI sceNpAuthWaitAsync(int req_id, int* result) {
  if (!result) return ORBIS_NP_AUTH_ERROR_INVALID_ARGUMENT;
  std::lock_guard lock(g_requestMutex);

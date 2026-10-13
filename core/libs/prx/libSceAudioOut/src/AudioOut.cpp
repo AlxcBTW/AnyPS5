@@ -500,6 +500,11 @@ int APS5_VABI sceAudioOutGetPortState(int handle, AudioOutPortState* state) {
     return 0;
 }
 
+int APS5_VABI sceAudioOutDeviceIdOpen() {
+    NotImplemented_nid_no_patch(__func__);
+    return 0;
+}
+
 int APS5_VABI sceAudioOutSysClose() {
     NotImplemented_nid_no_patch(__func__);
     return 0;

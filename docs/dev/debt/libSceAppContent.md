@@ -4,6 +4,7 @@
 
 - [sceAppContentDownloadDataGetAvailableSpaceKb](../../../core/libs/prx/libSceAppContent/Export.cpp) (libSceAppContent) - a title whose `param.json` declares `downloadDataSize` 0 gets 0 KB and OK; the console's behaviour for a title without a download data area is unverified (it may return an error instead). KytyPS5 does not special-case it, and shadPS4 stubs 1048576 KB
 - [sceAppContentGetAddcontDownloadProgress](../../../core/libs/prx/libSceAppContent/Export.cpp) (libSceAppContent) - imported by PPSA08755, which fails to load without it; added without an implementation because its behavior is unverified. [SharpProspero](https://github.com/SvenGDK/SharpProspero) lists `(uint32_t serviceLabel, entitlementLabel, SceAppContentAddcontDownloadProgress*)`, but no PS5 reference gives the progress layout or the error codes
+- [sceAppContentDownloadDataFormat](../../../core/libs/prx/libSceAppContent/Export.cpp) (libSceAppContent) - empties the `/download0` directory, creating it if needed. Imported by PPSA01317. A null mount point returns `PARAMETER` as `sceAppContentTemporaryDataFormat` does, and another mount point throws as in `sceAppContentDownloadDataGetAvailableSpaceKb`; the console's error codes for both and its behaviour with files still open are unverified
 
 ### Functional
 
