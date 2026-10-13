@@ -78,9 +78,11 @@ int64_t APS5_VABI sceCoredumpWriteUserData(const void* data, size_t size) {
     return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
-int APS5_VABI sceCoredumpGetStopInfoCpu(void) {
-    NotImplemented_nid_no_patch("kK0DUW1Ukgc");
-    return 0;
+int APS5_VABI sceCoredumpGetStopInfoCpu(void* info, size_t size) {
+    const auto address = reinterpret_cast<uintptr_t>(info);
+    if (info == nullptr || size != 16 || address % alignof(uint64_t) != 0 || size > UINTPTR_MAX - address)
+        throw std::runtime_error(std::string(__func__) + ": null, unaligned, wrapping or unsupported CPU stop-info buffer outside the core dump handler");
+    return SCE_COREDUMP_ERROR_NOT_IN_COREDUMP_HANDLER;
 }
 
 int APS5_VABI sceCoredumpGetThreadContextInfo(void* threadContextInfo, size_t threadContextInfoSize) {
