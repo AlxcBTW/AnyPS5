@@ -22,7 +22,7 @@ env:
 jobs:
   linux:
     if: github.repository == 'AlxcBTW/AnyPS5'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LEVER_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -55,7 +55,7 @@ jobs:
 
   windows:
     if: github.repository == 'AlxcBTW/AnyPS5'
-    runs-on: windows-latest
+    runs-on: ${{ vars.LEVER_WINDOWS_RUNNER || 'windows-latest' }}
     timeout-minutes: 45
     env:
       WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
