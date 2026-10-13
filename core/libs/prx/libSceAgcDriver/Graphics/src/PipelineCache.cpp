@@ -30,8 +30,9 @@ bool profiling() {
 
 }
 
-PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties) : context(context), properties(properties) {
-    const auto directory = ShaderRecompiler::ShaderCacheDirectory();
+PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool persist) : context(context), properties(properties) {
+    const auto loadStart = std::chrono::steady_clock::now();
+    const auto directory = persist ? ShaderRecompiler::ShaderCacheDirectory() : std::filesystem::path{};
     if (!directory.empty()) {
         std::string uuid;
         for (const auto byte : properties.pipelineCacheUUID) {
@@ -58,6 +59,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
+    std::fprintf(stderr, "[pipeline-cache] %s: %.1f MiB initial data, read + create %.0f ms\n", path.empty() ? "not persisted" : path.string().c_str(), static_cast<double>(initialData.size()) / 1048576.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loadStart).count());
     if (!path.empty()) saver = std::thread([this] { run(); });
 }
 
@@ -123,8 +125,13 @@ void PipelineCache::save(bool final) {
 }
 
 void PipelineCache::run() {
+    static const int interval = [] {
+        const char* text = std::getenv("APS5_EXP_PIPELINE_CACHE_SAVE_SECONDS");
+        const int seconds = text == nullptr ? SaveIntervalSeconds : std::atoi(text);
+        return seconds > 0 ? seconds : SaveIntervalSeconds;
+    }();
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    while (!wake.wait_for(lock, std::chrono::seconds(interval), [&] { return stopping; })) {
         lock.unlock();
         save(false);
         lock.lock();

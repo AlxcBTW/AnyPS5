@@ -235,9 +235,11 @@ std::shared_ptr<ComputePipelineObjects> BuildComputeObjects(const ComputeCreateF
     objects->destroyModule = functions.destroyModule;
     objects->destroyLayout = functions.destroyLayout;
     objects->destroyPipeline = functions.destroyPipeline;
+    std::vector<std::uint32_t> nonced;
+    const auto code = NoncedSpirv(spirv, nonced);
     VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    moduleInfo.codeSize = spirv.size() * sizeof(std::uint32_t);
-    moduleInfo.pCode = spirv.data();
+    moduleInfo.codeSize = code.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = code.data();
     check(functions.createModule(device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
     const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, settings.workgroupMemory ? workgroupLayout : VK_NULL_HANDLE};
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
@@ -1758,7 +1760,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     Graphics::PrepareImportWatch(graphicsContext());
     state->bufferPool = std::make_shared<Graphics::BufferPool>(graphicsContext());
     state->emptyBuffer = std::make_unique<Graphics::Buffer>(graphicsContext(), Graphics::EmptyBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties);
+    static const bool windowedCacheOnly = std::getenv("APS5_EXP_PIPELINE_CACHE_WINDOWED_ONLY") != nullptr;
+    static const bool noCacheFile = std::getenv("APS5_EXP_NO_PIPELINE_CACHE_FILE") != nullptr;
+    state->pipelineCache = std::make_unique<Graphics::PipelineCache>(graphicsContext(), state->properties, !noCacheFile && !(windowedCacheOnly && window == nullptr));
     state->detiler = std::make_unique<Graphics::TextureDetiler>(graphicsContext());
     state->textureCache = std::make_unique<Graphics::TextureCache>(graphicsContext());
     state->colorTransfer = std::make_unique<Graphics::GpuColorTransfer>(graphicsContext());

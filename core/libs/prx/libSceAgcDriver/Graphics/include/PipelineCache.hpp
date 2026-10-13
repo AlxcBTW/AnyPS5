@@ -15,7 +15,7 @@ class PipelineCache {
 public:
     static constexpr int SaveIntervalSeconds = 10;
 
-    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties);
+    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool persist = true);
     ~PipelineCache();
 
     PipelineCache(const PipelineCache&) = delete;

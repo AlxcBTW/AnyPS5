@@ -214,6 +214,10 @@ struct PipelinePreloadProgress {
 
 double ProcessSeconds();
 
+std::uint32_t PipelineSpirvNonce();
+
+std::span<const std::uint32_t> NoncedSpirv(std::span<const std::uint32_t> spirv, std::vector<std::uint32_t>& storage);
+
 PipelinePreloadProgress CurrentPipelinePreload();
 void PublishPipelinePreload(const PipelinePreloadProgress& progress);
 

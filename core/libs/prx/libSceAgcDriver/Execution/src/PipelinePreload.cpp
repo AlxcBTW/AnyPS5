@@ -2,6 +2,7 @@
 #include "ShaderCacheDirectory.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -334,6 +335,22 @@ void PipelinePreloadPool::work(bool lowPriority) {
         elapsedMs.store(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), std::memory_order_release);
         finished.notify_all();
     }
+}
+
+std::uint32_t PipelineSpirvNonce() {
+    static const std::uint32_t nonce = [] {
+        const char* text = std::getenv("APS5_EXP_PIPELINE_NONCE");
+        return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
+    }();
+    return nonce;
+}
+
+std::span<const std::uint32_t> NoncedSpirv(std::span<const std::uint32_t> spirv, std::vector<std::uint32_t>& storage) {
+    const auto nonce = PipelineSpirvNonce();
+    if (nonce == 0 || spirv.size() < 5) return spirv;
+    storage.assign(spirv.begin(), spirv.end());
+    storage[2] ^= nonce;
+    return storage;
 }
 
 double ProcessSeconds() {
