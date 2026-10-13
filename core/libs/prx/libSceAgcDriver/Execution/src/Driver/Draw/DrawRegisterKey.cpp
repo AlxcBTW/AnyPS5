@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -59,8 +60,61 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     return exact;
 }
 
+RegisterKeyParts RegisterStateParts(const QueueState& queue, bool allUserWords) {
+    const auto& masks = registerMasks();
+    RegisterKeyParts parts{};
+    const auto bank = [&](const Registers& registers, Graphics::RegisterBank which) { return registers.RecomputeFingerprint(*masks[static_cast<std::size_t>(which)]); };
+    parts[static_cast<std::size_t>(RegisterKeyPart::Context)] = bank(queue.context, Graphics::RegisterBank::Context);
+    parts[static_cast<std::size_t>(RegisterKeyPart::ShaderRegisters)] = bank(queue.shader, Graphics::RegisterBank::Shader);
+    parts[static_cast<std::size_t>(RegisterKeyPart::UserConfig)] = bank(queue.userConfig, Graphics::RegisterBank::UserConfig);
+    auto user = 0xcbf29ce484222325ull;
+    const auto words = [&](std::uint32_t base, std::uint32_t count) {
+        for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count; ++it) {
+            user = (user ^ it->first) * 0x100000001b3ull;
+            user = (user ^ it->second) * 0x100000001b3ull;
+        }
+    };
+    for (const auto base : {0x00cu, 0x08cu, 0x10cu}) {
+        const auto resources = queue.shader.find(base - 1);
+        const auto count = resources == queue.shader.end() ? 0u : ((resources->second >> 1u) & 0x1fu) | (((resources->second >> 27u) & 1u) << 5u);
+        words(base, allUserWords ? 32u : std::min(count, 32u));
+    }
+    words(0x082u, 2);
+    words(0x102u, 2);
+    parts[static_cast<std::size_t>(RegisterKeyPart::UserData)] = user;
+    return parts;
+}
 
-std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial) {
+void RegisterKeyMissTracker::Note(std::uint64_t identity, const RegisterKeyParts& parts, bool miss) {
+    constexpr std::size_t MaxIdentities = 4096;
+    const auto found = last.find(identity);
+    if (miss) {
+        ++counts.misses;
+        if (found == last.end()) {
+            ++counts.noCandidate;
+        } else {
+            bool any = false;
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (parts[i] == found->second[i]) continue;
+                ++counts.differing[i];
+                any = true;
+            }
+            if (!any) ++counts.identical;
+        }
+    }
+    if (found != last.end()) {
+        found->second = parts;
+        return;
+    }
+    if (last.size() >= MaxIdentities) last.clear();
+    last.emplace(identity, parts);
+}
+
+RegisterKeyMissCounts RegisterKeyMissTracker::Take() {
+    return std::exchange(counts, RegisterKeyMissCounts{});
+}
+
+std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegistry& registry, std::uint64_t deviceSerial, RegisterKeyParts* shaderPart, std::uint64_t* identity) {
     static const bool allUserWords = std::getenv("APS5_DRAW_KEY_ALL_USER_WORDS") != nullptr;
     static const bool verify = std::getenv("APS5_VERIFY_REGISTER_KEYS") != nullptr;
     auto key = RegisterStateKey(queue, allUserWords);
@@ -70,23 +124,36 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
         key *= 0x100000001b3ull;
     };
     mix(deviceSerial);
+    std::uint64_t shaderMix = 0xcbf29ce484222325ull ^ deviceSerial;
+    std::uint64_t identityMix = 0xcbf29ce484222325ull;
+    const auto note = [&](std::uint64_t value) { shaderMix = (shaderMix ^ value) * 0x100000001b3ull; };
+    const auto noteIdentity = [&](std::uint64_t value) { identityMix = (identityMix ^ value) * 0x100000001b3ull; };
     for (const auto base : {0x008u, 0x088u, 0x0c8u, 0x108u, 0x148u}) {
         const auto low = queue.shader.find(base);
         const auto high = queue.shader.find(base + 1);
         if (low == queue.shader.end() || high == queue.shader.end()) {
             mix(0);
+            noteIdentity(0);
             continue;
         }
         const auto address = (static_cast<std::uint64_t>(low->second) << 8u) | (static_cast<std::uint64_t>(high->second & 0xffu) << 40u);
+        noteIdentity(address);
         auto it = registry.upper_bound(address);
         if (it == registry.begin()) {
             mix(1);
+            note(1);
             continue;
         }
         --it;
-        for (const auto& snapshot : it->second) mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        for (const auto& snapshot : it->second) {
+            mix(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+            note(reinterpret_cast<std::uintptr_t>(snapshot.get()));
+        }
         mix(address - it->first);
+        note(address - it->first);
     }
+    if (shaderPart != nullptr) (*shaderPart)[static_cast<std::size_t>(RegisterKeyPart::Shader)] = shaderMix;
+    if (identity != nullptr) *identity = identityMix;
     return key;
 }
 
