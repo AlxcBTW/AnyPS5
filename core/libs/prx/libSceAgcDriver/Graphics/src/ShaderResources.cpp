@@ -2788,17 +2788,19 @@ void ResourceCache::noteMiss(const Key& key) {
             std::size_t at = 0;
             if (!chargeShaderKey(counts, key, at, diff)) ++counts.layout;
         }
-        ContentKeyDiff parts;
-        ++counts.window.compared;
-        if (!ShaderResources::DiffContentKeys(previous, key, draw, parts)) ++counts.window.unlabelled;
-        bool anyPart = false;
-        for (std::size_t i = 0; i < parts.size(); ++i) {
-            if (!parts[i]) continue;
-            ++counts.window.differing[i];
-            anyPart = true;
+        if (trace) {
+            ContentKeyDiff parts;
+            ++counts.window.compared;
+            if (!ShaderResources::DiffContentKeys(previous, key, draw, parts)) ++counts.window.unlabelled;
+            bool anyPart = false;
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (!parts[i]) continue;
+                ++counts.window.differing[i];
+                anyPart = true;
+            }
+            if (!anyPart) ++counts.window.identical;
+            traceMiss(churn, draw, variants, &parts);
         }
-        if (!anyPart) ++counts.window.identical;
-        if (trace) traceMiss(churn, draw, variants, &parts);
         found->second = key;
     }
     const auto now = std::chrono::steady_clock::now();
