@@ -244,6 +244,19 @@ class ProgressTests(unittest.TestCase):
             self.assertIn("| libSceExample | `A` |", report)
             self.assertIn("<summary>⚪ 1 behaviourally empty (constant return or throw)</summary>", report)
 
+    def test_cut_helpers_are_not_system_exports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "libSceExample"
+            library.mkdir()
+            (library / "Export.cpp").write_text(
+                "int APS5_VABI Ready_nid_no_patch_cut() { return 1; }\n"
+                "int APS5_VABI Pending_nid_no_patch_cut() { NotImplemented_nid_no_patch(__func__); }\n"
+                "int APS5_VABI Real() { return 2; }\n", encoding="utf-8")
+            group = progress.scan_library(library)
+            self.assertEqual(group["done_names"], ["Real"])
+            self.assertEqual(group["todo_names"], [])
+            self.assertEqual(group["inert_names"], ["Real"])
+
     def test_empty_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

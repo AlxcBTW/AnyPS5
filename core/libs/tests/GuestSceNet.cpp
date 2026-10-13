@@ -46,6 +46,7 @@ int APS5_VABI sceNetEpollControl(int, int, int, const NetEpollEvent*);
 int APS5_VABI sceNetEpollWait(int, NetEpollEvent*, int, int);
 int APS5_VABI sceNetEpollDestroy(int);
 int APS5_VABI sceNetEpollAbort(int, int);
+int APS5_VABI sceNetGetsockopt(int, int, int, void*, std::uint32_t*);
 extern const std::uint32_t sce_net_in6addr_any[4];
 extern const std::uint8_t sce_net_in6addr_linklocal_allnodes[16];
 int APS5_VABI sceNetResolverCreate(const char*, int, int);
@@ -248,6 +249,23 @@ static void CheckReceiveTimeout(int receiver, int sender, const std::array<std::
     Require(sceNetRecv(receiver, buffer, sizeof(buffer), 0) == sizeof(datagram) && std::strcmp(buffer, datagram) == 0);
     const int disabled = 0;
     Require(sceNetSetsockopt(receiver, 0xffff, 0x1006, &disabled, sizeof(disabled)) == 0);
+}
+
+static void CheckMicrosecondTimeouts(int receiver) {
+    const int receiveTimeout = 50000;
+    const int sendTimeout = 70000;
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1106, &receiveTimeout, sizeof(receiveTimeout)) == 0);
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1105, &sendTimeout, sizeof(sendTimeout)) == 0);
+    for (const auto [option, expected] : {std::array{0x1106, receiveTimeout}, std::array{0x1105, sendTimeout}}) {
+        int value = -1;
+        std::uint32_t size = sizeof(value);
+        Require(sceNetGetsockopt(receiver, 0xffff, option, &value, &size) == 0 && size == sizeof(value) && value == expected);
+    }
+    char buffer[8]{};
+    Require(Failed(sceNetRecv(receiver, buffer, sizeof(buffer), 0), 35));
+    const int disabled = 0;
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1106, &disabled, sizeof(disabled)) == 0);
+    Require(sceNetSetsockopt(receiver, 0xffff, 0x1105, &disabled, sizeof(disabled)) == 0);
 }
 
 static void CheckMessages(int receiver, int sender, const std::array<std::uint8_t, 16>& address) {
@@ -662,6 +680,7 @@ int main() {
     stdio_readable[0] = 1;
     Require(select_nid_postfix(1, stdio_readable, nullptr, nullptr, poll_now) == 0 && stdio_readable[0] == 0);
     CheckReceiveTimeout(udp_receiver, udp_sender, address);
+    CheckMicrosecondTimeouts(udp_receiver);
     CheckMessages(udp_receiver, udp_sender, address);
     Require(sceNetSocketClose(udp_sender) == 0);
     Require(sceNetSocketClose(udp_receiver) == 0);

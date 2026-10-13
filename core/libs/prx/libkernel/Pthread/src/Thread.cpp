@@ -372,6 +372,15 @@ bool GuestThreadIsLive(const PthreadPrivate* thread) {
     return false;
 }
 
+bool LiveGuestThreadExists(std::int64_t tid) {
+    auto& registry = CpuClocks();
+    std::lock_guard lock(registry.lock);
+    for (const auto& [id, thread] : registry.threads) {
+        if (!thread->_finished.load(std::memory_order_acquire) && thread->tid == tid) return true;
+    }
+    return false;
+}
+
 bool GuestThreadCpuNanos(int cpuClockThread, std::uint64_t* nanos) {
     auto& registry = CpuClocks();
     std::lock_guard lock(registry.lock);

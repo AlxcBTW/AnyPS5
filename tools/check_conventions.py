@@ -109,7 +109,7 @@ class Check:
                 if core and TITLE.search(text):
                     self.report("title-specific", path, number, TITLE.search(text).group(0))
                 match = EXPORT.search(bare)
-                if match and path.startswith("core/libs/prx/") and not match.group(1).endswith("_nid_no_patch"):
+                if match and path.startswith("core/libs/prx/") and not match.group(1).endswith(("_nid_no_patch", "_nid_no_patch_cut")):
                     source = source or self.show(path).splitlines()
                     body = function_body(source, number - 1)
                     if body is None:

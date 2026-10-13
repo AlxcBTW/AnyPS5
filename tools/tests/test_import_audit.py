@@ -304,6 +304,31 @@ class ImportAuditTests(unittest.TestCase):
         self.assertEqual((code, data["references"], data["unique_imports"], data["imports"]), (0, 0, 0, []))
         self.assertIn("0 references, 0 unique imports", out)
 
+    def test_current_stop_is_the_first_unresolved_import(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "game.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx"), ("BBBBBBBBBBB", "libSceA.prx"), ("CCCCCCCCCCC", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, err = work.run(registry, "--json", str(result))
+        self.assertEqual((code, err), (1, ""))
+        data = json.loads(result.read_text())
+        self.assertEqual(data["stops"], [{"registry": str(registry), "nid": "BBBBBBBBBBB", "library": "libSceA.prx", "name": None}])
+        self.assertIn("Current stop (first unresolved import, in registry order)", out)
+        self.assertIn("BBBBBBBBBBB", out)
+
+    def test_current_stop_is_none_when_every_import_resolves(self):
+        work = self.work
+        (work.libs / "libSceA.prx").write_bytes(exporting("AAAAAAAAAAA"))
+        registry = work.root / "clean.json"
+        write_registry(registry, [("AAAAAAAAAAA", "libSceA.prx")])
+        result = work.root / "audit.json"
+        code, out, _ = work.run(registry, "--json", str(result))
+        self.assertEqual(code, 0)
+        data = json.loads(result.read_text())
+        self.assertEqual(data["stops"], [{"registry": str(registry), "nid": None, "library": None, "name": None}])
+        self.assertIn(f"  {registry}: none", out)
+
     def test_removing_an_export_flips_the_class(self):
         work = self.work
         registry = work.root / "game.json"

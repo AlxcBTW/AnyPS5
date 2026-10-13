@@ -36,6 +36,18 @@ GnuHashLayout ReadGnuHashLayout(const std::vector<std::uint8_t>& elf, std::size_
     return layout;
 }
 
+void ValidateGnuHash(const std::vector<std::uint8_t>& elf, std::size_t offset, std::size_t size, std::size_t symCount) {
+    if (offset > elf.size() || size > elf.size() - offset || size < 16u)
+        throw std::runtime_error("invalid gnu.hash section range");
+    const auto layout = ReadGnuHashLayout(elf, offset);
+    if (layout.SymOffset > symCount || !layout.BloomSize || (layout.BloomSize & (layout.BloomSize - 1u)) ||
+        layout.BloomShift >= 32u || (!layout.NBuckets && layout.SymOffset != symCount))
+        throw std::runtime_error("invalid gnu.hash geometry");
+    const std::uint64_t required = 16u + std::uint64_t{layout.BloomSize} * 8u +
+        std::uint64_t{layout.NBuckets} * 4u + (symCount - layout.SymOffset) * 4u;
+    if (required > size) throw std::runtime_error("gnu.hash section too small to rebuild in place");
+}
+
 void ReorderDynSymForGnuHash(
     std::vector<std::uint8_t>& elf,
     std::size_t dynSymOffset,
@@ -333,7 +345,6 @@ void ElfNidPatcher::PatchNids(std::vector<std::uint8_t>& elf, const std::string&
         if (shdr.sh_type == kShtGnuHash) {
             gnuHashOffset = static_cast<std::size_t>(shdr.sh_offset);
             gnuHashSize = static_cast<std::size_t>(shdr.sh_size);
-            gnuHashSymOffset = Read<std::uint32_t>(elf, gnuHashOffset + 4u);
         }
         if (shdr.sh_type == kShtGnuVersym)
             versymOffset = static_cast<std::size_t>(shdr.sh_offset);
@@ -345,6 +356,10 @@ void ElfNidPatcher::PatchNids(std::vector<std::uint8_t>& elf, const std::string&
 
     const std::size_t symCount = dynSymSize / sizeof(Elf64_Sym);
     if (symCount == 0u) throw std::runtime_error(".dynsym is empty");
+    if (gnuHashOffset != 0u) {
+        ValidateGnuHash(elf, gnuHashOffset, gnuHashSize, symCount);
+        gnuHashSymOffset = Read<std::uint32_t>(elf, gnuHashOffset + 4u);
+    }
 
     const std::size_t dynStrSectionLink = [&]() -> std::size_t {
         for (std::uint16_t i = 0u; i < ehdr.e_shnum; ++i) {

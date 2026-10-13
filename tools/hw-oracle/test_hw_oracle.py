@@ -76,6 +76,45 @@ class OracleCacheTests(unittest.TestCase):
                 self.assertEqual([file for file in cache.rglob("*") if file.is_file()], [binary])
 
 
+class InputRowsTests(unittest.TestCase):
+    def test_invalid_rows_fail_before_assembler_or_gpu_lookup(self):
+        for row in ((1, 2, 3), (1, 2, 3, 4, 5), (-1, 0, 0, 0),
+                    (0x100000000, 0, 0, 0), (1.5, 0, 0, 0), ("1", 0, 0, 0)):
+            with self.subTest(row=row), patch.object(hw_oracle, "assemble", side_effect=AssertionError("assembler called")) as assemble:
+                with self.assertRaisesRegex(ValueError, "row 1"):
+                    hw_oracle.run("s_nop 0", [row], **MODES)
+                assemble.assert_not_called()
+
+    def test_unsigned_bits_and_indexable_values_are_preserved(self):
+        class Indexable:
+            def __index__(self):
+                return 0xffffffff
+
+        def dispatch(command, **kwargs):
+            data = Path(command[3]).read_bytes()
+            self.assertEqual(data[:16], hw_oracle.struct.pack("<4I", 0, 0xffffffff, 0x80000000, 1))
+            self.assertEqual(data[16:32 * 16], bytes(31 * 16))
+            self.assertEqual(data[32 * 16:], b"extra")
+            Path(command[4]).write_bytes(bytes(32 * 64))
+
+        with patch.object(hw_oracle, "assemble", return_value="kernel.co"), \
+                patch.object(hw_oracle, "oracle", return_value="oracle"), \
+                patch.object(hw_oracle.subprocess, "run", side_effect=dispatch):
+            results = hw_oracle.run("s_nop 0", [(0, Indexable(), 0x80000000, True)], b"extra", **MODES)
+        self.assertEqual(results, [tuple([0] * 16)])
+
+    def test_cli_accepts_zero_padded_decimal_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            body, rows = Path(tmp) / "body.s", Path(tmp) / "rows.txt"
+            body.write_text("s_nop 0")
+            rows.write_text("0001 08 0xFFFFFFFF 0b10\n")
+            argv = ["hw_oracle.py", str(body), str(rows)]
+            argv += [item for name, value in MODES.items() for item in ["--" + name.replace("_", "-"), str(value)]]
+            with patch("sys.argv", argv), patch.object(hw_oracle, "run", return_value=[]) as run:
+                hw_oracle.main()
+            self.assertEqual(run.call_args.args[1], [(1, 8, 0xffffffff, 2)])
+
+
 class FloatModeTests(unittest.TestCase):
     def test_python_requires_each_mode(self):
         for name in MODES:

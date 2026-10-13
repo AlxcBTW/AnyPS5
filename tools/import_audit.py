@@ -424,6 +424,16 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
     return ordered, dict(sorted(missing.items()))
 
 
+def current_stop(imports, records):
+    """The first import the loader cannot resolve, in registry order."""
+    classes = {(record["nid"], record["library"]): record for record in records}
+    for nid, library in imports:
+        record = classes.get((nid, library))
+        if record is not None and record["class"] == "absent":
+            return record
+    return None
+
+
 def load_names(path):
     if not Path(path).is_file():
         raise AuditError(f"{path}: names file not found; the audit never downloads one (see tools/nid_names.py for the source)")
@@ -469,7 +479,7 @@ def label(record):
     return f"{text}  (imported by {record['module']})" if record.get("module") else text
 
 
-def render(summary, records, missing):
+def render(summary, records, missing, stops):
     lines = [f"{summary['references']} references, {summary['unique_imports']} unique imports"]
     for kind in CLASSES:
         lines.append(f"  {kind:<12}{summary['unique_by_class'][kind]:>6} imports  {summary['references_by_class'][kind]:>6} references")
@@ -484,6 +494,12 @@ def render(summary, records, missing):
                     current = record["library"]
                     lines.append(f"  [{current or 'library not named'}]")
                 lines.append(f"    {label(record)}")
+    if stops:
+        lines.append("")
+        lines.append("Current stop (first unresolved import, in registry order)")
+        for entry in stops:
+            stop = entry["stop"]
+            lines.append(f"  {entry['registry']}: none" if stop is None else f"  {entry['registry']}: {label(stop)} [{stop['library']}]")
     if missing:
         lines.append("")
         lines.append(f"Needed libraries with no file in --libs or --modules ({len(missing)})")
@@ -512,16 +528,22 @@ def main(argv=None):
             output = args.json.resolve()
             if any(output == path.resolve() or (args.json.exists() and args.json.samefile(path)) for path in inputs):
                 raise AuditError(f"{args.json}: JSON output would overwrite an input file")
-        imports = [entry for registry in args.registries for entry in read_registry(registry)]
+        registries = [(registry, read_registry(registry)) for registry in args.registries]
+        imports = [entry for _, entries in registries for entry in entries]
         exports, libraries = built_libraries(args.libs)
         module_imports, module_exports = read_modules(args.modules)
         records, missing = audit(imports, exports, source_stubs(args.source), libraries, set(module_imports), module_imports, module_exports)
         if args.names:
             attach_names(records, load_names(args.names))
         summary = summarize(records, sum(record["references"] for record in records), missing)
+        stops = [{"registry": str(path), "stop": current_stop(entries, records)} for path, entries in registries]
         if args.json:
             commit, dirty = git_stamp(Path(args.source))
-            result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], **summary, "imports": records}
+            json_stops = [{"registry": entry["registry"],
+                           "nid": entry["stop"]["nid"] if entry["stop"] else None,
+                           "library": entry["stop"]["library"] if entry["stop"] else None,
+                           "name": entry["stop"]["name"] if entry["stop"] else None} for entry in stops]
+            result = {"source_commit": commit, "source_dirty": dirty, "registries": [str(path) for path in args.registries], **summary, "stops": json_stops, "imports": records}
             args.json.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     except AuditError as error:
         print(f"FAIL: {error}", file=sys.stderr)
@@ -529,7 +551,7 @@ def main(argv=None):
     except OSError as error:
         print(f"FAIL: {error.strerror}: {error.filename}" if error.filename else f"FAIL: {error}", file=sys.stderr)
         return 2
-    print(render(summary, records, missing))
+    print(render(summary, records, missing, stops))
     return 1 if summary["unique_by_class"]["absent"] or missing else 0
 
 

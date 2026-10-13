@@ -50,7 +50,12 @@ std::unordered_set<std::string> ReadPeExports(const std::vector<std::uint8_t>& b
     if (!directory.VirtualAddress || directory.Size < sizeof(PeExportDirectory)) throw std::runtime_error("missing reference PE exports");
     const auto sections = optional + optionalSize;
     RequireRange(binary, sections, std::uint64_t{sectionCount} * sizeof(PeSectionHeader));
+    const auto headersSize = ReadValue<std::uint32_t>(binary, optional + 60);
     const auto mapRva = [&](std::uint32_t rva, std::uint64_t size) -> std::uint64_t {
+        if (rva < headersSize && size <= headersSize - rva) {
+            RequireRange(binary, rva, size);
+            return rva;
+        }
         for (std::uint16_t index = 0; index < sectionCount; ++index) {
             const auto section = ReadValue<PeSectionHeader>(binary, sections + std::uint64_t{index} * sizeof(PeSectionHeader));
             if (rva < section.VirtualAddress) continue;
@@ -65,14 +70,20 @@ std::unordered_set<std::string> ReadPeExports(const std::vector<std::uint8_t>& b
     const auto table = ReadValue<PeExportDirectory>(binary, mapRva(directory.VirtualAddress, sizeof(PeExportDirectory)));
     if (!table.NumberOfNames) throw std::runtime_error("reference PE has no named exports");
     const auto names = mapRva(table.AddressOfNames, std::uint64_t{table.NumberOfNames} * 4);
+    const auto ordinals = mapRva(table.AddressOfNameOrdinals, std::uint64_t{table.NumberOfNames} * 2);
+    const auto functions = mapRva(table.AddressOfFunctions, std::uint64_t{table.NumberOfFunctions} * 4);
     std::unordered_set<std::string> result;
     for (std::uint32_t index = 0; index < table.NumberOfNames; ++index) {
+        const auto ordinal = ReadValue<std::uint16_t>(binary, ordinals + std::uint64_t{index} * 2);
+        if (ordinal >= table.NumberOfFunctions) throw std::runtime_error("invalid reference PE export ordinal");
+        if (!ReadValue<std::uint32_t>(binary, functions + std::uint64_t{ordinal} * 4)) continue;
         const auto rva = ReadValue<std::uint32_t>(binary, names + std::uint64_t{index} * 4);
         const auto offset = mapRva(rva, 1);
         auto name = ReadName(binary, offset, binary.size() - offset);
         mapRva(rva, name.size() + 1);
         if (!result.insert(name).second) throw std::runtime_error("duplicate reference export: " + name);
     }
+    if (result.empty()) throw std::runtime_error("reference PE has no named exports");
     return result;
 }
 

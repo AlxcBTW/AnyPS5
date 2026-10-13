@@ -87,6 +87,8 @@ constexpr int NET_SO_REUSEADDR = 0x4;
 constexpr int NET_SO_BROADCAST = 0x20;
 constexpr int NET_SO_SNDBUF = 0x1001;
 constexpr int NET_SO_RCVBUF = 0x1002;
+constexpr int NET_SO_SCE_SNDTIMEO = 0x1105;
+constexpr int NET_SO_SCE_RCVTIMEO = 0x1106;
 constexpr int NET_MSG_PEEK = 0x2;
 constexpr int NET_MSG_TRUNC = 0x10;
 constexpr int NET_UIO_MAXIOV = 1024;
@@ -436,6 +438,12 @@ struct NetMsghdr {
 };
 static_assert(sizeof(NetMsghdr) == 48 && offsetof(NetMsghdr, iov) == 16 && offsetof(NetMsghdr, control) == 32 &&
     offsetof(NetMsghdr, flags) == 44);
+
+int timeout_option(int optname) {
+    if (optname == NET_SO_SCE_SNDTIMEO) return NET_SO_SNDTIMEO;
+    if (optname == NET_SO_SCE_RCVTIMEO) return NET_SO_RCVTIMEO;
+    return optname;
+}
 
 std::int64_t message_length(const NetMsghdr* message) {
     if (!message) return fail(NET_EFAULT);
@@ -943,6 +951,7 @@ int APS5_VABI sceNetSetsockopt(int s, int level, int optname, const void* optval
         socket = it->second;
     }
     if (level != NET_SOL_SOCKET) return fail(NET_EOPNOTSUPP);
+    optname = timeout_option(optname);
     if (!optval || optlen < sizeof(int)) return fail(NET_EINVAL);
     int value = 0;
     std::memcpy(&value, optval, sizeof(value));
@@ -988,7 +997,7 @@ int APS5_VABI sceNetGetsockopt(int s, int level, int optname, void* optval, uint
     }
     if (level != NET_SOL_SOCKET) return fail(NET_EOPNOTSUPP);
     int value = 0;
-    switch (optname) {
+    switch (timeout_option(optname)) {
         case NET_SO_NBIO: value = socket.nonblock ? 1 : 0; break;
         case NET_SO_RCVTIMEO: value = socket.rcv_timeout_us; break;
         case NET_SO_SNDTIMEO: value = socket.snd_timeout_us; break;

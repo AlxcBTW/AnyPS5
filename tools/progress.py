@@ -164,7 +164,7 @@ def scan_library(path):
         wrappers = inert_wrappers(text)
         for match in DEFINITION.finditer(text):
             name = match.group(1)
-            if name.endswith("_nid_no_patch"):
+            if name.endswith(("_nid_no_patch", "_nid_no_patch_cut")):
                 continue
             body = text[match.end() - 1:body_end(text, match.end() - 1)]
             if any(call.group(1) in calls for call in CALL.finditer(body)):
