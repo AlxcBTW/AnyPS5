@@ -556,7 +556,11 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         if (memory.RegionSize > std::numeric_limits<std::uintptr_t>::max() - base || base + memory.RegionSize <= cursor) return false;
         auto regionEnd = base + memory.RegionSize;
         std::uint32_t logicalProtection = memory.Protect;
-        GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection);
+        if (GuestArena::GuestArenaProtection_nid_postfix(cursor, &logicalProtection)) {
+            constexpr std::uintptr_t viewPageBytes = 0x4000;
+            base = std::max(base, cursor & ~(viewPageBytes - 1));
+            regionEnd = std::min(regionEnd, (cursor & ~(viewPageBytes - 1)) + viewPageBytes);
+        }
         std::uintptr_t pendingEnd = 0;
         std::uint32_t pendingProtection = 0;
         const bool pending = memory.State == MEM_RESERVE && GuestArena::GuestArenaPending_nid_no_patch(cursor, &pendingEnd, &pendingProtection);

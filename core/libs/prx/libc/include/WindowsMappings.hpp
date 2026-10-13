@@ -806,7 +806,8 @@ private:
         if (!VirtualFree(reinterpret_cast<void*>(base), at - base, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("split a shared guest view placeholder");
         mapView(section->handle, base, offset, at - base);
         mapView(section->handle, at, offset + (at - base), last - at);
-        restoreProtection(base, last);
+        restoreProtection(base, at);
+        restoreProtection(at, last);
         ++statistics.viewsUnmapped;
         ++statistics.splits;
     }
