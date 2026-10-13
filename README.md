@@ -2,6 +2,10 @@
 
 Tool for automatic executables porting to Linux and Windows.
 
+[**Online converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+
+[Discord](https://discord.gg/BHFztBPUe)
+
 Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
 
 [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
@@ -12,7 +16,7 @@ Includes a [relinker](core/relinker) that converts executable to the target syst
 
 [![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/)
 
-[![progress history](https://boykopovar.github.io/AnyPS5/history.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
 
 <sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
 

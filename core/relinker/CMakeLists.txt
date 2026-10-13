@@ -87,6 +87,11 @@ if(BUILD_TESTING)
     set_tests_properties(relinker_conversion PROPERTIES TIMEOUT 20)
 endif()
 
+if(ANYPS5_BUILD_WASM)
+    target_compile_options(relinker_core PRIVATE -fexceptions)
+    add_subdirectory(wasm)
+endif()
+
 if(NOT ANYPS5_RELINKER_CLI)
     return()
 endif()
