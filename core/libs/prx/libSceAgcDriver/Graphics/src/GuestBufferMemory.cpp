@@ -3461,6 +3461,21 @@ bool GuestBufferMemory::HasCopiedWrites() const {
     return false;
 }
 
+bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    for (const auto& [begin, end] : writes) {
+        if (!(address < end && begin < address + bytes)) continue;
+        const auto* found = owner(begin);
+        if (found == nullptr) continue;
+        const auto& region = *found;
+        if (region.direct != nullptr) continue;
+        if (region.gpuCopy && (region.copiedBack || region.deviceLocal)) continue;
+        if (region.mirror != nullptr && !region.mirror->writable) continue;
+        return true;
+    }
+    return false;
+}
+
 void GuestBufferMemory::MarkDirectWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin);
