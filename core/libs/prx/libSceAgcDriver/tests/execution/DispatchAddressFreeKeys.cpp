@@ -45,7 +45,12 @@ public:
     }
 
     ~GuestBlock() {
-        GuestAllocations::Mutation().Remove(block);
+        try {
+            GuestAllocations::Mutation().Remove(block);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "address-free keys: the guest block stays registered: %s\n", error.what());
+            return;
+        }
 #ifdef _WIN32
         VirtualFree(block, 0, MEM_RELEASE);
 #else
@@ -81,8 +86,8 @@ public:
         const ShaderRecompiler::ShaderComputeStageInfo compute{{64, 1, 1}, 0, {true, false, false}, false, 1, {}};
         ShaderRecompiler::RecompileRequest request{
             {ShaderStage::Compute, codeAddress, code, 0, {}},
-            {64, 0, userData, compute, std::nullopt, std::nullopt, memory},
-            device.ComputeTarget(64),
+            {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+            device.Target(),
             {0, 0, 0, 128}
         };
         results.push_back(std::make_unique<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request)));
@@ -173,6 +178,11 @@ int ExecuteTests(AgcDriver::VulkanDevice& device) {
 }
 
 int main() {
+#ifdef _WIN32
+    _putenv("APS5_PIN_WAIT_MS=5000");
+#else
+    setenv("APS5_PIN_WAIT_MS", "5000", 1);
+#endif
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
