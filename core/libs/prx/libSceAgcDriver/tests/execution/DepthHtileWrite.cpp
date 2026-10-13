@@ -13,17 +13,18 @@ using DepthFastClearHarness::Covered;
 using DepthFastClearHarness::Draw;
 using DepthFastClearHarness::DrawOptions;
 using DepthFastClearHarness::Height;
+using DepthFastClearHarness::HtileBytes;
 using DepthFastClearHarness::Require;
 using DepthFastClearHarness::Surface;
 using DepthFastClearHarness::Width;
 
-// The words the bind-time read covers: one per 8x8 tile (the harness HtileBytes is the pipe-aligned extent).
-constexpr std::size_t Tiles = (Width / 8u) * (Height / 8u);
+// The words the bind-time read covers: the surface's whole pipe-aligned HTILE metadata.
+constexpr std::size_t Tiles = HtileBytes / 4u;
 
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
 alignas(4096) std::array<float, Width * Height> StencilDepth{};
 alignas(4096) std::array<std::uint8_t, Width * Height> Stencil{};
-alignas(256) std::array<std::uint32_t, 1024> Htile{};
+alignas(256) std::array<std::uint32_t, HtileBytes / 4u> Htile{};
 
 void Fill(std::uint32_t word, std::size_t count = Tiles) {
     std::fill_n(Htile.begin(), count, word);

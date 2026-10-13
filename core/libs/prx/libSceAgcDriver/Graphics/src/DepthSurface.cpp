@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -202,8 +203,6 @@ public:
         return false;
     }
 
-    std::uint64_t htileAddress = 0;
-    std::uint64_t htileGeneration = 0;
     const Context context;
     const DepthTarget target;
     const VkFormat hostFormat;
@@ -467,24 +466,46 @@ std::uint32_t expandedHtileWord(std::uint32_t word, bool stencilInHtile, VkImage
     return word;
 }
 
-void noteHtileWrites(DepthSurface& surface, const DepthTarget& target) {
-    if (target.htileAddress == 0) return;
-    const auto tiles = static_cast<std::size_t>((target.extent.width + 7u) / 8u) * ((target.extent.height + 7u) / 8u);
-    const auto bytes = tiles * 4u;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return;
+std::mutex& htileReadsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+// The write-tracker generation each HTILE range was last read (or stored back) at.
+std::map<std::uint64_t, std::uint64_t>& htileReads() {
+    static auto* reads = new std::map<std::uint64_t, std::uint64_t>();
+    return *reads;
+}
+
+// Reads the HTILE when it was written since it was last read, over the surface's whole pipe-aligned
+// metadata (HtileMetadataBytes, the extent HtileFillCovers takes as the surface's), and stores the words
+// back as expanded when every one of them marks the depth or the stencil cleared. Called outside the
+// surfaces mutex: the read and the store wait for recorded work over the range. Returns the aspects the
+// words marked cleared.
+VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
+    if (target.htileAddress == 0) return 0;
+    const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
-    if (surface.htileAddress == target.htileAddress && surface.htileGeneration != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, surface.htileGeneration)) return;
-    std::vector<std::uint32_t> words(tiles);
+    auto* recorder = RecorderFor(context);
+    if (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = htileReads().find(target.htileAddress);
+        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+    }
+    std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
-    surface.htileAddress = target.htileAddress;
-    surface.htileGeneration = collected;
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
-    if (cleared == 0) return;
-    surface.pendingClear |= cleared;
-    for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
-    GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
-    surface.htileGeneration = GuestMemory::CollectWrites(target.htileAddress, bytes);
+    auto generation = collected;
+    if (cleared != 0) {
+        for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
+        GuestMemory::Write(target.htileAddress, std::as_bytes(std::span(words)), 4);
+        generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
+    }
+    std::lock_guard lock(htileReadsMutex());
+    htileReads()[target.htileAddress] = generation;
+    return cleared;
 }
 
 }
@@ -534,6 +555,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    const auto htileCleared = storeBackClearedHtile(context, target);
     std::lock_guard lock(surfacesMutex());
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
     for (const auto& surface : surfaces()) {
@@ -541,7 +563,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->clearDepth = target.clearDepth;
         surface->clearStencil = target.clearStencil;
         if (cleared) surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
-        noteHtileWrites(*surface, target);
+        surface->pendingClear |= htileCleared;
         surface->ApplyFastClear();
         surface->written = ++depthWrites;
         drawnDepth = surface.get();
@@ -551,8 +573,6 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     auto& created = *surfaces().back();
     created.clearDepth = target.clearDepth;
     created.clearStencil = target.clearStencil;
-    noteHtileWrites(created, target);
-    created.ApplyFastClear();
     drawnDepth = &created;
     return created.view;
 }

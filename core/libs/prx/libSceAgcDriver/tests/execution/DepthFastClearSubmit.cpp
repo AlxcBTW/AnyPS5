@@ -144,6 +144,24 @@ void DispatchFillClearsDepth(AgcDriver::VulkanDevice& device, const Shaders& sha
     Require(Draw(device, shaders, surface, {}) == 0u, "the depth written after the compute fill clear was lost");
 }
 
+// A title kernel that decodes the depth through HTILE after drawing (the Nanite depth export of
+// PPSA25344, Unreal Engine 5) takes a tile with ZMask 0 as holding the clear value and skips its depth,
+// so after a fast clear and a draw the words must read expanded over the whole metadata.
+void DrawAfterFastClearExpandsHtile(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    for (const bool stencil : {false, true}) {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), stencil ? NewBlock().Address() : 0, htile.Address(), stencil, stencil ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        DmaFill(htile, HtileFillBytes, stencil ? 0xf0u : 0u);
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a fast clear through the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)");
+        std::vector<std::uint32_t> words(HtileFillBytes / 4u);
+        AgcDriver::GuestMemory::Read(htile.Address(), std::as_writable_bytes(std::span(words)), 4);
+        const auto expanded = stencil ? 0xfffff3ffu : 0xfffc000fu;
+        for (const auto word : words) Require(word == expanded, stencil ? "a draw after a depth and stencil fast clear left HTILE words other than expanded (0xfffff3ff)" : "a draw after a depth fast clear left HTILE words other than expanded (0xfffc000f): a kernel decoding the depth through ZMask 0 reads the clear value, not the drawn depth");
+        Require(Draw(device, shaders, surface, {}) == 0u, "the depth drawn after the fast clear was cleared again");
+    }
+}
+
 void DepthOnlyFillKeepsStencil(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
     const auto& htile = NewBlock();
     const Surface surface{NewBlock().Address(), NewBlock().Address(), htile.Address(), true, VK_FORMAT_D32_SFLOAT_S8_UINT};
@@ -167,6 +185,7 @@ int main() {
         const auto shaders = Compile(*device);
         DmaFillClearsDepth(*device, shaders);
         DepthOnlyFillKeepsStencil(*device, shaders);
+        DrawAfterFastClearExpandsHtile(*device, shaders);
         const bool computeRan = StoresFills(*device, NewBlock());
         if (computeRan) DispatchFillClearsDepth(*device, shaders);
         else std::printf("compute fill not run: the device does not store fills into imported guest memory\n");
