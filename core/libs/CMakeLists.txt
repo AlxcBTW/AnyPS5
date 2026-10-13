@@ -179,6 +179,15 @@ if(BUILD_TESTING)
         set_tests_properties(guest_posix_scalar_io PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
+    add_test_executable(nid_buffer_validation_tests nid/tests/BufferValidation.cpp)
+    target_include_directories(nid_buffer_validation_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/nid/include)
+    target_compile_features(nid_buffer_validation_tests PRIVATE cxx_std_20)
+    if(MINGW)
+        target_compile_options(nid_buffer_validation_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME nid_buffer_validation COMMAND nid_buffer_validation_tests)
+    set_tests_properties(nid_buffer_validation PROPERTIES TIMEOUT 10)
+
     find_package(Python3 QUIET COMPONENTS Interpreter)
     if(Python3_Interpreter_FOUND)
         add_test(NAME nid_patcher_macho COMMAND ${Python3_EXECUTABLE}

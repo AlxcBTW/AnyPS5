@@ -652,7 +652,7 @@ struct RegistrationModuleEntry {
 std::shared_ptr<const SpecializedModule> registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<std::shared_ptr<const SpecializedModule>()>& specialize) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
-    static std::shared_mutex mutex;
+    static PrimedSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<RegistrationModuleEntry>> modules;
     std::shared_ptr<RegistrationModuleEntry> entry;
     {
