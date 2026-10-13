@@ -847,6 +847,7 @@ private:
         }
         if (functions.empty()) return;
         std::map<std::uint32_t, std::set<std::uint32_t>> references;
+        std::set<std::uint32_t> moduleReferences;
         std::vector<std::uint32_t> pending;
         bool hasEntryPoint = false;
         current = 0;
@@ -862,6 +863,7 @@ private:
             }
             VisitIdOperands(instruction, switchLiteralWords, [&](std::size_t index) {
                 const auto id = instruction[index];
+                if (current == 0 && op != spv::OpName && op != spv::OpDecorate) moduleReferences.insert(id);
                 if (!functions.contains(id)) return;
                 if (current == 0) pending.push_back(id);
                 else references[current].insert(id);
@@ -869,6 +871,14 @@ private:
             if (op == spv::OpFunctionEnd) current = 0;
         }
         if (!hasEntryPoint) return;
+        for (const auto& [id, range] : functions) {
+            for (auto index = range.first; index < range.second; ++index) {
+                const auto result = Result(instructions[index]);
+                if (result == 0 || !moduleReferences.contains(result)) continue;
+                pending.push_back(id);
+                break;
+            }
+        }
         std::set<std::uint32_t> live;
         while (!pending.empty()) {
             const auto id = pending.back();
