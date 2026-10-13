@@ -207,7 +207,7 @@ void Run(AgcDriver::VulkanDevice& device, const AgcDriver::Graphics::ColorTarget
         subgroup.supportedStages = VK_SHADER_STAGE_ALL;
         subgroup.supportedOperations = 0xffu;
         subgroup.quadOperationsInAllStages = VK_TRUE;
-        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, false, false, true);
+        AgcDriver::Graphics::ValidateShaders(shaders, state, subgroup, false, false, false, false, false, false, false, true);
         return;
     }
     device.Draw(state, draw, shaders);
