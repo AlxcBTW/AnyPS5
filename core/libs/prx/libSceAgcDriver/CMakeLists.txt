@@ -177,6 +177,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/CompileProgress.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PipelinePreload.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PresentationScaler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
@@ -1583,6 +1584,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_compute_pipeline_capture PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_compute_pipeline_capture PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(agc_pipeline_preload_tests tests/PipelinePreload.cpp Execution/src/PipelinePreload.cpp)
+    target_include_directories(agc_pipeline_preload_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(agc_pipeline_preload_tests PRIVATE libc)
+    set_target_properties(agc_pipeline_preload_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_pipeline_preload_tests)
+    add_test(NAME agc_pipeline_preload COMMAND agc_pipeline_preload_tests)
+    set_tests_properties(agc_pipeline_preload PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_pipeline_preload PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
 

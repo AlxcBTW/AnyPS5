@@ -7,6 +7,8 @@
 #endif
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileProgress.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PipelinePreload.hpp"
+#include "ShaderDiskCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -208,12 +210,77 @@ struct ComputePipelineObjects {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    bool preloaded = false;
     ~ComputePipelineObjects() {
         if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
         if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
         if (module != VK_NULL_HANDLE) destroyModule(device, module, nullptr);
     }
 };
+
+struct ComputeCreateFunctions {
+    PFN_vkCreateShaderModule createModule = nullptr;
+    PFN_vkDestroyShaderModule destroyModule = nullptr;
+    PFN_vkCreatePipelineLayout createLayout = nullptr;
+    PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
+    PFN_vkCreateComputePipelines createPipelines = nullptr;
+    PFN_vkDestroyPipeline destroyPipeline = nullptr;
+};
+
+namespace {
+
+std::shared_ptr<ComputePipelineObjects> BuildComputeObjects(const ComputeCreateFunctions& functions, VkDevice device, VkPipelineCache cache, VkDescriptorSetLayout setLayout, VkDescriptorSetLayout workgroupLayout, std::span<const std::uint32_t> spirv, const ComputePipelineSettings& settings) {
+    auto objects = std::make_shared<ComputePipelineObjects>();
+    objects->device = device;
+    objects->destroyModule = functions.destroyModule;
+    objects->destroyLayout = functions.destroyLayout;
+    objects->destroyPipeline = functions.destroyPipeline;
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = spirv.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = spirv.data();
+    check(functions.createModule(device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+    const std::array<VkDescriptorSetLayout, 2> setLayouts{setLayout, settings.workgroupMemory ? workgroupLayout : VK_NULL_HANDLE};
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = settings.workgroupMemory ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
+    layoutInfo.pSetLayouts = setLayouts.data();
+    layoutInfo.pushConstantRangeCount = settings.pushConstants ? 1 : 0;
+    layoutInfo.pPushConstantRanges = settings.pushConstants ? &push : nullptr;
+    check(functions.createLayout(device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
+    std::vector<VkSpecializationMapEntry> entries;
+    for (std::size_t index = 0; index < settings.specialization.size(); ++index) entries.push_back({settings.specialization[index].id, static_cast<std::uint32_t>(index * sizeof(ComputeSpecialization) + offsetof(ComputeSpecialization, value)), sizeof(std::uint32_t)});
+    const VkSpecializationInfo specialization{static_cast<std::uint32_t>(entries.size()), entries.data(), settings.specialization.size() * sizeof(ComputeSpecialization), settings.specialization.data()};
+    {
+        AgcDriver::CompileScope compiling;
+        CreateComputePipeline(device, functions.createPipelines, cache, objects->module, objects->layout, settings.flags, 0, entries.empty() ? nullptr : &specialization, settings.subgroupSize, &objects->pipeline);
+    }
+    functions.destroyModule(device, objects->module, nullptr);
+    objects->module = VK_NULL_HANDLE;
+    return objects;
+}
+
+bool PipelinePreloadEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_PRELOAD") == nullptr;
+    return enabled;
+}
+
+unsigned PipelinePreloadThreads() {
+    static const unsigned threads = [] {
+        const auto hardware = std::max(1u, std::thread::hardware_concurrency());
+        unsigned count = std::clamp(hardware / 2u, 1u, 8u);
+        if (const char* text = std::getenv("APS5_PIPELINE_PRELOAD_THREADS"); text != nullptr && *text != '\0') {
+            unsigned parsed = 0;
+            const auto end = text + std::strlen(text);
+            const auto result = std::from_chars(text, end, parsed);
+            require(result.ec == std::errc{} && result.ptr == end && parsed >= 1 && parsed <= 64, "APS5_PIPELINE_PRELOAD_THREADS must be an integer from 1 through 64");
+            count = parsed;
+        }
+        return count;
+    }();
+    return threads;
+}
+
+}
 
 constexpr std::uint64_t WorkgroupMemoryGranule = 1u << 20u;
 
@@ -344,6 +411,27 @@ struct VulkanDevice::State {
     std::mutex computePipelinesMutex;
     std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::map<std::uint64_t, std::shared_future<std::shared_ptr<ComputePipelineObjects>>> computePipelinesBuilding;
+    PipelineClaims<ComputePipelineObjects> computeContent;
+    ComputeCreateFunctions computeFunctions;
+    std::unique_ptr<PipelineManifest> pipelineManifest;
+    std::unique_ptr<PipelinePreloadPool> pipelinePreload;
+    struct PreloadCounters {
+        std::atomic<std::uint64_t> served{0};
+        std::atomic<std::uint64_t> waited{0};
+        std::atomic<std::uint64_t> waitedUs{0};
+        std::atomic<std::uint64_t> deduplicated{0};
+        std::atomic<std::uint64_t> created{0};
+        std::atomic<std::uint64_t> createdUs{0};
+        std::atomic<std::uint64_t> preloaded{0};
+        std::atomic<std::uint64_t> preloadUs{0};
+        std::atomic<std::uint64_t> skipped{0};
+        std::atomic<std::uint64_t> failed{0};
+        std::atomic<std::uint64_t> remaining{0};
+        std::atomic<std::int64_t> lastReportMs{0};
+        double startedAt = 0;
+        std::size_t total = 0;
+        unsigned threads = 0;
+    } preloadCounters;
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
@@ -639,6 +727,8 @@ struct VulkanDevice::State {
     }
 
     ~State() {
+        if (pipelinePreload) pipelinePreload->Stop();
+        PublishPipelinePreload({});
         contextReady = false;
         if (compileOnly && device != VK_NULL_HANDLE) {
             reinterpret_cast<PFN_vkDestroyDevice>(deviceProc(device, "vkDestroyDevice"))(device, nullptr);
@@ -681,6 +771,7 @@ struct VulkanDevice::State {
                 computePipelines.clear();
                 computePipelinesBuilding.clear();
             }
+            computeContent.Clear();
             // Every ShaderResources (kept by the recorder or the resource cache) is gone now, so the
             // sets and samplers they borrowed can go.
             copiedWriters->clear();
@@ -1753,6 +1844,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         }
         state->scaler = std::make_unique<PresentationScaler>(graphicsContext(), VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM);
     }
+    if (window != nullptr && !compileOnly) startPipelinePreload();
 }
 
 VulkanDevice::~VulkanDevice() = default;
@@ -4093,51 +4185,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, const Graphics::ShaderResources& resources, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const std::uint64_t pipelineKey = shader.PipelineVariantId() != 0 ? (shader.PipelineVariantId() << 1u) | (pushStages != 0 ? 1u : 0u) : 0u;
-    std::promise<std::shared_ptr<ComputePipelineObjects>> building;
     if (pipelineKey != 0) {
-        std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;
-        {
-            std::lock_guard pipelines(state->computePipelinesMutex);
-            if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
-            if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
-            else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
-        }
-        if (other.valid()) return other.get();
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
     }
-    const auto finish = [&](std::shared_ptr<ComputePipelineObjects> built, std::exception_ptr error) {
-        if (pipelineKey == 0) return built;
-        {
-            std::lock_guard pipelines(state->computePipelinesMutex);
-            if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
-            state->computePipelinesBuilding.erase(pipelineKey);
-        }
-        if (error != nullptr) building.set_exception(error);
-        else building.set_value(built);
-        return built;
-    };
-    std::shared_ptr<ComputePipelineObjects> objects;
-    try {
+    const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+    const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
+    const auto build = [&] {
         const auto start = std::chrono::steady_clock::now();
-        objects = std::make_shared<ComputePipelineObjects>();
-        objects->device = state->device;
-        objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
-        objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
-        objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
-        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
-        moduleInfo.pCode = shader.spirv.data();
-        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
-        const std::array<VkDescriptorSetLayout, 2> setLayouts{resources.Layout(), shader.workgroupMemoryDwords != 0 ? state->workgroupMemoryLayout : VK_NULL_HANDLE};
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
-        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
-        layoutInfo.pSetLayouts = setLayouts.data();
-        layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
-        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
-        const VkPipelineCreateFlags pipelineFlags = (context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0) | VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
-        const Graphics::PipelineSpecialization specialization(shader);
-        const auto subgroupSize = state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize) ? std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize) : 0u;
+        Graphics::PipelineSpecialization::Validate(shader);
         if (const char* directory = std::getenv("APS5_DUMP_COMPUTE_PIPELINES"); directory != nullptr && *directory != '\0' && CaptureComputePipeline(shader.spirv.size())) {
             ComputePipelineCapture capture;
             capture.spirv = shader.spirv;
@@ -4153,7 +4209,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
             }
             capture.sets.push_back(std::move(resourcesLayout));
             if (shader.workgroupMemoryDwords != 0) capture.sets.push_back({0, {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0}}});
-            if (pushStages != 0) capture.pushConstants.push_back(push);
+            if (pushStages != 0) capture.pushConstants.push_back({VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes});
             for (const auto& value : shader.specialization) capture.specialization.push_back({value.id, value.value});
             capture.requiredSubgroupSize = subgroupSize;
             capture.flags = pipelineFlags;
@@ -4174,16 +4230,193 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
             for (const auto& value : shader.specialization) specializationHash = (((specializationHash ^ value.id) * 1099511628211ull) ^ value.value) * 1099511628211ull;
             std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx, spirv %016llx, specialization %016llx x%zu, flags 0x%x, subgroup %u)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(spirvHash), static_cast<unsigned long long>(specializationHash), shader.specialization.size(), static_cast<unsigned>(pipelineFlags), static_cast<unsigned>(subgroupSize));
         }
-        CreateComputePipeline(state->device, state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines"), context.pipelineCache, objects->module, objects->layout, pipelineFlags, 0, specialization.Info(), subgroupSize, &objects->pipeline);
-        objects->destroyModule(objects->device, objects->module, nullptr);
-        objects->module = VK_NULL_HANDLE;
+        ComputePipelineSettings settings;
+        const auto layouts = resources.SetLayouts();
+        settings.layoutKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+        const auto layoutBindings = resources.LayoutBindings();
+        const auto bindingFlags = resources.LayoutBindingFlags();
+        require(layoutBindings.size() == bindingFlags.size(), "compute pipeline binding flag count differs from layout");
+        for (std::size_t index = 0; index < layoutBindings.size(); ++index) {
+            const auto& binding = layoutBindings[index];
+            require(binding.pImmutableSamplers == nullptr, "compute pipelines take no immutable samplers");
+            settings.bindings.push_back({binding.binding, binding.descriptorType, binding.descriptorCount, binding.stageFlags, bindingFlags[index]});
+        }
+        settings.updateAfterBind = resources.LayoutUpdateAfterBind();
+        settings.workgroupMemory = shader.workgroupMemoryDwords != 0;
+        settings.pushConstants = pushStages != 0;
+        for (const auto& value : shader.specialization) settings.specialization.push_back({value.id, value.value});
+        settings.subgroupSize = subgroupSize;
+        settings.flags = pipelineFlags;
+        auto objects = BuildComputeObjects(state->computeFunctions, state->device, context.pipelineCache, resources.Layout(), state->workgroupMemoryLayout, shader.spirv, settings);
         Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
-        if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(programAddress));
-    } catch (...) {
-        finish(nullptr, std::current_exception());
-        throw;
+        const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), ms, static_cast<unsigned long long>(programAddress));
+        state->preloadCounters.created.fetch_add(1, std::memory_order_relaxed);
+        state->preloadCounters.createdUs.fetch_add(static_cast<std::uint64_t>(ms * 1000.0), std::memory_order_relaxed);
+        return std::pair{std::move(objects), std::move(settings)};
+    };
+    std::shared_ptr<ComputePipelineObjects> objects;
+    if (!PipelinePreloadEnabled()) {
+        std::promise<std::shared_ptr<ComputePipelineObjects>> building;
+        if (pipelineKey != 0) {
+            std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;
+            {
+                std::lock_guard pipelines(state->computePipelinesMutex);
+                if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
+                if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
+                else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
+            }
+            if (other.valid()) return other.get();
+        }
+        const auto finish = [&](std::shared_ptr<ComputePipelineObjects> built, std::exception_ptr error) {
+            if (pipelineKey == 0) return built;
+            {
+                std::lock_guard pipelines(state->computePipelinesMutex);
+                if (built != nullptr) built = state->computePipelines.try_emplace(pipelineKey, built).first->second;
+                state->computePipelinesBuilding.erase(pipelineKey);
+            }
+            if (error != nullptr) building.set_exception(error);
+            else building.set_value(built);
+            return built;
+        };
+        try {
+            objects = build().first;
+        } catch (...) {
+            finish(nullptr, std::current_exception());
+            throw;
+        }
+        return finish(std::move(objects), nullptr);
     }
-    return finish(std::move(objects), nullptr);
+    const auto spirvKey = HashPipelineWords(shader.spirv);
+    ComputePipelineSettings keySettings;
+    {
+        const auto layouts = resources.SetLayouts();
+        keySettings.layoutKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+        const auto layoutBindings = resources.LayoutBindings();
+        const auto bindingFlags = resources.LayoutBindingFlags();
+        require(layoutBindings.size() == bindingFlags.size(), "compute pipeline binding flag count differs from layout");
+        for (std::size_t index = 0; index < layoutBindings.size(); ++index) keySettings.bindings.push_back({layoutBindings[index].binding, layoutBindings[index].descriptorType, layoutBindings[index].descriptorCount, layoutBindings[index].stageFlags, bindingFlags[index]});
+        keySettings.updateAfterBind = resources.LayoutUpdateAfterBind();
+        keySettings.workgroupMemory = shader.workgroupMemoryDwords != 0;
+        keySettings.pushConstants = pushStages != 0;
+        for (const auto& value : shader.specialization) keySettings.specialization.push_back({value.id, value.value});
+        keySettings.subgroupSize = subgroupSize;
+        keySettings.flags = pipelineFlags;
+    }
+    const auto contentKey = ComputePipelineKey(spirvKey, shader.spirv.size(), keySettings);
+    auto& counters = state->preloadCounters;
+    for (;;) {
+        auto claim = state->computeContent.Acquire(contentKey);
+        if (claim.ready != nullptr) {
+            objects = std::move(claim.ready);
+            (objects->preloaded ? counters.served : counters.deduplicated).fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        if (claim.pending.valid()) {
+            const auto waitStart = std::chrono::steady_clock::now();
+            try {
+                objects = claim.pending.get();
+            } catch (const std::exception&) {
+                continue;
+            }
+            counters.waited.fetch_add(1, std::memory_order_relaxed);
+            counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+            break;
+        }
+        try {
+            auto built = build();
+            objects = std::move(built.first);
+            state->computeContent.Fulfill(contentKey, objects);
+            if (state->pipelineManifest != nullptr) state->pipelineManifest->Record({contentKey, spirvKey, static_cast<std::uint32_t>(shader.spirv.size()), std::move(built.second)}, shader.spirv);
+        } catch (...) {
+            state->computeContent.Fail(contentKey, std::current_exception());
+            throw;
+        }
+        break;
+    }
+    if (pipelineKey != 0) {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        objects = state->computePipelines.try_emplace(pipelineKey, objects).first->second;
+    }
+    if (profile) reportPipelinePreload();
+    return objects;
+}
+
+void VulkanDevice::startPipelinePreload() {
+    if (!PipelinePreloadEnabled() || !ShaderRecompiler::ShaderDiskCache::Enabled()) return;
+    auto& functions = state->computeFunctions;
+    functions.createModule = state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+    functions.destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    functions.createLayout = state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout");
+    functions.destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    functions.createPipelines = state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+    functions.destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+    char name[64];
+    std::snprintf(name, sizeof(name), "compute-%04x-%04x.manifest", state->properties.vendorID, state->properties.deviceID);
+    state->pipelineManifest = std::make_unique<PipelineManifest>(ShaderRecompiler::ShaderDiskCache::EntryDirectory() / "pipelines", name);
+    const auto loadStart = std::chrono::steady_clock::now();
+    auto entries = state->pipelineManifest->Load();
+    const auto loadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loadStart).count();
+    auto& counters = state->preloadCounters;
+    counters.startedAt = ProcessSeconds();
+    counters.total = entries.size();
+    counters.threads = PipelinePreloadThreads();
+    counters.remaining.store(entries.size(), std::memory_order_relaxed);
+    std::fprintf(stderr, "[preload] t=%.3f %zu compute pipelines in %s (read in %.1f ms), building on %u threads\n", counters.startedAt, entries.size(), state->pipelineManifest->File().string().c_str(), loadMs, counters.threads);
+    if (entries.empty()) return;
+    SetCompileExpected_nid_postfix(CompileSnapshot_nid_postfix().completed + entries.size());
+    PublishPipelinePreload({0, entries.size(), true});
+    const auto context = graphicsContext();
+    std::vector<PipelinePreloadTask> tasks;
+    tasks.reserve(entries.size());
+    for (auto& entry : entries) {
+        const double cost = static_cast<double>(entry.spirvWords);
+        tasks.push_back({cost, [this, context, entry = std::move(entry)] {
+            auto& counters = state->preloadCounters;
+            const auto finish = [&] {
+                const auto left = counters.remaining.fetch_sub(1, std::memory_order_acq_rel) - 1;
+                PublishPipelinePreload({counters.total - left, counters.total, left != 0});
+                if (left != 0) return;
+                SetCompileExpected_nid_postfix(0);
+                std::fprintf(stderr, "[preload] t=%.3f built %llu of %zu compute pipelines (%llu already built elsewhere, %llu failed) in %.1f s on %u threads, %.1f s of creation time\n", ProcessSeconds(), static_cast<unsigned long long>(counters.preloaded.load()), counters.total, static_cast<unsigned long long>(counters.skipped.load()), static_cast<unsigned long long>(counters.failed.load()), ProcessSeconds() - counters.startedAt, counters.threads, static_cast<double>(counters.preloadUs.load()) / 1e6);
+            };
+            if (!state->computeContent.TryClaim(entry.key)) {
+                counters.skipped.fetch_add(1, std::memory_order_relaxed);
+                finish();
+                return;
+            }
+            try {
+                const auto start = std::chrono::steady_clock::now();
+                std::vector<std::uint32_t> spirv;
+                require(state->pipelineManifest->LoadSpirv(entry, spirv), "pipeline manifest SPIR-V is missing or changed");
+                std::vector<VkDescriptorSetLayoutBinding> bindings;
+                std::vector<VkDescriptorBindingFlags> flags;
+                for (const auto& binding : entry.settings.bindings) {
+                    bindings.push_back({binding.binding, binding.type, binding.count, binding.stages, nullptr});
+                    flags.push_back(binding.flags);
+                }
+                const auto setLayout = state->descriptorCache->Layout(entry.settings.layoutKey, bindings, entry.settings.updateAfterBind, flags);
+                auto objects = BuildComputeObjects(state->computeFunctions, state->device, context.pipelineCache, setLayout, state->workgroupMemoryLayout, spirv, entry.settings);
+                objects->preloaded = true;
+                state->computeContent.Fulfill(entry.key, std::move(objects));
+                counters.preloaded.fetch_add(1, std::memory_order_relaxed);
+                counters.preloadUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            } catch (const std::exception& error) {
+                state->computeContent.Fail(entry.key, std::current_exception());
+                if (counters.failed.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[preload] a manifest pipeline was not built: %s\n", error.what());
+            }
+            finish();
+        }});
+    }
+    state->pipelinePreload = std::make_unique<PipelinePreloadPool>(std::move(tasks), counters.threads, true);
+}
+
+void VulkanDevice::reportPipelinePreload() {
+    auto& counters = state->preloadCounters;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReportMs.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !counters.lastReportMs.compare_exchange_strong(last, nowMs)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[preload] t=%.1f compute pipelines: %llu served by the preload, %llu waited for it (%.1f ms), %llu repeats served from the content map, %llu created here (%.1f ms); preload %llu built / %zu (%llu skipped, %llu failed), %zu recorded\n", ProcessSeconds(), static_cast<unsigned long long>(counters.served.load()), static_cast<unsigned long long>(counters.waited.load()), static_cast<double>(counters.waitedUs.load()) / 1000.0, static_cast<unsigned long long>(counters.deduplicated.load()), static_cast<unsigned long long>(counters.created.load()), static_cast<double>(counters.createdUs.load()) / 1000.0, static_cast<unsigned long long>(counters.preloaded.load()), counters.total, static_cast<unsigned long long>(counters.skipped.load()), static_cast<unsigned long long>(counters.failed.load()), state->pipelineManifest != nullptr ? state->pipelineManifest->Recorded() : std::size_t{0});
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
