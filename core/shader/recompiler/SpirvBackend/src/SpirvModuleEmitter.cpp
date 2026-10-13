@@ -505,6 +505,10 @@ std::uint32_t MeshOutputType(SpirvEmitterState& state, StageOutputKind kind) {
 
 namespace {
 
+std::uint32_t TessellationOuterFactors(const SpirvEmitterState& state) {
+    return state.inputInfo.vertex->tess.domain == 2u ? 4u : 3u;
+}
+
 std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     const auto kind = static_cast<TessellationAttribute>(inst.Argument(0)->ImmediateU32());
@@ -520,11 +524,12 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
             throw std::runtime_error("tessellation factor index must be immediate");
         }
         const auto index = inst.Argument(1)->ImmediateU32() / 4u;
-        const bool outer = index < 3u;
-        if (index >= 4u) {
+        const auto outerFactors = TessellationOuterFactors(state);
+        const bool outer = index < outerFactors;
+        if (index >= outerFactors + (outerFactors == 4u ? 2u : 1u)) {
             throw std::runtime_error("tessellation factor index out of range");
         }
-        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, outer ? index : index - 3u));
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, outer ? index : index - outerFactors));
         return pointer;
     }
     auto address = ctx.Arg(inst, 1);
@@ -628,16 +633,16 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
 
 void DefineTessellationExecutionModes(SpirvEmitterState& state) {
     const auto& tess = state.inputInfo.vertex->tess;
-    if (tess.domain != 1u || tess.partitioning != 2u || tess.outputTopology != 2u) {
+    if ((tess.domain != 1u && tess.domain != 2u) || tess.partitioning != 2u || (tess.outputTopology != 2u && tess.outputTopology != 3u)) {
         throw std::runtime_error("unsupported tessellation domain, partitioning, or output topology");
     }
     state.module.EmitCapability(spv::CapabilityTessellation);
     if (state.program.Resources().stage == IrShaderStage::TessellationControl) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputVertices, tess.outputControlPoints);
     } else {
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeTriangles);
+        state.module.AddExecutionMode(state.mainFunc, tess.domain == 2u ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSpacingFractionalOdd);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeVertexOrderCw);
+        state.module.AddExecutionMode(state.mainFunc, tess.outputTopology == 3u ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw);
     }
 }
 
@@ -1220,21 +1225,45 @@ std::uint32_t EmitGetTessellationAttribute(SpirvValueEmitContext& ctx, const IrV
     });
 }
 
+namespace {
+
+std::uint32_t TessellationLevel(SpirvEmitterState& state, std::uint32_t index) {
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, TessellationLevelPushOffsetBytes / 4u + index));
+    const auto word = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), word, pointer);
+    const auto level = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBitcast, TypeF32(state), level, word);
+    return level;
+}
+
+std::uint32_t TessellationLevelBound(SpirvEmitterState& state, std::uint32_t level, std::uint32_t operation, float limit) {
+    const auto bounded = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, TypeF32(state), bounded, GlslStd450(state), operation, level, ConstantF32Value(state, limit));
+    return bounded;
+}
+
+}
+
 void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
     EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&]() {
         auto value = ctx.Arg(inst, 2);
         if (inst.Argument(0)->ImmediateU32() == static_cast<std::uint32_t>(TessellationAttribute::Factor)) {
             auto& state = ctx.state;
-            const bool outer = inst.Argument(1)->HasImmediate() && inst.Argument(1)->ImmediateU32() / 4u < 3u;
+            if (state.program.Resources().stage != IrShaderStage::TessellationControl || state.pushConstantVariable == 0u) ctx.Fail(inst, "writes tessellation factors outside a hull program");
+            const bool outer = inst.Argument(1)->HasImmediate() && inst.Argument(1)->ImmediateU32() / 4u < TessellationOuterFactors(state);
+            const auto minimum = TessellationLevel(state, 0u);
+            const auto lowest = outer ? minimum : TessellationLevelBound(state, minimum, GLSLstd450FMax, 1.0f);
             const auto floating = state.module.AllocateId();
             state.module.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
-            const auto lower = ConstantF32Value(state, outer ? 0.0f : 1.0f);
             const auto inside = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), inside, floating, lower);
+            state.module.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), inside, floating, ConstantF32Value(state, outer ? 0.0f : 1.0f));
+            const auto raised = state.module.AllocateId();
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), raised, GlslStd450(state), GLSLstd450FMax, floating, lowest);
             const auto clamped = state.module.AllocateId();
-            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, floating, ConstantF32Value(state, 63.0f));
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, raised, TessellationLevelBound(state, TessellationLevel(state, 1u), GLSLstd450FMin, 63.0f));
             value = state.module.AllocateId();
-            state.module.AddFunction(spv::OpSelect, TypeF32(state), value, inside, clamped, outer ? floating : lower);
+            state.module.AddFunction(spv::OpSelect, TypeF32(state), value, inside, clamped, outer ? floating : lowest);
         }
         ctx.state.module.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
     });

@@ -1559,6 +1559,12 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
     }
+    if (state.stages.tessellation) {
+        for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
+        const std::array<float, ShaderRecompiler::TessellationLevelPushBytes / 4> levels{state.stages.minTessellationLevel, state.stages.maxTessellationLevel};
+        static_assert(ShaderRecompiler::TessellationLevelPushOffsetBytes + ShaderRecompiler::TessellationLevelPushBytes == PipelinePushSlotBytes);
+        std::memcpy(block.data() + ShaderRecompiler::TessellationLevelPushOffsetBytes, levels.data(), sizeof(levels));
+    }
     if (!state.stages.mesh) {
         pipeline.PushConstants(commands, stages, block);
         return;

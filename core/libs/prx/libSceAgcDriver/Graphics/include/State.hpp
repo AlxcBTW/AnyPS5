@@ -29,6 +29,8 @@ struct ShaderStages {
     std::uint32_t fragmentWaveSize;
     std::optional<ShaderRecompiler::MeshConfiguration> mesh;
     std::optional<ShaderRecompiler::TessellationConfiguration> tessellation;
+    float minTessellationLevel = 1.0f;
+    float maxTessellationLevel = 64.0f;
 };
 
 struct ColorTarget {

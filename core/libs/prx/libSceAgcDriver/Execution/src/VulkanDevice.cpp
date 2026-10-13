@@ -2172,7 +2172,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // a completion-deferred label): it lands only when that batch is reaped, whatever its fence.
     const auto completionStoreOverlaps = [&](std::uint64_t address) {
         if (alwaysSync || state->CopiedWriterOverlaps(address, bytes)) return true;
-        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes);
+        return Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes);
     };
     // The CPU decision (see the header): pure queries, in the order that makes the first failing
     // test the reason; a signaled writer of the source is fine (its in-place stores are final in
