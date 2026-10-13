@@ -1117,25 +1117,31 @@ void verifySpecializationDropsDeadConstants() {
         emit(spv::OpFunctionEnd, {});
         return words;
     };
-    const auto constants = [](const std::vector<std::uint32_t>& words) {
-        std::set<std::uint32_t> ids;
+    struct Contents {
+        std::map<std::uint32_t, std::uint32_t> constants;
         std::size_t names = 0;
+        std::uint32_t stored = 0;
+    };
+    const auto contents = [](const std::vector<std::uint32_t>& words) {
+        Contents result;
         for (std::size_t cursor = 5; cursor < words.size();) {
             const auto count = words[cursor] >> 16u;
             const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
             require(count != 0u && count <= words.size() - cursor, "dead constant removal truncated an instruction");
-            if (op == spv::OpConstant) ids.insert(words[cursor + 2u]);
-            if (op == spv::OpName && words[cursor + 1u] == 6u) ++names;
+            if (op == spv::OpConstant && count == 4u) result.constants.emplace(words[cursor + 2u], words[cursor + 3u]);
+            if (op == spv::OpName && words[cursor + 1u] == 6u) ++result.names;
+            if (op == spv::OpStore && words[cursor + 1u] == 8u) result.stored = words[cursor + 2u];
             cursor += count;
         }
-        return std::pair{ids, names};
+        return result;
     };
     const auto rgba = SpecializeSpirv(module(4u));
     const auto bgra = SpecializeSpirv(module(6u));
     require(rgba == bgra, "variants that differ only in a folded constant specialized to different SPIR-V");
-    const auto [ids, names] = constants(rgba);
-    require(!ids.contains(6u) && names == 0u, "specialization kept a constant the folding consumed, or its name");
-    require(ids.contains(7u) && ids.contains(21u), "specialization removed a constant that is still used (the selected value or an array length)");
+    const auto result = contents(rgba);
+    require(!result.constants.contains(6u) && result.names == 0u, "specialization kept a constant the folding consumed, or its name");
+    require(result.constants.contains(21u), "specialization removed the constant an array type's length still uses");
+    require(result.constants.contains(result.stored) && result.constants.at(result.stored) == 4u, "the store no longer reads the selected value");
     require(SpecializeSpirv(rgba) == rgba, "dead constant removal is not stable");
 }
 

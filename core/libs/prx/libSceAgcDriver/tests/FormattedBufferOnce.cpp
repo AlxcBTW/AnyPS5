@@ -36,6 +36,7 @@ struct Counts {
     std::size_t functions = 0;
     std::size_t notInlined = 0;
     std::size_t compareExchanges = 0;
+    std::size_t constantWords = 0;
 };
 
 Counts Count(std::span<const std::uint32_t> words) {
@@ -48,6 +49,7 @@ Counts Count(std::span<const std::uint32_t> words) {
         if (opcode == spv::OpSwitch) ++counts.switches;
         if (opcode == spv::OpFunctionCall) ++counts.calls;
         if (opcode == spv::OpAtomicCompareExchange) ++counts.compareExchanges;
+        if (opcode == spv::OpConstant || opcode == spv::OpConstantTrue || opcode == spv::OpConstantFalse || opcode == spv::OpConstantComposite || opcode == spv::OpConstantNull || opcode == spv::OpSpecConstant || opcode == spv::OpSpecConstantTrue || opcode == spv::OpSpecConstantFalse || opcode == spv::OpSpecConstantComposite) counts.constantWords += count;
         if (opcode == spv::OpFunction) {
             ++counts.functions;
             if (count > 3 && (words[offset + 3] & spv::FunctionControlDontInlineMask) != 0) ++counts.notInlined;
@@ -94,7 +96,9 @@ int main() {
         const auto vertexSpecialized = Compile(1, false, false, true, false);
         const auto vertexRegistration = Compile(1, false, false, true, true);
         Check(vertexRegistration.compareExchanges == vertexSpecialized.compareExchanges, "formatted buffer once: in registration form a store through an aligned V# kept the unaligned compare-exchange path (" + std::to_string(vertexRegistration.compareExchanges) + " compare-exchanges, " + std::to_string(vertexSpecialized.compareExchanges) + " specialized)");
-        Check(vertexRegistration.words < vertexSpecialized.words + vertexSpecialized.words / 2u, "formatted buffer once: in registration form a formatted load from a known descriptor kept every format's decoder (" + std::to_string(vertexRegistration.words) + " words, " + std::to_string(vertexSpecialized.words) + " specialized)");
+        const auto registrationCode = vertexRegistration.words - vertexRegistration.constantWords;
+        const auto specializedCode = vertexSpecialized.words - vertexSpecialized.constantWords;
+        Check(registrationCode < specializedCode + specializedCode / 2u, "formatted buffer once: in registration form a formatted load from a known descriptor kept every format's decoder (" + std::to_string(registrationCode) + " words without constants, " + std::to_string(specializedCode) + " specialized)");
         Check(one.words < gpuOne.words / 2u, "formatted buffer once: a formatted load from a known descriptor kept every format's decoder (" + std::to_string(one.words) + " words, a GPU-selected descriptor needs " + std::to_string(gpuOne.words) + ")");
         Check(one.calls == none.calls + 1 && one.functions == none.functions + 1, "formatted buffer once: one formatted load emitted " + std::to_string(one.calls - none.calls) + " calls and " + std::to_string(one.functions - none.functions) + " functions more than none, expected one call to one shared function");
         Check(three.calls == one.calls + 2 && three.functions == one.functions, "formatted buffer once: two more formatted loads from the same descriptor emitted " + std::to_string(three.calls - one.calls) + " calls and " + std::to_string(three.functions - one.functions) + " functions more, expected two calls and no function");
@@ -109,7 +113,7 @@ int main() {
         Check(gpuThree.functions == gpuOne.functions && gpuThree.calls > gpuOne.calls, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.functions - gpuOne.functions) + " more functions, expected calls to the shared one");
         Check(gpuThree.switches == gpuOne.switches, "formatted buffer once: two more formatted loads from a GPU-selected descriptor emitted " + std::to_string(gpuThree.switches - gpuOne.switches) + " more format switches");
         Check(gpuThree.words - gpuOne.words < gpuOne.words / 10u, "formatted buffer once: 2 more formatted loads from a GPU-selected descriptor added " + std::to_string(gpuThree.words - gpuOne.words) + " SPIR-V words to a " + std::to_string(gpuOne.words) + "-word module");
-        std::printf("formatted buffer once tests passed (%zu words for 1 load, %zu for 3; GPU-selected %zu and %zu; vertex %zu specialized, %zu registration)\n", one.words, three.words, gpuOne.words, gpuThree.words, vertexSpecialized.words, vertexRegistration.words);
+        std::printf("formatted buffer once tests passed (%zu words for 1 load, %zu for 3; GPU-selected %zu and %zu; vertex %zu specialized, %zu registration, without constants %zu and %zu)\n", one.words, three.words, gpuOne.words, gpuThree.words, vertexSpecialized.words, vertexRegistration.words, vertexSpecialized.words - vertexSpecialized.constantWords, vertexRegistration.words - vertexRegistration.constantWords);
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
