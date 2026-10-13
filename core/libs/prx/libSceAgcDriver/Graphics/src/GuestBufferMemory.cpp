@@ -115,6 +115,9 @@ struct GuestBufferMemory::AddressSpace {
     std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> directReads;
     mutable std::mutex tableMutex;
     mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
+    // exp (APS5_EXP_BDA_SWEEP_SKIP mask 2): AddressRanges() of builds with regions of their own, keyed
+    // by everything it reads besides this immutable space (see CachedAddressTable).
+    mutable std::map<std::vector<std::uint64_t>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> ownTables;
 };
 
 namespace {
@@ -3681,7 +3684,56 @@ void GuestBufferMemory::AddressRanges(std::vector<ShaderRecompiler::BdaAbi::Rang
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
-    if (space == nullptr || !regions.empty()) return std::nullopt;
+    if (space == nullptr) return std::nullopt;
+    if (!regions.empty()) {
+        // exp (APS5_EXP_BDA_SWEEP_SKIP mask 2, hot: read once per build here): a build with regions of
+        // its own takes AddressRanges() from the space's memo instead of merging, hashing and
+        // comparing the space's ~9000 entries again. The memo key is everything AddressRanges() reads
+        // besides the space, which is immutable while its serial lives: the writes as given, and per
+        // own region (in order) its table entry and the flags owner()'s write check reads.
+        if ((BdaSweepSkip() & 2) == 0) return std::nullopt;
+        Require(uploaded && !committed, "guest GPU address ranges are not available");
+        if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};
+        std::vector<std::uint64_t> key;
+        key.reserve(1 + writes.size() * 2 + regions.size() * (sizeof(ShaderRecompiler::BdaAbi::Range) / sizeof(std::uint64_t) + 1));
+        key.push_back(writes.size());
+        for (const auto& [begin, end] : writes) key.insert(key.end(), {begin, end});
+        static_assert(sizeof(ShaderRecompiler::BdaAbi::Range) % sizeof(std::uint64_t) == 0);
+        for (const auto& region : regions) {
+            const auto entry = addressRange(region);
+            std::uint64_t words[sizeof(entry) / sizeof(std::uint64_t)];
+            std::memcpy(words, &entry, sizeof(entry));
+            key.insert(key.end(), std::begin(words), std::end(words));
+            key.push_back((region.writable ? 1u : 0u) | (region.direct != nullptr ? 2u : 0u) | (region.mirror != nullptr ? 4u : 0u) | (region.mirror != nullptr && region.mirror->writable ? 8u : 0u));
+        }
+        std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> found;
+        std::uint64_t serial = 0;
+        {
+            std::lock_guard lock(space->tableMutex);
+            if (const auto it = space->ownTables.find(key); it != space->ownTables.end()) {
+                serial = it->second.first;
+                found = it->second.second;
+            }
+        }
+        if (found != nullptr) {
+            NoteSweepSkip(1, BdaSweepSkipVerify(), [&] {
+                const auto full = AddressRanges();
+                return full.size() == found->size() && (full.empty() || std::memcmp(full.data(), found->data(), full.size() * sizeof(full.front())) == 0);
+            });
+        } else {
+            auto built = std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(AddressRanges());
+            std::lock_guard lock(space->tableMutex);
+            if (space->ownTables.size() >= 16u && !space->ownTables.contains(key)) space->ownTables.erase(space->ownTables.begin());
+            // A build of another thread may have stored the same key meanwhile: equal ranges, and its
+            // serial is the one later builds bind.
+            const auto stored = space->ownTables.try_emplace(std::move(key), Spaces().serials.fetch_add(1, std::memory_order_relaxed) + 1, std::move(built)).first;
+            serial = stored->second.first;
+            found = stored->second.second;
+        }
+        writeTableSerial = serial;
+        writeTableRanges = found;
+        return CachedTable{serial, found.get()};
+    }
     Require(uploaded && !committed, "guest GPU address ranges are not available");
     if (writes.empty()) return CachedTable{space->serial, &space->ranges};
     if (writeTableRanges != nullptr) return CachedTable{writeTableSerial, writeTableRanges.get()};

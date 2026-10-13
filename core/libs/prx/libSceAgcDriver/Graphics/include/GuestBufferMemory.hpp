@@ -250,7 +250,9 @@ public:
     // The BDA table of the cached address space when it serves this upload alone (an address-based
     // build with no region outside it): its ranges, immutable while the space lives, and the
     // space's serial, by which BdaResources reuses the table buffer built for it without a
-    // compare. Nothing when a region of this build is not in the space (AddressRanges then merges).
+    // compare. Nothing when a region of this build is not in the space (AddressRanges then merges),
+    // except with APS5_EXP_BDA_SWEEP_SKIP mask 2 (exp, never push): then the space's memo of
+    // AddressRanges() for this build's own regions and writes, under a serial of its own.
     struct CachedTable {
         std::uint64_t serial;
         const std::vector<ShaderRecompiler::BdaAbi::Range>* ranges;
