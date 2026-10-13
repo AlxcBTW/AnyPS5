@@ -28,6 +28,14 @@ class Recorder;
 void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
+// exp (APS5_EXP_HEAP_BUDGET): a texture cache's budget while the device-local heap is short: what it held
+// at that heap's reading less its share of the excess (`cached` of `total`), down to 512 MiB, set once per
+// reading; `budget` otherwise.
+struct ShortTextureBudget {
+    std::uint64_t reading = 0;
+    std::uint64_t target = 0;
+};
+std::uint64_t ShortTextureCacheBudget(ShortTextureBudget& state, std::uint64_t budget, std::uint64_t cached, std::uint64_t total);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 struct TextureCacheUse {

@@ -869,6 +869,8 @@ struct HeapWatch {
     std::atomic<std::uint64_t> syncPromotions{0};
     std::atomic<std::uint64_t> devicePromotions{0};
     std::atomic<std::uint64_t> devicePromotedBytes{0};
+    // Readings of the heaps' budgets taken so far (under `mutex`).
+    std::uint64_t readings = 0;
 };
 
 // exp (APS5_EXP_HEAP_BUDGET): the device-local bytes mirrors may still take: up to 85 % of that heap's
@@ -3023,6 +3025,7 @@ HostHeapState PollHostHeap(const Context& context, std::uint64_t liveImports, bo
         heaps.last = state;
         heaps.read = now;
         heaps.physical = context.physical;
+        ++heaps.readings;
     }
     auto& state = heaps.last;
     state.imports = liveImports;
@@ -3064,6 +3067,16 @@ std::uint64_t MirrorDeviceRoom() {
     auto& heaps = Heaps();
     std::lock_guard lock(heaps.mutex);
     return mirrorDeviceRoom(heaps.last);
+}
+
+DevicePressure DeviceHeapPressure() {
+    if (!heapBudgetEnabled()) return {};
+    auto& heaps = Heaps();
+    std::lock_guard lock(heaps.mutex);
+    const auto& last = heaps.last;
+    if (last.deviceHeap == UINT32_MAX || last.deviceBudget == 0) return {};
+    const auto wanted = last.deviceUsage + DeviceHeapReserve(last.deviceBudget);
+    return {wanted > last.deviceBudget ? wanted - last.deviceBudget : 0, heaps.readings};
 }
 
 void ResetHeapRebalance() {

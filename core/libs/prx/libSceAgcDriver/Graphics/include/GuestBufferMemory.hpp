@@ -131,6 +131,13 @@ std::uint64_t DeviceHeapRoom();
 // may move imports to mirrors or back at once.
 std::uint64_t MirrorDeviceRoom();
 void ResetHeapRebalance();
+// How far the device-local heap's use is past its budget less its reserve (an eighth) at the last reading,
+// and that reading's serial (zero without APS5_EXP_HEAP_BUDGET, a reading, or a short heap).
+struct DevicePressure {
+    std::uint64_t excess = 0;
+    std::uint64_t reading = 0;
+};
+DevicePressure DeviceHeapPressure();
 std::uint64_t DeviceHeapReserve(std::uint64_t deviceBudget);
 // The import bytes a heap with `heapBudget` leaves when `others` bytes of it are in other use.
 std::uint64_t HeapImportAllowance(std::uint64_t heapBudget, std::uint64_t others, std::uint64_t headroom);

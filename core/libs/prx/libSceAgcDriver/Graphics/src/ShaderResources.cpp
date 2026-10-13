@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <atomic>
@@ -116,6 +117,7 @@ struct CachedTexture {
 // still kept), the linear lookup of before.
 struct TextureCache {
     std::mutex mutex;
+    ShortTextureBudget shortened;
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
@@ -694,7 +696,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
-    const auto budget = sampledBudget(context, cache);
+    const auto budget = ShortTextureCacheBudget(cache.shortened, sampledBudget(context, cache), cache.bytes, cache.bytes + storageCacheBytes());
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
@@ -740,6 +742,7 @@ struct CachedStorageTexture {
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
     std::mutex mutex;
+    ShortTextureBudget shortened;
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
@@ -885,7 +888,8 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
-            const auto budget = storageBudget(context);
+            const auto cached = cache.bytes.load(std::memory_order_relaxed);
+            const auto budget = ShortTextureCacheBudget(cache.shortened, storageBudget(context), cached, cached + SampledTextureMemory());
             while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
             cache.bytes += entry.accounted;
             texture = entry.texture;
@@ -921,6 +925,23 @@ std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     const auto usage = reported->heapUsage[*heap];
     const auto reserved = usage - std::min<std::uint64_t>(usage, textureBytes) + TextureCacheBudget(memory) + budget / 8u;
     return std::max<std::uint64_t>(2048ull << 20u, budget > reserved ? budget - reserved : 0u);
+}
+
+// exp (APS5_EXP_HEAP_BUDGET): while the device-local heap is short (DeviceHeapPressure: its use past its
+// budget less an eighth), a texture cache keeps what it held at that heap reading less its share of the
+// excess (by its part of `total`, both caches' bytes), down to 512 MiB, instead of a floor of 2 GiB, so its
+// least recently used entries go when it next inserts. parl0v's 16 GB / 8 GB run of 2aad7b15a died on VRAM
+// with 1.19 GB of sampled textures and 1.84 GB of storage images, both under that floor, so neither cache
+// ever gave memory back. An evicted entry is made again from guest memory when it is next used.
+std::uint64_t ShortTextureCacheBudget(ShortTextureBudget& state, std::uint64_t budget, std::uint64_t cached, std::uint64_t total) {
+    const auto pressure = DeviceHeapPressure();
+    if (pressure.excess == 0) return budget;
+    if (state.reading != pressure.reading) {
+        state.reading = pressure.reading;
+        const auto share = total == 0 ? 0 : static_cast<std::uint64_t>(static_cast<double>(pressure.excess) * static_cast<double>(cached) / static_cast<double>(total));
+        state.target = std::max<std::uint64_t>(std::uint64_t{512} << 20u, cached > share ? cached - share : 0);
+    }
+    return std::min(budget, state.target);
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {

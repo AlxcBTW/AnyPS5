@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -587,9 +588,20 @@ void HeapBudget() {
         const auto shortFrees = mock.frees;
         { DeviceBuffer large(context, 4 * MiB, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT); }
         Expect(mock.frees == shortFrees + 1, "a large device-local buffer was retained while the device-local heap was short");
+        // Meanwhile the texture caches give up their shares of the excess (half the reserve), down to 512 MiB,
+        // set once per reading of the heap.
+        const auto excess = DeviceHeapPressure().excess;
+        Expect(excess == deviceReserve / 2, "the device-local heap's excess is not its use past the budget less the reserve");
+        ShortTextureBudget sampledShort;
+        const auto target = ShortTextureCacheBudget(sampledShort, 2048 * MiB, 1536 * MiB, 3072 * MiB);
+        Expect(target == 1536 * MiB - excess / 2, "a texture cache does not give up its share of the device-local heap's excess");
+        Expect(ShortTextureCacheBudget(sampledShort, 2048 * MiB, 1024 * MiB, 3072 * MiB) == target, "a texture cache's short budget moved within one reading");
+        ShortTextureBudget storageShort;
+        Expect(ShortTextureCacheBudget(storageShort, 2048 * MiB, 600 * MiB, 600 * MiB) == 512 * MiB, "a texture cache's short budget went below 512 MiB");
         mockBudget.heapUsage[0] = 4473 * MiB;
         state = PollHostHeap(context, 2000 * MiB, true);
         Expect(!BufferPool::DeviceHeapTight() && DeviceHeapRoom() == 8188 * MiB - 4473 * MiB - deviceReserve, "the device-local heap's room is wrong once it has room again");
+        Expect(DeviceHeapPressure().excess == 0 && ShortTextureCacheBudget(sampledShort, 2048 * MiB, 1536 * MiB, 3072 * MiB) == 2048 * MiB, "a texture cache stayed short once the device-local heap had room");
         SetRamFreeOverride(UINT64_MAX);
         SetHeapBudgetExperiment(0);
         SetHostImportHeap(UINT32_MAX);
