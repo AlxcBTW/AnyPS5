@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -482,8 +483,18 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
 // back as expanded when every one of them marks the depth or the stencil cleared. Called outside the
 // surfaces mutex: the read and the store wait for recorded work over the range. Returns the aspects the
 // words marked cleared.
+// Lab switch (local/sots-htile-mainnow, not upstream): the store-back runs only with
+// APS5_HTILE_STORE_BACK=1 until a gameplay row has checked it.
+bool htileStoreBack() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_HTILE_STORE_BACK");
+        return text != nullptr && *text != 0 && *text != '0';
+    }();
+    return enabled;
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
-    if (target.htileAddress == 0) return 0;
+    if (!htileStoreBack() || target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);

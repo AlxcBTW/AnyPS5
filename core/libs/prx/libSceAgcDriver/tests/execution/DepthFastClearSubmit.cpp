@@ -180,6 +180,11 @@ void DepthOnlyFillKeepsStencil(AgcDriver::VulkanDevice& device, const Shaders& s
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_HTILE_STORE_BACK", "1");
+#else
+        setenv("APS5_HTILE_STORE_BACK", "1", 1);
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = Compile(*device);

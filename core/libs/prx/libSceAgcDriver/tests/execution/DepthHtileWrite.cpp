@@ -3,6 +3,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 
@@ -46,6 +47,11 @@ DrawOptions StencilDraw(VkCompareOp compare, std::uint32_t reference, VkStencilO
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_HTILE_STORE_BACK", "1");
+#else
+        setenv("APS5_HTILE_STORE_BACK", "1", 1);
+#endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = Compile(*device);
