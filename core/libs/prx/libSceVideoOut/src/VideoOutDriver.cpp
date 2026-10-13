@@ -618,6 +618,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 }
             }
             padInput.Update();
+            window.UpdateCompileTitle();
             updateDisplayRefreshRate();
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
