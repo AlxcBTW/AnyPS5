@@ -427,6 +427,7 @@ add_test_executable(agc_driver_dispatch_relocation_tests EXCLUDE_FROM_ALL
 target_include_directories(agc_driver_dispatch_relocation_tests PRIVATE
         ${LIBS_INCLUDE_DIR}
         ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+        $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 set_target_properties(agc_driver_dispatch_relocation_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_driver_dispatch_relocation_tests)

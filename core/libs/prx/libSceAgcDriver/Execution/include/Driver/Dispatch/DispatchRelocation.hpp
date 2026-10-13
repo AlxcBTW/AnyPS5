@@ -13,6 +13,10 @@
 #include <utility>
 #include <vector>
 
+namespace ShaderRecompiler {
+struct DescriptorValue;
+}
+
 // Address-free dispatch-cache entries (APS5_NO_DISPATCH_CONTENT_KEY=1 turns them off).
 //
 // A dispatch-cache variant stores the SRT words a capture walked, at the addresses it walked them.

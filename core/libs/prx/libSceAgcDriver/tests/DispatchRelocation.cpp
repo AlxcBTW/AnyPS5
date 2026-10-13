@@ -2,6 +2,7 @@
 // relative runs, relocatable V# fields and their guards, the content key, the user-word and field
 // rules, the patch, and a relocated hit against a fresh materialization.
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -300,6 +301,68 @@ void testRelocatedHit() {
     check(!SameMaterialization(patched, broken, why) && !why.empty(), "a different descriptor word is reported");
 }
 
+// The SotS compute layout (sots/shader/*.req): an inline uniform-buffer V# in user words 8..11, a
+// ring pointer in user words 12..13 to a table holding another V# whose 64-byte buffer ends right
+// where the table starts (the same ring). Both V#s and the pointer relocate; the next dispatch, with
+// everything moved by its own delta, keeps the content key and patches equal to a fresh result.
+void testRingLayout() {
+    const auto layout = [](std::uint64_t ring, std::uint64_t inlineBase) {
+        Scene scene;
+        const auto table = ring + 0x40;
+        scene.buffer = vsharp(ring, 16, 4);
+        const auto inlineV = vsharp(inlineBase, 16, 1, 0x0004dfacu);
+        scene.user = {0x30683c00u, 0xc1600000u, 0x7fc7ffu, 0x91b44204u, 0u, 0x700060u, 0u, 0u};
+        const auto v = words(inlineV);
+        scene.user.insert(scene.user.end(), v.begin(), v.end());
+        scene.user.push_back(static_cast<std::uint32_t>(table));
+        scene.user.push_back(static_cast<std::uint32_t>(table >> 32u));
+        scene.table = {0x30683c00u, 0xc1600000u, 0x7fc7ffu, 0x91b55204u};
+        const auto t = words(scene.buffer);
+        scene.table.insert(scene.table.end(), t.begin(), t.end());
+        const std::vector<MemoryRegion> regions{{table, std::as_bytes(std::span(scene.table))}};
+        SrtUserDataUse use;
+        use.asBase = 1u << 12u;
+        use.asValue = (0xfffu) | (1u << 13u);
+        for (std::uint64_t i = 0; i < scene.table.size(); ++i) use.reads.emplace_back(table + i * 4, 12);
+        scene.profile.userData = scene.user;
+        scene.profile.pointerWords = SplitRelativeRuns(regions, use, use.asBase & ~use.asValue, scene.runs, scene.bases, scene.stored);
+        scene.compiled = compiledWith({v, t});
+        const std::vector<DescriptorValue> buffers{inlineV, scene.buffer};
+        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, std::vector<std::uint32_t>{}, scene.compiled, scene.profile);
+        scene.profile.forwarded = scene.compiled.shaderDataUserWords;
+        return scene;
+    };
+    const auto first = layout(0x31bbdcc020ull, 0x30542defd0ull);
+    const auto& profile = first.profile;
+    check(profile.pointerWords == (1u << 12u), "the ring pointer in user word 12 is relative");
+    check(profile.relocatableBuffers == 2 && profile.userFields.size() == 2 && profile.wordFields.size() == 2, "the inline V# and the table's V# (buffer ending at the table) both relocate");
+    const auto shape = ShapeOf(profile, first.runs, first.bases);
+    check(shape.userMasks.size() == 14 && shape.userMasks[12] == PointerWordMask && shape.userMasks[8] == BufferBaseLowMask && shape.userMasks[9] == BufferBaseHighMask && shape.userMasks[13] == 0, "the shape leaves out the pointer and the inline V# base bits");
+
+    const auto next = layout(0x31bbdcd000ull, 0x30542df000ull);
+    FakeMemory memory;
+    const auto tableOf = [](const Scene& scene) { return (static_cast<std::uint64_t>(scene.user[13]) << 32u) | scene.user[12]; };
+    memory.put(tableOf(first), first.table);
+    memory.put(tableOf(next), next.table);
+    const auto read = [&](std::uint64_t address, std::span<std::uint32_t> out) { return memory.read(address, out); };
+    check(DispatchContentKey(7, shape, first.user, read) == DispatchContentKey(7, shape, next.user, read), "the next dispatch keeps the content key");
+    check(UserWordsFit(profile, next.user), "the next dispatch's user words fit");
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+    for (std::uint32_t position = 0; position < first.stored.size(); ++position) {
+        if (first.stored[position] != next.stored[position]) liveData.emplace_back(position, next.stored[position]);
+    }
+    check(std::all_of(liveData.begin(), liveData.end(), [&](const auto& live) { return std::binary_search(profile.maskPositions.begin(), profile.maskPositions.end(), live.first); }) && FieldsFit(profile, first.stored, liveData), "only the table's V# base differs, and it fits");
+    auto liveWords = first.stored;
+    for (const auto& [position, value] : liveData) liveWords[position] = value;
+    auto patched = first.compiled;
+    ApplyRelocation(patched, profile, liveWords, next.user);
+    std::string why;
+    check(SameMaterialization(patched, next.compiled, why), "the patched result binds what a fresh capture of the next dispatch binds");
+    auto otherImage = next.user;
+    otherImage[3] = 0x91b66204u;
+    check(!UserWordsFit(profile, otherImage), "another inline T# word does not fit");
+}
+
 }
 
 int main() {
@@ -309,6 +372,7 @@ int main() {
         testContentKey();
         testFitAndPatch();
         testRelocatedHit();
+        testRingLayout();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "exception: %s\n", error.what());
         return 1;
