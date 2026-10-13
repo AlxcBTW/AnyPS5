@@ -2277,6 +2277,71 @@ void verifyInt64AtomicCapabilities() {
     require(declares(compile(imageAtomic, spv::CapabilityInt64ImageEXT), spv::CapabilityInt64ImageEXT), "64-bit atomics: an image_atomic_swap on a 32_32 image does not declare Int64ImageEXT");
 }
 
+void verifySpecializedBufferAtomicBindings() {
+    using namespace ShaderRecompiler;
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    alignas(256) static std::array<std::uint32_t, 64> buffer{};
+    const auto bufferAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(buffer.data()));
+    const std::array<std::uint32_t, 16> userData{
+        0u, 0u, 0u, 0u,
+        static_cast<std::uint32_t>(bufferAddress), static_cast<std::uint32_t>((bufferAddress >> 32u) & 0xffffu), 256u, 0x31016facu,
+        0u, 0u, 0u, 0u,
+        0u, 0u, 0u, 0u};
+    const std::vector<std::uint32_t> code{0xe0f05000u, 0x80012803u, 0xbf810000u};
+    const auto compile = [&](std::span<const std::uint32_t> supported) {
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x58800u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.supportedCapabilities = supported;
+        request.target.supportedExtensions = extensions;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        return Recompile(request);
+    };
+    const auto result = compile(capabilities);
+    std::size_t tables = 0;
+    std::size_t faults = 0;
+    std::size_t atomicElements = 0;
+    for (const auto& binding : result.bindings) {
+        if (binding.role == DescriptorRole::BdaPagetable) ++tables;
+        if (binding.role == DescriptorRole::FaultBuffer) ++faults;
+        atomicElements += static_cast<std::size_t>(std::count(binding.bufferAtomic.begin(), binding.bufferAtomic.end(), true));
+    }
+    require(tables == 0, "specialized buffer atomic: a buffer_atomic_inc through a V# the program specializes binds the address tables");
+    require(faults == 1 && result.bdaAbiVersion == BdaAbi::Version, "specialized buffer atomic: the program has no fault buffer for its unaligned atomic");
+    require(atomicElements == 1, "specialized buffer atomic: the V# element is not reported as atomic");
+    const std::vector<std::uint32_t>& words = result.spirv;
+    std::uint32_t faultFunction = 0;
+    std::size_t faultCalls = 0;
+    bool physical = false;
+    bool int64 = false;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        const auto opcode = words[cursor] & 0xffffu;
+        require(count != 0 && count <= words.size() - cursor, "specialized buffer atomic: truncated SPIR-V instruction");
+        if (opcode == spv::OpCapability && words[cursor + 1] == spv::CapabilityPhysicalStorageBufferAddresses) physical = true;
+        if (opcode == spv::OpCapability && words[cursor + 1] == spv::CapabilityInt64) int64 = true;
+        if (opcode == spv::OpMemoryModel && words[cursor + 1] != spv::AddressingModelLogical) physical = true;
+        if (opcode == spv::OpName && std::string_view(reinterpret_cast<const char*>(&words[cursor + 2])) == "record_bda_fault") faultFunction = words[cursor + 1];
+        if (opcode == spv::OpFunctionCall && faultFunction != 0 && words[cursor + 3] == faultFunction) ++faultCalls;
+        cursor += count;
+    }
+    require(!physical, "specialized buffer atomic: the module addresses physical storage without an address access");
+    require(int64, "specialized buffer atomic: the fault address is 64-bit and the module does not declare Int64");
+    require(faultFunction != 0 && faultCalls == 1, "specialized buffer atomic: an unaligned atomic does not record exactly one fault");
+    const std::array<std::uint32_t, 1> shaderOnly{spv::CapabilityShader};
+    expectFailure([&] { static_cast<void>(compile(shaderOnly)); }, "buffer atomic fault addresses require shaderInt64", "specialized buffer atomic: the program compiled without shaderInt64");
+}
+
 void verifyCoherentBufferAccesses() {
     using namespace ShaderRecompiler;
     alignas(256) static std::array<std::uint32_t, 64> input{};
@@ -3303,6 +3368,7 @@ int main(int argc, char** argv) {
         verifyComputedTexelOffsets();
         verifyShaderClockScopes();
         verifyInt64AtomicCapabilities();
+        verifySpecializedBufferAtomicBindings();
         verifyCoherentBufferAccesses();
         verifyUnnormalizedSamplers();
         verifyUnusedUnnormalizedSampler();

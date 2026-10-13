@@ -118,8 +118,8 @@ int DescriptorFilterError(int kqueueDescriptor, std::uintptr_t ident) {
         return GUEST_EBADF;
     }
     const int descriptor = static_cast<int>(ident);
-    if (descriptor >= GuestSockets::FirstDescriptor) {
-        return GuestSockets::IsOpen(descriptor) ? 0 : GUEST_EBADF;
+    if (GuestSockets::IsOpen(descriptor)) {
+        return 0;
     }
     if (!DescriptorIsOpen_nid_no_patch(descriptor)) {
         return GUEST_EBADF;
@@ -135,7 +135,7 @@ int AddDescriptorKnote(const KernelEqueueRef& queue, KernelEvent& change, std::u
         }
         NotImplemented_nid_no_patch("kevent: EVFILT_READ on a kqueue descriptor");
     }
-    if (descriptor < GuestSockets::FirstDescriptor) {
+    if (!GuestSockets::IsOpen(descriptor)) {
         NotImplemented_nid_no_patch(change.filter == EVFILT_READ ? "kevent: EVFILT_READ on a non-socket descriptor" : "kevent: EVFILT_WRITE on a non-socket descriptor");
     }
     if ((change.fflags & NOTE_LOWAT) != 0) {
@@ -324,10 +324,6 @@ int APS5_VABI kqueue_nid_postfix() {
         if (errno == EMFILE) return PosixFailure(GUEST_EMFILE);
         if (errno == ENFILE) return PosixFailure(GUEST_ENFILE);
         throw std::runtime_error(std::string(__func__) + ": reserving a descriptor failed, errno=" + std::to_string(errno));
-    }
-    if (descriptor >= GuestSockets::FirstDescriptor) {
-        ReleaseDescriptor(descriptor);
-        throw std::runtime_error(std::string(__func__) + ": host descriptor reached the guest socket range");
     }
     auto queue = std::make_shared<KernelEqueuePrivate>(static_cast<KernelEqueue>(descriptor), true);
     queue->SetName("kqueue");

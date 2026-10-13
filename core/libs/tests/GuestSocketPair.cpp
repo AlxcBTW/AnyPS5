@@ -51,7 +51,7 @@ constexpr int CloseOnExec = 0x10000000;
 constexpr int NonBlocking = 0x20000000;
 constexpr int NoSignal = 0x20000;
 constexpr int Peek = 2;
-constexpr int FirstSocket = 0x10000000;
+constexpr int DescriptorSetSize = 1024;
 constexpr short In = 0x1;
 constexpr short Out = 0x4;
 constexpr short Hup = 0x10;
@@ -90,7 +90,7 @@ static bool Unnamed(int descriptor, int (APS5_VABI *query)(int, void*, std::uint
 int main() {
     int pair[2] = {-1, -1};
     Require(socketpair_nid_postfix(Unix, Stream, 0, pair) == 0);
-    Require(pair[0] >= FirstSocket && pair[1] >= FirstSocket && pair[0] != pair[1]);
+    Require(pair[0] >= 0 && pair[0] < DescriptorSetSize && pair[1] >= 0 && pair[1] < DescriptorSetSize && pair[0] != pair[1]);
     Require(Exchange(pair[0], pair[1], "one way"));
     Require(Exchange(pair[1], pair[0], "other way"));
     Require(Unnamed(pair[0], getsockname_nid_postfix) && Unnamed(pair[1], getpeername_nid_postfix));

@@ -59,6 +59,8 @@ int APS5_VABI sceNetResolverGetError(int, int*);
 int APS5_VABI sceNetCtlGetState(int*);
 int APS5_VABI select_nid_postfix(int, void*, void*, void*, const void*);
 int APS5_VABI open_nid_postfix(const char*, int, int);
+int APS5_VABI socket_nid_postfix(int, int, int);
+int APS5_VABI bind_nid_postfix(int, const void*, std::uint32_t);
 int APS5_VABI close_nid_postfix(int);
 int APS5_VABI setsockopt_nid_postfix(int, int, int, const void*, std::uint32_t);
 int* APS5_VABI __error_nid_postfix();
@@ -578,7 +580,7 @@ int main() {
 
     const int udp_receiver = sceNetSocket(nullptr, 2, 2, 17);
     const int udp_sender = sceNetSocket(nullptr, 2, 2, 17);
-    Require(udp_receiver >= 0 && udp_sender >= 0);
+    Require(udp_receiver >= 0 && udp_sender >= 0 && udp_receiver < 1024 && udp_sender < 1024);
     address = {16, 2, 0, 0, 127, 0, 0, 1};
     Require(sceNetBind_nid_postfix(udp_receiver, address.data(), address.size()) == 0);
     address_size = address.size();
@@ -621,6 +623,17 @@ int main() {
     Require(((random_readable[udp_receiver / 64] >> (udp_receiver % 64)) & 1u) == 0);
     Require(random_urgent[random / 64] == 0);
     Require(close_nid_postfix(random) == 0);
+    const int kernel_socket = socket_nid_postfix(2, 2, 0);
+    Require(kernel_socket >= 0 && kernel_socket < 1024 && kernel_socket != udp_receiver && kernel_socket != udp_sender);
+    std::array<std::uint8_t, 16> kernel_address{16, 2, 0, 0, 127, 0, 0, 1};
+    Require(bind_nid_postfix(kernel_socket, kernel_address.data(), kernel_address.size()) == 0);
+    std::uint64_t mixed_writable[16]{};
+    mixed_writable[kernel_socket / 64] |= std::uint64_t{1} << (kernel_socket % 64);
+    mixed_writable[udp_sender / 64] |= std::uint64_t{1} << (udp_sender % 64);
+    Require(select_nid_postfix(std::max(kernel_socket, udp_sender) + 1, nullptr, mixed_writable, nullptr, wait_second) == 2);
+    Require(((mixed_writable[kernel_socket / 64] >> (kernel_socket % 64)) & 1u) != 0);
+    Require(((mixed_writable[udp_sender / 64] >> (udp_sender % 64)) & 1u) != 0);
+    Require(close_nid_postfix(kernel_socket) == 0);
     std::uint64_t stdio_readable[16]{1};
     std::uint64_t stdio_writable[16]{6};
     Require(select_nid_postfix(3, stdio_readable, stdio_writable, nullptr, poll_now) == 2);

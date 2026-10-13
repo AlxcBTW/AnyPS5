@@ -620,8 +620,9 @@ int APS5_VABI sceNetSocket(const char* name, int family, int type, int protocol)
         close_socket(native);
         return fail(12);
     }
+    const int fd = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(handle->value));
+    if (fd < 0) return fail(-fd);
     std::lock_guard lk(g_mutex);
-    const int fd = g_next_sock++;
     Sock s;
     s.family = family;
     s.type = type;
@@ -639,6 +640,7 @@ int APS5_VABI sceNetSocketClose(int s) {
         native = it->second.native;
         g_socks.erase(it);
     }
+    KernelReleaseSocketNumber_nid_no_patch(s);
     if (native) {
 #ifdef _WIN32
         ::shutdown(native->value, SD_BOTH);
@@ -735,10 +737,10 @@ int APS5_VABI sceNetAccept(int s, void* addr, uint32_t* addrlen) {
     connection.family = listener.family;
     connection.type = NET_SOCK_STREAM;
     connection.native = std::move(handle);
-    int descriptor;
+    const int descriptor = KernelReserveSocketNumber_nid_no_patch(static_cast<std::uintptr_t>(connection.native->value));
+    if (descriptor < 0) return fail(-descriptor);
     {
         std::lock_guard lk(g_mutex);
-        descriptor = g_next_sock++;
         g_socks.emplace(descriptor, connection);
     }
     if (addr && !native_to_guest_address(peer, addr, addrlen)) {
