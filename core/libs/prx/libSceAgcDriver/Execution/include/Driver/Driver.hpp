@@ -247,6 +247,13 @@ private:
     static bool& resolvingAhead();
     static bool& gateOpened();
     void resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from);
+    // exp (APS5_EXP_LAND_CHECK, never push; LandCheck.cpp): the gated group resolved from current memory
+    // before a landing that has to wait, then compared with memory after it (1: census only, the group is
+    // resolved again as before; 2: the unchanged results are kept for adoption, the changed ones dropped).
+    static std::int64_t landCheckMode();
+    static bool landingWouldWait();
+    void speculateGroupBeforeLanding(const Submission& submission, const QueueState& live, std::size_t from);
+    static void checkGroupAfterLanding(const Submission& submission, std::int64_t mode);
     static void clearResolvedAhead();
     static void reportGroupCapture(std::uint32_t queue);
     static PollStats& pollStats();

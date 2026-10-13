@@ -231,8 +231,20 @@ void Driver::execute(const Submission& submission) {
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
+            // exp (APS5_EXP_LAND_CHECK, never push): see LandCheck.cpp.
+            const auto landCheck = submission.queue != 0 && gateOpened() ? landCheckMode() : 0;
+            const bool speculated = landCheck != 0 && landingWouldWait();
+            if (speculated) {
+                gateOpened() = false;
+                currentPacketOffset() = cursor;
+                timed(&WorkerProfile::dispatchMs, [&] { speculateGroupBeforeLanding(submission, queue, cursor); });
+            }
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
+            if (speculated) {
+                checkGroupAfterLanding(submission, landCheck);
+                timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
+            }
             if (gateOpened()) {
                 gateOpened() = false;
                 timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
