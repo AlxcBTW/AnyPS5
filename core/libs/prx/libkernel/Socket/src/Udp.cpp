@@ -718,6 +718,12 @@ int APS5_VABI accept_nid_postfix(int descriptor, void* address, std::uint32_t* l
     try {
         auto accepted = std::make_shared<Socket>(native, listener->family, listener->type);
         guard.value = Invalid;
+        bool inheritNonblocking;
+        {
+            std::lock_guard modeLock(listener->modeMutex);
+            inheritNonblocking = listener->nonblocking;
+        }
+        if (inheritNonblocking && SetNonBlocking(*accepted)) return -1;
         std::lock_guard lock(socketsMutex);
         if (nextDescriptor == INT_MAX) return Fail(24);
         const int acceptedDescriptor = nextDescriptor++;

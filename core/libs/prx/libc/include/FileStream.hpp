@@ -36,6 +36,10 @@ static constexpr const char* FOPEN_MSG_NULL_ARG = "null argument";
 static constexpr const char* FOPEN_MSG_NOT_FOUND = "file not found";
 static constexpr const char* FOPEN_MSG_OPEN_FAILED = "open failed";
 
+#ifndef _WIN32
+extern "C" int KeepHostStandardError_nid_no_patch();
+#endif
+
 class FileStream {
     // Only the macro-accessed FreeBSD prefix is exposed. The remaining guest
     // FILE area is reserved; host state lives beyond it and is never a guest FILE*.
@@ -80,6 +84,7 @@ public:
         GuestFileLockForget_nid_no_patch(::_fileno(previous));
         _handle = ::_wfreopen(filename.c_str(), wideMode.c_str(), previous);
 #else
+        if (::fileno(previous) == 2) KeepHostStandardError_nid_no_patch();
         _handle = std::freopen(filename.c_str(), mode, previous);
 #endif
         if (!_handle) return false;

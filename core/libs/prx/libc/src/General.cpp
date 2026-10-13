@@ -1,3 +1,5 @@
+#include <atomic>
+#include <cstdio>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -250,6 +252,38 @@ int SetWorkingDirectory(WorkingDirectory& state, const std::filesystem::path& re
     return 0;
 }
 }
+
+#ifndef _WIN32
+namespace {
+std::mutex g_hostStandardErrorMutex;
+std::atomic<int> g_hostStandardError{-1};
+}
+
+extern "C" int KeepHostStandardError_nid_no_patch() {
+    const std::lock_guard lock(g_hostStandardErrorMutex);
+    if (const int kept = g_hostStandardError.load(); kept >= 0) return kept;
+    const int kept = ::fcntl(2, F_DUPFD_CLOEXEC, 3);
+    if (kept < 0) {
+        if (errno == EBADF) return -1;
+        throw std::system_error(errno, std::generic_category(), "Keeping the host standard error");
+    }
+    std::FILE* const stream = ::fdopen(kept, "w");
+    if (stream == nullptr) {
+        const int error = errno;
+        ::close(kept);
+        throw std::system_error(error, std::generic_category(), "Keeping the host standard error");
+    }
+    std::setvbuf(stream, nullptr, _IONBF, 0);
+    std::fflush(stderr);
+    stderr = stream;
+    g_hostStandardError.store(kept);
+    return kept;
+}
+
+extern "C" int HostStandardError_nid_no_patch() {
+    return g_hostStandardError.load();
+}
+#endif
 
 extern "C" void AddPathAlias_nid_no_patch(const char* guestPrefix, const char* hostPath) {
     if (guestPrefix == nullptr || hostPath == nullptr) {

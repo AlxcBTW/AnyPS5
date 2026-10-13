@@ -60,6 +60,7 @@ void RunColorTargetLayoutTests() {
     Require(DecodeColorTileMode(0x4dc14000) == ColorTileMode::Standard4KB, "4 KiB standard color descriptor was rejected");
     const ColorTargetLayout standard(256, 256, ColorTileMode::Standard4KB);
     Require(standard.Bytes() == ComputeSurfaceSize(ComputeElementMipLayout(TextureTileMode::kStandard4KB, 4, 256, 256, 1), 1) && standard.Alignment() == 4096, "4 KiB standard color layout differs from the texture layout");
+    Require(ColorTargetLayout(1920, 1080, ColorTileMode::RenderTarget, 16).Bytes() == 0x1fe0000u, "four-sample 1920x1080 color target should fit before the next 32 MiB allocation");
     Require(standard.Offset(32, 0) == 4096 && standard.Offset(0, 32) == 8 * 4096 && standard.Offset(1, 0) == 4 && standard.Offset(0, 1) == 16, "4 KiB standard block or element addressing is incorrect");
     std::vector<bool> standardSeen(1024);
     for (std::uint32_t y = 0; y < 32; ++y) {

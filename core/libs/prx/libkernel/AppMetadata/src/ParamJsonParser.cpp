@@ -230,7 +230,10 @@ JsonValue parseJsonNumber(const std::string& text, std::size_t& position) {
     JsonValue value;
     value.type = JsonType::Number;
     value.numberText = text.substr(start, position - start);
-    value.numberValue = std::stod(value.numberText);
+    const auto& number = value.numberText;
+    const auto converted = std::from_chars(number.data(), number.data() + number.size(), value.numberValue);
+    if (converted.ec != std::errc{} || converted.ptr != number.data() + number.size())
+        throw std::runtime_error("number outside supported range in param.json");
     return value;
 }
 

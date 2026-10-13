@@ -1,5 +1,6 @@
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include <chrono>
+#include <clocale>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,37 @@ static ParsedParamJson ParseText(const std::filesystem::path& path, const std::s
         Require(static_cast<bool>(file), "Cannot write param.json fixture");
     }
     return parseParamJson(path);
+}
+
+static void CheckNumericLocale(const std::filesystem::path& path) {
+    struct RestoreLocale {
+        std::string previous = std::setlocale(LC_NUMERIC, nullptr);
+        ~RestoreLocale() { std::setlocale(LC_NUMERIC, previous.c_str()); }
+    } restore;
+    bool commaLocale = false;
+    for (const auto* name : {"French", "French_France.1252", "fr_FR.UTF-8", "de_DE.UTF-8"}) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr && std::string(std::localeconv()->decimal_point) == ",") {
+            commaLocale = true;
+            break;
+        }
+    }
+    if (!commaLocale) {
+#ifdef _WIN32
+        throw std::runtime_error("No Windows comma-decimal locale available for regression");
+#else
+        std::cout << "Comma-decimal locale regression unavailable on this host\n";
+        return;
+#endif
+    }
+    for (const auto& [number, expected] : {std::pair{"1.25e3", std::uint64_t{1250}},
+            std::pair{"0.5e3", std::uint64_t{500}}, std::pair{"12.75e2", std::uint64_t{1275}},
+            std::pair{"1.25", std::uint64_t{1}}}) {
+        Require(ParseSize(path, number).downloadDataSizeMiB == expected,
+            std::string("JSON number depends on host locale: ") + number);
+    }
+    bool rejected = false;
+    try { ParseSize(path, "-0.5"); } catch (const std::exception&) { rejected = true; }
+    Require(rejected, "Negative fractional size was accepted under comma locale");
 }
 
 static void CheckUserDefinedParams(const std::filesystem::path& path) {
@@ -147,6 +179,7 @@ int main() {
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
     int result = 0;
     try {
+        CheckNumericLocale(path);
         CheckUtf8(path);
         CheckNumberSyntax(path);
         const std::pair<const char*, std::uint64_t> sizes[] = {

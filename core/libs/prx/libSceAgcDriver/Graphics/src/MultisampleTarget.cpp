@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -193,7 +194,16 @@ void guardReads(std::uint64_t address, std::size_t bytes) {
 }
 
 void guard(const Context& context, const ColorTarget& target) {
-    const auto bytes = std::max<std::uint64_t>(target.bytes * target.samples, static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples);
+    auto bytes = std::max<std::uint64_t>(target.bytes * target.samples, static_cast<std::uint64_t>(target.extent.width) * target.extent.height * target.elementBytes * target.samples);
+    if (target.tileMode == ColorTileMode::RenderTarget && std::has_single_bit(target.elementBytes) && std::has_single_bit(target.samples)) {
+        const auto log2Samples = std::countr_zero(target.samples);
+        const auto log2Pixels = 16u - std::countr_zero(target.elementBytes) - log2Samples;
+        const auto log2Width = (log2Pixels + ((log2Samples & 1u) == 0u ? 1u : 0u)) / 2u;
+        const auto blockWidth = 1u << log2Width;
+        const auto blockHeight = 1u << (log2Pixels - log2Width);
+        const auto align = [](std::uint32_t extent, std::uint32_t block) { return (static_cast<std::uint64_t>(extent) + block - 1u) / block * block; };
+        bytes = align(target.extent.width, blockWidth) * align(target.extent.height, blockHeight) * target.elementBytes * target.samples;
+    }
     std::unique_lock lock(guardedMutex());
     guarded().push_back({context.device, target.address, bytes, target.samples});
     anyGuarded().store(true, std::memory_order_release);

@@ -6,6 +6,9 @@
 #include <limits>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 namespace LibcException {
@@ -23,7 +26,15 @@ static void RawWrite(const char* data, std::size_t size) {
         size -= written;
     }
 #else
-    std::fwrite(data, 1, size, stderr);
+    const int kept = HostStandardError_nid_no_patch();
+    const int descriptor = kept >= 0 ? kept : STDERR_FILENO;
+    while (size != 0) {
+        const auto written = ::write(descriptor, data, size);
+        if (written < 0 && errno == EINTR) continue;
+        if (written <= 0) return;
+        data += written;
+        size -= static_cast<std::size_t>(written);
+    }
 #endif
 }
 

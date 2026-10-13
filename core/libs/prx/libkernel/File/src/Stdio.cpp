@@ -525,15 +525,13 @@ void PreserveHostStandardError() {
 #ifdef _WIN32
     const int saved = WithoutParameterHandler([] { return ::_dup(2); });
 #else
-    const int saved = ::dup(2);
+    const int saved = KeepHostStandardError_nid_no_patch();
 #endif
     if (saved < 0) throw std::runtime_error("dup2: cannot keep the host standard error");
     int expected = -1;
     if (!g_hostStandardError.compare_exchange_strong(expected, saved)) {
 #ifdef _WIN32
         _close(saved);
-#else
-        ::close(saved);
 #endif
     }
 }

@@ -286,7 +286,7 @@ bool parseRfc2822DateTime(const char* cursor, RtcDateTime& time, std::int64_t& o
         ++cursor;
         if (readDigits(cursor, 2, second) == 0) return false;
         if (*cursor == ' ' && !parseZone(cursor + 1, offsetMinutes)) return false;
-    } else if (*cursor != 0 && *cursor != ' ') {
+    } else if (*cursor != ' ') {
         return false;
     }
     time = makeDateTime(year, month, day, hour, minute, second, 0);

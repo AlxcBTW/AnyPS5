@@ -299,6 +299,13 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
     return true;
 }
 
+static Shader GuestShaderFields(const Shader* shader) {
+    GuestMemory::CheckRange(shader, sizeof(Shader), 1);
+    Shader fields;
+    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    return fields;
+}
+
 bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     if (snapshot.headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return true;
     if (snapshot.header.size() < sizeof(Shader)) return false;
@@ -312,7 +319,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
 }
 
 std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader) {
-    const auto found = registry.find(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code)));
+    const auto found = registry.find(reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code)));
     if (found == registry.end()) return {};
     for (const auto& snapshot : found->second) {
         if (snapshot->headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return snapshot;
@@ -950,8 +957,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         std::lock_guard lock(mutex);
         registry = shaders;
         for (const auto* shader : stages) {
-            GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+            const auto fields = GuestShaderFields(shader);
+            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
             const auto selected = RegisteredHeader(*registry, shader);
             require(selected != nullptr, "graphics ABI refers to a replaced shader header");
@@ -962,10 +969,10 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             registered.shader.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.shader.insert_or_assign(offset, value); });
             registered.context.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.context.insert_or_assign(offset, value); });
             registered.userConfig.ForEach([&](std::uint32_t offset, std::uint32_t value) { state.userConfig.insert_or_assign(offset, value); });
-            if (shader->type != snapshot.type) {
-                const std::size_t count = shader->num_sh_registers;
-                GuestMemory::CheckRange(shader->sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
-                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(shader->sh_registers[index].offset, shader->sh_registers[index].value);
+            if (fields.type != snapshot.type) {
+                const std::size_t count = fields.num_sh_registers;
+                GuestMemory::CheckRange(fields.sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
+                for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(fields.sh_registers[index].offset, fields.sh_registers[index].value);
             }
         }
     }
@@ -1018,8 +1025,8 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     PerformanceTimer timing("Shader.ResolveAbi");
     ShaderPreparationTransaction transaction;
     CheckFailure();
-    GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-    if (shader->type != 0 && shader->type != 1) {
+    const auto fields = GuestShaderFields(shader);
+    if (fields.type != 0 && fields.type != 1) {
         const std::array<const Shader*, 1> stages{shader};
         ResolveGraphicsStagesAbi(stages, context, primitive);
         transaction.Commit();
@@ -1028,7 +1035,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
     std::shared_ptr<const ShaderSnapshot> snapshot;
     {
         std::lock_guard lock(mutex);
-        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
         require(shaders != nullptr && shaders->contains(address), "static ABI refers to an unregistered shader");
         snapshot = RegisteredHeader(*shaders, shader);
         require(snapshot != nullptr, "static ABI refers to a replaced shader header");
@@ -1095,10 +1102,8 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
     std::shared_ptr<const ShaderSnapshot> fragment;
     {
         std::lock_guard lock(mutex);
-        GuestMemory::CheckRange(vertex, sizeof(Shader), alignof(Shader));
-        GuestMemory::CheckRange(pixel, sizeof(Shader), alignof(Shader));
         const auto lookup = [&](const Shader* shader) {
-            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+            const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(GuestShaderFields(shader).code));
             require(shaders != nullptr && shaders->contains(address), "rectangle ABI refers to an unregistered shader");
             const auto snapshot = RegisteredHeader(*shaders, shader);
             require(snapshot != nullptr, "rectangle ABI refers to a replaced shader header");
