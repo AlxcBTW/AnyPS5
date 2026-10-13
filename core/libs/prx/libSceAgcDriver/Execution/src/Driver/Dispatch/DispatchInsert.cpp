@@ -62,10 +62,12 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
             positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
             auto learned = std::make_shared<DispatchShape>(ShapeOf(*relocation, fresh->runs, fresh->runBases));
             if (!learned->userMasks.empty()) shape = std::move(learned);
-            fresh->relocation = relocation;
         } else {
             fresh->runBases.clear();
         }
+        // Even an empty profile is kept: a content key leaves user words out, so a hit has to
+        // check them (an empty profile requires every user word equal).
+        fresh->relocation = relocation;
         bool stable = true;
         if (stampValidate()) {
 
