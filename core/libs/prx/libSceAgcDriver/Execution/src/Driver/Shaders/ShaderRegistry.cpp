@@ -600,6 +600,18 @@ struct RegisteredPreparation {
     std::shared_ptr<VulkanDevice> prebuildDevice;
 };
 
+std::optional<std::uint32_t> DefaultProgramRegister(std::uint32_t type) {
+    switch (type) {
+    case 0: return 0x20c;
+    case 1: return 0x008;
+    case 2: return 0x0c8;
+    case 4: return 0x0c8;
+    case 6: return 0x088;
+    case 7: return 0x108;
+    default: return std::nullopt;
+    }
+}
+
 std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration, bool* deferred = nullptr) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto header = ReadHeader(snapshot);
@@ -627,10 +639,14 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         *deferred = true;
         return std::unique_ptr<RegisteredPreparation>{};
     };
-    if (deferred != nullptr && (!state.shader.contains(programRegister) || !state.shader.contains(programRegister + 1))) return defer("its program address is not in the shader registers");
-    const auto high = RegisterValue(state.shader, programRegister + 1);
-    if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
-    const auto address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
+    std::uint64_t address = snapshot.codeAddress;
+    if (state.shader.contains(programRegister) && state.shader.contains(programRegister + 1)) {
+        const auto high = RegisterValue(state.shader, programRegister + 1);
+        if ((high & ~0xffu) != 0) throw std::runtime_error("AGC driver: invalid registered program address");
+        address = (static_cast<std::uint64_t>(RegisterValue(state.shader, programRegister)) << 8u) | (static_cast<std::uint64_t>(high) << 40u);
+    } else if (deferred == nullptr) {
+        throw std::runtime_error("AGC driver: missing static shader ABI register " + std::to_string(programRegister));
+    }
     if (address < snapshot.codeAddress || address - snapshot.codeAddress >= snapshot.code.size() * 4u) throw std::runtime_error("AGC driver: registered entry point is outside shader code");
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / 4u);
     const auto code = std::span(snapshot.code).subspan(codeOffset);
@@ -1252,6 +1268,14 @@ void Driver::RegisterShader(const Shader* shader) {
         localDevice = device;
     }
     snapshot.registeredState = std::make_shared<const RegisteredShaderState>(DecodeRegisteredState(snapshot));
+    if (const auto programReg = DefaultProgramRegister(snapshot.type)) {
+        if (!snapshot.registeredState->shader.contains(*programReg) && !snapshot.registeredState->shader.contains(*programReg + 1u)) {
+            auto registeredState = *snapshot.registeredState;
+            registeredState.shader.insert_or_assign(*programReg, static_cast<std::uint32_t>(snapshot.codeAddress >> 8u));
+            registeredState.shader.insert_or_assign(*programReg + 1u, static_cast<std::uint32_t>(snapshot.codeAddress >> 40u));
+            snapshot.registeredState = std::make_shared<const RegisteredShaderState>(std::move(registeredState));
+        }
+    }
     QueueState registered{};
     registered.shader = snapshot.registeredState->shader;
     registered.context = snapshot.registeredState->context;
