@@ -4,6 +4,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/CreationMask.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/gcc/StackGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CrashReport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/CallTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/linux/DlIteratePhdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/macos/GuestImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Strings.cpp
@@ -410,6 +411,18 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(guest_errors PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    if(WIN32)
+        add_test_executable(guest_call_trace_tests ${LIBS_INCLUDE_DIR}/tests/GuestCallTrace.cpp)
+        target_include_directories(guest_call_trace_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(guest_call_trace_tests PRIVATE libc)
+        configure_windows_unwind(guest_call_trace_tests)
+        add_test(NAME guest_call_trace COMMAND guest_call_trace_tests)
+        add_test(NAME guest_call_trace_abort COMMAND guest_call_trace_tests abort)
+        set_tests_properties(guest_call_trace guest_call_trace_abort PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(guest_call_trace_abort PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION
+            "last traced system library calls[^~]*#1 thread [0-9]+ libTraced.prx Integers from [^~]*guest_call_trace_tests.exe[^~]*#2 thread [0-9]+ libOther.prx Blocks from[^~]*most called traced imports \\(2 calls in total\\):[^~]* 1 libTraced.prx Integers[^~]* 1 libOther.prx Blocks")
     endif()
     add_test_executable(guest_syslog_tests ${LIBS_INCLUDE_DIR}/tests/GuestSyslog.cpp)
     target_include_directories(guest_syslog_tests PRIVATE ${LIBS_INCLUDE_DIR})
