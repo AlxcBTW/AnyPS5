@@ -8,7 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileProgress.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelinePreload.hpp"
-#include "ShaderDiskCache.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -4347,7 +4347,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 }
 
 void VulkanDevice::startPipelinePreload() {
-    if (!PipelinePreloadEnabled() || !ShaderRecompiler::ShaderDiskCache::Enabled()) return;
+    const auto cacheDirectory = ShaderRecompiler::ShaderCacheDirectory();
+    if (!PipelinePreloadEnabled() || cacheDirectory.empty()) return;
     auto& functions = state->computeFunctions;
     functions.createModule = state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule");
     functions.destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
@@ -4357,7 +4358,7 @@ void VulkanDevice::startPipelinePreload() {
     functions.destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
     char name[64];
     std::snprintf(name, sizeof(name), "compute-%04x-%04x.manifest", state->properties.vendorID, state->properties.deviceID);
-    state->pipelineManifest = std::make_unique<PipelineManifest>(ShaderRecompiler::ShaderDiskCache::EntryDirectory() / "pipelines", name);
+    state->pipelineManifest = std::make_unique<PipelineManifest>(cacheDirectory / "pipelines", name);
     const auto loadStart = std::chrono::steady_clock::now();
     auto entries = state->pipelineManifest->Load();
     const auto loadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - loadStart).count();
