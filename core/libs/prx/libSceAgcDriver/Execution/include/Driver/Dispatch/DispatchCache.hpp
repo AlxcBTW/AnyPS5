@@ -47,7 +47,7 @@ struct DispatchVariant {
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     // Address-free entries (DispatchRelocation.hpp): what of the stored words only carries an
-    // address; null keeps every word exact (APS5_NO_DISPATCH_CONTENT_KEY=1, or nothing to relocate).
+    // address (an empty one still pins every user word); null with APS5_NO_DISPATCH_CONTENT_KEY=1.
     std::shared_ptr<const RelocationProfile> relocation;
 
     std::shared_ptr<ShaderMemory> memory;
