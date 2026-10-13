@@ -67,7 +67,7 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     checkFeature(spv::CapabilityFragmentBarycentricKHR, barycentricEnabled, "fragmentShaderBarycentric");
     checkFeature(spv::CapabilityMeshShadingEXT, meshEnabled, "meshShader");
     checkFeature(spv::CapabilityDrawParameters, drawParameters != nullptr && drawParameters->shaderDrawParameters == VK_TRUE, "shaderDrawParameters");
-    checkFeature(static_cast<spv::Capability>(6030), fma != nullptr && fma->shaderFmaFloat16 == VK_TRUE, "shaderFmaFloat16");
+    checkFeature(static_cast<spv::Capability>(6030), fma != nullptr && fma->shaderFmaFloat16 == VK_TRUE && fma->shaderFmaFloat32 == VK_TRUE, "shaderFmaFloat16 and shaderFmaFloat32");
     checkFeature(spv::CapabilityShaderClockKHR, clock != nullptr && clock->shaderSubgroupClock == VK_TRUE && clock->shaderDeviceClock == VK_TRUE, "shader clock");
     Require(!target.fragmentShaderBarycentricEnabled || barycentricEnabled, "shader device profile exposes disabled barycentrics");
     Require(!target.mesh || meshEnabled, "shader device profile exposes disabled mesh shaders");

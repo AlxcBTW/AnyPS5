@@ -207,6 +207,7 @@ std::uint32_t EmitFPTrigPreop64(SpirvEmitterState& state, std::uint32_t arg0, st
 std::uint32_t EmitFPDot2F32F16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
 std::uint32_t EmitFPInterpolateF32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode);
 std::uint32_t EmitFPInterpolateF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2, const IrValue* mode);
+std::uint32_t EmitFPMixF16(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
 std::uint32_t EmitConvertF32F64(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF64F32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitConvertF64S32(SpirvEmitterState& state, std::uint32_t arg0);

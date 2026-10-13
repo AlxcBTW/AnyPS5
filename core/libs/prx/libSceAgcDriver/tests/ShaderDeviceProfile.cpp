@@ -116,6 +116,7 @@ void CheckProfile() {
     half.nativeFloat16Arithmetic = true;
     half.capabilities.insert(half.capabilities.end(), {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve, 6030u});
     half.fma.shaderFmaFloat16 = VK_TRUE;
+    half.fma.shaderFmaFloat32 = VK_TRUE;
     const AgcDriver::ShaderDeviceProfile halfProfile(half.Target(), half.device, half.limits);
     Require(halfProfile.Target().nativeFloat16Arithmetic && !profile.Target().nativeFloat16Arithmetic && halfProfile.Target().supportedCapabilities.size() == 8u, "the profile lost native f16 arithmetic");
 }
