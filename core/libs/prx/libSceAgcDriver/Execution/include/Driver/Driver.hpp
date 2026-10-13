@@ -118,8 +118,15 @@ private:
     void eraseDispatchEntry(std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>>::iterator it);
     void classifyDiffering(std::uint64_t program, std::uint64_t key, const DispatchVariant& old, const DispatchVariant& fresh, const ShaderRecompiler::ResourceCapture* capture, EntryCounters& counters);
     void reportDispatchCache(EntryCounters& counters);
-    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
-    void insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
+    // Address-free dispatch-cache keys and entries (DispatchRelocation.hpp); APS5_NO_DISPATCH_CONTENT_KEY=1 turns them off.
+    static bool contentKeys();
+    // APS5_VERIFY_CONTENT_HITS=N: every Nth relocated hit is captured and materialized again and must bind the same (aborts otherwise).
+    static std::uint64_t verifyContentHits();
+    std::uint64_t dispatchContentKey(std::uint64_t identity, std::span<const std::uint32_t> userData, bool& contentKey);
+    void noteKeyMiss(std::uint64_t identity, std::span<const std::uint32_t> userData, bool absent, bool contentKey, EntryCounters& counters);
+    void verifyRelocatedHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& patched);
+    void lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t identity, std::span<const std::uint32_t> userData, bool contentKey, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& relocatedHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering);
+    void insertDispatch(std::uint64_t address, std::uint64_t key, std::uint64_t identity, std::span<const std::uint32_t> userData, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming);
     void dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments = 0);
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool drawEntries();
@@ -241,7 +248,10 @@ private:
     static void appendEntryRegions(const DispatchVariant& variant, std::vector<ShaderRecompiler::MemoryRegion>& regions, const std::vector<std::uint32_t>* words = nullptr);
     static std::shared_ptr<const ShaderRecompiler::RecompileResult> patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words);
     bool syncPendingRuns(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& synced, PendingView& pending, std::optional<SampledReadScope>& sampling);
-    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr);
+    // `positions` (sorted) replaces the variant's data positions as the masked words and `runs` its
+    // runs as the ranges checked for pending images, shadows and queued labels (a relocated
+    // variant's rebased runs); empty spans keep the variant's.
+    EntryOutcome validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live = nullptr, std::span<const std::uint32_t> positions = {}, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs = {});
     static int waitTimeoutMs();
     static bool pollReapAll();
     static bool pollTryEach();
@@ -266,7 +276,7 @@ private:
         std::vector<ShaderRecompiler::MemoryRegion> captured;
         std::vector<std::uint32_t> liveWords;
         std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
-        bool dataHit = false, cached = false, validated = false;
+        bool dataHit = false, relocatedHit = false, cached = false, validated = false;
         std::chrono::steady_clock::time_point resolvedAt{};
     };
     struct GroupCaptureStats {
@@ -351,6 +361,11 @@ private:
 
     using ValueSet = std::pair<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::vector<std::uint32_t>>;
     std::unordered_map<std::uint64_t, std::deque<ValueSet>> priorValueSets;
+
+    // Under dispatchCacheMutex: the content-key shape per dispatch identity (learned at the first
+    // insert with something to relocate, then fixed) and the [dispatch-keymiss] memory.
+    std::unordered_map<std::uint64_t, std::shared_ptr<const DispatchShape>> dispatchShapes;
+    std::unordered_map<std::uint64_t, KeyMissMemory> keyMissMemory;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DrawEntry>> drawCache;
     std::unordered_map<std::uint64_t, std::uint64_t> drawShapes;

@@ -138,6 +138,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/Dispatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchAhead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchRelocation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchCacheStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchInsert.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchLookup.cpp
@@ -425,6 +426,22 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_key_miss PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+add_test_executable(agc_driver_dispatch_relocation_tests EXCLUDE_FROM_ALL
+        tests/DispatchRelocation.cpp
+        Execution/src/Driver/Dispatch/DispatchRelocation.cpp
+)
+target_include_directories(agc_driver_dispatch_relocation_tests PRIVATE
+        ${LIBS_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/shader/recompiler
+)
+set_target_properties(agc_driver_dispatch_relocation_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_driver_dispatch_relocation_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_driver_dispatch_relocation_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_dispatch_relocation COMMAND agc_driver_dispatch_relocation_tests)
+    set_tests_properties(agc_driver_dispatch_relocation PROPERTIES TIMEOUT 30)
 endif()
 
 add_test_executable(agc_driver_tests EXCLUDE_FROM_ALL

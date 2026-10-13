@@ -78,14 +78,16 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
     return true;
 }
 
-EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live, std::span<const std::uint32_t> positions, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    const std::span<const std::uint32_t> maskPositions = positions.empty() ? std::span<const std::uint32_t>(variant.dataPositions) : positions;
+    const std::span<const std::pair<std::uint64_t, std::uint64_t>> checkedRuns = runs.empty() ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(variant.runs) : runs;
     if (live != nullptr) live->clear();
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && std::any_of(variant.runs.begin(), variant.runs.end(), [&](const auto& run) { return pipeline.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && std::any_of(checkedRuns.begin(), checkedRuns.end(), [&](const auto& run) { return pipeline.Overlaps(run.first, static_cast<std::size_t>(run.second - run.first)); })) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     }
-    const bool masked = live != nullptr && !variant.dataPositions.empty();
-    const DataMask mask{variant.dataPositions, live};
+    const bool masked = live != nullptr && !maskPositions.empty();
+    const DataMask mask{maskPositions, live};
     PendingView pending;
     pending.Load();
     if (!syncPendingRuns(program, queue, *variant.compiled, regions, runsSynced, pending, sampling)) return EntryOutcome::Differing;
@@ -93,7 +95,7 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
     auto pendingSerial = Graphics::StorageTexture::PendingSerial();
     auto forget = GuestMemory::ForgetSerial();
 
-    if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) {
+    if (Graphics::StorageTexture::AnyPendingOverlaps(checkedRuns) || Graphics::AnyShadowedOverlaps(checkedRuns)) {
         for (const auto& region : regions) {
             if (Graphics::StorageTexture::FlushPending(region.guestAddress, region.bytes.size(), nullptr, "dispatch-cache entry")) ++imagesFlushed;
         }
@@ -102,11 +104,11 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
         publish = Graphics::Recorder::PublishGeneration();
         pendingSerial = Graphics::StorageTexture::PendingSerial();
         forget = GuestMemory::ForgetSerial();
-        if (Graphics::StorageTexture::AnyPendingOverlaps(variant.runs) || Graphics::AnyShadowedOverlaps(variant.runs)) return EntryOutcome::FlushingImage;
+        if (Graphics::StorageTexture::AnyPendingOverlaps(checkedRuns) || Graphics::AnyShadowedOverlaps(checkedRuns)) return EntryOutcome::FlushingImage;
     }
     if ((forget & 1) != 0) return EntryOutcome::ForgetMoved;
     for (const auto& label : deferredLabels().labels) {
-        for (const auto& [begin, end] : variant.runs) {
+        for (const auto& [begin, end] : checkedRuns) {
             if (label.address < end && begin < label.address + label.size) return EntryOutcome::QueuedLabel;
         }
     }

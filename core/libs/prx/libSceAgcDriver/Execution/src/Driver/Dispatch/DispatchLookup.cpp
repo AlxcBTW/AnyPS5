@@ -1,18 +1,102 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <ranges>
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+namespace {
+
+// A relocated variant's runs at the live pointer words (runBases names the user word a run is
+// relative to; -1 or a missing entry keeps the run where it was captured).
+void rebaseRuns(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& rebased) {
+    const auto& profile = *variant.relocation;
+    rebased.assign(variant.runs.begin(), variant.runs.end());
+    for (std::size_t run = 0; run < rebased.size() && run < variant.runBases.size(); ++run) {
+        const auto base = variant.runBases[run];
+        if (base < 0 || static_cast<std::size_t>(base) >= userData.size() || static_cast<std::size_t>(base) >= profile.userData.size()) continue;
+        const auto delta = AlignedPointer(userData[base]) - AlignedPointer(profile.userData[base]);
+        rebased[run].first += delta;
+        rebased[run].second += delta;
+    }
+}
+
+void appendRegionsAt(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::vector<ShaderRecompiler::MemoryRegion>& regions) {
+    regions.reserve(regions.size() + runs.size());
+    std::size_t offset = 0;
+    for (const auto& [begin, end] : runs) {
+        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+        regions.push_back({begin, std::as_bytes(words.subspan(offset, count))});
+        offset += count;
+    }
+}
+
+}
+
+bool Driver::contentKeys() {
+    static const bool enabled = std::getenv("APS5_DISPATCH_CONTENT_KEY") != nullptr && std::getenv("APS5_NO_DISPATCH_CONTENT_KEY") == nullptr && !stampValidate();
+    return enabled;
+}
+
+std::uint64_t Driver::verifyContentHits() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_CONTENT_HITS");
+        return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 10), 1) : 0;
+    }();
+    return every;
+}
+
+std::uint64_t Driver::dispatchContentKey(std::uint64_t identity, std::span<const std::uint32_t> userData, bool& contentKey) {
+    contentKey = false;
+    std::shared_ptr<const DispatchShape> shape;
+    {
+        std::lock_guard lock(dispatchCacheMutex);
+        if (const auto found = dispatchShapes.find(identity); found != dispatchShapes.end()) shape = found->second;
+    }
+    if (shape == nullptr) return 0;
+    contentKey = true;
+    return DispatchContentKey(identity, *shape, userData, [](std::uint64_t address, std::span<std::uint32_t> out) { return GuestMemory::CopyMapped(address, std::as_writable_bytes(out)) == GuestMemory::Compare::Equal; });
+}
+
+void Driver::noteKeyMiss(std::uint64_t identity, std::span<const std::uint32_t> userData, bool absent, bool contentKey, EntryCounters& counters) {
+    if (keyMissMemory.size() > 65536) keyMissMemory.clear();
+    const auto [it, first] = keyMissMemory.try_emplace(identity);
+    auto& memory = it->second;
+    if (absent) {
+        if (contentKey) ++counters.missContentKey;
+        if (first) {
+            ++counters.missFirstSight;
+        } else if (std::ranges::equal(memory.userData, userData)) {
+            ++counters.missSameUser;
+        } else {
+            bool pointers = false, addresses = false, values = memory.userData.size() != userData.size();
+            for (std::size_t i = 0; i < userData.size() && i < memory.userData.size(); ++i) {
+                const auto changed = memory.userData[i] ^ userData[i];
+                if (changed == 0) continue;
+                if (i < counters.missWords.size()) ++counters.missWords[i];
+                const auto mask = i < memory.userMasks.size() ? memory.userMasks[i] : 0u;
+                if (i < 64 && (memory.pointerWords >> i & 1u) != 0) pointers = true;
+                else if ((changed & ~mask) == 0) addresses = true;
+                else values = true;
+            }
+            ++(values ? counters.missValues : pointers && addresses ? counters.missPointersAddresses : pointers ? counters.missPointers : counters.missAddresses);
+        }
+    }
+    memory.userData.assign(userData.begin(), userData.end());
+}
+
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, std::uint64_t identity, std::span<const std::uint32_t> userData, bool contentKey, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& relocatedHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
         std::unique_lock cacheLock(dispatchCacheMutex);
         ++entryCounters.lookups;
+        if (contentKey) ++entryCounters.contentLookups;
         const auto found = dispatchCache.find(key);
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) ++entryCounters.absent;
+        if (profile) noteKeyMiss(identity, userData, entry == nullptr, contentKey, entryCounters);
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
         if (entry != nullptr) {
@@ -30,6 +114,10 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<ShaderRecompiler::MemoryRegion> regions;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+            // A relocated variant: its runs at the live pointer words, and those of the hit.
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> rebased, hitRuns;
+            std::uint64_t refusedUser = 0, refusedFields = 0;
+            bool movedPointers = false, movedAddresses = false;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
@@ -38,20 +126,50 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
 
                 for (std::size_t i = 0; i < variants.size(); ++i) {
                     regions.clear();
-                    appendEntryRegions(*variants[i], regions);
+                    const auto& candidate = *variants[i];
+                    const bool relocatable = candidate.relocation != nullptr && contentKeys();
+                    std::span<const std::uint32_t> positions;
+                    std::span<const std::pair<std::uint64_t, std::uint64_t>> runs;
+                    if (relocatable) {
+                        // Every user word the profile does not relocate must be equal; a refusal
+                        // is a differing variant without reading memory.
+                        if (!UserWordsFit(*candidate.relocation, userData)) {
+                            ++refusedUser;
+                            ++compared;
+                            if (i == 0) outcome = EntryOutcome::Differing;
+                            continue;
+                        }
+                        rebaseRuns(candidate, userData, rebased);
+                        appendRegionsAt(rebased, candidate.words, regions);
+                        positions = candidate.relocation->maskPositions;
+                        runs = rebased;
+                    } else {
+                        appendEntryRegions(candidate, regions);
+                    }
                     ++compared;
-                    auto result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                    auto result = validateVariant(address, submission.queue, candidate, regions, imagesFlushed, runsSynced, sampling, &liveData, positions, runs);
 
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) {
-                        result = validateVariant(address, submission.queue, *variants[i], regions, imagesFlushed, runsSynced, sampling, &liveData);
+                        result = validateVariant(address, submission.queue, candidate, regions, imagesFlushed, runsSynced, sampling, &liveData, positions, runs);
                         ++(result == EntryOutcome::Equal || result == EntryOutcome::EqualData ? retriesEqual : retriesMoved);
+                    }
+                    const bool equal = result == EntryOutcome::Equal || result == EntryOutcome::EqualData;
+                    if (equal && relocatable && !FieldsFit(*candidate.relocation, candidate.words, liveData)) {
+                        ++refusedFields;
+                        result = EntryOutcome::Differing;
                     }
                     if (i == 0) outcome = result;
                     if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
                         outcome = result;
                         variant = variants[i];
                         rank = i;
-                        dataHit = result == EntryOutcome::EqualData;
+                        dataHit = relocatable ? std::any_of(liveData.begin(), liveData.end(), [&](const auto& live) { return std::binary_search(candidate.dataPositions.begin(), candidate.dataPositions.end(), live.first); }) : result == EntryOutcome::EqualData;
+                        if (relocatable) {
+                            movedPointers = !std::ranges::equal(userData, candidate.relocation->userData);
+                            movedAddresses = std::any_of(liveData.begin(), liveData.end(), [&](const auto& live) { return std::binary_search(candidate.relocation->maskPositions.begin(), candidate.relocation->maskPositions.end(), live.first) && !std::binary_search(candidate.dataPositions.begin(), candidate.dataPositions.end(), live.first); });
+                            relocatedHit = movedPointers || movedAddresses;
+                            if (relocatedHit) hitRuns = rebased;
+                        }
                         break;
                     }
                 }
@@ -103,6 +221,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             counters.retriesEqual += retriesEqual;
             counters.retriesMoved += retriesMoved;
             counters.variantsCompared += compared;
+            counters.refusedUser += refusedUser;
+            counters.refusedFields += refusedFields;
             switch (outcome) {
                 case EntryOutcome::Equal: ++counters.equal; break;
                 case EntryOutcome::EqualData: ++counters.equal; break;
@@ -117,16 +237,29 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;
-                if (dataHit) {
+                if (dataHit || relocatedHit) {
 
                     liveWords = variant->words;
                     for (const auto& [position, value] : liveData) liveWords[position] = value;
                     regions.clear();
-                    appendEntryRegions(*variant, regions, &liveWords);
-                    compiledResult = patchDataWords(*variant, liveWords);
-                    ++counters.dataHits;
-                    counters.dataWordsRefreshed += liveData.size();
-                    ++counters.dataHitsByRank[rank];
+                    if (relocatedHit) appendRegionsAt(hitRuns, liveWords, regions);
+                    else appendEntryRegions(*variant, regions, &liveWords);
+                    std::shared_ptr<const ShaderRecompiler::RecompileResult> patched = variant->compiled;
+                    if (dataHit) {
+                        patched = patchDataWords(*variant, liveWords);
+                        ++counters.dataHits;
+                        counters.dataWordsRefreshed += liveData.size();
+                        ++counters.dataHitsByRank[rank];
+                    }
+                    if (relocatedHit) {
+                        auto relocated = std::make_shared<ShaderRecompiler::RecompileResult>(*patched);
+                        ApplyRelocation(*relocated, *variant->relocation, liveWords, userData);
+                        ++counters.relocatedHits;
+                        if (movedPointers) ++counters.relocatedPointers;
+                        if (movedAddresses) ++counters.relocatedAddresses;
+                        patched = std::move(relocated);
+                    }
+                    compiledResult = std::move(patched);
                 }
                 if (stampValidate()) {
                     captured = variant->captured;
