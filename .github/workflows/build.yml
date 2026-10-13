@@ -12,6 +12,11 @@ on:
         description: Pull request number to build
         required: true
         type: string
+      linux:
+        description: Also build and test on Linux
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -214,7 +219,7 @@ jobs:
 
   linux:
     needs: eligibility
-    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.eligibility.outputs.full == 'true' }}
+    if: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.linux)) && needs.eligibility.outputs.full == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
