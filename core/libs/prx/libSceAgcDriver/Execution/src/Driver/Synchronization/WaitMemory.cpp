@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <tuple>
 #include <vector>
+#include <array>
+#include <map>
 
 namespace AgcDriver::DriverDetail {
 
@@ -104,6 +106,50 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     }
 }
 
+// exp (APS5_PROFILE_DRAW, never push; diagnostic, no behaviour change): the [waitmem] census. Every
+// WAIT_REG_MEM not satisfied at entry is timed and classified by how it ended: the value was stored by a
+// packet of another queue or of the waiting one after the wait was received (storedSince), the recorder's
+// label table holds it (recorded GPU work of that queue writes it), the recorded writes settled (a
+// landing wait), or memory showed it (polled: a GPU write landed, or a store nobody noted). Per 10 s and
+// waiting queue: count and ms by end, the waits that made a submit, and the addresses that cost the most
+// with the last writer the packet history knows for them (queue and opcode: 0x49 RELEASE_MEM, 0x37
+// WRITE_DATA, 0x40 COPY_DATA, 0x50 DMA_DATA).
+namespace {
+
+enum class WaitEnd : std::size_t { StoredOther, StoredSame, LabelOther, LabelSame, Settled, Memory, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(WaitEnd::Count)> WaitEndNames{"stored by another queue", "stored by its own queue", "label table, another queue", "label table, own queue", "recorded writes settled", "memory (polled)"};
+
+struct WaitCensus {
+    struct PerQueue {
+        std::array<std::uint64_t, static_cast<std::size_t>(WaitEnd::Count)> count{};
+        std::array<double, static_cast<std::size_t>(WaitEnd::Count)> ms{};
+        std::uint64_t atEntry = 0, submitted = 0, sleeps = 0;
+        struct Address {
+            std::uint64_t count = 0;
+            double ms = 0;
+            std::uint32_t writerQueue = 0xffffffffu;
+            std::uint32_t writerOpcode = 0;
+            std::array<std::uint64_t, static_cast<std::size_t>(WaitEnd::Count)> ends{};
+        };
+        std::map<std::uint64_t, Address> addresses;
+    };
+    std::mutex mutex;
+    std::map<std::uint32_t, PerQueue> queues;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+WaitCensus& Census() {
+    static WaitCensus census;
+    return census;
+}
+
+bool CensusOn() {
+    static const bool on = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return on;
+}
+
+}
+
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
     auto start = std::chrono::steady_clock::now();
@@ -135,10 +181,88 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        if (CensusOn()) {
+            std::lock_guard lock(Census().mutex);
+            ++Census().queues[queue].atEntry;
+        }
         return;
     }
     if (heldAtSubmit) return;
+    struct CensusWait {
+        Driver& driver;
+        bool on;
+        std::uint32_t queue;
+        std::uint64_t address;
+        std::chrono::steady_clock::time_point begin;
+        WaitEnd end = WaitEnd::Memory;
+        bool submitted = false;
+        bool slept = false;
+        ~CensusWait() {
+            if (!on) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+            // The newest write the packet history knows for the awaited dword (a ring the packet loop fills).
+            std::uint32_t writerQueue = 0xffffffffu, writerOpcode = 0;
+            const auto& history = Driver::writeHistory();
+            const auto cursor = Driver::writeCursor();
+            for (std::size_t back = 1; back <= history.size() && back <= cursor; ++back) {
+                const auto& record = history[(cursor - back) % history.size()];
+                if (record.length != 0 && record.target <= address && address < record.target + std::max<std::uint64_t>(record.length, 4)) {
+                    writerQueue = record.queue;
+                    writerOpcode = record.opcode;
+                    break;
+                }
+            }
+            auto& census = Census();
+            std::lock_guard lock(census.mutex);
+            auto& perQueue = census.queues[queue];
+            const auto index = static_cast<std::size_t>(end);
+            ++perQueue.count[index];
+            perQueue.ms[index] += ms;
+            if (submitted) ++perQueue.submitted;
+            if (slept) ++perQueue.sleeps;
+            auto& entry = perQueue.addresses[address];
+            ++entry.count;
+            entry.ms += ms;
+            ++entry.ends[index];
+            if (writerQueue != 0xffffffffu) {
+                entry.writerQueue = writerQueue;
+                entry.writerOpcode = writerOpcode;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - census.reported < std::chrono::seconds(10)) return;
+            census.reported = now;
+            for (auto& [waiting, stats] : census.queues) {
+                std::string line;
+                char item[256];
+                std::uint64_t waits = 0;
+                double total = 0;
+                for (std::size_t kind = 0; kind < stats.count.size(); ++kind) {
+                    waits += stats.count[kind];
+                    total += stats.ms[kind];
+                    if (stats.count[kind] == 0) continue;
+                    std::snprintf(item, sizeof(item), "%s %s %llu/%.0fms", line.empty() ? "" : ",", WaitEndNames[kind], static_cast<unsigned long long>(stats.count[kind]), stats.ms[kind]);
+                    line += item;
+                }
+                std::vector<std::pair<std::uint64_t, const WaitCensus::PerQueue::Address*>> top;
+                for (const auto& [where, stat] : stats.addresses) top.emplace_back(where, &stat);
+                std::sort(top.begin(), top.end(), [](const auto& left, const auto& right) { return left.second->ms > right.second->ms; });
+                std::string tops;
+                for (std::size_t rank = 0; rank < top.size() && rank < 8; ++rank) {
+                    const auto& stat = *top[rank].second;
+                    std::size_t mainEnd = 0;
+                    for (std::size_t kind = 1; kind < stat.ends.size(); ++kind) {
+                        if (stat.ends[kind] > stat.ends[mainEnd]) mainEnd = kind;
+                    }
+                    std::snprintf(item, sizeof(item), " 0x%llx x%llu %.0fms (writer queue 0x%x opcode 0x%x; mostly %s)", static_cast<unsigned long long>(top[rank].first), static_cast<unsigned long long>(stat.count), stat.ms, stat.writerQueue, stat.writerOpcode, WaitEndNames[mainEnd]);
+                    tops += item;
+                }
+                AgcDriver::ProfilePrint_nid_no_patch("[waitmem] queue 0x%x (10 s): %llu waits satisfied at entry; %llu blocked %.0f ms by end:%s; %llu made a submit, %llu slept; top addresses:%s\n", waiting, static_cast<unsigned long long>(stats.atEntry), static_cast<unsigned long long>(waits), total, line.c_str(), static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.sleeps), tops.c_str());
+                stats = WaitCensus::PerQueue{};
+            }
+        }
+    } censusWait{*this, CensusOn(), queue, awaited, std::chrono::steady_clock::now()};
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        censusWait.end = writer != queue ? WaitEnd::StoredOther : WaitEnd::StoredSame;
         if (writer != queue) notePendingWait(packet, queue, received);
         else epochPoint.bump = false;
         return;
@@ -178,6 +302,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate("trusted", hit, refusal);
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        censusWait.end = hit->queue == queue ? WaitEnd::LabelSame : WaitEnd::LabelOther;
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -220,7 +345,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
             }
 
-            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
+            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
+                localDevice->SubmitRecorded(false);
+                censusWait.submitted = true;
+            }
         }
     }
 
@@ -301,6 +429,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             submitted = true;
         }
         if (submitted) {
+            censusWait.submitted = true;
             ++outcomes.pollSubmits;
             if (pollProfile) ++poll.submits;
         }
@@ -332,6 +461,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+            censusWait.end = writer != queue ? WaitEnd::StoredOther : WaitEnd::StoredSame;
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
             return;
@@ -342,6 +472,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if ((polls & 63u) != 0) continue;
             if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
         } else if (pauseSpin || polls >= 4000) {
+            censusWait.slept = true;
             PollSleep();
         } else {
             std::this_thread::yield();
@@ -352,7 +483,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    censusWait.end = WaitEnd::Settled;
+                    return;
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
