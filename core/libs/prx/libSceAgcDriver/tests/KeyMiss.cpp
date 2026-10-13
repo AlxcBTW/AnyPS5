@@ -87,6 +87,25 @@ void testDispatchKey() {
     expectOnly(diff, std::nullopt, "data words are not part of the key without dataWords");
 }
 
+std::vector<std::uint32_t> withDevice(std::vector<std::uint32_t> key, std::uint32_t device) {
+    key.push_back(device);
+    key.push_back(0u);
+    return key;
+}
+
+void testDispatchKeyWithDevice() {
+    ContentKeyDiff diff;
+    const auto base = withDevice(shaderKey(false, false, bindings()), 5);
+    check(ShaderResources::DiffContentKeys(base, base, false, diff), "dispatch key with device words was not comparable");
+    expectOnly(diff, std::nullopt, "equal dispatch keys with device words reported a difference");
+    auto buffer = bindings();
+    buffer[0].words[0] += 1;
+    check(ShaderResources::DiffContentKeys(base, withDevice(shaderKey(false, false, buffer), 5), false, diff), "dispatch V# word 0 with device words");
+    expectOnly(diff, ContentKeyComponent::BufferWord0, "dispatch V# word 0 with device words");
+    check(ShaderResources::DiffContentKeys(base, withDevice(shaderKey(false, false, bindings()), 6), false, diff), "dispatch device change");
+    expectOnly(diff, ContentKeyComponent::Other, "dispatch device change");
+}
+
 void testDrawKey() {
     ContentKeyDiff diff;
     const auto base = drawKey(5, shaderKey(true, true, bindings()), 0x1000);
@@ -109,6 +128,7 @@ void testDrawKey() {
 int main() {
     try {
         testDispatchKey();
+        testDispatchKeyWithDevice();
         testDrawKey();
         std::puts("Key miss attribution passed");
         return 0;

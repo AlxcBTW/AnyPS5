@@ -1890,7 +1890,15 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
 
 bool LabelContentKey(std::span<const std::uint32_t> key, bool draw, bool movable, std::vector<std::uint8_t>& labels) {
     labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
-    if (!draw) return LabelShaderKey(key, 0, key.size(), movable, labels);
+    if (!draw) {
+        if (LabelShaderKey(key, 0, key.size(), movable, labels)) return true;
+        if (key.size() < 2) return false;
+        labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
+        if (!LabelShaderKey(key, 0, key.size() - 2, movable, labels)) return false;
+        labels[key.size() - 2] = static_cast<std::uint8_t>(Component::Other);
+        labels[key.size() - 1] = static_cast<std::uint8_t>(Component::Other);
+        return true;
+    }
     if (key.size() < 4) return false;
     std::fill(labels.begin() + 1, labels.begin() + 3, static_cast<std::uint8_t>(Component::Other));
     std::size_t at = 4;
