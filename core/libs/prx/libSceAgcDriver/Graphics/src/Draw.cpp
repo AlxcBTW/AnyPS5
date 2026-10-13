@@ -469,7 +469,7 @@ struct DrawProfile {
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
-constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown", "empty indirect (no capture)"};
 
 DrawProfile& Profile() {
     static DrawProfile profile;

@@ -90,7 +90,9 @@ private:
     std::size_t bucketMask = 0;
 };
 
-enum class DrawVerdict { Drawn, Nothing, Rejected };
+// EmptyIndirect: a CPU-side indirect draw whose records draw nothing, ended before its captures
+// (Driver::draw, APS5_NO_EMPTY_INDIRECT_SKIP=1 turns that off).
+enum class DrawVerdict { Drawn, Nothing, Rejected, EmptyIndirect };
 
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;

@@ -22,6 +22,29 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
     if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
 }
 
+bool Driver::emptyIndirectSkip() {
+    static const bool skip = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
+    return skip;
+}
+
+std::optional<Graphics::IndirectDrawPath> Driver::IndirectCpuBeforeCapture(const Graphics::ShaderStages& stages, bool rectList, const Pm4::DrawParameters& drawParameters, const VulkanDevice::IndirectDrawSupport& support) {
+    using Path = Graphics::IndirectDrawPath;
+    const auto& indirect = *drawParameters.indirect;
+    constexpr std::uint32_t NoLocation = 0x280u;
+    const bool meshPath = stages.mesh.has_value() && !stages.tessellation && !rectList;
+    const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
+    if ((stages.path != Graphics::ShaderPath::Vertex || rectList) && !meshGpuSide) return Path::NonVertexPath;
+    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) return Path::DrawIndex;
+    if (indirect.countIndirect && !support.count) return Path::FeatureGap;
+    if (indirect.countIndirect && indirect.count > 1 && !support.multi) return Path::FeatureGap;
+    return std::nullopt;
+}
+
+bool Driver::IndirectRecordDraws(const Pm4::DrawArguments& arguments, const Pm4::DrawParameters& drawParameters) {
+    if (arguments.count == 0 || arguments.instances == 0) return false;
+    return !drawParameters.indexed || arguments.firstVertexOrIndex < drawParameters.indexCount;
+}
+
 std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
@@ -29,13 +52,9 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     using Path = Graphics::IndirectDrawPath;
     const auto support = localDevice->DrawIndirectSupport();
     const auto fail = [&](Path reason) { if (!indirectCpu) indirectCpu = reason; };
-    constexpr std::uint32_t NoLocation = 0x280u;
-    const bool meshPath = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList;
-    const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
-    if ((graphics.stages.path != Graphics::ShaderPath::Vertex || graphics.rectList) && !meshGpuSide) fail(Path::NonVertexPath);
-    if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) fail(Path::DrawIndex);
-    if (indirect.countIndirect && !support.count) fail(Path::FeatureGap);
-    if (indirect.countIndirect && indirect.count > 1 && !support.multi) fail(Path::FeatureGap);
+    // The checks that do not read `result` come first (Draw reads the records before the captures
+    // when one of them already sends the draw to the CPU).
+    if (const auto early = IndirectCpuBeforeCapture(graphics.stages, graphics.rectList, drawParameters, support)) fail(*early);
     const auto dimension = [&](std::int32_t k, std::int32_t p, bool shared, bool conflict, std::uint32_t x, Rule& rule, std::uint32_t& constant) {
         if (p < 0) {
             rule = Rule::Constant;

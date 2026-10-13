@@ -139,6 +139,24 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.baseVertexSgpr = sgprOf(indirect.baseVertexLocation);
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
+        // A draw the CPU loop below resolves whatever its front stage compiles to reads its records
+        // first: when none of them draws, the packet ends here, before the stage captures, the
+        // recompiles and the draw cache lookup the loop would throw away. The record reads wait for
+        // the GPU writer as the capture's reads did. APS5_NO_EMPTY_INDIRECT_SKIP=1: capture first.
+        if (emptyIndirectSkip() && !programs.empty() && roles.front() != Role::GeometryBack) {
+            if (const auto reason = IndirectCpuBeforeCapture(graphics.stages, graphics.rectList, drawParameters, localDevice->DrawIndirectSupport())) {
+                recordQueuedLabelsBeforeRead(submission.queue);
+                const auto readStart = std::chrono::steady_clock::now();
+                const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
+                bool draws = false;
+                for (std::uint32_t record = 0; record < count && !draws; ++record) draws = IndirectRecordDraws(Pm4::ReadDrawArguments(indirect, record), drawParameters);
+                if (!draws) {
+                    Graphics::CountIndirectDraw(*reason, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+                    if (traceIndirect) std::fprintf(stderr, "[draw]   %u records draw nothing: ended before the captures (cpu: %s)\n", count, Graphics::IndirectDrawPathName(*reason));
+                    return DrawVerdict::EmptyIndirect;
+                }
+            }
+        }
     }
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
@@ -343,7 +361,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::uint32_t record = 0; record < records.size(); ++record) {
             const auto& arguments = records[record];
             if (traceIndirect) std::fprintf(stderr, "[draw]   record %u: count %u instances %u first %u vertexOffset %u startInstance %u\n", record, arguments.count, arguments.instances, arguments.firstVertexOrIndex, arguments.vertexOffset, arguments.firstInstance);
-            if (arguments.count == 0 || arguments.instances == 0) continue;
+            if (!IndirectRecordDraws(arguments, drawParameters)) continue;
             std::set<std::size_t> patched;
             const auto patch = [&](const std::optional<std::pair<std::size_t, std::size_t>>& word, std::uint32_t value) {
                 if (!word) return;
