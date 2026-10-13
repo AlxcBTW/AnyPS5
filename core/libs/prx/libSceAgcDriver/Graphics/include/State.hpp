@@ -78,6 +78,7 @@ struct DepthTarget {
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
     std::uint32_t samples = 1;
+    std::uint32_t slice = 0;
 };
 
 struct State {
