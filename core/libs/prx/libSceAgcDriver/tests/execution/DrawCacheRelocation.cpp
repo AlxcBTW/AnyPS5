@@ -120,6 +120,11 @@ void MovedDataHitsTheCache(bool libraries) {
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_EXP_PR4943", "1");
+#else
+        setenv("APS5_EXP_PR4943", "1", 1);
+#endif
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();

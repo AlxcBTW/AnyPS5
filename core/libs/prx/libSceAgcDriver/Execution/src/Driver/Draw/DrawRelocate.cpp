@@ -23,7 +23,8 @@ std::uint64_t AlignedWord(std::uint32_t word) {
 }
 
 bool Driver::drawRelocationEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr;
+    // Lab switch APS5_EXP_PR4943 (default off).
+    static const bool enabled = std::getenv("APS5_EXP_PR4943") != nullptr && std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr;
     return enabled;
 }
 
