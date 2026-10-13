@@ -189,6 +189,45 @@ static bool ExtendedBits(long double value, std::uint64_t mantissa, std::uint16_
     return actualMantissa == mantissa && actualSignExponent == signExponent;
 }
 
+static void CheckNanConversions() {
+    const struct { const char* text; std::size_t consumed; bool negative; } cases[] = {
+        {"nan(0x123)", 10, false}, {" -NaN(1)!", 8, true}, {"nan(0x800000)", 13, false},
+        {"nan(0x10000000000000)", 21, false}, {"nan(0x8000000000000000)", 23, false},
+    };
+    bool correct = true;
+    for (const auto& test : cases) {
+        const char* expectedEnd = test.text + test.consumed;
+        const std::uint64_t expectedDouble = test.negative ? 0xfff8000000000000ull : 0x7ff8000000000000ull;
+        char* end = nullptr;
+        const auto value = std::bit_cast<std::uint64_t>(strtod_nid_postfix(test.text, &end));
+        if (value != expectedDouble || end != expectedEnd) {
+            std::fprintf(stderr, "strtod(\"%s\") = 0x%016llx\n", test.text, static_cast<unsigned long long>(value));
+            correct = false;
+        }
+        const auto ascii = std::bit_cast<std::uint64_t>(atof_nid_postfix(test.text));
+        if (ascii != expectedDouble) {
+            std::fprintf(stderr, "atof(\"%s\") = 0x%016llx\n", test.text, static_cast<unsigned long long>(ascii));
+            correct = false;
+        }
+        const auto single = std::bit_cast<std::uint32_t>(strtof_nid_postfix(test.text, &end));
+        if (single != (test.negative ? 0xffc00000u : 0x7fc00000u) || end != expectedEnd) {
+            std::fprintf(stderr, "strtof(\"%s\") = 0x%08x\n", test.text, static_cast<unsigned>(single));
+            correct = false;
+        }
+        const long double extended = strtold_nid_postfix(test.text, &end);
+        if (!ExtendedBits(extended, 0xc000000000000000ull, test.negative ? 0xffff : 0x7fff) || end != expectedEnd) {
+            std::uint64_t significand = 0;
+            std::uint16_t signExponent = 0;
+            std::memcpy(&significand, &extended, sizeof(significand));
+            std::memcpy(&signExponent, reinterpret_cast<const unsigned char*>(&extended) + sizeof(significand), sizeof(signExponent));
+            std::fprintf(stderr, "strtold(\"%s\") = 0x%04x'%016llx\n", test.text, static_cast<unsigned>(signExponent),
+                static_cast<unsigned long long>(significand));
+            correct = false;
+        }
+    }
+    Require(correct);
+}
+
 static void CheckHypotSpecialValue() {
     Require(std::bit_cast<std::uint64_t>(hypot_nid_postfix(INFINITY, std::bit_cast<double>(0x7ff0000000000001ull))) == 0x7ff0000000000000ull);
     Require(std::bit_cast<std::uint64_t>(hypot_nid_postfix(std::bit_cast<double>(0x7ff0000000000001ull), INFINITY)) == 0x7ff0000000000000ull);
@@ -710,6 +749,7 @@ int main() {
     Require(std::isinf(strtof_nid_postfix("1e1000", nullptr)));
     Require(*__error_nid_postfix() == 34);
     Require(strtold_nid_postfix("1.0000000000000000001!", &end) > 1.L && *end == '!');
+    CheckNanConversions();
     Require(fmodf_nid_postfix(5.5f, 2.f) == 1.5f);
     Require(fmodf_nid_postfix(-5.5f, 2.f) == -1.5f);
     Require(std::signbit(fmodf_nid_postfix(-4.f, 2.f)));

@@ -1,3 +1,4 @@
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -36,6 +37,33 @@ std::string AsciiPrefix(const char16_t* text) {
     return prefix;
 }
 
+bool IsNanSubject(const char* text) {
+    while (*text == ' ' || (*text >= '\t' && *text <= '\r')) ++text;
+    if (*text == '+' || *text == '-') ++text;
+    return *text == 'n' || *text == 'N';
+}
+
+double QuietNan(double value, const char* text) {
+    const auto bits = std::bit_cast<std::uint64_t>(value);
+    if ((bits & 0x7ff0000000000000u) != 0x7ff0000000000000u || !IsNanSubject(text)) return value;
+    return std::bit_cast<double>((bits & 0x8000000000000000u) | 0x7ff8000000000000u);
+}
+
+float QuietNan(float value, const char* text) {
+    const auto bits = std::bit_cast<std::uint32_t>(value);
+    if ((bits & 0x7f800000u) != 0x7f800000u || !IsNanSubject(text)) return value;
+    return std::bit_cast<float>((bits & 0x80000000u) | 0x7fc00000u);
+}
+
+long double QuietNan(long double value, const char* text) {
+    std::uint16_t exponent;
+    std::memcpy(&exponent, reinterpret_cast<const unsigned char*>(&value) + sizeof(std::uint64_t), sizeof(exponent));
+    if ((exponent & 0x7fffu) != 0x7fffu || !IsNanSubject(text)) return value;
+    const std::uint64_t significand = 0xc000000000000000u;
+    std::memcpy(&value, &significand, sizeof(significand));
+    return value;
+}
+
 template<typename TParse>
 auto ParseAsciiPrefix(const char16_t* text, char16_t** end, TParse parse) {
     const std::string prefix = AsciiPrefix(text);
@@ -50,7 +78,7 @@ TFloat ParseFloat(const char* text, char** end, TFloat (*parse)(const char*, cha
     char* parsedEnd = nullptr;
     const TFloat value = parse(text, &parsedEnd);
     if (end != nullptr) *end = parsedEnd;
-    return parsedEnd == text ? TFloat{0} : value;
+    return parsedEnd == text ? TFloat{0} : QuietNan(value, text);
 }
 
 }

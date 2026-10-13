@@ -4,6 +4,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <initializer_list>
+#include <bit>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 
 extern "C" {
 const char16_t* APS5_VABI wmemchr_nid_postfix(const char16_t* s, char16_t c, std::size_t n);
@@ -183,6 +187,13 @@ int main() {
     require(wcstof_nid_postfix(u"0.25", nullptr) == 0.25f);
     const char16_t* half = u"-1.5é";
     require(wcstold_nid_postfix(half, &end) == -1.5L && end == half + 4);
+    const char16_t* wideNan = u" -nan(0x123)é";
+    require(std::bit_cast<std::uint64_t>(wcstod_nid_postfix(wideNan, &end)) == 0xfff8000000000000u && end == wideNan + 12);
+    require(std::bit_cast<std::uint32_t>(wcstof_nid_postfix(wideNan, &end)) == 0xffc00000u && end == wideNan + 12);
+    const long double wideExtended = wcstold_nid_postfix(wideNan, &end);
+    std::uint64_t significand;
+    std::memcpy(&significand, &wideExtended, sizeof(significand));
+    require(std::isnan(wideExtended) && std::signbit(wideExtended) && significand == 0xc000000000000000u && end == wideNan + 12);
 
     require(wcscoll_nid_postfix(u"a", u"b") < 0);
     require(wcscoll_nid_postfix(u"￿", u"a") > 0);

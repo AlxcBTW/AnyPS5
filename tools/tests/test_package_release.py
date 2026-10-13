@@ -89,6 +89,30 @@ class ReleasePackageTests(unittest.TestCase):
         with working_directory(self.source), self.assertRaisesRegex(RuntimeError, "Missing patched libraries"):
             package_release.package("linux", self.build, self.output, "v1.0")
 
+    def test_directory_destination_preserves_every_existing_asset(self):
+        names = ["prx-linux-v1.zip", "prx-linux-v1.tar.gz", "relinker-v1"]
+        for blocked in names:
+            with self.subTest(blocked=blocked), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp)
+                for name in names:
+                    destination = output / name
+                    if name == blocked:
+                        destination.mkdir()
+                        (destination / "keep.txt").write_bytes(b"directory content")
+                    else:
+                        destination.write_bytes(b"old " + name.encode())
+                (output / "unrelated.txt").write_bytes(b"unrelated")
+                with self.assertRaises((OSError, RuntimeError)):
+                    package_release.package("linux", self.build, output, "v1")
+                self.assertEqual(sorted(path.name for path in output.iterdir()), sorted(names + ["unrelated.txt"]))
+                for name in names:
+                    destination = output / name
+                    if name == blocked:
+                        self.assertEqual((destination / "keep.txt").read_bytes(), b"directory content")
+                    else:
+                        self.assertEqual(destination.read_bytes(), b"old " + name.encode())
+                self.assertEqual((output / "unrelated.txt").read_bytes(), b"unrelated")
+
     def test_invalid_tag_creates_no_assets(self):
         with self.assertRaises(ValueError):
             package_release.package("linux", self.build, self.output, "../v1.0")

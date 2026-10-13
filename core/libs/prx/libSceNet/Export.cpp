@@ -1010,8 +1010,15 @@ int APS5_VABI sceNetGetsockname(int s, void* addr, uint32_t* addrlen) {
     if (!addr || !addrlen) return fail(NET_EINVAL);
     sockaddr_storage native{};
     NativeLength native_length = sizeof(native);
-    if (::getsockname(socket.native->value, reinterpret_cast<sockaddr*>(&native), &native_length) != 0)
+    if (::getsockname(socket.native->value, reinterpret_cast<sockaddr*>(&native), &native_length) != 0) {
+#ifdef _WIN32
+        if (WSAGetLastError() != WSAEINVAL) return fail(native_error());
+        native = {};
+        native.ss_family = socket.family == NET_AF_INET ? AF_INET : AF_INET6;
+#else
         return fail(native_error());
+#endif
+    }
     return native_to_guest_address(native, addr, addrlen) ? 0 : fail(NET_EAFNOSUPPORT);
 }
 

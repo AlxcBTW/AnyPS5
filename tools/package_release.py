@@ -26,8 +26,13 @@ def package(platform, build, output, version):
     for file in [*files, binary]:
         if not file.is_file() or file.stat().st_size == 0:
             raise RuntimeError(f"Missing or empty release file: {file}")
-    output.mkdir(parents=True, exist_ok=True)
     asset = f"relinker-{version}.exe" if platform == "windows" else f"relinker-{version}"
+    names = (f"prx-{platform}-{version}.zip", f"prx-{platform}-{version}.tar.gz", asset)
+    for name in names:
+        destination = output / name
+        if destination.exists() and not destination.is_file():
+            raise RuntimeError(f"Release destination is not a file: {destination}")
+    output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".release-", dir=output) as temporary:
         staging = Path(temporary)
         with zipfile.ZipFile(staging / f"prx-{platform}-{version}.zip", "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
