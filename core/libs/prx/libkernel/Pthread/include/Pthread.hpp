@@ -117,6 +117,7 @@ struct PthreadPrivate {
     std::atomic<unsigned> references{2};
     std::atomic<bool> inWait{false};
     std::atomic<int> pendingException{0};
+    std::atomic<int> schedPolicy{1};
     void* wakeEvent = nullptr;
     void* stackAddress = nullptr;
     std::size_t stackSize = 0;

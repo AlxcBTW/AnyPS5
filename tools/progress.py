@@ -443,6 +443,6 @@ if __name__ == "__main__":
     (output / "badge-libraries.svg").write_text(badge("libraries*", libraries))
     (output / "badge-shaders.svg").write_text(badge("shaders", shaders))
     (output / "progress.svg").write_text(render(libraries, shaders))
-    (output / "index.html").write_text(summary(libraries, shaders))
+    (output / "progress.html").write_text(summary(libraries, shaders))
     print(f'libraries {libraries["done"]}/{libraries["total"]} ({libraries["percent"]}%)')
     print(f'shaders {shaders["done"]}/{shaders["total"]} ({shaders["percent"]}%)')
