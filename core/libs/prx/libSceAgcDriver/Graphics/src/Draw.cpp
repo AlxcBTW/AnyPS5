@@ -665,6 +665,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(tessellation.domain);
             add(tessellation.partitioning);
             add(tessellation.outputTopology);
+            add(tessellation.patchesPerGroup);
         }
     }
     return keyed;
