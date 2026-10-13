@@ -221,7 +221,14 @@ void ArrayViewCase(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     std::copy(texture.begin(), texture.end(), userData.begin() + 4);
     userData[14] = std::bit_cast<std::uint32_t>(1.0f / 64.0f);
     const auto program = Compile(device, StoreLayerCode, userData);
-    ExpectRefusal([&] { device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data())); }, "storage image access to depth/stencil surface", "a one-layer 2D array storage view of the depth plane");
+    device.Dispatch(program, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(StoreLayerCode.data()));
+    AgcDriver::Graphics::StorageTexture::FlushPending(reinterpret_cast<std::uintptr_t>(block), Width * Height * sizeof(float), nullptr, "test");
+    device.WaitIdle();
+    for (std::uint32_t x = 0; x < Threads; ++x) {
+        float texel = 0.0f;
+        std::memcpy(&texel, block + x * sizeof(float), sizeof(texel));
+        Require(texel == static_cast<float>(x) / 64.0f, "guest depth texel " + std::to_string(x) + " is " + std::to_string(texel) + " after a store through a one-layer 2D array view");
+    }
 }
 
 void MultisampledCase(AgcDriver::VulkanDevice& device, const Shaders& compiled, std::uint8_t* block) {
@@ -301,10 +308,10 @@ int main() {
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
         StoreBackCase(*device, shaders, block.Data());
-        ArrayViewCase(*device, block.Data());
         MultisampledCase(*device, shaders, block.Data());
         TwoViewsCase(*device, block.Data());
         SampledCopyCase(*device, shaders, block.Data());
+        ArrayViewCase(*device, block.Data());
         std::puts("depth storage dispatch tests passed");
         return 0;
     } catch (const std::exception& error) {
