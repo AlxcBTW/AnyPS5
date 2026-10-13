@@ -66,6 +66,9 @@ public:
     Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, DepthCopyTag);
     static VkFormat DepthCopyFormat(VkFormat colorFormat);
     static bool CanDepthCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    struct BlockCopyTag {};
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, BlockCopyTag);
+    static bool CanBlockCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
     struct DepthCopyCounts {
@@ -106,6 +109,7 @@ public:
 
 private:
     void release() noexcept;
+    bool refreshBlockCopy();
     void createFirstLayerView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
     void prepareBaseLevelView(const GuestTextureResource& descriptor, VkImageViewCreateInfo viewInfo);
 
@@ -133,6 +137,7 @@ private:
     bool copiedOnce = false;
     std::uint64_t copiedVersion = 0;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+    VkFormat blockFormat = VK_FORMAT_UNDEFINED;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
 };
 

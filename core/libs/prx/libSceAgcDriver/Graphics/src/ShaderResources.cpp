@@ -553,7 +553,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // memory first.
     const bool depthCopy = depthCompare && guestBytes >= DepthCopyMinBytes() && Texture::DepthCopyFormat(ResolveTextureFormat(resource.format)) != VK_FORMAT_UNDEFINED && resource.dimension != TextureDimension::k3D;
     auto source = StorageTexture::FindPending(address, guestBytes);
-    if (source != nullptr && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
+    const bool blockCopy = source != nullptr && !depthCompare && Texture::CanBlockCopyFrom(*source, resource);
+    if (source != nullptr && !blockCopy && (depthCompare ? !depthCopy || !Texture::CanDepthCopyFrom(*source, resource) : !Texture::CanCopyFrom(*source, resource))) source.reset();
     if (source != nullptr && MetadataMoved(*source, resource)) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -625,6 +626,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             texture->RefreshDepthCopy();
             return texture;
         }
+        if (source != nullptr && blockCopy) {
+            auto texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
+            texture->RefreshDepthCopy();
+            return texture;
+        }
         if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
@@ -676,6 +682,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.sourceVersion = source->Version();
         if (depthCompare) {
             entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::DepthCopyTag{});
+            entry.texture->RefreshDepthCopy();
+        } else if (blockCopy) {
+            entry.texture = std::make_shared<Texture>(context, source, resource, components, Texture::BlockCopyTag{});
             entry.texture->RefreshDepthCopy();
         } else {
             entry.texture = std::make_shared<Texture>(context, source, resource, components);
