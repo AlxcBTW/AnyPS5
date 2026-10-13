@@ -993,7 +993,28 @@ std::uint32_t EmitTrigCycleF32(SpirvEmitterState& state, std::uint32_t src, bool
     return result;
 }
 
+void EmitF16DenormPreserve(SpirvEmitterState& state) {
+    if (state.f16DenormPreserveEmitted) return;
+    state.module.EmitCapability(spv::CapabilityDenormPreserve);
+    state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDenormPreserve, 16u);
+    state.f16DenormPreserveEmitted = true;
+}
+
 std::uint32_t EmitF16BitsToF32(SpirvEmitterState& state, std::uint32_t bits) {
+    if (!state.float16DenormPreserve) return EmitF16BitsToF32Decoded(state, bits);
+    EmitF16DenormPreserve(state);
+    const auto u32 = TypeU32(state);
+    const auto f32 = TypeF32(state);
+    const auto unpacked = state.module.AllocateId();
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state), GLSLstd450UnpackHalf2x16, bits);
+    state.module.AddFunction(spv::OpCompositeExtract, f32, value, unpacked, 0u);
+    const auto signAndPayload = Binary(state, spv::OpShiftRightArithmetic, u32, Binary(state, spv::OpShiftLeftLogical, u32, bits, ConstantU32(state, 16u)), ConstantU32(state, 3u));
+    const auto nan = Unary(state, spv::OpBitcast, f32, Binary(state, spv::OpBitwiseOr, u32, signAndPayload, ConstantU32(state, 0x7f800000u)));
+    return Select(state, f32, Unary(state, spv::OpIsNan, TypeBool(state), value), nan, value);
+}
+
+std::uint32_t EmitF16BitsToF32Decoded(SpirvEmitterState& state, std::uint32_t bits) {
     const auto u32 = TypeU32(state);
     const auto f32 = TypeF32(state);
     const auto op = [&](spv::Op opcode, std::uint32_t lhs, std::uint32_t rhs) { return Binary(state, opcode, u32, lhs, rhs); };

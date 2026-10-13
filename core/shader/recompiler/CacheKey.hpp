@@ -245,6 +245,7 @@ private:
         append(key, value.registrationModules);
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
+        append(key, value.float16DenormPreserve);
     }
 };
 
