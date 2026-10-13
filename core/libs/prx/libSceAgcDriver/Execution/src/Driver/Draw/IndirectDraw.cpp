@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -50,6 +51,12 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
     if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
     if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
+
+    const auto rangeBytes = indirect.RangeBytes();
+    if (rangeBytes > 0) {
+        if (!Graphics::RegisteredReadableCovers(indirect.arguments, static_cast<std::size_t>(rangeBytes))) fail(Path::NotImported);
+        if (indirect.countIndirect && !Graphics::RegisteredReadableCovers(indirect.countAddress, 4)) fail(Path::NotImported);
+    }
 
     static const std::uint64_t vertexCap = [] { const char* text = std::getenv("APS5_INDIRECT_VERTEX_MIB"); return (text ? std::strtoull(text, nullptr, 10) : 64ull) << 20u; }();
     for (const auto& attribute : result.vertexAttributes) {

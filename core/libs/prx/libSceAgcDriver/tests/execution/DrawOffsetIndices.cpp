@@ -475,6 +475,25 @@ std::string Run(Fixture& fixture) {
             fixture.Draw(vertex, draw);
             failures += fixture.Check(what + ", drawn on the GPU", bufferIndices, 0x51u, 0x62u, true);
         }
+        {
+            const std::string what = "indexed indirect record whose arguments are outside registered guest memory";
+            const auto vertex = fixture.Vertex(PostAddCode, staleUserData);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            auto unmapped = indexedIndirect;
+            unmapped.arguments = 0xdeadbeef0000ull;
+            draw.indirect = unmapped;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, Path::NotImported, Rule::InPlace);
+        }
+        {
+            const std::string what = "indexed indirect record whose count buffer is outside registered guest memory";
+            const auto vertex = fixture.Vertex(PostAddCode, staleUserData);
+            AgcDriver::Pm4::DrawParameters draw{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+            auto unmapped = indexedIndirect;
+            unmapped.countIndirect = true;
+            unmapped.countAddress = 0xdeadbeef1000ull;
+            draw.indirect = unmapped;
+            failures += Classified(fixture, what, vertex, staleUserData, draw, Path::NotImported, Rule::InPlace);
+        }
     }
     return failures;
 }
