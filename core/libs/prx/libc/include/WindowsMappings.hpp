@@ -748,7 +748,7 @@ private:
 
     static bool viewSplitAt(std::uintptr_t at, MEMORY_BASIC_INFORMATION& memory) {
         if (VirtualQuery(reinterpret_cast<const void*>(at), &memory, sizeof(memory)) != sizeof(memory)) return false;
-        return memory.State != MEM_FREE && memory.Type == MEM_MAPPED && reinterpret_cast<std::uintptr_t>(memory.AllocationBase) != at;
+        return memory.State == MEM_COMMIT && memory.Type == MEM_MAPPED && reinterpret_cast<std::uintptr_t>(memory.AllocationBase) != at;
     }
 
     bool splitBusy(std::uintptr_t at) {
@@ -798,7 +798,8 @@ private:
         const auto base = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
         const auto last = allocationEnd(memory);
         const auto head = views.find(base);
-        if (head == views.end() || at % pageBytes != 0) throw std::runtime_error("cannot split a shared guest view between its pages");
+        if (head == views.end()) return;
+        if (at % pageBytes != 0) throw std::runtime_error("cannot split a shared guest view between its pages");
         const auto section = head->second.section;
         const auto offset = head->second.offset;
         if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(base), MEM_PRESERVE_PLACEHOLDER)) fail("unmap a shared guest view to split it");
