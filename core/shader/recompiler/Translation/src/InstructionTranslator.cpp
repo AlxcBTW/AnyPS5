@@ -532,6 +532,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
         context.SetFloatMode(options.floatMode);
         context.SetNativeFloat16(options.nativeFloat16);
         context.SetEntryRounding(entryRounding.at(cfgBlock.id));
+        context.SetNativeFloat16Arithmetic(options.nativeFloat16Arithmetic, options.nativeFloat16Fma);
         for (std::uint32_t index = cfgBlock.instructionBegin; index < cfgBlock.instructionEnd; index++) {
             const auto& instruction = decoded.instructions[index];
             if (isCodeTableLoad(cfg, instruction.programCounter)) {

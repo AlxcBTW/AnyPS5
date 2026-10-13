@@ -18,13 +18,15 @@ struct ProfileInput {
     std::vector<std::uint32_t> capabilities{spv::CapabilityShader, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
     std::array<std::string, 2> extensionStrings{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     std::array<std::string_view, 2> extensions{extensionStrings[0], extensionStrings[1]};
-    VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE, VK_TRUE};
+    VkPhysicalDeviceShaderFmaFeaturesKHR fma{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT, &fma, VK_FALSE, VK_FALSE, VK_TRUE};
     VkPhysicalDeviceDescriptorIndexingFeatures indexing{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES, &robustness};
     VkPhysicalDevice8BitStorageFeatures bytes{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES, &indexing, VK_TRUE};
     VkPhysicalDeviceBufferDeviceAddressFeatures bda{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES, &bytes, VK_TRUE};
     VkPhysicalDeviceFeatures core{};
     VkDeviceCreateInfo device{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     VkPhysicalDeviceLimits limits{};
+    bool nativeFloat16Arithmetic = false;
 
     ProfileInput() {
         core.shaderInt64 = VK_TRUE;
@@ -42,6 +44,7 @@ struct ProfileInput {
         target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
         target.supportedCapabilities = capabilities;
         target.supportedExtensions = extensions;
+        target.nativeFloat16Arithmetic = nativeFloat16Arithmetic;
         return target;
     }
 };
@@ -99,6 +102,9 @@ void CheckProfile() {
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityStorageImageMultisample); }, "shaderStorageImageMultisample");
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityFragmentBarycentricKHR); }, "fragmentShaderBarycentric");
     invalid([](auto& value) { value.capabilities.push_back(spv::CapabilityMeshShadingEXT); }, "meshShader");
+    invalid([](auto& value) { value.capabilities.push_back(6030u); }, "shaderFmaFloat16");
+    invalid([](auto& value) { value.nativeFloat16Arithmetic = true; }, "native f16 arithmetic");
+    invalid([](auto& value) { value.nativeFloat16Arithmetic = true; value.capabilities.insert(value.capabilities.end(), {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE}); }, "native f16 arithmetic");
     ProfileInput enabled;
     enabled.capabilities.push_back(spv::CapabilitySampledImageArrayDynamicIndexing);
     enabled.capabilities.push_back(spv::CapabilityStorageImageArrayNonUniformIndexing);
@@ -106,6 +112,12 @@ void CheckProfile() {
     enabled.indexing.shaderStorageImageArrayNonUniformIndexing = VK_TRUE;
     const AgcDriver::ShaderDeviceProfile accepted(enabled.Target(), enabled.device, enabled.limits);
     Require(accepted.Target().supportedCapabilities.size() == 6u, "enabled descriptor indexing was rejected");
+    ProfileInput half;
+    half.nativeFloat16Arithmetic = true;
+    half.capabilities.insert(half.capabilities.end(), {spv::CapabilityFloat16, spv::CapabilityRoundingModeRTE, spv::CapabilityDenormPreserve, 6030u});
+    half.fma.shaderFmaFloat16 = VK_TRUE;
+    const AgcDriver::ShaderDeviceProfile halfProfile(half.Target(), half.device, half.limits);
+    Require(halfProfile.Target().nativeFloat16Arithmetic && !profile.Target().nativeFloat16Arithmetic && halfProfile.Target().supportedCapabilities.size() == 8u, "the profile lost native f16 arithmetic");
 }
 
 void CheckAbi() {

@@ -210,6 +210,10 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != request.target.supportedCapabilities.end(); };
     translateOptions.nativeFloat16 = supports(spv::CapabilityFloat16) && supports(spv::CapabilityRoundingModeRTE) && supports(spv::CapabilityDenormPreserve);
     translateOptions.floatMode = request.context.floatMode;
+    translateOptions.nativeFloat16Arithmetic = request.target.nativeFloat16Arithmetic;
+#if !ANYPS5_ENABLE_SPIRV_TOOLS
+    translateOptions.nativeFloat16Fma = request.target.nativeFloat16Arithmetic && std::ranges::find(request.target.supportedCapabilities, 6030u) != request.target.supportedCapabilities.end();
+#endif
     translateOptions.inputInfo = inputInfo;
 
     constexpr InstructionTranslator translator;

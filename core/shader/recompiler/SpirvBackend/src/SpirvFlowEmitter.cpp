@@ -376,6 +376,12 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::CompositeExtractU32x3: return Invoke(EmitCompositeExtractU32x3, ctx, inst);
         case IrOpcode::CompositeExtractU32x4: return Invoke(EmitCompositeExtractU32x4, ctx, inst);
         case IrOpcode::PackHalf2x16: return Invoke(EmitPackHalf2x16, ctx, inst);
+        case IrOpcode::F16x2Add: return Invoke(EmitF16x2Add, ctx, inst);
+        case IrOpcode::F16x2Mul: return Invoke(EmitF16x2Mul, ctx, inst);
+        case IrOpcode::F16x2Fma: return Invoke(EmitF16x2Fma, ctx, inst);
+        case IrOpcode::F16x2Min: return Invoke(EmitF16x2Min, ctx, inst);
+        case IrOpcode::F16x2Max: return Invoke(EmitF16x2Max, ctx, inst);
+        case IrOpcode::F16x2Nan: return Invoke(EmitF16x2Nan, ctx, inst);
         case IrOpcode::PackFloat2x16Rtz: return Invoke(EmitPackFloat2x16Rtz, ctx, inst);
         case IrOpcode::FPAdd16x2: return Invoke(EmitFPAdd16x2, ctx, inst);
         case IrOpcode::FPMul16x2: return Invoke(EmitFPMul16x2, ctx, inst);

@@ -1,11 +1,14 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
 #include "IntermediateRepresentation/IrValue.hpp"
+#include "Recompiler.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -1503,6 +1506,96 @@ std::uint32_t EmitPackHalf2x16(SpirvEmitterState& state, std::uint32_t arg0) {
     };
     const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), component(1u), ConstantU32(state, 16u));
     return Binary(state, spv::OpBitwiseOr, TypeU32(state), component(0u), high);
+}
+
+constexpr auto OpFmaKhr = static_cast<spv::Op>(4427);
+
+static std::uint32_t EmitF16x2(SpirvEmitterState& state, spv::Op opcode, std::initializer_list<std::uint32_t> arguments) {
+    if (!NativeF16Rte(state)) FailEmit("native f16 arithmetic needs Float16 with RTE and preserved denormals");
+    EmitNativeF16Modes(state);
+    const auto pair = state.module.Type(spv::OpTypeVector, state.module.Type(spv::OpTypeFloat, 16u), 2u);
+    std::vector<std::uint32_t> words{static_cast<std::uint32_t>(opcode), pair, state.module.AllocateId()};
+    for (const auto argument : arguments) words.push_back(Unary(state, spv::OpBitcast, pair, argument));
+    state.module.AddFunction(words);
+    if (opcode != OpFmaKhr) Exact(state, words[2]);
+    return Unary(state, spv::OpBitcast, TypeU32(state), words[2]);
+}
+
+std::uint32_t EmitF16x2Add(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitF16x2(state, spv::OpFAdd, {arg0, arg1});
+}
+
+std::uint32_t EmitF16x2Mul(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitF16x2(state, spv::OpFMul, {arg0, arg1});
+}
+
+std::uint32_t EmitF16x2Fma(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    state.module.EmitCapability(6030u);
+    state.module.EmitExtension("SPV_KHR_fma");
+    return EmitF16x2(state, OpFmaKhr, {arg0, arg1, arg2});
+}
+
+static std::uint32_t EmitF16x2MinMax(SpirvEmitterState& state, GLSLstd450 instruction, std::uint32_t arg0, std::uint32_t arg1) {
+    if (!NativeF16Rte(state)) FailEmit("native f16 arithmetic needs Float16 with RTE and preserved denormals");
+    EmitNativeF16Modes(state);
+    const auto pair = state.module.Type(spv::OpTypeVector, state.module.Type(spv::OpTypeFloat, 16u), 2u);
+    return Unary(state, spv::OpBitcast, TypeU32(state), EmitExt(state, pair, instruction, {Unary(state, spv::OpBitcast, pair, arg0), Unary(state, spv::OpBitcast, pair, arg1)}));
+}
+
+std::uint32_t EmitF16x2Min(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitF16x2MinMax(state, GLSLstd450NMin, arg0, arg1);
+}
+
+std::uint32_t EmitF16x2Max(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitF16x2MinMax(state, GLSLstd450NMax, arg0, arg1);
+}
+
+std::uint32_t EmitF16x2Nan(SpirvEmitterState& state, std::uint32_t result, std::uint32_t lhs, std::uint32_t rhs, std::uint32_t addend, const IrValue* flagsValue) {
+    const auto flags = flagsValue->ImmediateU32();
+    const auto u32 = TypeU32(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto op = [&](spv::Op opcode, std::uint32_t a, std::uint32_t b) { return Binary(state, opcode, u32, a, b); };
+    const auto nanBits = [&](std::uint32_t bits) { return op(spv::OpBitwiseAnd, op(spv::OpIAdd, op(spv::OpBitwiseAnd, bits, constant(0x7fff7fffu)), constant(0x03ff03ffu)), constant(0x80008000u)); };
+    const auto lanes = [&](std::uint32_t signBits) { return op(spv::OpIMul, op(spv::OpShiftRightLogical, signBits, constant(15u)), constant(0xffffu)); };
+    const auto pick = [&](std::uint32_t mask, std::uint32_t chosen, std::uint32_t other) { return op(spv::OpBitwiseXor, other, op(spv::OpBitwiseAnd, op(spv::OpBitwiseXor, chosen, other), mask)); };
+    const auto quiet = [&](std::uint32_t bits) { return (flags & F16x2NanQuiet) != 0u ? op(spv::OpBitwiseOr, bits, constant(0x02000200u)) : bits; };
+    const auto invert = [&](std::uint32_t bits) { return Unary(state, spv::OpNot, u32, bits); };
+    const bool minMax = (flags & F16x2NanMinMax) != 0u;
+    const auto lhsNan = minMax ? nanBits(lhs) : 0u;
+    const auto rhsNan = minMax ? nanBits(rhs) : 0u;
+    const auto fix = [&]() -> std::uint32_t {
+        if (minMax) {
+            auto lane = pick(lanes(lhsNan), rhs, result);
+            lane = pick(lanes(rhsNan), lhs, lane);
+            if ((flags & F16x2NanQuiet) == 0u) return lane;
+            const auto signaling = [&](std::uint32_t bits, std::uint32_t nan) {
+                return op(spv::OpBitwiseAnd, lanes(nan), invert(lanes(op(spv::OpBitwiseAnd, op(spv::OpShiftLeftLogical, bits, constant(6u)), constant(0x80008000u)))));
+            };
+            lane = pick(signaling(rhs, rhsNan), quiet(rhs), lane);
+            return pick(signaling(lhs, lhsNan), quiet(lhs), lane);
+        }
+        auto candidate = constant(0xfe00fe00u);
+        if ((flags & F16x2NanProduct) != 0u) {
+            const auto magnitude = [&](std::uint32_t bits) { return op(spv::OpBitwiseAnd, bits, constant(0x7fff7fffu)); };
+            const auto equalBits = [&](std::uint32_t value, std::uint32_t target) {
+                return op(spv::OpBitwiseAnd, invert(op(spv::OpIAdd, op(spv::OpBitwiseXor, value, constant(target)), constant(0x7fff7fffu))), constant(0x80008000u));
+            };
+            const auto lhsMagnitude = magnitude(lhs);
+            const auto rhsMagnitude = magnitude(rhs);
+            const auto invalid = op(spv::OpBitwiseOr, op(spv::OpBitwiseAnd, equalBits(lhsMagnitude, 0x7c007c00u), equalBits(rhsMagnitude, 0u)), op(spv::OpBitwiseAnd, equalBits(rhsMagnitude, 0x7c007c00u), equalBits(lhsMagnitude, 0u)));
+            candidate = pick(lanes(op(spv::OpBitwiseAnd, nanBits(addend), invert(invalid))), addend, candidate);
+        }
+        candidate = pick(lanes(nanBits(rhs)), rhs, candidate);
+        candidate = quiet(pick(lanes(nanBits(lhs)), lhs, candidate));
+        return pick(lanes(nanBits(result)), candidate, result);
+    };
+    static const bool branch = [] {
+        const char* value = std::getenv("APS5_F16_NAN_BRANCH");
+        return value == nullptr || std::string(value) != "0";
+    }();
+    if (!branch) return fix();
+    const auto any = minMax ? op(spv::OpBitwiseOr, lhsNan, rhsNan) : nanBits(result);
+    return EmitValueOrDefaultIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), any, constant(0u)), u32, result, fix);
 }
 
 std::uint32_t EmitFPFma32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
