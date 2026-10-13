@@ -478,6 +478,14 @@ std::map<std::uint64_t, std::uint64_t>& htileReads() {
     return *reads;
 }
 
+// A fill or clear the driver recognized over an HTILE: the next bind reads the words again (and
+// stores them back), also when the write tracker did not see the fill's stores.
+void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard lock(htileReadsMutex());
+    auto& reads = htileReads();
+    reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
+}
+
 // Reads the HTILE when it was written since it was last read, over the surface's whole pipe-aligned
 // metadata (HtileMetadataBytes, the extent HtileFillCovers takes as the surface's), and stores the words
 // back as expanded when every one of them marks the depth or the stencil cleared. Called outside the
@@ -494,7 +502,10 @@ bool htileStoreBack() {
 }
 
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
-    if (!htileStoreBack() || target.htileAddress == 0) return 0;
+    // A slice other than 0 of a depth array decodes to slice 0's HTILE address, so the words there are
+    // not its own: reading them could take slice 0's clear, and storing them back would hide that clear
+    // from slice 0. Such a slice keeps the fill-time fast clears only.
+    if (!htileStoreBack() || target.htileAddress == 0 || target.slice != 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
@@ -623,6 +634,7 @@ void NoteMemoryValueFill(const MemoryValueFill& fill) {
 
 void NoteHtileDepthClear(std::uint64_t htileAddress) {
     std::lock_guard lock(surfacesMutex());
+    forgetHtileReads(htileAddress, 4);
     bool existing = false;
     for (const auto& surface : surfaces()) {
         if (surface->target.htileAddress != htileAddress) continue;
@@ -720,6 +732,7 @@ bool HtileFillCovers(std::uint64_t htile, VkExtent2D extent, std::uint64_t addre
 
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     std::lock_guard lock(surfacesMutex());
+    forgetHtileReads(address, bytes);
     for (const auto& surface : surfaces()) {
         const auto& target = surface->target;
         if (!HtileFillCovers(target.htileAddress, target.extent, address, bytes)) continue;

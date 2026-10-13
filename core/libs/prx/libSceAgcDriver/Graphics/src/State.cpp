@@ -240,6 +240,7 @@ void decodeDepth(const Registers& cx, std::uint32_t depthControl, bool testValEx
     const auto size = read(cx, 0x007);
     depth.extent = {(size & 0x3fffu) + 1u, ((size >> 16u) & 0x3fffu) + 1u};
     if (const auto slice = view & 0x1fffu; slice != 0) {
+        depth.slice = slice;
         if (depth.address != 0) depth.address += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, zFormat == 1 ? 2u : 4u);
         if (depth.stencilAddress != 0) depth.stencilAddress += static_cast<std::uint64_t>(slice) * DepthSliceBytes(depth.extent, 1u);
     }

@@ -76,6 +76,9 @@ struct DepthTarget {
     std::uint64_t htileAddress = 0;
     bool htileStencil = false;
     std::uint32_t samples = 1;
+    // DB_DEPTH_VIEW SLICE_START. The Z and stencil addresses include the slice's offset, htileAddress
+    // does not (it stays slice 0's, see the technical debt on the per-slice HTILE stride).
+    std::uint32_t slice = 0;
 };
 
 struct State {
