@@ -6,6 +6,7 @@
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -502,6 +503,11 @@ std::string Run(Fixture& fixture) {
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_EXP_PR4868", "1");
+#else
+        setenv("APS5_EXP_PR4868", "1", 1);
+#endif
         std::shared_ptr<AgcDriver::VulkanDevice> device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Fixture fixture(device);

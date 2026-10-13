@@ -1268,7 +1268,9 @@ void Driver::RegisterShader(const Shader* shader) {
         localDevice = device;
     }
     snapshot.registeredState = std::make_shared<const RegisteredShaderState>(DecodeRegisteredState(snapshot));
-    if (const auto programReg = DefaultProgramRegister(snapshot.type)) {
+    // Lab switch APS5_EXP_PR4856 (default off).
+    static const bool prewarmDefaults = std::getenv("APS5_EXP_PR4856") != nullptr;
+    if (const auto programReg = prewarmDefaults ? DefaultProgramRegister(snapshot.type) : std::nullopt) {
         if (!snapshot.registeredState->shader.contains(*programReg) && !snapshot.registeredState->shader.contains(*programReg + 1u)) {
             auto registeredState = *snapshot.registeredState;
             registeredState.shader.insert_or_assign(*programReg, static_cast<std::uint32_t>(snapshot.codeAddress >> 8u));

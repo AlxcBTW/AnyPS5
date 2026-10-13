@@ -52,8 +52,10 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
     if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
     if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
 
+    // Lab switch APS5_EXP_PR4868 (default off).
+    static const bool coverageCheck = std::getenv("APS5_EXP_PR4868") != nullptr;
     const auto rangeBytes = indirect.RangeBytes();
-    if (rangeBytes > 0) {
+    if (coverageCheck && rangeBytes > 0) {
         if (!Graphics::RegisteredReadableCovers(indirect.arguments, static_cast<std::size_t>(rangeBytes))) fail(Path::NotImported);
         if (indirect.countIndirect && !Graphics::RegisteredReadableCovers(indirect.countAddress, 4)) fail(Path::NotImported);
     }
