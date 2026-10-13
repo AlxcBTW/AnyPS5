@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -495,6 +496,57 @@ void testCopyIntoHostMemory() {
     GuestHeap::GuestHeapFree_nid_postfix(produced);
 }
 
+// exp (APS5_EXP_DMA_BEHIND, port of perf/dma-copy-behind-writers): with the lever a 16 KiB copy from a
+// range a GPU copy just wrote goes behind it on the GPU with the right bytes; a copy into memory the
+// GPU cannot write and one from bytes only the CPU wrote stay on the CPU path. Without the lever every
+// one resolves on the CPU with the same bytes. Registered twice: agc_driver (lever off) and
+// agc_driver_dma_behind (APS5_EXP_DMA_BEHIND=1 APS5_EXP_DMA_BEHIND_VERIFY=1).
+void testCopyBehindWriters() {
+    const char* lever = std::getenv("APS5_EXP_DMA_BEHIND");
+    const bool behind = lever != nullptr && std::strtoll(lever, nullptr, 10) != 0;
+    constexpr std::size_t words = 32768;
+    constexpr auto bytes = static_cast<std::uint32_t>(words * 4);
+    constexpr std::size_t smallWords = 4096;
+    constexpr auto smallBytes = static_cast<std::uint32_t>(smallWords * 4);
+    auto* produced = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+    auto* source = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, bytes));
+    auto* copied = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, smallBytes));
+    std::vector<std::uint32_t> host(smallWords);
+    alignas(64) static volatile std::uint32_t landed = 0;
+    std::uint32_t round = 0;
+    const auto submitAndLand = [&](std::vector<std::uint32_t> packets) {
+        const auto label = endOfPipeLabel(&landed, ++round);
+        packets.insert(packets.end(), label.begin(), label.end());
+        submit(0, packets);
+        waitFor(&landed, round, "the end-of-pipe label after the copies never landed");
+        AgcDriverWaitIdle_nid_postfix();
+    };
+    const auto reset = [&] {
+        for (std::size_t i = 0; i < words; ++i) {
+            produced[i] = 0xc3000000u | static_cast<std::uint32_t>(i);
+            source[i] = 0x3c000000u | static_cast<std::uint32_t>(i);
+        }
+        std::fill(copied, copied + smallWords, 0u);
+        std::fill(host.begin(), host.end(), 0u);
+    };
+    reset();
+    const auto before = AgcDriver::DriverDetail::copiesBehindWriters.load();
+    submitAndLand(commands(memoryCopy(source, produced, bytes), memoryCopy(copied, source, smallBytes)));
+    check(std::equal(copied, copied + smallWords, produced), "a small copy whose source a GPU copy writes did not see that copy's bytes");
+    check(AgcDriver::DriverDetail::copiesBehindWriters.load() == before + (behind ? 1u : 0u), behind ? "a small copy whose source a GPU copy writes waited for it on the CPU instead of following it on the GPU" : "a small copy was recorded on the GPU with the lever off");
+    reset();
+    submitAndLand(commands(memoryCopy(source, produced, bytes), memoryCopy(host.data(), source, smallBytes)));
+    check(std::equal(host.begin(), host.end(), produced), "a small copy into memory the GPU cannot write did not see the GPU copy into its source");
+    check(AgcDriver::DriverDetail::copiesBehindWriters.load() == before + (behind ? 1u : 0u), "a small copy into memory the GPU cannot write was recorded on the GPU");
+    reset();
+    submitAndLand(commands(memoryCopy(copied, source, smallBytes)));
+    check(std::equal(copied, copied + smallWords, source), "a small copy of bytes only the CPU wrote stored the wrong bytes");
+    check(AgcDriver::DriverDetail::copiesBehindWriters.load() == before + (behind ? 1u : 0u), "a small copy whose source no GPU work writes was recorded on the GPU");
+    GuestHeap::GuestHeapFree_nid_postfix(copied);
+    GuestHeap::GuestHeapFree_nid_postfix(source);
+    GuestHeap::GuestHeapFree_nid_postfix(produced);
+}
+
 void testShaderHeaderAlignment() {
     alignas(256) static const std::array<std::uint32_t, 64> code{0xbf810000};
     struct Header {
@@ -783,6 +835,7 @@ int main(int argc, char** argv) {
         testShaderHeaderAlignment();
         testHeaderWithoutProgramAddress();
         testCopyIntoHostMemory();
+        testCopyBehindWriters();
         testRegisteredFloatMode();
         testReadOnlyResummarize();
         testWorkerFailure();

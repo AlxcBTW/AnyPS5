@@ -9,11 +9,48 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "HotLever.hpp"
+#include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// exp (APS5_EXP_DMA_BEHIND=1, hot, never push; port of perf/dma-copy-behind-writers 59a4e2d6a): a
+// DMA_DATA memory copy of up to 64 KiB whose source has an unsignaled GPU writer, or storage results
+// pending over it, goes through VulkanDevice::CopyBuffer's GPU path, the one copies over 64 KiB
+// already take: its barrier orders the copy behind those writes and the destination is noted as a
+// pending write, instead of the CPU read that waits for the writers (the flush hook) and stores the
+// bytes as a label. A copy CopyBuffer refuses (not imported) resolves on the CPU as before. Read once
+// per packet. APS5_EXP_DMA_BEHIND_VERIFY=N: every Nth such copy syncs the recorder right after it and
+// aborts unless the destination holds the source's bytes (what the CPU path would have stored).
+std::int64_t leverInteger(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr ? static_cast<std::int64_t>(std::strtoll(value, nullptr, 10)) : 0;
+}
+
+bool dmaBehindWriters() {
+    static const Aps5Hot::Lever lever("APS5_EXP_DMA_BEHIND", leverInteger("APS5_EXP_DMA_BEHIND"));
+    return lever.On();
+}
+
+std::int64_t dmaBehindVerify() {
+    static const Aps5Hot::Lever lever("APS5_EXP_DMA_BEHIND_VERIFY", leverInteger("APS5_EXP_DMA_BEHIND_VERIFY"));
+    return lever.Value();
+}
+
+bool sourceWaitsForGpu(std::uint64_t source, std::size_t bytes) {
+    if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(source, bytes) && !recorder->PendingWriteSettled(source, bytes)) return true;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{source, source + bytes}}};
+    return Graphics::StorageTexture::AnyPendingOverlaps(range);
+}
+
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -112,7 +149,38 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        bool copiedOnGpu = false;
+        if (opcode == 0x50 && dmaBehindWriters()) {
+            const auto copy = Pm4::DecodeMemoryCopy(packet);
+            if (copy.has_value() && copy->bytes <= gpuStoreLimit && copy->destination % 4 == 0 && copy->bytes % 4 == 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                if (const auto localDevice = device.Load()) {
+                    recordDeferredLabels(localDevice.get(), submission.queue);
+                    if (sourceWaitsForGpu(copy->source, copy->bytes)) {
+                        const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                        if (outcome.path == 1 || outcome.path == 3) {
+                            const auto copied = ++copiesBehindWriters;
+                            wroteOnGpu = true;
+                            drained = false;
+                            copiedOnGpu = true;
+                            const auto verify = dmaBehindVerify();
+                            const bool apart = copy->source + copy->bytes <= copy->destination || copy->destination + copy->bytes <= copy->source;
+                            if (verify > 0 && apart && copied % static_cast<std::uint64_t>(verify) == 0) {
+                                if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+                                if (std::memcmp(reinterpret_cast<const void*>(copy->destination), reinterpret_cast<const void*>(copy->source), copy->bytes) != 0) {
+                                    std::fprintf(stderr, "FATAL: [sync] DMA_BEHIND verify: the GPU copy 0x%llx -> 0x%llx (+0x%zx) left other bytes than the source holds\n", static_cast<unsigned long long>(copy->source), static_cast<unsigned long long>(copy->destination), copy->bytes);
+                                    std::fflush(stderr);
+                                    std::abort();
+                                }
+                                ++copiesBehindVerified;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (const auto store = copiedOnGpu ? std::optional<Pm4::StoreWrite>{} : Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
