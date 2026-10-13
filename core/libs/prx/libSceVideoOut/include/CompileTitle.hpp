@@ -17,6 +17,7 @@ struct CompileTitleInput {
     std::uint64_t lastBeginMs;
     std::uint64_t lastEndMs;
     std::uint64_t lastDurationMs;
+    std::uint64_t expected = 0;
 };
 
 bool CompileTitleVisible(const CompileTitleInput& input);

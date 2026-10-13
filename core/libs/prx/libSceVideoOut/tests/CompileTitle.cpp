@@ -45,6 +45,12 @@ void formatsFinishedCompile() {
     require(FormatCompileTitle("T", input) == "T | compiling shaders: 3 done, 1.3 s on the last one", "finished compile");
 }
 
+void formatsKnownTotal() {
+    auto input = running(50000);
+    input.expected = 170;
+    require(FormatCompileTitle("T", input) == "T | compiling shaders: 47 / ~170 done, 12.3 s on the last one", "known total");
+}
+
 void clockSkewDoesNotWrap() {
     const CompileTitleInput input{100, 200, 1, 1, 300, 0, 0};
     require(!CompileTitleVisible(input), "present after now");
@@ -60,6 +66,7 @@ int main() {
         lingersAfterTheLastCompile();
         formatsRunningCompile();
         formatsFinishedCompile();
+        formatsKnownTotal();
         clockSkewDoesNotWrap();
     } catch (const std::exception& error) {
         std::cerr << "compile title test failed: " << error.what() << "\n";

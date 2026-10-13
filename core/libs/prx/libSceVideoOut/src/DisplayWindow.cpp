@@ -136,7 +136,7 @@ void DisplayWindow::UpdateCompileTitle() {
     static const AppTitle title = GetAppTitle_nid_postfix();
     const auto progress = AgcDriver::CompileSnapshot_nid_postfix();
     const auto now = AgcDriver::CompileClockMs();
-    const CompileTitleInput input{now, lastPresentMs, progress.completed, progress.active, progress.lastBeginMs, progress.lastEndMs, progress.lastDurationMs};
+    const CompileTitleInput input{now, lastPresentMs, progress.completed, progress.active, progress.lastBeginMs, progress.lastEndMs, progress.lastDurationMs, 0};
     if (!CompileTitleVisible(input)) {
         if (!compileTitleShown) return;
         SDL_SetWindowTitle(window, title.value);
