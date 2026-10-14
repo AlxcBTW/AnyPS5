@@ -2570,9 +2570,23 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     static const bool storeAtFlip = Graphics::StorageTexture::StoreAtFlipRequested(std::getenv("APS5_STORE_AT_FLIP"));
     if (storeAtFlip) Graphics::StorageTexture::FlushAllPending("flip");
     else Graphics::StorageTexture::FlushDumpSelected("flip");
+    auto& dumps = Dumps();
     if (buffer.tilingMode == 1) {
         const auto pixels = ReadDisplayBuffer(buffer);
-        return present(buffer.width, buffer.height, true, pixels);
+        bool dumpFrame = false;
+        if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+            if (dumps.cpu) {
+                WriteFrameBmp(dumps.dumped++, buffer.width, buffer.height, pixels, DumpScale());
+            } else {
+                state->nextDumpIndex = dumps.dumped++;
+                dumpFrame = true;
+            }
+        }
+        if (!present(buffer.width, buffer.height, true, pixels, nullptr, nullptr, VK_FILTER_LINEAR, dumpFrame)) {
+            if (dumpFrame) --dumps.dumped;
+            return false;
+        }
+        return true;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The display buffer is usually a resident render target whose results are still on the GPU: it
@@ -2611,7 +2625,6 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         }
     }
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
-    auto& dumps = Dumps();
     bool dumpFrame = false;
     if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
         if (dumps.cpu) {
