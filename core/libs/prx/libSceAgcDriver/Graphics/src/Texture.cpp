@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ScratchWindowUnion.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -91,6 +92,16 @@ std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, sta
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
+std::atomic<std::uint64_t> writeBackWindowsBefore{0}, writeBackWindowsAfter{0}, writeBackWindowBatches{0}, writeBackScratchGapBytes{0};
+std::atomic<std::uint64_t> batchedWriteBacks{0};
+
+bool BatchWriteBackWindows() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_BATCH_WRITEBACK_WINDOWS");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -133,6 +144,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
     traffic.writeBacks.clear();
+    AgcDriver::ProfilePrint_nid_no_patch("[writeback-windows] 10 s: windows %llu -> %llu, batches %llu, extra scratch MiB %.3f\n", take(writeBackWindowsBefore), take(writeBackWindowsAfter), take(writeBackWindowBatches), take(writeBackScratchGapBytes) / 1048576.0);
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
 }
@@ -1997,6 +2009,10 @@ std::uint64_t StorageTexture::SinglePassMoves() {
     return singlePassMoves.load(std::memory_order_relaxed);
 }
 
+std::uint64_t StorageTexture::BatchedWriteBacks() {
+    return batchedWriteBacks.load(std::memory_order_relaxed);
+}
+
 bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -2749,6 +2765,58 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     }
     if (runs.empty()) return 0;
     auto windows = sliceWindows(runs);
+    const auto originalWindowCount = windows.size();
+    if (BatchWriteBackWindows() && windows.size() > 1 && !geometry.thick &&
+        geometry.imageDepth == 1 && BlockWidth(descriptor.format) == 1) {
+        const auto layer = windows.front().layer, level = windows.front().level;
+        const bool oneSlice = std::all_of(windows.begin(), windows.end(), [=](const SliceWindow& window) {
+            return window.layer == layer && window.level == level;
+        });
+        const auto& mip = mips[level];
+        if (oneSlice && !mip.tail) {
+            const auto sliceBegin = geometry.GuestLayerOffset(layer) + mip.tiledOffset;
+            const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
+            const auto united = PlanScratchWindowUnion(runs, sliceBegin, sliceBegin + mip.tiledSize, block[0]);
+            if (united) {
+                auto candidate = sliceWindows(std::span(&*united, 1));
+                std::uint64_t originalLinearBytes = 0;
+                bool linearBudgetValid = true;
+                for (const auto& window : windows) {
+                    if (window.linearBytes > std::numeric_limits<std::uint64_t>::max() - originalLinearBytes) {
+                        linearBudgetValid = false;
+                        break;
+                    }
+                    originalLinearBytes += window.linearBytes;
+                }
+                bool descriptorsFit = false;
+                if (candidate.size() == 1) {
+                    const auto& window = candidate.front().window;
+                    const auto tiledBytes = window.rangeEnd == UINT32_MAX ? mip.tiledSize :
+                        std::min<std::uint64_t>(mip.tiledSize, window.rangeEnd) - window.tiledBase;
+                    const auto linearBytes = window.linearBytes != 0 ? window.linearBytes :
+                        mip.linearSize - std::min<std::uint64_t>(window.linearBase, mip.linearSize);
+                    // A single accepted window occupies position 0 in each fresh buffer below.
+                    // These are the actual DispatchImage/Dispatch offsets, not the mip bases.
+                    descriptorsFit = ScratchWindowDescriptorFits(0, tiledBytes, context.limits.minStorageBufferOffsetAlignment, context.limits.maxStorageBufferRange) &&
+                        (singlePass() || ScratchWindowDescriptorFits(0, linearBytes, context.limits.minStorageBufferOffsetAlignment, context.limits.maxStorageBufferRange));
+                }
+                if (candidate.size() == 1 && candidate.front().layer == layer && candidate.front().level == level &&
+                    linearBudgetValid && candidate.front().linearBytes <= originalLinearBytes && descriptorsFit) {
+                    // Only scratch widens. Every copy/seed below still intersects the original runs.
+                    windows = std::move(candidate);
+                    batchedWriteBacks.fetch_add(1, std::memory_order_relaxed);
+                    if (LookupOutcomes::Profiled()) {
+                        writeBackWindowBatches.fetch_add(1, std::memory_order_relaxed);
+                        writeBackScratchGapBytes.fetch_add(united->second - united->first - storedBytes, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+    }
+    if (LookupOutcomes::Profiled()) {
+        writeBackWindowsBefore.fetch_add(originalWindowCount, std::memory_order_relaxed);
+        writeBackWindowsAfter.fetch_add(windows.size(), std::memory_order_relaxed);
+    }
     // The linear rows and the tiled bytes of every window, each at a 256-byte position; the tail
     // levels of a layer retile into one scratch region (their block is shared).
     std::vector<std::uint64_t> linearPositions, scratchPositions;

@@ -3765,11 +3765,19 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
 // memory back (watched memory through the flush hook, after a store into the import's unit shadow):
 // each 4-byte word is the clear texel or the pattern, and the texels are exactly the surface's.
 // The 64 KiB-aligned tiled cases store through block windows, the others whole layers.
-void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watched) {
+bool writeBackPaddingTests(const Device& device, Recorder& recorder, bool watched, bool forceTwoPass = false, bool requireDirect = false) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: write-back padding not tested\n";
-        return;
+        return false;
+    }
+    if (requireDirect) {
+        VkFormatProperties properties{};
+        base.formatProperties(base.physical, TextureDetiler::ImageElementFormat(4), &properties);
+        if (!base.singlePassStorage || (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) == 0) {
+            std::cout << "direct write-back unavailable: direct window-union test skipped\n";
+            return false;
+        }
     }
     struct Case {
         const char* name;
@@ -3778,6 +3786,8 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         std::uint32_t height;
         std::uint32_t mipCount;
         std::uint64_t offset;
+        bool cpuGap = false;
+        bool gpuGap = false;
     };
     constexpr Case cases[] = {
         {"64 KiB R_X 200x150", TextureTileMode::kR64KBX, 200, 150, 1, 0},
@@ -3786,11 +3796,17 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         {"64 KiB R_X 200x150 off a 64 KiB boundary, 3 mips", TextureTileMode::kR64KBX, 200, 150, 3, 4096},
         {"4 KiB S 100x70, 2 mips", TextureTileMode::kStandard4KB, 100, 70, 2, 0},
         {"linear 200x150", TextureTileMode::kLinear, 200, 150, 1, 0},
+        {"64 KiB R_X 512x128, CPU-owned gap", TextureTileMode::kR64KBX, 512, 128, 1, 0, true},
+        {"64 KiB R_X 512x120, CPU-owned gap and padding", TextureTileMode::kR64KBX, 512, 120, 1, 0, true},
+        {"64 KiB R_X 512x120, GPU-owned gap and padding", TextureTileMode::kR64KBX, 512, 120, 1, 0, false, true},
     };
     const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
     constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
+    constexpr std::array<std::uint8_t, 4> green{0, 255, 0, 255};
     std::string failures;
     for (const auto& test : cases) {
+        const bool gap = test.cpuGap || test.gpuGap;
+        if (gap && !watched) continue;
         const std::string what = std::string(watched ? "(watched) " : "") + test.name;
         GuestTextureResource resource{};
         resource.width = test.width;
@@ -3807,6 +3823,11 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
         std::size_t texelCount = 0;
         for (const auto& mip : geometry.mips) texelCount += static_cast<std::size_t>(mip.width) * mip.height;
+        if (gap) {
+            const auto tile = ThinBlockLayout(test.tileMode, 4);
+            Require(test.width == 4 * tile[1] && test.height <= tile[2], "gap test must cover four tile columns in one row");
+            texelCount -= static_cast<std::size_t>(tile[1]) * test.height;
+        }
         // The surface, then a 64 KiB unit past it that no store may reach.
         const auto bytes = (static_cast<std::size_t>(test.offset) + surfaceBytes + 65535) / 65536 * 65536 + 65536;
         void* block = nullptr;
@@ -3814,7 +3835,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             block = AllocateWatched(bytes, 65536);
             if (block == nullptr) {
                 std::cout << "no write watching: write-back padding in watched memory not tested\n";
-                return;
+                return false;
             }
         } else {
 #ifdef _WIN32
@@ -3849,11 +3870,16 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         } unregister{base, block, blockAddress, bytes, watched};
         if (HostImportFor(base, blockAddress, bytes) == nullptr) {
             std::cout << "host import of the write-back padding block refused: write-back padding not tested\n";
-            return;
+            return false;
+        }
+        if (gap && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
+            std::cout << "import is not write watched: CPU-gap write-back not tested\n";
+            return false;
         }
         TextureDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
+        if (forceTwoPass) context.singlePassStorage = false;
         resource.baseAddress = address;
         {
             auto image = StorageTexture::Create(context, detiler, resource, 0);
@@ -3865,7 +3891,47 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
             image->MarkDirty();
+            if (test.cpuGap) {
+                // Finish the initial import read before the CPU replaces one complete tile block.
+                // The other three blocks are still the image's; batching must not publish this gap.
+                recorder.Sync();
+                std::memset(memory + test.offset + 65536, 0x6d, 65536);
+            }
+            if (test.gpuGap) {
+                // Retire this one unit from the first producer before another GPU image owns it.
+                // Its later green store must survive the outer image's widened scratch window.
+                Require(StorageTexture::FlushPending(address + 65536, 65536, nullptr, "window union gap", PublishScope::None),
+                    "GPU-gap setup did not store the original middle unit");
+                auto gapResource = resource;
+                gapResource.baseAddress += 65536;
+                gapResource.width = 128;
+                gapResource.height = 128;
+                auto gapImage = StorageTexture::Create(context, detiler, gapResource, 0);
+                const auto gapCommands = recorder.Commands();
+                recorder.Keep(gapImage);
+                const VkClearColorValue gapValue{{0.0f, 1.0f, 0.0f, 1.0f}};
+                RecordMemoryBarrier(context, gapCommands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(gapCommands, gapImage->Image(), VK_IMAGE_LAYOUT_GENERAL, &gapValue, 1, &range);
+                RecordMemoryBarrier(context, gapCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                gapImage->MarkDirty();
+                gapImage->WriteBack();
+                recorder.Sync();
+            }
+            const auto batchesBefore = StorageTexture::BatchedWriteBacks();
+            const auto singlePassBefore = StorageTexture::SinglePassMoves();
             image->WriteBack();
+            if (gap) {
+                const char* batchFlag = std::getenv("APS5_BATCH_WRITEBACK_WINDOWS");
+                const bool enabled = batchFlag != nullptr && std::strcmp(batchFlag, "1") == 0;
+                Require(StorageTexture::BatchedWriteBacks() == batchesBefore + (enabled ? 1u : 0u),
+                    "gap write-back did not take the selected batching path");
+                if (requireDirect) Require(StorageTexture::SinglePassMoves() == singlePassBefore + 1,
+                    "direct window-union test did not execute a direct image retile");
+                if (forceTwoPass) Require(StorageTexture::SinglePassMoves() == singlePassBefore,
+                    "two-pass window-union test unexpectedly executed a direct image retile");
+            }
             recorder.Submit();
             device.WaitQueue();
             recorder.Sync();
@@ -3875,11 +3941,13 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             std::size_t texels = 0, garbage = 0, outside = 0;
             for (std::size_t i = 0; i < bytes; i += 4) {
                 const bool inside = i >= test.offset && i < test.offset + surfaceBytes;
-                bool isTexel = inside, isPattern = true;
+                const bool inGap = gap && i >= test.offset + 65536 && i < test.offset + 2 * 65536;
+                bool isTexel = inside && !inGap, isPattern = true;
                 for (std::size_t c = 0; c < 4; ++c) {
                     const auto byte = std::to_integer<std::uint8_t>(read[i + c]);
                     isTexel = isTexel && byte == red[c];
-                    isPattern = isPattern && byte == pattern(i + c);
+                    const auto preserved = inGap ? (test.gpuGap ? green[c] : 0x6d) : pattern(i + c);
+                    isPattern = isPattern && byte == preserved;
                 }
                 if (isTexel) ++texels;
                 else if (!isPattern) ++(inside ? garbage : outside);
@@ -3892,6 +3960,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
     }
     if (!failures.empty()) throw std::runtime_error("write-back padding:\n" + failures);
     std::cout << "write-back padding" << (watched ? " (watched)" : "") << ": ok\n";
+    return true;
 }
 
 void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
@@ -7060,6 +7129,16 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--writeback-window-union-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            if (!writeBackPaddingTests(device, recorder, true, true)) return 77;
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--writeback-window-union-direct-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            if (!writeBackPaddingTests(device, recorder, true, false, true)) return 77;
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
