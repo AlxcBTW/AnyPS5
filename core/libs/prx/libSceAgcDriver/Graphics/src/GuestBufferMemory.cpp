@@ -2919,8 +2919,30 @@ std::uint64_t shadowStageMax() {
 // (every cached build keeps its own buffer): APS5_SHADOW_STAGE_BUDGET_MIB (384, 768 with shadow
 // copy-back). Past it a region is bound in place as before (counted as a device refusal).
 std::uint64_t shadowStageBudget() {
-    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", YoloGpu() ? 1536 : ShadowCopyBackEnabled() ? 768 : 384) << 10u;
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", ShadowCopyBackEnabled() ? 768 : 384) << 10u;
     return bytes;
+}
+
+// The device-local heap's headroom (VK_EXT_memory_budget) a stage must leave free:
+// APS5_SHADOW_STAGE_RESERVE_MIB (1024). The 8 GB laptop part ran out of device memory with a
+// 768 MiB stage budget beside 2 GiB of unit-shadow slabs and the storage image cache; a stage
+// that would cut into the reserve is refused (the region stays in place).
+bool stageHeadroom(const Context& context, std::uint64_t bytes) {
+    static const std::uint64_t reserve = kibSetting("APS5_SHADOW_STAGE_RESERVE_MIB", 1024) << 10u;
+    if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return true;
+    std::uint32_t heap = 0;
+    try {
+        heap = context.memory.memoryTypes[context.MemoryType(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)].heapIndex;
+    } catch (const std::exception&) {
+        return true;
+    }
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    properties.pNext = &reported;
+    context.memoryProperties2(context.physical, &properties);
+    const auto budget = reported.heapBudget[heap];
+    const auto usage = reported.heapUsage[heap];
+    return budget == 0 || usage + bytes + reserve <= budget;
 }
 
 // APS5_YOLO_GPU: a region is staged from the shadow when any unit of it is fresh (readers too), with
@@ -3320,6 +3342,11 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
         return false;
     }
     auto& live = shadowStageLive();
+    if (!stageHeadroom(context, bytes)) {
+        if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
+        region.shadowRefused = true;
+        return false;
+    }
     if (live.fetch_add(bytes, std::memory_order_relaxed) + bytes > shadowStageBudget()) {
         live.fetch_sub(bytes, std::memory_order_relaxed);
         if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
