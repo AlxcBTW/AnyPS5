@@ -94,6 +94,7 @@ struct EntryCounters {
     // insert (pointer words and relocatable V#s per profile), shapes learned.
     std::uint64_t contentLookups = 0, relocatedHits = 0, relocatedPointers = 0, relocatedAddresses = 0, refusedUser = 0, refusedFields = 0;
     std::uint64_t profilesBuilt = 0, profilesEmpty = 0, profilePointerWords = 0, profileBuffers = 0, shapesLearned = 0;
+    std::array<std::uint64_t, FieldRefusalCount> fieldRefusals{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
