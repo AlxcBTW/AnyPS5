@@ -204,7 +204,9 @@ public:
     // Submits and waits for every batch, running completions in order.
     void Sync();
     void CountSamples();
-    bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
+    // The MeshArguments pass of a GPU-side mesh indirect draw: reads the record at `record` and
+    // writes the MeshArguments at `arguments` by the eight MeshArgumentRules words (Draw.hpp).
+    bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 8> rules);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -404,6 +406,8 @@ public:
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
     VkDevice Device() const { return context.device; }
+    // The context the recorder records with (tests build their buffers from it).
+    const Context& GraphicsContext() const { return context; }
     // Whether the calling thread runs inside a batch's completion action (finish()): a store made
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();

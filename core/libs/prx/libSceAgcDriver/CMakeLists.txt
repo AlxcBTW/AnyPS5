@@ -393,8 +393,11 @@ if(BUILD_TESTING)
     set_target_properties(agc_driver_empty_indirect_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_driver_empty_indirect COMMAND agc_driver_empty_indirect_tests)
     set_tests_properties(agc_driver_empty_indirect PROPERTIES TIMEOUT 30)
+    # The same checks with non-indexed mesh indirect draws back on the CPU loop.
+    add_test(NAME agc_driver_empty_indirect_no_gpu_mesh COMMAND agc_driver_empty_indirect_tests)
+    set_tests_properties(agc_driver_empty_indirect_no_gpu_mesh PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_NO_GPU_MESH_INDIRECT=1")
     if(WIN32)
-        set_tests_properties(agc_driver_empty_indirect PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_empty_indirect agc_driver_empty_indirect_no_gpu_mesh PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

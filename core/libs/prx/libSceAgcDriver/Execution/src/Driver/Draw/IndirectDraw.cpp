@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <cstdlib>
 
@@ -32,7 +33,10 @@ std::optional<Graphics::IndirectDrawPath> Driver::IndirectCpuBeforeCapture(const
     const auto& indirect = *drawParameters.indirect;
     constexpr std::uint32_t NoLocation = 0x280u;
     const bool meshPath = stages.mesh.has_value() && !stages.tessellation && !rectList;
-    const bool meshGpuSide = meshPath && drawParameters.indexed && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
+    // A single-record mesh draw that names no SGPR location runs on the GPU (RecordMeshArguments):
+    // indexed, and non-indexed unless APS5_NO_GPU_MESH_INDIRECT=1 (its record's start vertex and
+    // start instance reach no register then, so the draw's constants are exact).
+    const bool meshGpuSide = meshPath && (drawParameters.indexed || Graphics::GpuMeshIndirectDraws()) && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
     if ((stages.path != Graphics::ShaderPath::Vertex || rectList) && !meshGpuSide) return Path::NonVertexPath;
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) return Path::DrawIndex;
     if (indirect.countIndirect && !support.count) return Path::FeatureGap;

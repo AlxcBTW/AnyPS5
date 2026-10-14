@@ -48,6 +48,13 @@ struct MeshArguments {
     std::uint32_t firstIndex;
 };
 static_assert(sizeof(MeshArguments) == ShaderRecompiler::MeshArgumentBytes);
+// The rules that turn one indirect record into MeshArguments, on the GPU (MeshArguments.comp, the
+// eight words in this order) or on the CPU (ResolveMeshArguments). `indexed` is 0 for a non-indexed
+// draw (DRAW_INDIRECT 0x24): its record's start vertex goes only to the SH register the packet
+// names (the driver keeps a draw that names one on the CPU path), never into the generated vertex
+// indices, so it is ignored and the vertex count is unbounded (no index buffer clamps it); the
+// indices start at the draw's vertex constant (GE_INDX_OFFSET plus the folded offset), exactly as
+// the CPU path's direct draw per record does.
 struct MeshArgumentRules {
     std::uint32_t indexCount;
     std::uint32_t inputSize;
@@ -56,9 +63,15 @@ struct MeshArgumentRules {
     std::uint32_t maxGroups;
     std::uint32_t maxInstances;
     std::uint32_t maxTotal;
+    std::uint32_t indexed;
 };
-MeshArgumentRules MeshArgumentRulesFor(const Context& context, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t indexCount);
+MeshArgumentRules MeshArgumentRulesFor(const Context& context, const ShaderRecompiler::MeshConfiguration& mesh, std::uint32_t indexCount, bool indexed = true);
 MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshArgumentRules& rules);
+// Whether single-record non-indexed mesh indirect draws without SGPR locations take the GPU-side
+// path (MeshArguments pass + vkCmdDrawMeshTasksIndirectEXT) like the indexed ones, so queue 0
+// never waits for their GPU-written records (APS5_NO_GPU_MESH_INDIRECT=1: the CPU loop as before;
+// read once per process).
+bool GpuMeshIndirectDraws();
 
 // Why DrawWithRecipe did not record from the recipe (the caller then runs Draw): the draw is not
 // recordable (no recorder, APS5_SYNC_DRAWS, APS5_DUMP_TARGETS), a resident target is gone from the

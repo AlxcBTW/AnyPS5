@@ -5241,6 +5241,18 @@ void meshArgumentTests() {
     Require(same(ResolveMeshArguments(record(96 * 6, 600, 0), rules(triangles, 96 * 6)), {6, 600, 1, 96 * 6, 0}), "groups times instances at the device limit");
     Require(same(ResolveMeshArguments(record(0xffffffffu, 1, 0xfffffff0u), rules(points, 0xffffffffu)), {15, 1, 1, 15, 0xfffffff0u}), "first index near the end of a huge index buffer");
     Require(same(ResolveMeshArguments(record(0xffffffffu, 1, 0), rules(points, 0xffffffffu)), {0, 0, 0, 0xffffffffu, 0}), "groups over the device limit draw nothing");
+    // Non-indexed records (DRAW_INDIRECT): no index buffer bounds the count, and the start vertex
+    // reaches no register on the GPU-side path, so it neither offsets nor bounds the vertices.
+    const auto autoRules = [&](const ShaderRecompiler::MeshConfiguration& mesh) { return AgcDriver::Graphics::MeshArgumentRulesFor(context, mesh, 0u, false); };
+    Require(autoRules(triangles).indexCount == 0xffffffffu && autoRules(triangles).indexed == 0u && rules(triangles, 300).indexed == 1u, "non-indexed rules are not unbounded and marked");
+    Require(same(ResolveMeshArguments(record(99, 2, 0), autoRules(triangles)), {2, 2, 1, 99, 0}), "non-indexed: a partial second group");
+    Require(same(ResolveMeshArguments(record(99, 2, 45), autoRules(triangles)), {2, 2, 1, 99, 0}), "non-indexed: the start vertex offset the vertices");
+    Require(same(ResolveMeshArguments(record(3, 1, 0xffffffffu), autoRules(triangles)), {1, 1, 1, 3, 0}), "non-indexed: a start vertex at the end of the range bounded the count");
+    Require(same(ResolveMeshArguments(record(0, 1, 0), autoRules(triangles)), {0, 0, 0, 0, 0}), "non-indexed: no vertices drew");
+    Require(same(ResolveMeshArguments(record(96, 0, 7), autoRules(triangles)), {0, 0, 0, 96, 0}), "non-indexed: no instances drew");
+    Require(same(ResolveMeshArguments(record(2, 1, 0), autoRules(triangles)), {0, 0, 0, 2, 0}), "non-indexed: no complete triangle drew");
+    Require(same(ResolveMeshArguments(record(96 * 7, 600, 0), autoRules(triangles)), {0, 0, 0, 96 * 7, 0}), "non-indexed: groups times instances over the device limit drew");
+    Require(same(ResolveMeshArguments(record(0xffffffffu, 1, 0), autoRules(points)), {0, 0, 0, 0xffffffffu, 0}), "non-indexed: groups over the device limit drew");
 }
 
 void debugBranchTests() {

@@ -2,7 +2,9 @@
 // CPU path before any stage is captured (Driver::IndirectCpuBeforeCapture, the stage-independent part of
 // ClassifyIndirectDraw) and which records the CPU loop draws (Driver::IndirectRecordDraws).
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <optional>
 #include <stdexcept>
@@ -53,18 +55,36 @@ void testCpuBeforeCapture() {
     // A plain vertex-path draw is decided by the front stage: nothing is known before the capture.
     check(!Driver::IndirectCpuBeforeCapture(vertexStages(), false, indirectDraw(false), full), "a vertex-path draw was sent to the CPU before its capture");
     check(!Driver::IndirectCpuBeforeCapture(vertexStages(), false, indirectDraw(true), full), "an indexed vertex-path draw was sent to the CPU before its capture");
-    // A rect list, a non-vertex path and a non-indexed mesh draw always take the CPU path.
+    // A rect list and a non-vertex path always take the CPU path.
     check(Driver::IndirectCpuBeforeCapture(vertexStages(), true, indirectDraw(false), full) == IndirectDrawPath::NonVertexPath, "a rect-list indirect draw was not a CPU draw");
-    check(Driver::IndirectCpuBeforeCapture(meshStages(), false, indirectDraw(false), full) == IndirectDrawPath::NonVertexPath, "a non-indexed mesh indirect draw was not a CPU draw");
     ShaderStages tessellation{ShaderPath::Tessellation, 0, 64, 64, std::nullopt, std::nullopt};
     check(Driver::IndirectCpuBeforeCapture(tessellation, false, indirectDraw(true), full) == IndirectDrawPath::NonVertexPath, "a tessellation indirect draw was not a CPU draw");
-    // The indexed single-record mesh draw without SGPR locations runs on the GPU (RecordMeshArguments).
+    // The single-record mesh draw without SGPR locations runs on the GPU (RecordMeshArguments):
+    // indexed always, non-indexed unless APS5_NO_GPU_MESH_INDIRECT=1 (the agc_driver_empty_indirect_no_gpu_mesh
+    // registration runs this test with it).
+    const bool gpuMesh = std::getenv("APS5_NO_GPU_MESH_INDIRECT") == nullptr;
+    check(gpuMesh == AgcDriver::Graphics::GpuMeshIndirectDraws(), "the GPU mesh indirect switch does not follow APS5_NO_GPU_MESH_INDIRECT");
     check(!Driver::IndirectCpuBeforeCapture(meshStages(), false, indirectDraw(true), full), "the GPU-side mesh draw was sent to the CPU");
-    auto located = indirectDraw(true);
-    located.indirect->startInstanceLocation = 0x30cu;
-    check(Driver::IndirectCpuBeforeCapture(meshStages(), false, located, full) == IndirectDrawPath::NonVertexPath, "a mesh draw with a start instance location stayed on the GPU");
-    auto multi = indirectDraw(true, 2);
-    check(Driver::IndirectCpuBeforeCapture(meshStages(), false, multi, full) == IndirectDrawPath::NonVertexPath, "a two-record mesh draw stayed on the GPU");
+    if (gpuMesh) check(!Driver::IndirectCpuBeforeCapture(meshStages(), false, indirectDraw(false), full), "the GPU-side non-indexed mesh draw was sent to the CPU");
+    else check(Driver::IndirectCpuBeforeCapture(meshStages(), false, indirectDraw(false), full) == IndirectDrawPath::NonVertexPath, "a non-indexed mesh indirect draw stayed on the GPU under APS5_NO_GPU_MESH_INDIRECT=1");
+    for (const bool indexed : {true, false}) {
+        auto located = indirectDraw(indexed);
+        located.indirect->startInstanceLocation = 0x30cu;
+        check(Driver::IndirectCpuBeforeCapture(meshStages(), false, located, full) == IndirectDrawPath::NonVertexPath, "a mesh draw with a start instance location stayed on the GPU");
+        located = indirectDraw(indexed);
+        located.indirect->baseVertexLocation = 0x30cu;
+        check(Driver::IndirectCpuBeforeCapture(meshStages(), false, located, full) == IndirectDrawPath::NonVertexPath, "a mesh draw with a base vertex location stayed on the GPU");
+        auto multi = indirectDraw(indexed, 2);
+        check(Driver::IndirectCpuBeforeCapture(meshStages(), false, multi, full) == IndirectDrawPath::NonVertexPath, "a two-record mesh draw stayed on the GPU");
+        auto counted = indirectDraw(indexed, 1);
+        counted.indirect->countIndirect = true;
+        counted.indirect->countAddress = 0x20000;
+        check(Driver::IndirectCpuBeforeCapture(meshStages(), false, counted, full) == IndirectDrawPath::NonVertexPath, "a counted mesh draw stayed on the GPU");
+        auto indexedDraw = indirectDraw(indexed, 1);
+        indexedDraw.indirect->drawIndexEnabled = true;
+        indexedDraw.indirect->drawIndexLocation = 0x30du;
+        check(Driver::IndirectCpuBeforeCapture(meshStages(), false, indexedDraw, full) == IndirectDrawPath::NonVertexPath, "a mesh draw with a draw index location stayed on the GPU");
+    }
     // A draw index the front program reads in an SGPR, and device gaps, are known before the capture.
     auto drawIndex = indirectDraw(false, 4);
     drawIndex.indirect->drawIndexEnabled = true;

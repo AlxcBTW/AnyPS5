@@ -13,13 +13,15 @@ layout(push_constant) uniform Parameters {
     uint maxGroups;
     uint maxInstances;
     uint maxTotal;
-    uint unused;
+    uint indexed;
 } parameters;
 
 void main() {
     uint count = parameters.record.words[0];
     uint instances = parameters.record.words[1];
-    uint first = parameters.record.words[2];
+    // A non-indexed record's start vertex goes only to the SH register its packet names (none on
+    // this path), never into the generated vertex indices: they start at the draw's vertex constant.
+    uint first = parameters.indexed != 0u ? parameters.record.words[2] : 0u;
     uint effective = first < parameters.indexCount ? min(count, parameters.indexCount - first) : 0u;
     uint groups = 0u;
     if (effective >= parameters.inputSize && instances != 0u) {
