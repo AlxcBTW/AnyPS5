@@ -223,6 +223,7 @@ private:
     static int waitTimeoutMs();
     static bool pollReapAll();
     static bool pollTryEach();
+    static bool waitOnSerial();
     static bool traceLateLabels();
     void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false);
     struct PendingWait {

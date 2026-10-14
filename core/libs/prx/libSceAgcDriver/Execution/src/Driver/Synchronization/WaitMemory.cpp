@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -47,6 +48,11 @@ bool Driver::pollReapAll() {
 bool Driver::pollTryEach() {
     static const bool each = std::getenv("APS5_POLL_TRY_EACH") != nullptr;
     return each;
+}
+
+bool Driver::waitOnSerial() {
+    static const bool on = [] { const char* text = std::getenv("APS5_WAIT_ON_SERIAL"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+    return on;
 }
 
 bool Driver::traceLateLabels() {
@@ -319,6 +325,42 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    // APS5_WAIT_ON_SERIAL=1: once the spin is over, a label written by a recorded batch is waited for
+    // on the recorder's timeline (a pending writer is submitted first) instead of sleep-polling; the
+    // wait is cut into short slices so the loop keeps its other exits, then the batches that finished
+    // are reaped (their completion actions store the value).
+    std::uint64_t serialWaited = 0;
+    bool serialCounted = false;
+    const auto waitForWriter = [&] {
+        auto serial = Graphics::Recorder::LabelWriterSerial(awaited, awaitedBytes);
+        if (!serial.has_value()) return;
+        const auto localDevice = device.Load();
+        if (localDevice == nullptr || !localDevice->CanWaitUnlocked()) return;
+        if (*serial == 0) {
+            {
+                std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+                if (!gpuLock.owns_lock()) return;
+                localDevice->SubmitRecorded(false);
+            }
+            ++outcomes.serialSubmits;
+            serial = Graphics::Recorder::LabelWriterSerial(awaited, awaitedBytes);
+            if (!serial.has_value() || *serial == 0) return;
+        }
+        if (*serial <= serialWaited) return;
+        const auto begin = std::chrono::steady_clock::now();
+        const bool reached = localDevice->WaitRecordedFor(*serial, 2000);
+        outcomes.serialUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+        ++outcomes.serialSlices;
+        if (!serialCounted) {
+            serialCounted = true;
+            ++outcomes.serialWaits;
+        }
+        if (!reached) return;
+        serialWaited = *serial;
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+        if (gpuLock.owns_lock()) localDevice->ReapRecorded();
+    };
+
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
         Driver& driver;
@@ -348,6 +390,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         CheckFailure();
         if (pollService(!spinning)) return;
+        if (waitOnSerial() && labelTable && !spinning) {
+            waitForWriter();
+            if (Pm4::WaitSatisfiedUnchecked(packet)) break;
+        }
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
