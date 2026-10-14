@@ -43,6 +43,13 @@ struct HostImport;
 // or mutate freshness); the registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending ->
 // Shadows -> tracker).
 bool UnitShadowEnabled();
+// APS5_YOLO_GPU=1 (lab ceiling, inexact on purpose; GuestBufferMemory and ShaderResources): a
+// written region bound in place gets no flush (no write-back, no publish), and regions over any
+// fresh unit are staged from the shadow (readers too) and copy back into it. The staging window,
+// CPU-facing consumers (hook, labels, indirect arguments, copies, scanout) and storage refreshes
+// are unchanged. The shadow-sourced staging and shadow copy-back it builds on (GuestBufferMemory)
+// are inert without it.
+bool YoloGpu();
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
@@ -91,6 +98,9 @@ struct ShadowedRange {
 // publish records nothing (the store's own stamp makes the unit stale; a recorded publish would land
 // over the store later).
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason);
+// Units PublishShadow copied on the calling thread so far (a caller takes the difference around a
+// call for its own census; other threads' publishes are not in it).
+std::uint64_t ThreadPublishedUnits();
 // No GpuMutex, no tracker: conservative (a unit with a generation and no publish counts), for
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);

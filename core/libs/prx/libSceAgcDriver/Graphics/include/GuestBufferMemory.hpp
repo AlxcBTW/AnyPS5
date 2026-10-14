@@ -204,6 +204,15 @@ struct AddressCopy {
 };
 std::string AddressCopyOverflow(std::vector<AddressCopy> copies, std::uint64_t limit);
 
+// Lazy write-back (shadow-sourced staging, see GuestBufferMemory.cpp): on unless
+// APS5_YOLO_GPU=1 and APS5_NO_LAZY_WRITEBACK unset, and only while unit shadows are on.
+bool LazyWritebackEnabled();
+// Whether a region of `regionBytes` whose copy-in would read `shadowBytes` from unit-shadow slabs
+// is staged from the shadow instead of bound in place: at most `maxBytes`, at least one unit from
+// the shadow, and at least half of it, so the import part the copy-in reads over the bus never
+// exceeds the publish it replaces.
+bool ShadowStageAccepted(std::uint64_t regionBytes, std::uint64_t shadowBytes, std::uint64_t maxBytes);
+
 class GuestBufferMemory {
 public:
     explicit GuestBufferMemory(const Context& context);
@@ -291,6 +300,18 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    // Lazy write-back (see GuestBufferMemory.cpp, "shadow-sourced staging"; APS5_NO_LAZY_WRITEBACK=1
+    // turns it off): whether [begin, end) lies inside a region staged from the unit shadow. Such a
+    // region's flush stores the pending images into the shadow without publishing them into the
+    // import (PublishScope::None), and its copy-in reads the fresh units from their slab.
+    bool ShadowSourced(std::uint64_t begin, std::uint64_t end) const;
+    // Publishes the units that a written range inside a shadow-sourced region covers partly: its
+    // copy-back stamps them, so the rest of each such unit must be in the import first. Called after
+    // the region's flush and before its copy-in, under GuestMemory::GpuMutex.
+    void PublishShadowSourcedEdges() const;
+    // [lazywb] census of a region bound in place whose flush published the unit shadow into its
+    // import (PublishScope::Whole): units copied, by whether a descriptor writes the region.
+    static void NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units);
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;
@@ -351,7 +372,20 @@ private:
         bool gpuCopy = false;
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
+        // The import's size, with copySource and copySourceBase its identity for the unit shadow
+        // (UnitShadow's registry keys a shadow by all three).
+        std::uint64_t copySourceBytes = 0;
         bool copiedBack = false;
+        // A device-local staging region whose copy-in reads the import's fresh unit-shadow units
+        // from their slab and the rest from the import; nothing over it was published for its use
+        // (see "shadow-sourced staging" in GuestBufferMemory.cpp).
+        bool shadowSourced = false;
+        // A written range inside was flushed without a publish (UploadFinish): every path the
+        // region takes afterwards publishes before reading, or sources the copy from the shadow.
+        bool deferredPublish = false;
+        // Bytes this region holds of the shadow-staging budget (stageFromShadow), returned by the
+        // destructor.
+        std::uint64_t budgetBytes = 0;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
@@ -407,6 +441,15 @@ private:
     // and an atomic element or a size within the written-shadow window. Independent of the import,
     // so UploadPrepare and UploadFinish decide alike.
     bool stagingEligible(const Region& region, bool addressable) const;
+    // Lazy write-back: whether the region may be staged from the unit shadow (a staging-eligible
+    // region, or with APS5_NO_SHADOW_STAGE unset any region of a dispatch build up to
+    // APS5_SHADOW_STAGE_MAX_KIB), independent of the import and of the shadow's state.
+    bool shadowStagingCandidate(const Region& region, bool addressable) const;
+    // A region UploadFinish took in place (`entry` its import), after its flush stored the pending
+    // images without a publish: staged from the shadow when ShadowStageAccepted holds for the fresh
+    // bytes the copy-in would read from slabs, and a device-local buffer is to be had.
+    bool stageFromShadow(Region& region, bool addressable);
+    void publishEdges(const Region& region) const;
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
