@@ -1,0 +1,126 @@
+# Fork-only build. A separate CI commit adds this workflow to the reviewed source.
+name: SotS target FPS package
+
+on:
+  push:
+    branches: ['ci/lab/target-fps-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: target-fps-package-keys5851
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      SSL_CERT_FILE: C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          submodules: recursive
+      - name: Verify source and CI separation
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only HEAD^ HEAD)
+          test "$changed" = '.github/workflows/target-fps-lab.yml'
+          git rev-parse HEAD^
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - name: Install toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+      - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-${{ env.WINLIBS_ZIP }}-Release-g1off
+          restore-keys: ccache-windows-
+          max-size: 2G
+          evict-old-files: job
+      - name: Configure
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DAPS5_ENABLE_TIMING_LOG=ON \
+            -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build package and targeted tests
+        run: |
+          cmake --build build --target libs relinker agc_scratch_window_union_tests \
+            agc_driver_recorder_tests agc_host_import_retire_tests agc_driver_dispatch_address_free_keys_tests --parallel 4
+      - name: Run CPU scratch planner test
+        run: ctest --test-dir build -R '^agc_scratch_window_union$' --output-on-failure --no-tests=error
+      - name: Stage and hash package
+        id: stage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'target-fps-package'
+          New-Item -ItemType Directory -Path $out | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $out 'tests') | Out-Null
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'build/core/relinker/relinker.exe') -Destination $out
+          Get-ChildItem -LiteralPath 'build/core/libs/libs' -Filter '*.prx' -File | Copy-Item -Destination $out
+          if (-not (Test-Path -LiteralPath (Join-Path $out 'libSceAgcDriver.prx'))) { throw 'AGC library missing' }
+          foreach ($name in @('libgcc_s_seh-1.dll', 'libstdc++-6.dll', 'libwinpthread-1.dll')) {
+            Copy-Item -LiteralPath (Join-Path 'C:/winlibs/mingw64/bin' $name) -Destination $out
+            Copy-Item -LiteralPath (Join-Path 'C:/winlibs/mingw64/bin' $name) -Destination (Join-Path $out 'tests')
+          }
+          foreach ($name in @('libc.prx', 'libkernel.prx', 'libSceAgcDriver.prx')) {
+            Copy-Item -LiteralPath (Join-Path 'build/core/libs/libs/unpatched' $name) -Destination (Join-Path $out 'tests')
+          }
+          foreach ($name in @('agc_scratch_window_union_tests.exe', 'agc_driver_recorder_tests.exe', 'agc_host_import_retire_tests.exe', 'agc_driver_dispatch_address_free_keys_tests.exe')) {
+            Copy-Item -LiteralPath (Join-Path 'build/tests' $name) -Destination (Join-Path $out 'tests')
+          }
+          $sourceSha = (git rev-parse HEAD^).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Source SHA unavailable' }
+          $buildSha = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Build SHA unavailable' }
+          $files = @(Get-ChildItem -LiteralPath $out -Recurse -File | Sort-Object FullName | ForEach-Object {
+            [ordered]@{
+              path = [IO.Path]::GetRelativePath($out, $_.FullName).Replace('\', '/')
+              sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              size = $_.Length
+            }
+          })
+          $manifest = [ordered]@{
+            schemaVersion = 1
+            sourceSha = $sourceSha
+            buildSha = $buildSha
+            relinkerPath = 'relinker.exe'
+            libraryDirectory = '.'
+            testLibraryDirectory = 'tests'
+            timingLogEnabled = $true
+            files = $files
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $out 'artifact-manifest.json') -Encoding utf8
+          $sums = @(Get-ChildItem -LiteralPath $out -Recurse -File | Sort-Object FullName | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($out, $_.FullName).Replace('\', '/')
+            '{0} *{1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(), $relative
+          })
+          $sums | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS') -Encoding ascii
+          "dir=$out" >> $env:GITHUB_OUTPUT
+          "source_sha=$sourceSha" >> $env:GITHUB_OUTPUT
+          Write-Host "Source $sourceSha; $($files.Count) package files. GPU tests are staged for local NVIDIA execution."
+      - uses: actions/upload-artifact@v7
+        with:
+          name: target-fps-${{ steps.stage.outputs.source_sha }}
+          path: ${{ steps.stage.outputs.dir }}
+          retention-days: 3
+          compression-level: 1
+          if-no-files-found: error
