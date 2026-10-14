@@ -5,6 +5,7 @@
 #include "ImageTableAbi.hpp"
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -72,6 +73,9 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
         // Even an empty profile is kept: a content key leaves user words out, so a hit has to
         // check them (an empty profile requires every user word equal).
         fresh->relocation = relocation;
+        if (relocation != nullptr && traceContentKeys()) {
+            std::fprintf(stderr, "[dispatch-content] insert 0x%llx key %016llx: %zu user words, pointer candidates %llx (asBase %llx asValue %llx, %zu reads), relative %llx, %zu runs, %zu buffers of which %u relocate (%zu walked fields, %zu user fields, %zu patches), %zu forwarded, shape %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(key), userData.size(), static_cast<unsigned long long>(pointerCandidates), static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size(), static_cast<unsigned long long>(relocation->pointerWords), fresh->runs.size(), capture->snapshot.buffers.size(), relocation->relocatableBuffers, relocation->wordFields.size(), relocation->userFields.size(), relocation->patches.size(), relocation->forwarded.size(), shape != nullptr ? "learned" : "none");
+        }
         bool stable = true;
         if (stampValidate()) {
 

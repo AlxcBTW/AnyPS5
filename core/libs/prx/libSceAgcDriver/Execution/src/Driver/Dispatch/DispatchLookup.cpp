@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <ranges>
 
@@ -45,6 +46,11 @@ std::uint64_t Driver::verifyContentHits() {
         return text != nullptr ? std::max<std::uint64_t>(std::strtoull(text, nullptr, 10), 1) : 0;
     }();
     return every;
+}
+
+bool Driver::traceContentKeys() {
+    static const bool trace = std::getenv("APS5_TRACE_DISPATCH_CONTENT") != nullptr;
+    return trace;
 }
 
 std::uint64_t Driver::dispatchContentKey(std::uint64_t identity, std::span<const std::uint32_t> userData, bool& contentKey) {
@@ -97,6 +103,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
         std::shared_ptr<DispatchEntry> entry = found != dispatchCache.end() ? found->second : nullptr;
         if (entry == nullptr) ++entryCounters.absent;
         if (profile) noteKeyMiss(identity, userData, entry == nullptr, contentKey, entryCounters);
+        if (traceContentKeys()) std::fprintf(stderr, "[dispatch-content] lookup 0x%llx key %016llx (%s): %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(key), contentKey ? "content key" : "user-word key", entry == nullptr ? "no entry" : "entry found");
         if (validateUnlocked) cacheLock.unlock();
         phaseTiming.Phase(PhaseLookup);
         if (entry != nullptr) {
@@ -134,6 +141,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         // Every user word the profile does not relocate must be equal; a refusal
                         // is a differing variant without reading memory.
                         if (!UserWordsFit(*candidate.relocation, userData)) {
+                            if (traceContentKeys()) std::fprintf(stderr, "[dispatch-content] variant %zu of 0x%llx refused by its user words\n", i, static_cast<unsigned long long>(address));
                             ++refusedUser;
                             ++compared;
                             if (i == 0) outcome = EntryOutcome::Differing;
@@ -158,6 +166,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         ++refusedFields;
                         result = EntryOutcome::Differing;
                     }
+                    if (relocatable && traceContentKeys()) std::fprintf(stderr, "[dispatch-content] variant %zu of 0x%llx: outcome %d, %zu masked words live, %zu runs rebased\n", i, static_cast<unsigned long long>(address), static_cast<int>(result), liveData.size(), rebased.size());
                     if (i == 0) outcome = result;
                     if (result == EntryOutcome::Equal || result == EntryOutcome::EqualData) {
                         outcome = result;
