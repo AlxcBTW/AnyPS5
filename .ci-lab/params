@@ -1,0 +1,5 @@
+name=pin6060n
+build_type=Release
+g1=on
+cmake=
+artifact=lab-libs-pin6060n-ecbee5ecb5-50438
