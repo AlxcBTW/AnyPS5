@@ -73,6 +73,8 @@ public:
     bool CanWaitUnlocked() const;
     std::uint64_t SubmitAndEpoch();
     void WaitRecorded(std::uint64_t serial);
+    // WaitRecorded bounded by `timeoutUs`; false when the serial was not reached in time.
+    bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutUs);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();

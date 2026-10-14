@@ -1400,6 +1400,29 @@ void targetKeyProofTests(const Device& device, Recorder& recorder) {
     Require(ProvedCurrentDccKeys(address, surfaceBytes, proof) == DccKeys::Clear0000 && proofs() == proved + 1, "the proof after the fill landed did not hold");
 }
 
+// The serial a WAIT_REG_MEM poller may wait on (APS5_WAIT_ON_SERIAL): none for an untabled range, 0
+// while the label sits in the open batch, the batch's serial once submitted, and a bounded timeline
+// wait on it returns.
+void labelWriterSerialTests(const Device& device, Recorder& recorder) {
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::uint64_t label = 0x90000;
+    Require(!Recorder::LabelWriterSerial(label, 4).has_value(), "(9) a range without a label has a writer");
+    recorder.NoteLabel(label, one, 80, 0);
+    const auto open = Recorder::LabelWriterSerial(label, 4);
+    Require(open.has_value() && *open == 0, "(9) a label in the open batch has a serial");
+    recorder.Submit();
+    const auto submitted = Recorder::LabelWriterSerial(label, 4);
+    Require(submitted.has_value() && *submitted != 0, "(9) a submitted label has no serial");
+    if (recorder.HasTimeline()) {
+        bool reached = false;
+        for (int i = 0; i < 5000 && !reached; ++i) reached = recorder.WaitSerialFor(*submitted, 1'000'000);
+        Require(reached, "(9) the writing batch never signaled the timeline");
+    }
+    device.WaitQueue();
+    recorder.Sync();
+    Require(!Recorder::LabelWriterSerial(label, 4).has_value(), "(9) the entry outlived its batch");
+}
+
 // (8) The group close against a collect in progress: a CPU store made after the close must refuse
 // the entry although another thread's resetting walk of the label's page (over a large range) may
 // absorb the store and stamp the block with the generation it took before the close. And an entry
@@ -8230,6 +8253,7 @@ int main(int argc, char** argv) {
         largeLabelTests(recorder);
         unchangedSinceTests();
         closeRaceTests(device, recorder);
+        labelWriterSerialTests(device, recorder);
         keyProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
         refreshProofTests(device, recorder);
