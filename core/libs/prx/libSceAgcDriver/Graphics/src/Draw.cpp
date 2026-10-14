@@ -383,6 +383,8 @@ struct DrawInputCounts {
     std::uint64_t snapshots = 0;
     std::uint64_t snapshotBytes = 0;
     std::array<std::uint64_t, InPlaceRefusalCount> refused{};
+    // PrepareDrawBindings' time (the snapshot copies, or the in-place rebinds, and the set).
+    double bindingsUs = 0;
     void Add(const DrawInputCounts& other, const ShaderResources::DrawBindingCounts& bindings) {
         indexInPlace += other.indexInPlace;
         indexCopied += other.indexCopied;
@@ -392,6 +394,7 @@ struct DrawInputCounts {
         vertexCopied += other.vertexCopied;
         vertexCopiedBytes += other.vertexCopiedBytes;
         zeroPadded += other.zeroPadded;
+        bindingsUs += other.bindingsUs;
         buffersKept += bindings.kept;
         buffersRebound += bindings.rebound;
         snapshots += bindings.snapshots;
@@ -632,7 +635,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         const auto& in = profile.inputs;
         const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
         char bound[512];
-        int b = std::snprintf(bound, sizeof(bound), "; in place %s: index buffers in place %llu / copied %llu, highest-index scans skipped %llu, indices scanned %llu; vertex ranges in place %llu / copied %llu (%.1f MiB), zero-padded %llu; read-only buffers kept in place %llu, rebound in place %llu, snapshots %llu (%.1f MiB), not rebound:", ShaderResources::DrawInPlace() ? "on" : "off", count(in.indexInPlace), count(in.indexCopied), count(in.scansSkipped), count(in.indicesScanned), count(in.vertexInPlace), count(in.vertexCopied), static_cast<double>(in.vertexCopiedBytes) / 1048576.0, count(in.zeroPadded), count(in.buffersKept), count(in.buffersRebound), count(in.snapshots), static_cast<double>(in.snapshotBytes) / 1048576.0);
+        int b = std::snprintf(bound, sizeof(bound), "; in place %s: index buffers in place %llu / copied %llu, highest-index scans skipped %llu, indices scanned %llu; vertex ranges in place %llu / copied %llu (%.1f MiB), zero-padded %llu; read-only buffers (%.1f ms) kept in place %llu, rebound in place %llu, snapshots %llu (%.1f MiB), not rebound:", ShaderResources::DrawInPlace() ? "on" : "off", count(in.indexInPlace), count(in.indexCopied), count(in.scansSkipped), count(in.indicesScanned), count(in.vertexInPlace), count(in.vertexCopied), static_cast<double>(in.vertexCopiedBytes) / 1048576.0, count(in.zeroPadded), in.bindingsUs / 1000.0, count(in.buffersKept), count(in.buffersRebound), count(in.snapshots), static_cast<double>(in.snapshotBytes) / 1048576.0);
         for (std::size_t i = 0; i < InPlaceRefusalCount && b > 0 && static_cast<std::size_t>(b) < sizeof(bound); ++i) b += std::snprintf(bound + b, sizeof(bound) - static_cast<std::size_t>(b), " %s %llu", InPlaceRefusalNames[i], count(in.refused[i]));
         std::fprintf(stderr, "%s; zero-fetch clamps %llu%s\n", parts, static_cast<unsigned long long>(profile.clamps), bound);
     }
@@ -1797,7 +1800,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    const auto bindingsStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, &outcome.bindings);
+    if (timer.profile) outcome.inputs.bindingsUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - bindingsStart).count();
     // The moved buffers the set binds in place (DrawInPlace) are read by this draw like the
     // template's own in-place ranges: a queued key or label store over one lands before it, they
     // join the pass's reads (a write earlier in the pass ends it) and the hazard tracker's.
