@@ -173,10 +173,17 @@ public:
             while (family < count && (families[family].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) ++family;
             Require(family < count, "no Vulkan compute queue");
             const float priority = 1;
+            const float priorities[2]{1, 1};
             VkDeviceQueueCreateInfo queue{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
             queue.queueFamilyIndex = family;
             queue.queueCount = 1;
             queue.pQueuePriorities = &priority;
+#ifdef _WIN32
+            if (families[family].queueCount >= 2) {
+                queue.queueCount = 2;
+                queue.pQueuePriorities = priorities;
+            }
+#endif
             VkPhysicalDeviceFeatures enabled{};
             enabled.shaderInt64 = VK_TRUE;
             graphics = (families[family].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0;
@@ -270,10 +277,19 @@ public:
             context.formatProperties = function<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
             context.imageFormatProperties = function<PFN_vkGetPhysicalDeviceImageFormatProperties>("vkGetPhysicalDeviceImageFormatProperties");
             context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 0, &context.queue);
+            context.queueFamily = family;
             VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
             pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
             pool.queueFamilyIndex = family;
             Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.pool), "vkCreateCommandPool");
+#ifdef _WIN32
+            if (queue.queueCount == 2) {
+                context.Function<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(context.device, family, 1, &context.settleQueue);
+                Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &pool, nullptr, &context.settlePool), "vkCreateCommandPool settle");
+                context.settleFamily = family;
+                context.settleQueueMutex = &settleMutex;
+            }
+#endif
         } catch (...) {
             release();
             throw;
@@ -300,6 +316,8 @@ private:
     }
 
     void release() noexcept {
+        if (context.device != VK_NULL_HANDLE) ClearHostImports(context.device);
+        if (context.settlePool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.settlePool, nullptr);
         if (context.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.pool, nullptr);
         context.bufferPool.reset();
         if (context.device != VK_NULL_HANDLE) {
@@ -315,6 +333,7 @@ private:
     VkInstance instance = VK_NULL_HANDLE;
     Context context{};
     bool graphics = false;
+    std::mutex settleMutex;
     bool nullDescriptors = false;
 };
 
@@ -3765,8 +3784,9 @@ void importWatchTests(const Device& device) {
     }
     const auto probe = ProbeImportWriteProtection(context);
     Require(probe.failure == nullptr, std::string("(w) the Windows import probe failed at ") + (probe.failure != nullptr ? probe.failure : "") + " (" + std::to_string(static_cast<int>(probe.result)) + ")");
-    std::cout << "Windows import probe: " << probe.writtenAtImport << " of " << probe.pages << " scratch pages reported written at the import, " << probe.writtenAfterSubmit << " after the first GPU read, " << probe.writtenAfterSecondSubmit << " after the second, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenByCpu << " after a CPU store\n";
+    std::cout << "Windows import probe: " << probe.writtenAtImport << " of " << probe.pages << " scratch pages reported written at the import, " << probe.writtenDuringSettle << " by its 4-byte settle read, " << probe.writtenAfterSettle << " after it, " << probe.writtenAfterSubmit << " after a full GPU read, " << probe.writtenAfterSecondSubmit << " after a second, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenByCpu << " after a CPU store\n";
     Require(probe.writtenByCpu != 0, "(w) a CPU store into a host-imported MEM_WRITE_WATCH range was not collected");
+    Require(probe.writtenAfterSettle == 0 || PrepareImportWatch(context) == ImportWatch::Unwatch, "(w) a settled import kept reporting writes and stayed watched");
 #else
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
         std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";

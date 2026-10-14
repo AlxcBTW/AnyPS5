@@ -184,6 +184,16 @@ struct HostImports {
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
     bool watchPrivateImports = false;
+#ifdef _WIN32
+    VkDevice settleDevice = VK_NULL_HANDLE;
+    VkBuffer settleTarget = VK_NULL_HANDLE;
+    VkDeviceMemory settleMemory = VK_NULL_HANDLE;
+    VkCommandBuffer settleCommands = VK_NULL_HANDLE;
+    VkFence settleFence = VK_NULL_HANDLE;
+    PFN_vkDestroyFence destroyFence = nullptr;
+    PFN_vkDestroyBuffer settleDestroyBuffer = nullptr;
+    PFN_vkFreeMemory settleFreeMemory = nullptr;
+#endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
 };
@@ -641,50 +651,84 @@ ImportWatchRequest importWatchRequest() {
 #endif
 
 #ifdef _WIN32
-const char* settleImport(const Context& context, const HostImport& entry, VkResult& result) {
-    VkBuffer destination = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkCommandBuffer commands = VK_NULL_HANDLE;
-    VkFence fence = VK_NULL_HANDLE;
+const char* settleImport(const Context& context, HostImports& state, const HostImport& entry, VkResult& result) {
     std::unique_lock queueLock(*context.settleQueueMutex);
-    const auto run = [&]() -> const char* {
+    if (state.settleDevice != context.device) {
+        state.settleDevice = context.device;
+        state.settleTarget = VK_NULL_HANDLE;
+        state.settleMemory = VK_NULL_HANDLE;
+        state.settleCommands = VK_NULL_HANDLE;
+        state.settleFence = VK_NULL_HANDLE;
+        state.destroyFence = context.Function<PFN_vkDestroyFence>("vkDestroyFence");
+        state.settleDestroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
+        state.settleFreeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
+    }
+    if (state.settleTarget == VK_NULL_HANDLE) {
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = 256;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &destination)) != VK_SUCCESS) return "vkCreateBuffer (settle)";
+        if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &state.settleTarget)) != VK_SUCCESS) {
+            state.settleTarget = VK_NULL_HANDLE;
+            return "vkCreateBuffer (settle)";
+        }
         VkMemoryRequirements requirements{};
-        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, destination, &requirements);
+        context.Function<PFN_vkGetBufferMemoryRequirements>("vkGetBufferMemoryRequirements")(context.device, state.settleTarget, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         allocation.memoryTypeIndex = static_cast<std::uint32_t>(std::countr_zero(requirements.memoryTypeBits));
-        if ((result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory)) != VK_SUCCESS) return "vkAllocateMemory (settle)";
-        if ((result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, destination, memory, 0)) != VK_SUCCESS) return "vkBindBufferMemory (settle)";
+        if ((result = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &state.settleMemory)) != VK_SUCCESS || (result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, state.settleTarget, state.settleMemory, 0)) != VK_SUCCESS) {
+            context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, state.settleTarget, nullptr);
+            if (state.settleMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, state.settleMemory, nullptr);
+            state.settleTarget = VK_NULL_HANDLE;
+            state.settleMemory = VK_NULL_HANDLE;
+            return "the settle target";
+        }
         VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         allocate.commandPool = context.settlePool;
         allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocate.commandBufferCount = 1;
-        if ((result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &commands)) != VK_SUCCESS) return "vkAllocateCommandBuffers (settle)";
+        if ((result = context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &state.settleCommands)) != VK_SUCCESS) {
+            state.settleCommands = VK_NULL_HANDLE;
+            return "vkAllocateCommandBuffers (settle)";
+        }
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if ((result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &state.settleFence)) != VK_SUCCESS) {
+            state.settleFence = VK_NULL_HANDLE;
+            return "vkCreateFence (settle)";
+        }
+    }
+    if (state.settleCommands == VK_NULL_HANDLE || state.settleFence == VK_NULL_HANDLE) return "the settle commands";
+    VkBuffer source = entry.buffer;
+    VkBuffer alias = VK_NULL_HANDLE;
+    const auto run = [&]() -> const char* {
+        if (context.settleFamily != context.queueFamily) {
+            VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkBufferCreateInfo aliasInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+            aliasInfo.size = std::min<VkDeviceSize>(entry.bytes, 65536);
+            aliasInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            if ((result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &aliasInfo, nullptr, &alias)) != VK_SUCCESS) return "vkCreateBuffer (settle alias)";
+            if ((result = context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, alias, entry.memory, 0)) != VK_SUCCESS) return "vkBindBufferMemory (settle alias)";
+            source = alias;
+        }
+        if ((result = context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &state.settleFence)) != VK_SUCCESS) return "vkResetFences (settle)";
+        if ((result = context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(state.settleCommands, 0)) != VK_SUCCESS) return "vkResetCommandBuffer (settle)";
         VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer (settle)";
+        if ((result = context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(state.settleCommands, &begin)) != VK_SUCCESS) return "vkBeginCommandBuffer (settle)";
         const VkBufferCopy region{0, 0, 4};
-        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, entry.buffer, destination, 1, &region);
-        if ((result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands)) != VK_SUCCESS) return "vkEndCommandBuffer (settle)";
-        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        if ((result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence)) != VK_SUCCESS) return "vkCreateFence (settle)";
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(state.settleCommands, source, state.settleTarget, 1, &region);
+        if ((result = context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(state.settleCommands)) != VK_SUCCESS) return "vkEndCommandBuffer (settle)";
         VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
         submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &commands;
-        if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit (settle)";
-        if ((result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences (settle)";
+        submit.pCommandBuffers = &state.settleCommands;
+        if ((result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, state.settleFence)) != VK_SUCCESS) return "vkQueueSubmit (settle)";
+        if ((result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &state.settleFence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences (settle)";
         return nullptr;
     };
     const char* step = run();
-    if (step != nullptr && fence != VK_NULL_HANDLE) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.settleQueue);
-    if (fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
-    if (commands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.settlePool, 1, &commands);
-    if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
-    if (memory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
+    if (step != nullptr) context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.settleQueue);
+    if (alias != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, alias, nullptr);
     return step;
 }
 #endif
@@ -697,7 +741,7 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.unwatchDmaBufImports = false;
     state.watchPrivateImports = false;
     if (context.hostImportAlignment == 0 || !GuestMemory::WriteWatched()) return;
-    if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) {
+    if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr || std::getenv("APS5_NO_WATCHED_PRIVATE_IMPORTS") != nullptr) {
         std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons (%s); separate shared aliases retain guest write tracking\n", std::getenv("APS5_NO_WATCHED_PRIVATE_IMPORTS") != nullptr ? "APS5_NO_WATCHED_PRIVATE_IMPORTS" : "no second queue to settle imports on");
         return;
     }
@@ -706,8 +750,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] host imports of write-watched memory keep the write watch: unknown (probe failed at %s, %d); direct host imports use comparisons, separate shared aliases retain guest write tracking\n", probe.failure, static_cast<int>(probe.result));
         return;
     }
-    state.watchPrivateImports = probe.writtenAfterSecondSubmit == 0 && probe.writtenAfterFill == 0 && probe.writtenByCpu != 0;
-    std::fprintf(stderr, "[write-watch] host imports of write-watched memory keep the write watch: %s (%u of %u scratch pages reported written at the import, %u after the first GPU read, %u after the second, %u after a GPU write, %u after a CPU store); direct host imports of private memory %s, separate shared aliases retain guest write tracking\n", state.watchPrivateImports ? "yes" : "no", probe.writtenAtImport, probe.pages, probe.writtenAfterSubmit, probe.writtenAfterSecondSubmit, probe.writtenAfterFill, probe.writtenByCpu, state.watchPrivateImports ? "are settled and stay watched" : "use comparisons");
+    state.watchPrivateImports = probe.writtenAfterSettle == 0 && probe.writtenAfterSubmit == 0 && probe.writtenAfterSecondSubmit == 0 && probe.writtenAfterFill == 0 && probe.writtenByCpu != 0;
+    std::fprintf(stderr, "[write-watch] host imports of write-watched memory keep the write watch: %s (%u of %u scratch pages reported written at the import, %u by its 4-byte settle read, %u after it, %u after a full GPU read, %u after a second, %u after a GPU write, %u after a CPU store); direct host imports of private memory %s, separate shared aliases retain guest write tracking\n", state.watchPrivateImports ? "yes" : "no", probe.writtenAtImport, probe.pages, probe.writtenDuringSettle, probe.writtenAfterSettle, probe.writtenAfterSubmit, probe.writtenAfterSecondSubmit, probe.writtenAfterFill, probe.writtenByCpu, state.watchPrivateImports ? "are settled and stay watched" : "use comparisons");
 #else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
@@ -1106,7 +1150,11 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     GuestMemory::ImportWatched(base, bytes, [&] {
         step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result) : createHostPointerImport(context, entry, result);
 #ifdef _WIN32
-        if (step == nullptr && settled) step = settleImport(context, entry, result);
+        if (step == nullptr && settled && (step = settleImport(context, state, entry, result)) != nullptr) {
+            destroyImport(context, entry);
+            entry.buffer = VK_NULL_HANDLE;
+            entry.memory = VK_NULL_HANDLE;
+        }
 #endif
         return step == nullptr;
     }, watchedHostPointer);
@@ -2242,6 +2290,18 @@ void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
+#ifdef _WIN32
+    if (state.settleDevice == device) {
+        if (state.settleFence != VK_NULL_HANDLE) state.destroyFence(device, state.settleFence, nullptr);
+        if (state.settleTarget != VK_NULL_HANDLE) state.settleDestroyBuffer(device, state.settleTarget, nullptr);
+        if (state.settleMemory != VK_NULL_HANDLE) state.settleFreeMemory(device, state.settleMemory, nullptr);
+        state.settleDevice = VK_NULL_HANDLE;
+        state.settleTarget = VK_NULL_HANDLE;
+        state.settleMemory = VK_NULL_HANDLE;
+        state.settleCommands = VK_NULL_HANDLE;
+        state.settleFence = VK_NULL_HANDLE;
+    }
+#endif
     if (state.device != device) return;
     for (const auto& [address, entry] : state.imports) {
         state.destroyBuffer(state.device, entry.buffer, nullptr);
@@ -2261,7 +2321,7 @@ void ClearHostImports(VkDevice device) {
 
 namespace {
 
-void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t bytes, const std::function<const char*(HostImport&, VkResult&)>& importStep, const std::function<bool(std::uint32_t&)>& collect, ImportProbe& probe) {
+void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t bytes, const std::function<const char*(HostImport&, VkResult&)>& importStep, const std::function<bool(std::uint32_t&)>& collect, ImportProbe& probe, const std::function<const char*(HostImport&, VkResult&)>& settleStep = {}) {
     HostImport import{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     VkBuffer destination = VK_NULL_HANDLE;
     VkDeviceMemory destinationMemory = VK_NULL_HANDLE;
@@ -2275,6 +2335,11 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         if (quiet != 0) return "an unwritten scratch range";
         if (const char* step = importStep(import, probe.result)) return step;
         if (!collect(probe.writtenAtImport)) return "the collect after the import";
+        if (settleStep) {
+            if (const char* step = settleStep(import, probe.result)) return step;
+            if (!collect(probe.writtenDuringSettle)) return "the collect after the settle";
+            if (!collect(probe.writtenAfterSettle)) return "the collect after a settled import";
+        }
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -2352,7 +2417,7 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     }
     constexpr std::uint64_t page = 4096;
     const std::uint64_t alignment = std::max<std::uint64_t>(context.hostImportAlignment, page);
-    const std::uint64_t bytes = (4 * page + alignment - 1) / alignment * alignment;
+    const std::uint64_t bytes = (4096 * page + alignment - 1) / alignment * alignment;
     probe.pages = static_cast<std::uint32_t>(bytes / page);
     void* raw = VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes + alignment), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
     if (raw == nullptr) {
@@ -2372,7 +2437,8 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     };
     std::uint32_t touched = 0;
     if (!collect(touched)) probe.failure = "GetWriteWatch";
-    else runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result); }, collect, probe);
+    else if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) probe.failure = "the settle queue";
+    else runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result); }, collect, probe, [&](HostImport& import, VkResult& result) { return settleImport(context, Imports(), import, result); });
     VirtualFree(raw, 0, MEM_RELEASE);
     return probe;
 #else

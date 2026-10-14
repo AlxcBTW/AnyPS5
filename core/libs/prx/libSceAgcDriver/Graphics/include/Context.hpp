@@ -168,6 +168,7 @@ struct Context {
     std::mutex* sparseQueueMutex = nullptr;
     VkQueue settleQueue = VK_NULL_HANDLE;
     VkCommandPool settlePool = VK_NULL_HANDLE;
+    std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     RenderCache* renderCache = nullptr;
