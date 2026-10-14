@@ -979,6 +979,31 @@ void CountDrawSkip(DrawSkip kind, double us) {
     stats.skipUs[static_cast<std::size_t>(kind)] += us;
 }
 
+namespace {
+
+std::mutex srtFillMutex;
+SrtFillCounts srtFillCounts;
+
+}
+
+SrtFillCounts TakeSrtFillCounts() {
+    std::lock_guard lock(srtFillMutex);
+    return std::exchange(srtFillCounts, SrtFillCounts{});
+}
+
+void RecordSrtFills(const Context& context, VkCommandBuffer commands, Recorder* recorder, std::span<const SrtFillCopy> fills) {
+    if (fills.empty()) return;
+    // The words' writers (recorded earlier: a dispatch in place, a fill, a copy, a label) precede
+    // the copies, which precede every shader read of the destination buffers.
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (const auto& fill : fills) {
+        Require(fill.import != nullptr && fill.address >= fill.import->base && fill.address - fill.import->base + sizeof(std::uint32_t) <= fill.import->bytes, "an SRT fill's word lies outside its host import");
+        CopyBuffer(context, commands, fill.import->buffer, fill.address - fill.import->base, fill.destination, fill.offset, sizeof(std::uint32_t));
+        if (recorder != nullptr) recorder->NotePendingRead(fill.address, sizeof(std::uint32_t), Recorder::ReadKind::Indirect);
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+}
+
 
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
@@ -1768,6 +1793,7 @@ struct RecordedDraw {
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::vector<std::shared_ptr<StorageTexture>> proxies;
     const IndirectRecord* indirect = nullptr;
+    std::span<const SrtFillCopy> srtFills;
     std::span<const ShaderResources::MovedBuffer> moved;
     bool listed = false;
     bool completion = false;
@@ -1900,6 +1926,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
+        if (std::any_of(record.srtFills.begin(), record.srtFills.end(), [&](const SrtFillCopy& fill) { return begin < fill.address + sizeof(std::uint32_t) && fill.address < end; })) return true;
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
@@ -1926,6 +1953,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
+    for (const auto& fill : record.srtFills) passReads.emplace_back(fill.address, fill.address + sizeof(std::uint32_t));
     const auto passImages = resources.StorageImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
@@ -1935,7 +1963,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
+    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || !record.srtFills.empty(), fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
@@ -1953,6 +1981,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             reads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
             if (args->countIndirect) reads.emplace_back(args->countAddress, args->countAddress + 4);
         }
+        for (const auto& fill : record.srtFills) reads.emplace_back(fill.address, fill.address + sizeof(std::uint32_t));
         auto images = resources.StorageImages();
         for (const auto& target : record.targets) {
             if (target != nullptr) images.emplace_back(target->Image(), true);
@@ -1978,6 +2007,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             countBarrier(1);
         }
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");
+        if (!record.srtFills.empty()) {
+            RecordSrtFills(context, commands, recorder, record.srtFills);
+            countBarrier(2);
+        }
         if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
@@ -2240,23 +2273,24 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     indirect.args = args;
     indirect.moved = args != nullptr && state.rectList && GpuIndexedIndirect();
     std::vector<Pm4::DrawArguments> records;
+    // Also decides the stages' SRT fills below (the same in-place GPU read of guest bytes).
+    const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
+        if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
+            if (recorder != nullptr) {
+                Recorder::CountSync(2);
+                recorder->Sync();
+            }
+            return IndirectDrawPath::PendingImage;
+        }
+        if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
+        const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
+        if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+        if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
+        if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
+        return IndirectDrawPath::Gpu;
+    };
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
-        const auto decide = [&](std::uint64_t address, std::size_t bytes, const HostImport*& import) {
-            if (StorageTexture::FlushPending(address, bytes, nullptr, "indirect draw arguments")) {
-                if (recorder != nullptr) {
-                    Recorder::CountSync(2);
-                    recorder->Sync();
-                }
-                return IndirectDrawPath::PendingImage;
-            }
-            if (recorder != nullptr && recorder->PendingLabelIn(address, bytes)) return IndirectDrawPath::PendingLabelOrCopy;
-            const auto overlaps = [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); };
-            if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if (std::any_of(DrawCopiedWriters()->begin(), DrawCopiedWriters()->end(), overlaps)) return IndirectDrawPath::PendingLabelOrCopy;
-            if ((import = HostImportFor(context, address, bytes)) == nullptr) return IndirectDrawPath::NotImported;
-            return IndirectDrawPath::Gpu;
-        };
         const auto rangeBytes = args->RangeBytes();
         if (rangeBytes == 0) {
             report(" indirect draw without records");
@@ -2340,6 +2374,49 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.moved.clear();
     }
+    // The FlattenedSrt words the stages' captures left to the draw (CompiledShader::srtFills: a
+    // speculative capture met a word whose writer was still pending). A lean recorded draw copies
+    // each from the host import before its pass (recordDraw) when the GPU can read it there, by
+    // the decision the indirect records take above; otherwise, and for every other draw, the word
+    // is read here through the flush hook, which waits for its writer as the capture would have,
+    // into the draw's own FlattenedSrt buffer (ShaderResources::NeverReusable keeps such a build
+    // out of every cache, so no other draw sees these bytes).
+    std::vector<SrtFillCopy> srtFillCopies;
+    if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.srtFills.empty(); })) {
+        SrtFillCounts counts;
+        counts.draws = 1;
+        for (std::size_t index = 0; index < shaders.size(); ++index) {
+            const auto& fills = shaders[index].srtFills;
+            auto* buffer = fills.empty() ? nullptr : resources->FlattenedSrtBuffer(index);
+            if (buffer == nullptr) continue;
+            const auto bytes = buffer->Bytes();
+            for (const auto& fill : fills) {
+                const auto offset = static_cast<std::size_t>(fill.word) * sizeof(std::uint32_t);
+                Require(offset + sizeof(std::uint32_t) <= bytes.size(), "an SRT fill lies outside its flattened SRT buffer");
+                const HostImport* import = nullptr;
+                if (lean) {
+                    const auto path = decide(fill.address, sizeof(std::uint32_t), import);
+                    ++counts.words[static_cast<std::size_t>(path)];
+                    if (path == IndirectDrawPath::Gpu) {
+                        srtFillCopies.push_back({buffer->Handle(), offset, import, fill.address});
+                        continue;
+                    }
+                } else {
+                    ++counts.notRecorded;
+                }
+                std::uint32_t word = 0;
+                {
+                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::SrtFill);
+                    GuestMemory::Read(fill.address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+                }
+                std::memcpy(bytes.data() + offset, &word, sizeof(word));
+            }
+        }
+        std::lock_guard lock(srtFillMutex);
+        for (std::size_t path = 0; path < counts.words.size(); ++path) srtFillCounts.words[path] += counts.words[path];
+        srtFillCounts.notRecorded += counts.notRecorded;
+        srtFillCounts.draws += counts.draws;
+    }
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto masked = maskedState(state, inputs.fragmentOutputs);
@@ -2384,6 +2461,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             if (binding.proxied) record.proxies.push_back(binding.resident);
         }
         record.indirect = args != nullptr ? &indirect : nullptr;
+        record.srtFills = srtFillCopies;
         record.listed = listed;
         record.completion = completion;
         record.waited = outcome.waited;

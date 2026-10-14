@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -126,6 +127,31 @@ bool GpuIndexedIndirectVerify();
 // final-record read of a GPU-side non-indexed mesh draw). `path` is why the CPU read them.
 enum class IndirectSite : std::uint8_t { GpuSide, EarlySkip, CpuLoop, RecordFallback, Peek };
 void CountIndirectPacket(IndirectSite site, const State& state, const Pm4::DrawParameters::IndirectDraw& indirect, IndirectDrawPath path, double readMs);
+
+// The FlattenedSrt words draws filled (CompiledShader::srtFills) since the previous call: by the
+// path that served each (Gpu: a copy from the host import before the draw; PendingImage,
+// PendingLabelOrCopy, NotImported: a CPU read through the flush hook, as the capture would have
+// made), `notRecorded` of them read on the CPU because the draw was not a lean recorded one, and
+// the draws that had any.
+struct SrtFillCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> words{};
+    std::uint64_t notRecorded = 0;
+    std::uint64_t draws = 0;
+};
+SrtFillCounts TakeSrtFillCounts();
+
+// A FlattenedSrt word a lean recorded draw copies from the host import before its pass (Draw's SRT
+// fills): `destination`+`offset` is the stage's FlattenedSrt buffer word, `import` covers `address`.
+struct SrtFillCopy {
+    VkBuffer destination;
+    VkDeviceSize offset;
+    const HostImport* import;
+    std::uint64_t address;
+};
+// Records the copies outside any render pass: a barrier after everything recorded before (the
+// words' writers), one 4-byte copy per fill, a barrier before every later shader read; with a
+// recorder, each source word is noted as read in place by the open batch.
+void RecordSrtFills(const Context& context, VkCommandBuffer commands, Recorder* recorder, std::span<const SrtFillCopy> fills);
 
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and

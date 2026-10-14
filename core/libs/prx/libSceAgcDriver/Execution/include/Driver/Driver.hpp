@@ -159,6 +159,16 @@ private:
     // APS5_NO_MESH_INDIRECT_PEEK unset: a GPU-side non-indexed mesh draw whose record is final
     // (indirectRecordsFinal) reads it on the CPU and records nothing when it draws nothing.
     static bool meshIndirectPeek();
+    // APS5_NO_GPU_DRAW_INDIRECT unset: a GPU-side mesh indirect draw captures speculatively and
+    // fills on the GPU the flattened-SRT words whose writer is still pending (materializeDrawStage,
+    // Graphics::SrtFill) instead of waiting for that writer on queue 0.
+    static bool gpuSrtFills();
+    struct SrtFillCaptureCounts {
+        std::uint64_t speculative, filled, words, repeated, refused;
+    };
+    // Speculative stage captures, those that left words to the GPU (and how many words), those
+    // repeated without speculation, and captures of refused programs, since the previous call.
+    static SrtFillCaptureCounts TakeSrtFillCaptureCounts();
     // Whether an indirect draw's records are final in guest memory for this queue thread: no
     // deferred label and no recorded, unfinished GPU write covers them, so a read does not wait.
     static bool indirectRecordsFinal(const Pm4::DrawParameters::IndirectDraw& indirect);

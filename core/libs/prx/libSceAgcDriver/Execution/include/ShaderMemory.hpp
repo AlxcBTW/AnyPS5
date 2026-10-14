@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -70,6 +71,25 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // Speculation (the draw path's GPU fill of flattened-SRT words, see Driver::materializeDrawStage):
+    // while on, a word that recorded GPU work still writes (the query says Sync) is not read through
+    // the flush hook; the read returns the bytes guest memory holds now, without waiting, and its
+    // address is listed for TakeSpeculated. Such a word is never cached as read: it joins no region,
+    // and a later read (speculating or not) asks again. Off by default (dispatches never speculate).
+    void Speculate(bool enabled) { speculating = enabled; }
+    bool Speculating() const { return speculating; }
+    // The addresses speculated since the previous call (or construction), in read order.
+    std::vector<std::uint64_t> TakeSpeculated();
+    // Counters for the [srtfill] line: words speculated, and hook reads of pending words a
+    // speculating capture could not avoid (none: every Sync read speculates) or that a non-speculating
+    // draw capture made (`counted` captures, see CountSyncReads).
+    struct SpeculationCounts {
+        std::uint64_t speculated = 0;
+        std::uint64_t syncReads = 0;
+    };
+    static SpeculationCounts TakeSpeculationCounts();
+    // Whether this capture's hook reads of pending words are counted as SpeculationCounts::syncReads.
+    void CountSyncReads(bool enabled) { countSyncReads = enabled; }
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -95,7 +115,18 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    bool speculating = false;
+    bool countSyncReads = false;
+    std::vector<std::uint64_t> speculated;
 };
+
+// The GPU fills a speculative capture needs (Driver::materializeDrawStage): every speculated
+// address must be the leaf of at least one pure flat-SRT slot (ShaderRecompiler::SrtReadTrace
+// `leaves`, as (flat offset, address)) and no other read of the walk (`otherReads`, sorted), so the
+// walk consumed none of the speculated words and only those slots hold a stale value. Returns the
+// (flat offset, address) of every such leaf, sorted by flat offset; nullopt when some speculated
+// address fails (the capture must be repeated without speculation).
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
 // capture read (ShaderRecompiler::SrtReadTrace), for a hit that differs only there. `runs` are the

@@ -3562,9 +3562,116 @@ void verifySrgbDepthCompareModes() {
     }
 }
 
+// The pending-write query of verifySpeculativeCapture: recorded GPU work writes [begin, end).
+std::uint64_t speculationPendingBegin = 0;
+std::uint64_t speculationPendingEnd = 0;
+AgcDriver::ShaderMemory::PendingWrite speculationQuery(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+    return address < speculationPendingEnd && speculationPendingBegin < address + bytes ? AgcDriver::ShaderMemory::PendingWrite::Sync : AgcDriver::ShaderMemory::PendingWrite::None;
+}
+
+// The draw path's speculative capture (GPU SRT fill, Driver::materializeDrawStage): a word whose
+// writer is pending is read without the hook, listed and never captured as a region; a capture
+// whose speculated words are only pure-slot leaves is accepted with those slots, one that
+// speculated a word the walk consumed (the table pointer) is refused; without speculation the
+// pending words are read and counted.
+void verifySpeculativeCapture() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    struct alignas(4096) GuestTables {
+        std::uint32_t payload = 0;
+        std::uint64_t table = 0;
+    };
+    static GuestTables guest;
+    guest.payload = 0x40a00000u;
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(&guest.table);
+    const auto payloadAddress = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    request.target = BufferTarget();
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    const auto covers = [](const std::vector<MemoryRegion>& regions, std::uint64_t address) {
+        return std::any_of(regions.begin(), regions.end(), [&](const MemoryRegion& region) { return region.guestAddress <= address && address < region.guestAddress + region.bytes.size(); });
+    };
+    static_cast<void>(AgcDriver::ShaderMemory::TakeSpeculationCounts());
+    {
+        // The payload (the pure slot's leaf) is pending: speculated, accepted for its slot.
+        speculationPendingBegin = payloadAddress;
+        speculationPendingEnd = payloadAddress + sizeof(std::uint32_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        memory.Speculate(true);
+        const auto capture = memory.Capture(request);
+        const auto speculated = memory.TakeSpeculated();
+        require(speculated.size() == 1 && speculated[0] == payloadAddress, "the pending payload was not speculated");
+        require(memory.TakeSpeculated().empty(), "TakeSpeculated did not clear its list");
+        const auto slots = AgcDriver::SpeculatedLeafSlots(speculated, capture->readTrace.leaves, capture->readTrace.otherReads);
+        require(slots.has_value() && slots->size() == 1 && slots->front().second == payloadAddress && slots->front().first == capture->readTrace.leaves.at(0).first, "a speculated pure leaf was not accepted for its slot");
+        require(capture->snapshot.flattenedSrt.at(slots->front().first) == guest.payload, "the speculated slot does not hold the bytes guest memory held");
+        const auto regions = memory.Regions();
+        require(!covers(regions, payloadAddress), "a speculated word joined the captured regions");
+        require(covers(regions, tableAddress), "the table pointer was not captured");
+        const auto counts = AgcDriver::ShaderMemory::TakeSpeculationCounts();
+        require(counts.speculated == 1 && counts.syncReads == 0, "the speculation counters disagree with the capture");
+    }
+    {
+        // The table pointer (consumed by the walk as the payload's address) is pending: refused.
+        speculationPendingBegin = tableAddress;
+        speculationPendingEnd = tableAddress + sizeof(std::uint64_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        memory.Speculate(true);
+        const auto capture = memory.Capture(request);
+        const auto speculated = memory.TakeSpeculated();
+        require(!speculated.empty() && std::all_of(speculated.begin(), speculated.end(), [&](std::uint64_t address) { return address >= tableAddress && address < tableAddress + sizeof(std::uint64_t); }), "the pending table pointer was not speculated");
+        require(!AgcDriver::SpeculatedLeafSlots(speculated, capture->readTrace.leaves, capture->readTrace.otherReads).has_value(), "a speculated word the walk consumed was accepted");
+        static_cast<void>(AgcDriver::ShaderMemory::TakeSpeculationCounts());
+    }
+    {
+        // Without speculation the pending payload is read (through the hook) and counted.
+        speculationPendingBegin = payloadAddress;
+        speculationPendingEnd = payloadAddress + sizeof(std::uint32_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        memory.CountSyncReads(true);
+        const auto capture = memory.Capture(request);
+        require(memory.TakeSpeculated().empty(), "a capture without speculation speculated");
+        require(covers(memory.Regions(), payloadAddress), "a payload read through the hook was not captured");
+        const auto slot = capture->readTrace.leaves.at(0).first;
+        require(capture->snapshot.flattenedSrt.at(slot) == guest.payload, "the read payload did not reach its slot");
+        const auto counts = AgcDriver::ShaderMemory::TakeSpeculationCounts();
+        require(counts.speculated == 0 && counts.syncReads == 1, "the hook read of a pending word was not counted");
+    }
+    speculationPendingBegin = speculationPendingEnd = 0;
+    {
+        // The rule alone: every speculated address must be a leaf and no other read.
+        using Leaves = std::vector<std::pair<std::uint32_t, std::uint64_t>>;
+        const Leaves leaves{{3u, 0x1000u}, {1u, 0x2000u}, {5u, 0x1000u}};
+        const std::vector<std::uint64_t> other{0x3000u};
+        const auto twice = AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x1000u, 0x1000u}, leaves, other);
+        require(twice.has_value() && *twice == Leaves{{3u, 0x1000u}, {5u, 0x1000u}}, "a word speculated twice did not fill each of its leaves once");
+        require(AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x2000u, 0x1000u}, leaves, other) == std::optional(Leaves{{1u, 0x2000u}, {3u, 0x1000u}, {5u, 0x1000u}}), "the slots are not sorted by flat offset");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x3000u}, leaves, other).has_value(), "a word only the walk read was accepted");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x4000u}, leaves, other).has_value(), "an untraced word was accepted");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x2000u}, leaves, std::vector<std::uint64_t>{0x2000u}).has_value(), "a leaf the walk also read was accepted");
+        require(AgcDriver::SpeculatedLeafSlots({}, leaves, other) == std::optional(Leaves{}), "nothing speculated needs fills");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--speculative-capture") {
+            verifySpeculativeCapture();
+            std::cout << "Speculative captures leave only pure SRT leaves to the GPU\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--frontend-pair") {
             verifyFrontendPair();
             std::cout << "Prepared frontend reuse preserves full and partial-thread programs\n";
@@ -3620,6 +3727,7 @@ int main(int argc, char** argv) {
         verifyBdaReadFallbackFunctions();
         verifyFunctionLdsBound();
         verifySrtReadPatching();
+        verifySpeculativeCapture();
         verifyGuardedNullPointers();
         verifyCubeDepthCompareMode();
         verifySrgbDepthCompareModes();

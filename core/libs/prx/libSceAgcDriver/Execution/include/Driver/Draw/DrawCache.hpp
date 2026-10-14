@@ -100,6 +100,8 @@ struct StageCapture {
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
+    // The FlattenedSrt words the capture left to the draw (Graphics::SrtFill).
+    std::vector<Graphics::SrtFill> srtFills;
 };
 
 struct RelocatableUserWord {

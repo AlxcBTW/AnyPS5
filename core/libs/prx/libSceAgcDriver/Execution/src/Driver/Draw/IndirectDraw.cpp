@@ -34,6 +34,11 @@ bool Driver::meshIndirectPeek() {
     return peek;
 }
 
+bool Driver::gpuSrtFills() {
+    static const bool fills = std::getenv("APS5_NO_GPU_DRAW_INDIRECT") == nullptr;
+    return fills;
+}
+
 bool Driver::indirectRecordsFinal(const Pm4::DrawParameters::IndirectDraw& indirect) {
     const auto bytes = indirect.RangeBytes();
     if (bytes == 0 || indirect.countIndirect) return false;

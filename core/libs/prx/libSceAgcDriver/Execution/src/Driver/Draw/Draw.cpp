@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -186,6 +187,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // A GPU-side mesh indirect draw (the shape IndirectCpuBeforeCapture keeps on the GPU, without a
+    // rect list or tessellation) captures speculatively: a flattened-SRT word whose writer is still
+    // pending is filled by the draw on the GPU instead of waited for here (materializeDrawStage,
+    // APS5_NO_GPU_DRAW_INDIRECT=1 waits as before). Every indirect draw's captures count their hook
+    // reads of pending words for the [srtfill] line.
+    if (drawParameters.indirect) {
+        shaderMemory.CountSyncReads(true);
+        const bool gpuSideMesh = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList && !IndirectCpuBeforeCapture(graphics.stages, graphics.rectList, drawParameters, localDevice->DrawIndirectSupport());
+        shaderMemory.Speculate(gpuSideMesh && gpuSrtFills() && !drawRelocationEnabled() && dumpTarget == 0 && dumpSlot1 == 0);
+    }
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<Graphics::CompiledShader> stages;
     results.reserve(programs.size() + 2u);
@@ -273,6 +284,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        stages.back().srtFills = drawHit ? matched[i]->srtFills : stageCaptures[i].srtFills;
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
 
@@ -284,6 +296,19 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    // A queued label over a word a stage leaves to the draw (Graphics::SrtFill) is recorded now:
+    // Graphics::Draw then finds it pending and reads that word through the flush hook.
+    const auto queuedLabelOverFill = [&] {
+        for (const auto& stage : stages) {
+            for (const auto& fill : stage.srtFills) {
+                for (const auto& label : deferredLabels().labels) {
+                    if (label.address < fill.address + sizeof(std::uint32_t) && fill.address < label.address + label.size) return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (queuedLabelOverFill()) recordQueuedLabelsBeforeRead(submission.queue);
 
     bool rectListBuilt = false;
 
@@ -396,6 +421,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 result = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected);
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                for (auto& stage : stages) {
+                    if (stage.program == &result) stage.srtFills = stageCaptures[programIndex].srtFills;
+                }
             }
             fold(*programResults[0], direct);
             if (graphics.rectList && patched.contains(0)) buildRectList();

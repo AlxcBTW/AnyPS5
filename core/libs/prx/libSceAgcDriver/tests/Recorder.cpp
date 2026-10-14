@@ -2018,6 +2018,92 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// The GPU SRT fill of a draw (Graphics::RecordSrtFills, Driver::materializeDrawStage): the word a
+// recorded GPU store wrote into a host import reaches the stage's FlattenedSrt buffer through the
+// copy, ordered after that store, at its word offset, and no other word of the buffer changes; a
+// build of a stage with fills gives that buffer a transfer destination and is never reusable.
+// Returns false when the device or host cannot import guest memory (skipped).
+bool srtFillTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: SRT fills not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the watched block refused: SRT fills not tested\n";
+        return false;
+    }
+    auto* guest = static_cast<std::uint32_t*>(block);
+    constexpr std::size_t wordIndex = 0x50;
+    const auto word = address + wordIndex * sizeof(std::uint32_t);
+    guest[wordIndex] = 0x11111111u;
+    guest[wordIndex + 1] = 0x33333333u;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    // Word 2 holds the bytes the capture saw before the writer ran.
+    binding.guestDescriptor = {0xa0u, 0xa1u, 0x11111111u, 0xa3u};
+    program.bindings.push_back(binding);
+    const CompiledShader filled{ShaderRecompiler::ShaderStage::Compute, &program, 0, {{2u, word}}};
+    const CompiledShader plain{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Require(ShaderResources::NeverReusable(std::span(&filled, 1)), "a stage with SRT fills counts as reusable");
+    Require(!ShaderResources::NeverReusable(std::span(&plain, 1)), "a stage without SRT fills counts as never reusable");
+    ShaderResources resources(context, filled);
+    auto* buffer = resources.FlattenedSrtBuffer(0);
+    Require(buffer != nullptr && buffer->Bytes().size() == 4 * sizeof(std::uint32_t), "the stage's FlattenedSrt buffer is missing");
+    Require(resources.FlattenedSrtBuffer(1) == nullptr, "a stage the build does not have has a FlattenedSrt buffer");
+    {
+        const auto* words = reinterpret_cast<const std::uint32_t*>(buffer->Bytes().data());
+        Require(words[0] == 0xa0u && words[1] == 0xa1u && words[2] == 0x11111111u && words[3] == 0xa3u, "the FlattenedSrt buffer does not hold the binding's words");
+    }
+    // The writer: a GPU store of the word's new value into the import, recorded before the fill
+    // (a dispatch in place does the same in a title); the copy must see its result.
+    const std::uint32_t written = 0x22222222u;
+    const auto commands = recorder.Commands();
+    context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer")(commands, import->buffer, word - import->base, sizeof(written), &written);
+    const SrtFillCopy fill{buffer->Handle(), 2 * sizeof(std::uint32_t), import, word};
+    RecordSrtFills(context, commands, &recorder, std::span(&fill, 1));
+    Require(!Recorder::ReadTracking() || recorder.PendingReadOverlaps(word, sizeof(std::uint32_t), false), "the fill's source word was not noted as read in place");
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    const auto* words = reinterpret_cast<const std::uint32_t*>(buffer->Bytes().data());
+    Require(words[2] == written, "the fill did not copy the word its writer produced");
+    Require(words[0] == 0xa0u && words[1] == 0xa1u && words[3] == 0xa3u, "the fill changed other FlattenedSrt words");
+    Require(guest[wordIndex] == written && guest[wordIndex + 1] == 0x33333333u, "the writer's store did not land in guest memory as recorded");
+    Require(!recorder.PendingReadOverlaps(word, sizeof(std::uint32_t), false), "the finished batch still reads the fill's word");
+    std::cout << "SRT fill tests passed\n";
+    return true;
+}
+
 void drawSnapshotPatchTests(const Device& device) {
     const DrawSnapshotsOn snapshotsOn;
     const auto& context = device.GetContext();
@@ -6404,6 +6490,9 @@ int main(int argc, char** argv) {
             drawDescriptorWriteTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--srt-fill-only") {
+            return srtFillTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-bindings-only") {
             if (device.GetContext().hostImportAlignment == 0) {

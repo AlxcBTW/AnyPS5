@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchRelocation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -44,6 +45,9 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    // Draw stages: the FlattenedSrt words a hit's draw fills (StageCapture::srtFills; empty for
+    // dispatches).
+    std::vector<Graphics::SrtFill> srtFills;
 
     // Address-free entries (DispatchRelocation.hpp): what of the stored words only carries an
     // address (an empty one still pins every user word); null with APS5_NO_DISPATCH_CONTENT_KEY=1.

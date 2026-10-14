@@ -6,10 +6,42 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Programs whose speculative capture failed once (a speculated word was consumed by the walk, or
+// read where no pure flat-SRT leaf reads it): they capture without speculation from then on. A
+// stale entry (the address reused by other code) only costs that code its speculation.
+std::mutex refusedMutex;
+std::unordered_set<std::uint64_t>& refusedPrograms() {
+    static std::unordered_set<std::uint64_t> programs;
+    return programs;
+}
+
+bool speculationRefused(std::uint64_t program) {
+    std::lock_guard lock(refusedMutex);
+    return refusedPrograms().contains(program);
+}
+
+void refuseSpeculation(std::uint64_t program) {
+    std::lock_guard lock(refusedMutex);
+    refusedPrograms().insert(program);
+}
+
+std::atomic<std::uint64_t> speculativeCaptures{0}, filledCaptures{0}, filledWords{0}, repeatedCaptures{0}, refusedCaptures{0};
+
+}
+
+Driver::SrtFillCaptureCounts Driver::TakeSrtFillCaptureCounts() {
+    return {speculativeCaptures.exchange(0, std::memory_order_relaxed), filledCaptures.exchange(0, std::memory_order_relaxed), filledWords.exchange(0, std::memory_order_relaxed), repeatedCaptures.exchange(0, std::memory_order_relaxed), refusedCaptures.exchange(0, std::memory_order_relaxed)};
+}
 
 ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
     PerformanceTimer timing("Shader.DrawStage");
@@ -30,10 +62,55 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
     stageCapture.pushOffset = pushOffset;
-    const auto capture = [&] {
+    const auto captureOnce = [&] {
         const SampledReadScope sampling(evidenceReads);
         return shaderMemory.Capture(invocation);
-    }();
+    };
+    // A speculating draw (Driver::draw: a GPU-side mesh indirect draw, APS5_NO_GPU_DRAW_INDIRECT=1
+    // off) reads a word that recorded GPU work still writes without waiting for it. The capture
+    // stands when every such word is only the leaf of pure flat-SRT slots (the walk consumed none
+    // of them: SpeculatedLeafSlots); the draw then fills those FlattenedSrt words from guest memory
+    // on the GPU (Graphics::Draw), after the writer, and the stale bytes in the snapshot never
+    // reach a shader. Otherwise the capture is repeated without speculation, which waits as before,
+    // and the program never speculates again.
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    stageCapture.srtFills.clear();
+    const bool speculating = shaderMemory.Speculating();
+    if (speculating && speculationRefused(program.binary.codeAddress)) {
+        ++refusedCaptures;
+        shaderMemory.Speculate(false);
+    }
+    if (shaderMemory.Speculating()) {
+        ++speculativeCaptures;
+        try {
+            capture = captureOnce();
+        } catch (...) {
+            if (shaderMemory.TakeSpeculated().empty()) throw;
+            capture = nullptr;
+        }
+        if (capture != nullptr) {
+            const auto speculated = shaderMemory.TakeSpeculated();
+            if (!speculated.empty()) {
+                const auto slots = SpeculatedLeafSlots(speculated, capture->readTrace.leaves, capture->readTrace.otherReads);
+                if (slots.has_value()) {
+                    for (const auto& [slot, address] : *slots) stageCapture.srtFills.push_back({slot, address});
+                    ++filledCaptures;
+                    filledWords += slots->size();
+                } else {
+                    capture = nullptr;
+                }
+            }
+        }
+        if (capture == nullptr) {
+            ++repeatedCaptures;
+            refuseSpeculation(program.binary.codeAddress);
+            shaderMemory.Speculate(false);
+            capture = captureOnce();
+        }
+    } else {
+        capture = captureOnce();
+    }
+    shaderMemory.Speculate(speculating);
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.userDataUse = capture->userDataUse;
@@ -97,6 +174,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             variant->forgetSerial = stageCapture.forgetSerial;
             variant->pushOffset = stageCapture.pushOffset;
             if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
+            variant->srtFills = stageCapture.srtFills;
 
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
