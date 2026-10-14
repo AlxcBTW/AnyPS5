@@ -76,6 +76,8 @@ public:
     void WaitRecorded(std::uint64_t serial);
     // exp (APS5_EXP_WAIT_WAKE=2): Recorder::WaitNextCompletion, without the mutex (nullopt: no recorder or timeline).
     std::optional<bool> WaitNextGpuCompletion(std::chrono::microseconds bound);
+    // WaitRecorded bounded by `timeoutUs`; false when the serial was not reached in time.
+    bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutUs);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();

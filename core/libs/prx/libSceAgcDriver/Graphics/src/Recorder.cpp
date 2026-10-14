@@ -1228,6 +1228,17 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     return labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
 }
 
+std::optional<std::uint64_t> Recorder::LabelWriterSerial(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard tableLock(labelTableMutex);
+    if (labelTableOwner == nullptr || bytes == 0) return std::nullopt;
+    std::optional<std::uint64_t> serial;
+    for (auto it = labelTableOwner->labels.lower_bound(address); it != labelTableOwner->labels.end() && it->first < address + bytes; ++it) {
+        if (it->second.batch == nullptr) continue;
+        serial = std::max(serial.value_or(0), it->second.batch->publishedSerial.load(std::memory_order_acquire));
+    }
+    return serial;
+}
+
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
     std::lock_guard tableLock(labelTableMutex);
     return labelTableOwner != nullptr && labelTableOwner->wideLabelInLocked(address, bytes);
@@ -3268,6 +3279,7 @@ void Recorder::Submit() {
     Check(function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence), "vkQueueSubmit recorder");
     batch->submitted = true;
     batch->serial = ++submissions;
+    batch->publishedSerial.store(batch->serial, std::memory_order_release);
     batch->submittedAt = std::chrono::steady_clock::now();
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
@@ -3361,6 +3373,19 @@ std::optional<bool> Recorder::WaitNextCompletion(std::chrono::microseconds bound
     const auto result = waitSemaphores(context.device, &wait, static_cast<std::uint64_t>(bound.count()) * 1000u);
     if (result == VK_TIMEOUT) return false;
     Check(result, "vkWaitSemaphoresKHR recorder (next completion)");
+    return true;
+}
+
+bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNs) {
+    if (timeline == VK_NULL_HANDLE || serial == 0) return true;
+    const UnlockedWaiter waiter{id};
+    VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
+    wait.semaphoreCount = 1;
+    wait.pSemaphores = &timeline;
+    wait.pValues = &serial;
+    const auto result = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context.device, &wait, timeoutNs);
+    if (result == VK_TIMEOUT) return false;
+    Check(result, "vkWaitSemaphoresKHR recorder");
     return true;
 }
 

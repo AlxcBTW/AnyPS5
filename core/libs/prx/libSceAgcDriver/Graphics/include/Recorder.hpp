@@ -198,6 +198,8 @@ public:
     // passes the value it holds now (the next batch completes) or `bound` elapses: true when a batch
     // completed, false at the bound, nullopt without a timeline (the caller sleeps its timer instead).
     std::optional<bool> WaitNextCompletion(std::chrono::microseconds bound);
+    // As WaitSerial for at most `timeoutNs`; false when the serial was not reached in time.
+    bool WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNs);
     // Under the mutex: finishes (completions, release) the in-flight batches up to `serial`, from the
     // front only; tolerates batches another thread finished meanwhile. Later batches stay in flight.
     void FinishUpTo(std::uint64_t serial);
@@ -331,6 +333,10 @@ public:
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
+    // The newest submitted batch serial among the recorded labels over [address, address + bytes):
+    // 0 when only the open batch holds one, nullopt when no recorded label covers the range. Table
+    // mutex only, so a WAIT_REG_MEM poller can pick a serial to wait on (WaitSerialFor).
+    static std::optional<std::uint64_t> LabelWriterSerial(std::uint64_t address, std::size_t bytes);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
@@ -561,6 +567,8 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        // `serial` published for the label table readers (LabelWriterSerial); 0 until submitted.
+        std::atomic<std::uint64_t> publishedSerial{0};
         bool submitted = false;
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
