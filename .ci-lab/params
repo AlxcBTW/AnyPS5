@@ -1,0 +1,5 @@
+name=yolo-skip
+build_type=Release
+g1=on
+cmake=
+artifact=lab-libs-yolo-skip-67c727cabf-35916
