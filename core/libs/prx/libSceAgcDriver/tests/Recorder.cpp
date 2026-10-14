@@ -6046,6 +6046,14 @@ int main(int argc, char** argv) {
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-bindings-only") {
+            resourceReadTests(device, recorder);
+            misalignedSnapshotTests(device, recorder);
+            misalignedRegionTests(device, recorder);
+            drawSnapshotReuseTests(device, recorder);
+            std::cout << "Draw binding tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             std::cout << "Draw snapshot cap tests passed\n";
