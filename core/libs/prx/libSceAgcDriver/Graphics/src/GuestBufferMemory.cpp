@@ -2878,6 +2878,102 @@ std::uint64_t atomicStageMax() {
     return bytes;
 }
 
+// Shadow-sourced staging (lazy write-back). A region bound in place reads its import, so the
+// flush before its use stores the storage images pending over it into the import's unit shadow
+// (VRAM) and then publishes every fresh unit into the import (PublishScope::Whole, over the bus),
+// where the shader reads it over the bus again. At the SotS title that was ~230 MiB of publishes
+// per present (16 regions of ~14 MiB), next to ~490 MiB of write-backs that stay in device memory.
+// A device-local staged region needs no publish: its copy-in reads each fresh unit from its slab
+// and only the other units from the import (ShadowSources, as a storage upload does). So its flush
+// stores without publishing (PublishScope::None) and the results stay in the shadow until a
+// host-facing consumer publishes them (the flush hook, a region bound in place, a copy, a label,
+// scanout, eviction, retirement), as storage results did before they met a buffer binding.
+// A written range's copy-back stamps the units it covers. Units it covers wholly get the staged
+// bytes (the slab's, plus the shader's stores) from the copy-back itself; units it covers partly are
+// published first (publishEdges), so the rest of each such unit is in the import before the stamp
+// drops the unit from the shadow.
+// Besides the staging window's regions (whose copy-in now prefers the slab), a region of a
+// dispatch build that would be bound in place is staged instead when, after its flush, at least
+// half of it (and at least one unit) reads from slabs and it is at most APS5_SHADOW_STAGE_MAX_KIB
+// (32768): its copy-in then moves less over the bus than the publish it replaces
+// (ShadowStageAccepted). The decision is the build's: a reused build copies in from the shadow on
+// every use, as a staged region always does. Written ones are copied back like any staged region
+// (the same accepted trade-off: a CPU write between copy-in and copy-back is rolled back for the
+// batch's latency).
+// APS5_NO_LAZY_WRITEBACK=1 restores the publish-first order everywhere; APS5_NO_SHADOW_STAGE=1
+// keeps the slab-sourced copy-in of the staging window's regions and stages nothing more.
+bool shadowStageEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SHADOW_STAGE") != nullptr;
+    return LazyWritebackEnabled() && !disabled;
+}
+
+std::uint64_t shadowStageMax() {
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_MAX_KIB", 32768);
+    return bytes;
+}
+
+// The device memory the regions staged from the shadow beyond the staging window may hold at once
+// (every cached build keeps its own buffer): APS5_SHADOW_STAGE_BUDGET_MIB (384). Past it a region
+// is bound in place as before (counted as a device refusal).
+std::uint64_t shadowStageBudget() {
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", 384) << 10u;
+    return bytes;
+}
+
+std::atomic<std::uint64_t>& shadowStageLive() {
+    static std::atomic<std::uint64_t> live{0};
+    return live;
+}
+
+// APS5_PROFILE_DRAW: the [lazywb] line (10 s deltas, printed with [buffers] staging).
+struct LazyStats {
+    // Copy-ins that read from the unit shadow: regions, bytes from slabs, bytes from imports.
+    std::atomic<std::uint64_t> sourced{0};
+    std::atomic<std::uint64_t> slabBytes{0};
+    std::atomic<std::uint64_t> importBytes{0};
+    // Regions staged from the shadow instead of bound in place (built), those written.
+    std::atomic<std::uint64_t> staged{0};
+    std::atomic<std::uint64_t> stagedBytes{0};
+    std::atomic<std::uint64_t> stagedWritten{0};
+    // Candidates bound in place after all: too few fresh units, too large, no device buffer.
+    std::atomic<std::uint64_t> refusedFresh{0};
+    std::atomic<std::uint64_t> refusedFreshBytes{0};
+    std::atomic<std::uint64_t> refusedSize{0};
+    std::atomic<std::uint64_t> refusedSizeBytes{0};
+    std::atomic<std::uint64_t> refusedDevice{0};
+    // Units published at the edges of written ranges (publishEdges).
+    std::atomic<std::uint64_t> edgeUnits{0};
+    // Regions bound in place whose flush published units, by read-only / written, and those over 16 MiB.
+    std::atomic<std::uint64_t> inPlaceRead{0};
+    std::atomic<std::uint64_t> inPlaceReadUnits{0};
+    std::atomic<std::uint64_t> inPlaceWritten{0};
+    std::atomic<std::uint64_t> inPlaceWrittenUnits{0};
+    std::atomic<std::uint64_t> inPlaceLarge{0};
+    std::atomic<std::uint64_t> inPlaceLargeUnits{0};
+};
+
+LazyStats& Lazy() {
+    static LazyStats stats;
+    return stats;
+}
+
+void reportLazy() {
+    auto& stats = Lazy();
+    constexpr std::size_t Count = 17;
+    const std::array<std::uint64_t, Count> now{stats.sourced.load(), stats.slabBytes.load(), stats.importBytes.load(), stats.staged.load(), stats.stagedBytes.load(), stats.stagedWritten.load(), stats.refusedFresh.load(), stats.refusedFreshBytes.load(), stats.refusedSize.load(), stats.refusedSizeBytes.load(), stats.refusedDevice.load(), stats.edgeUnits.load(), stats.inPlaceRead.load(), stats.inPlaceReadUnits.load(), stats.inPlaceWritten.load(), stats.inPlaceWrittenUnits.load(), stats.inPlaceLarge.load()};
+    static std::array<std::uint64_t, Count> last{};
+    std::array<std::uint64_t, Count> d{};
+    for (std::size_t k = 0; k < Count; ++k) d[k] = now[k] - last[k];
+    last = now;
+    const auto largeUnits = stats.inPlaceLargeUnits.load();
+    static std::uint64_t lastLargeUnits = 0;
+    const auto dLargeUnits = largeUnits - lastLargeUnits;
+    lastLargeUnits = largeUnits;
+    constexpr double mib = 1048576.0;
+    constexpr double unitMib = 65536.0 / 1048576.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[lazywb] (10 s) %s; copy-ins from the unit shadow: %llu regions, %.1f MiB from slabs, %.1f MiB from imports; staged instead of in place: %llu regions (%.1f MiB, %llu written), refused: fresh %llu (%.1f MiB), size %llu (%.1f MiB), device %llu; edge publishes %.1f MiB; in-place region publishes: read-only %llu / %.1f MiB, written %llu / %.1f MiB, regions over 16 MiB %llu / %.1f MiB\n", LazyWritebackEnabled() ? (shadowStageEnabled() ? "on" : "on, window only") : "off", static_cast<unsigned long long>(d[0]), d[1] / mib, d[2] / mib, static_cast<unsigned long long>(d[3]), d[4] / mib, static_cast<unsigned long long>(d[5]), static_cast<unsigned long long>(d[6]), d[7] / mib, static_cast<unsigned long long>(d[8]), d[9] / mib, static_cast<unsigned long long>(d[10]), d[11] * unitMib, static_cast<unsigned long long>(d[12]), d[13] * unitMib, static_cast<unsigned long long>(d[14]), d[15] * unitMib, static_cast<unsigned long long>(d[16]), dLargeUnits * unitMib);
+}
+
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
@@ -2955,6 +3051,7 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    reportLazy();
 }
 
 }
@@ -2964,6 +3061,9 @@ void ShutdownGuestBufferWorkers() {
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
+    for (const auto& region : regions) {
+        if (region.budgetBytes != 0) shadowStageLive().fetch_sub(region.budgetBytes, std::memory_order_relaxed);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
     // A staged region whose last use recorded its copy-in but no copy-back (the use threw before
@@ -2989,6 +3089,120 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(), SweptShadowMax) : writtenShadowMax());
+}
+
+bool LazyWritebackEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_LAZY_WRITEBACK") == nullptr && UnitShadowEnabled();
+    return enabled;
+}
+
+bool ShadowStageAccepted(std::uint64_t regionBytes, std::uint64_t shadowBytes, std::uint64_t maxBytes) {
+    constexpr std::uint64_t unit = 65536;
+    return regionBytes != 0 && regionBytes <= maxBytes && shadowBytes <= regionBytes && shadowBytes >= std::min(unit, regionBytes) && shadowBytes * 2 >= regionBytes;
+}
+
+bool GuestBufferMemory::shadowStagingCandidate(const Region& region, bool addressable) const {
+    if (!LazyWritebackEnabled() || Recorder::Active() == nullptr || space != nullptr) return false;
+    if (stagingEligible(region, addressable)) return true;
+    if (!shadowStageEnabled() || !stagingAllowed || addressable || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr || sparseHeapCandidate(region)) return false;
+    return region.end - region.begin <= shadowStageMax();
+}
+
+bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto bytes = region.end - region.begin;
+    if (!shadowStageEnabled() || region.copySource == VK_NULL_HANDLE || region.begin < region.copySourceBase || region.end > region.copySourceBase + region.copySourceBytes) return false;
+    // Nothing fresh and unpublished over the region: the flush published nothing, so in place
+    // costs nothing more.
+    if (!AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(bytes))) return false;
+    auto& stats = Lazy();
+    if (bytes > shadowStageMax()) {
+        if (profile) {
+            stats.refusedSize.fetch_add(1, std::memory_order_relaxed);
+            stats.refusedSizeBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    HostImport import{};
+    import.base = region.copySourceBase;
+    import.bytes = region.copySourceBytes;
+    import.buffer = region.copySource;
+    const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
+    std::uint64_t shadowBytes = 0;
+    for (const auto& source : ShadowSources(context, import, region.begin, std::span(&run, 1), {}, false)) {
+        if (source.shadow) shadowBytes += source.end - source.begin;
+    }
+    if (!ShadowStageAccepted(bytes, shadowBytes, shadowStageMax())) {
+        if (profile) {
+            stats.refusedFresh.fetch_add(1, std::memory_order_relaxed);
+            stats.refusedFreshBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    auto& live = shadowStageLive();
+    if (live.fetch_add(bytes, std::memory_order_relaxed) + bytes > shadowStageBudget()) {
+        live.fetch_sub(bytes, std::memory_order_relaxed);
+        if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+    if (buffer == nullptr) {
+        live.fetch_sub(bytes, std::memory_order_relaxed);
+        if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    region.budgetBytes = bytes;
+    region.buffer = std::move(buffer);
+    region.direct = nullptr;
+    region.snapshot.clear();
+    region.gpuCopy = true;
+    region.deviceLocal = true;
+    region.shadowSourced = true;
+    if (profile) {
+        stats.staged.fetch_add(1, std::memory_order_relaxed);
+        stats.stagedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) stats.stagedWritten.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void GuestBufferMemory::publishEdges(const Region& region) const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::uint64_t units = 0;
+    for (const auto& [begin, end] : writes) {
+        const auto from = std::max(begin, region.begin);
+        const auto to = std::min(end, region.end);
+        if (from >= to || !AnyShadowedOverlaps(from, static_cast<std::size_t>(to - from))) continue;
+        units += PublishShadow(from, static_cast<std::size_t>(to - from), PublishScope::PartialUnits, PublishReason::Region);
+    }
+    if (profile && units != 0) Lazy().edgeUnits.fetch_add(units, std::memory_order_relaxed);
+}
+
+bool GuestBufferMemory::ShadowSourced(std::uint64_t begin, std::uint64_t end) const {
+    if (!uploaded || committed) return false;
+    for (const auto& region : regions) {
+        if (region.shadowSourced && region.gpuCopy && region.deviceLocal && region.begin <= begin && end <= region.end) return true;
+    }
+    return false;
+}
+
+void GuestBufferMemory::PublishShadowSourcedEdges() const {
+    if (!uploaded || committed) return;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    for (const auto& region : regions) {
+        if (region.shadowSourced && region.gpuCopy && region.deviceLocal) publishEdges(region);
+    }
+}
+
+void GuestBufferMemory::NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units) {
+    if (units == 0) return;
+    auto& stats = Lazy();
+    (written ? stats.inPlaceWritten : stats.inPlaceRead).fetch_add(1, std::memory_order_relaxed);
+    (written ? stats.inPlaceWrittenUnits : stats.inPlaceReadUnits).fetch_add(units, std::memory_order_relaxed);
+    if (regionBytes > (std::uint64_t{16} << 20u)) {
+        stats.inPlaceLarge.fetch_add(1, std::memory_order_relaxed);
+        stats.inPlaceLargeUnits.fetch_add(units, std::memory_order_relaxed);
+    }
 }
 
 void GuestBufferMemory::UploadPrepare(bool addressable) {
@@ -3163,7 +3377,20 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     uploaded = true;
-    for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
+    // Lazy write-back: a written range inside a region that may be staged from the unit shadow is
+    // stored without a publish. Whatever path the region takes below publishes before anything
+    // reads its import (in place, a copy from it, a CPU copy), or sources its copy-in from the
+    // shadow and publishes the edges of its written ranges (see "shadow-sourced staging").
+    for (const auto& [begin, end] : writes) {
+        Region* inside = nullptr;
+        if (space == nullptr) {
+            const auto found = std::upper_bound(regions.begin(), regions.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+            if (found != regions.begin() && std::prev(found)->end >= end) inside = &*std::prev(found);
+        }
+        const bool deferred = inside != nullptr && shadowStagingCandidate(*inside, addressable);
+        if (deferred) inside->deferredPublish = true;
+        StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", deferred ? PublishScope::None : PublishScope::Whole);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     if (context.hostImportAlignment != 0) {
@@ -3280,6 +3507,11 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 // region in place (Descriptor prefers `direct`), and a kept buffer would count as copied.
                 region.buffer.reset();
                 region.deviceLocal = false;
+                // The import's identity, for a stage from the unit shadow after the flush below
+                // (stageFromShadow), taken under the lock as for a copy.
+                region.copySource = entry->buffer;
+                region.copySourceBase = entry->base;
+                region.copySourceBytes = entry->bytes;
             } else if (entry != nullptr && recorder != nullptr && (staged || gpuCopyEligible(region))) {
                 // Misaligned in the import (or staged): the GPU copies the sub-range out of it. The
                 // handle and base are taken now, under the import lock: a reconcile by the flush
@@ -3289,6 +3521,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 region.deviceLocal = staged;
                 region.copySource = entry->buffer;
                 region.copySourceBase = entry->base;
+                region.copySourceBytes = entry->bytes;
             }
         }
         if (region.direct != nullptr) {
@@ -3297,7 +3530,25 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // an address-based shader maps are exempt (they hold every pending image, and such shaders
             // do not read texture memory through pointers); APS5_BDA_FLUSH=1 flushes for them too.
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
-            if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            if (!(addressable && region.hostBacked) || bdaFlush) {
+                // Lazy write-back: the pending images are stored into the unit shadow first, without
+                // a publish; when enough of the region is then fresh there, the region is staged
+                // from the shadow instead (stageFromShadow), else the Whole flush below publishes
+                // as before. The batch is opened first, as for a copy.
+                const std::pair<std::uint64_t, std::uint64_t> whole{region.begin, region.end};
+                if (recorder != nullptr && (region.deferredPublish || shadowStagingCandidate(region, addressable)) && (AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(bytes)) || StorageTexture::AnyPendingOverlaps(std::span(&whole, 1)))) {
+                    static_cast<void>(recorder->Commands());
+                    StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
+                    if (stageFromShadow(region, addressable)) {
+                        publishEdges(region);
+                        gpuCopies.push_back(&region);
+                        continue;
+                    }
+                }
+                const auto before = profile ? ThreadPublishedUnits() : 0;
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+                if (profile) NoteInPlacePublish(WritesOverlap(region.begin, static_cast<std::size_t>(bytes)), bytes, ThreadPublishedUnits() - before);
+            }
             continue;
         }
         if (copyOnGpu) {
@@ -3307,11 +3558,29 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
             static_cast<void>(recorder->Commands());
-            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            // Lazy write-back: a staged region's copy-in reads the fresh units from the unit shadow,
+            // so the flush stores without a publish (its device buffer is made now: the host-buffer
+            // fallback of recordGpuCopies copies from the import and needs the publish).
+            if (region.deviceLocal && region.buffer == nullptr && shadowStagingCandidate(region, addressable)) {
+                region.buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
+                if (region.buffer == nullptr) {
+                    region.deviceLocal = false;
+                    region.unstaged = true;
+                }
+            }
+            if (region.deviceLocal && region.buffer != nullptr && shadowStagingCandidate(region, addressable)) {
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region", PublishScope::None);
+                region.shadowSourced = true;
+                publishEdges(region);
+            } else {
+                StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            }
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
         }
+        // A written range flushed without a publish above: published before the CPU copy reads.
+        if (region.deferredPublish) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "written buffer range");
         if (region.deviceLocal) {
             // The staging shadow UploadPrepare made cannot take the CPU copy (no host mapping): the
             // region falls back to a host buffer of its own.
@@ -3539,6 +3808,42 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
+        }
+        if (region->shadowSourced && region->deviceLocal) {
+            // Shadow-sourced staging: each fresh unit of the import's unit shadow from its slab
+            // (nothing was published for this use), the rest from the import, as a storage upload
+            // reads them. The slabs are kept by the batch like the import.
+            HostImport import{};
+            import.base = region->copySourceBase;
+            import.bytes = region->copySourceBytes;
+            import.buffer = region->copySource;
+            const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
+            std::uint64_t slabBytes = 0, importBytes = 0;
+            for (const auto& source : ShadowSources(context, import, region->begin, std::span(&run, 1), {}, false)) {
+                CopyBuffer(context, commands, source.buffer, source.offset, region->buffer->Handle(), source.begin, source.end - source.begin);
+                if (source.slab != nullptr) recorder->Keep(source.slab);
+                if (source.shadow) {
+                    slabBytes += source.end - source.begin;
+                } else {
+                    importBytes += source.end - source.begin;
+                    recorder->NotePendingRead(region->begin + source.begin, static_cast<std::size_t>(source.end - source.begin), Recorder::ReadKind::GpuCopy);
+                }
+            }
+            recorder->Keep(region->buffer);
+            region->snapshot.clear();
+            traceStaged(region->begin, region->end, region->atomic);
+            if (profile) {
+                stagedAny = true;
+                Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
+                Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+                Copies().staged.fetch_add(1, std::memory_order_relaxed);
+                Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
+                if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+                Lazy().sourced.fetch_add(1, std::memory_order_relaxed);
+                Lazy().slabBytes.fetch_add(slabBytes, std::memory_order_relaxed);
+                Lazy().importBytes.fetch_add(importBytes, std::memory_order_relaxed);
+            }
+            continue;
         }
         std::vector<std::byte> expected;
         const auto address = region->begin;

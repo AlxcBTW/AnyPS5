@@ -23,6 +23,9 @@ constexpr std::uint64_t UnitBytes = 65536;
 constexpr std::size_t ReasonCount = static_cast<std::size_t>(PublishReason::Count);
 constexpr const char* ReasonNames[ReasonCount] = {"hook", "region", "indirect", "copy-src", "copy-dst", "fill", "fill-clear", "label", "keys", "scanout", "validate", "upload", "tail", "evict", "retire", "teardown"};
 
+// Units PublishShadow copied on this thread (ThreadPublishedUnits).
+thread_local std::uint64_t threadPublishedUnits = 0;
+
 std::uint64_t BudgetBytes() {
     static const std::uint64_t budget = [] {
         const char* text = std::getenv("APS5_UNIT_SHADOW_MIB");
@@ -486,7 +489,12 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     }
     std::size_t units = 0;
     for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason);
+    threadPublishedUnits += units;
     return units;
+}
+
+std::uint64_t ThreadPublishedUnits() {
+    return threadPublishedUnits;
 }
 
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {

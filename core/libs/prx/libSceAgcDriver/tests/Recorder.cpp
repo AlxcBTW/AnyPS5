@@ -2649,6 +2649,149 @@ void unitShadowTests(const Device& device, Recorder& recorder) {
     Require(words[127 * unit] == 0x66 && words[128 * unit] == 0x77, "the retire did not publish the second slab's units covered by the old registration");
 }
 
+// Lazy write-back (shadow-sourced staging, GuestBufferMemory.cpp): a staged region's copy-in reads
+// the fresh units of the unit shadow from their slab and publishes nothing; a written range's
+// partly covered units are published before its copy-back stamps them; a region less than half of
+// which is fresh stays bound in place and is published as before.
+void shadowStagingTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::uint64_t max = std::uint64_t{32} << 20u;
+    Require(ShadowStageAccepted(14u << 20u, 14u << 20u, max) && ShadowStageAccepted(4096, 4096, max) && ShadowStageAccepted(4 * unit, 2 * unit, max) && ShadowStageAccepted(max, max / 2, max), "a region at least half fresh within the cap was refused");
+    Require(!ShadowStageAccepted(14u << 20u, 6u << 20u, max) && !ShadowStageAccepted(max + unit, max + unit, max) && !ShadowStageAccepted(1u << 20u, unit / 2, max) && !ShadowStageAccepted(0, 0, max) && !ShadowStageAccepted(unit, 2 * unit, max), "a region less than half fresh, over the cap, empty or inconsistent was accepted");
+    const auto& context = device.GetContext();
+    if (!LazyWritebackEnabled() || context.hostImportAlignment == 0) {
+        std::cout << "lazy write-back off or host imports unavailable: shadow-sourced staging not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 2u << 20u;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the staging test block refused: shadow-sourced staging not tested\n";
+        return;
+    }
+    if (!Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: shadow-sourced staging not tested\n";
+        return;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* guest = static_cast<const std::uint8_t*>(block);
+    const auto at = [&](std::uint64_t index) { return address + index * unit; };
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    // Whole units [first, first + count) retiled with `value`, as a storage write-back records it.
+    const auto retile = [&](std::uint64_t first, std::uint64_t count, std::uint8_t value) {
+        auto destination = ShadowDestinationFor(context, *import, at(first), at(first + count));
+        Require(destination.has_value() && destination->seedUnits.empty(), "no slab destination for the test retile");
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(count * unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), value, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, count * unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        std::vector<ShadowedRange> ranges;
+        for (auto index = first; index < first + count; ++index) ranges.push_back({at(index), at(index + 1), destination->slab});
+        MarkShadowed(*import, ranges, TrackerGeneration());
+    };
+    // The bytes the region's binding holds, read back through a host buffer after a sync.
+    const auto boundBytes = [&](const GuestBufferMemory& memory, std::uint64_t begin, std::uint64_t length) {
+        std::uint32_t adjustment = 0;
+        const auto info = memory.Descriptor(begin, static_cast<std::size_t>(length), adjustment);
+        Require(adjustment == 0, "the test view needs an adjustment");
+        auto readback = std::make_shared<Buffer>(context, static_cast<std::size_t>(length), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(readback);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{info.offset, 0, length};
+        copyBuffer(commands, info.buffer, readback->Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        const auto copied = readback->Bytes();
+        return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(copied.data()), reinterpret_cast<const std::uint8_t*>(copied.data()) + copied.size());
+    };
+    const auto all = [](const std::vector<std::uint8_t>& values, std::uint8_t value) { return !values.empty() && std::all_of(values.begin(), values.end(), [value](std::uint8_t entry) { return entry == value; }); };
+    // A read-only region past the staging window, every unit fresh: staged, read from the slab,
+    // nothing published.
+    retile(2, 4, 0x22);
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddReadable(at(2), static_cast<std::size_t>(4 * unit));
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty() && memory.ShadowSourced(at(2), at(6)), "a read-only region fresh in the unit shadow was not staged from it");
+        Require(all(boundBytes(memory, at(2), 4 * unit), 0x22), "the shadow-sourced copy-in did not read the slab");
+        Require(guest[2 * unit] == 0x11 && guest[6 * unit - 1] == 0x11, "the shadow-sourced staging published the units");
+        Require(AnyShadowedOverlaps(at(2), static_cast<std::size_t>(4 * unit)), "the staged units are no longer shadowed");
+        memory.RecordCopyBacks(recorder);
+        recorder.Sync();
+        Require(guest[2 * unit] == 0x11, "a read-only staged region was copied back");
+    }
+    // A written range in the staging window over fresh units 8..11, covering units 8 and 11 partly:
+    // those two are published before the copy-in, units 9 and 10 are not; the copy-back leaves the
+    // slab's bytes in the import and its stamp sends unit 9 back to the import.
+    retile(8, 4, 0x33);
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        const auto begin = at(8) + 4096;
+        constexpr std::uint64_t length = 3 * unit;
+        memory.AddWritable(begin, static_cast<std::size_t>(length));
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty() && memory.ShadowSourced(begin, begin + length), "a written region in the staging window was not staged from the unit shadow");
+        recorder.Sync();
+        Require(guest[8 * unit] == 0x33 && guest[8 * unit + 4095] == 0x33 && guest[11 * unit + 4096] == 0x33 && guest[12 * unit - 1] == 0x33, "the units the written range covers partly were not published first");
+        Require(guest[9 * unit] == 0x11 && guest[11 * unit - 1] == 0x11, "units the written range covers wholly were published");
+        Require(all(boundBytes(memory, begin, length), 0x33), "the written region's copy-in did not read the slab");
+        memory.RecordCopyBacks(recorder);
+        memory.MarkDirectWrites();
+        recorder.Sync();
+        Require(std::all_of(guest + 8 * unit, guest + 12 * unit, [](std::uint8_t value) { return value == 0x33; }), "the copy-back did not leave the slab's bytes in the import");
+        const std::pair<std::uint64_t, std::uint64_t> run{9 * unit, 10 * unit};
+        const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {}, false);
+        Require(sources.size() == 1 && !sources.front().shadow, "a unit the copy-back stamped still reads from the slab");
+    }
+    // A read-only region of eight units with one fresh: bound in place, and the flush published it.
+    retile(20, 1, 0x44);
+    {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddReadable(at(16), static_cast<std::size_t>(8 * unit));
+        memory.Upload(false);
+        const auto reads = memory.InPlaceReads();
+        Require(reads.size() == 1 && reads.front().first == at(16) && reads.front().second == at(24) && !memory.ShadowSourced(at(16), at(24)), "a region an eighth fresh was staged from the unit shadow");
+        recorder.Sync();
+        Require(guest[20 * unit] == 0x44 && guest[21 * unit - 1] == 0x44 && guest[16 * unit] == 0x11, "the region bound in place was not published");
+    }
+    std::cout << "shadow-sourced staging verified\n";
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -6025,6 +6168,7 @@ int main(int argc, char** argv) {
                 return 77;
             }
             unitShadowTests(device, recorder);
+            shadowStagingTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
