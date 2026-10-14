@@ -153,6 +153,13 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 thread_local std::uint64_t threadWriteBackBytes = 0;
 thread_local bool uploadTookClear = false;
 std::atomic<std::uint64_t> clearCensusRefreshes{0}, clearCensusBytes{0}, refreshWriteBackBytes{0};
+// Windowed write-backs and their windows (dispatches) before and after APS5_YOLO_BATCH's merge.
+std::atomic<std::uint64_t> windowCensusWriteBacks{0}, windowCensusBefore{0}, windowCensusAfter{0};
+
+bool YoloBatch() {
+    static const bool enabled = std::getenv("APS5_YOLO_BATCH") != nullptr;
+    return enabled;
+}
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
     threadWriteBackBytes += bytes;
@@ -1927,7 +1934,7 @@ bool StorageTexture::Refresh() {
 }
 
 StorageTexture::ClearCounts StorageTexture::ClearCensus() {
-    return {clearCensusRefreshes.load(std::memory_order_relaxed), clearCensusBytes.load(std::memory_order_relaxed), refreshWriteBackBytes.load(std::memory_order_relaxed)};
+    return {clearCensusRefreshes.load(std::memory_order_relaxed), clearCensusBytes.load(std::memory_order_relaxed), refreshWriteBackBytes.load(std::memory_order_relaxed), windowCensusWriteBacks.load(std::memory_order_relaxed), windowCensusBefore.load(std::memory_order_relaxed), windowCensusAfter.load(std::memory_order_relaxed)};
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
@@ -2688,6 +2695,21 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     }
     if (runs.empty()) return 0;
     auto windows = sliceWindows(runs);
+    // APS5_YOLO_BATCH: one window per slice and level over the span of every run (one dispatch
+    // each instead of one per run); the retile writes the gaps into the scratch only, and the
+    // copies below still take the kept runs alone. Up to a span of 4x the kept bytes.
+    const auto windowsBefore = windows.size();
+    if (YoloBatch() && runs.size() > 1) {
+        std::pair<std::uint64_t, std::uint64_t> whole{runs.front().first, runs.front().second};
+        for (const auto& [from, to] : runs) {
+            whole.first = std::min(whole.first, from);
+            whole.second = std::max(whole.second, to);
+        }
+        if (whole.second - whole.first <= 4 * storedBytes) windows = sliceWindows(std::span(&whole, 1));
+    }
+    windowCensusWriteBacks.fetch_add(1, std::memory_order_relaxed);
+    windowCensusBefore.fetch_add(windowsBefore, std::memory_order_relaxed);
+    windowCensusAfter.fetch_add(windows.size(), std::memory_order_relaxed);
     // The linear rows and the tiled bytes of every window, each at a 256-byte position; the tail
     // levels of a layer retile into one scratch region (their block is shared).
     std::vector<std::uint64_t> linearPositions, scratchPositions;

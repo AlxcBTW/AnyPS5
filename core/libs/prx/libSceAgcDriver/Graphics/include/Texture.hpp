@@ -200,6 +200,10 @@ public:
         std::uint64_t nextClear = 0;
         std::uint64_t nextClearBytes = 0;
         std::uint64_t refreshBytes = 0;
+        // Windowed write-backs and their windows before and after APS5_YOLO_BATCH's merge.
+        std::uint64_t windowedWriteBacks = 0;
+        std::uint64_t windowsBefore = 0;
+        std::uint64_t windowsAfter = 0;
     };
     static ClearCounts ClearCensus();
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or

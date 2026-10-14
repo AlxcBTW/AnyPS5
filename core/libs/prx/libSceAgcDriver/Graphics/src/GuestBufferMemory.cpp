@@ -2919,8 +2919,16 @@ std::uint64_t shadowStageMax() {
 // (every cached build keeps its own buffer): APS5_SHADOW_STAGE_BUDGET_MIB (384, 768 with shadow
 // copy-back). Past it a region is bound in place as before (counted as a device refusal).
 std::uint64_t shadowStageBudget() {
-    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", ShadowCopyBackEnabled() ? 768 : 384) << 10u;
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", YoloGpu() ? 1536 : ShadowCopyBackEnabled() ? 768 : 384) << 10u;
     return bytes;
+}
+
+// APS5_YOLO_GPU: a region is staged from the shadow when any unit of it is fresh (readers too), with
+// no flip limit and no flip back to in place.
+bool shadowStageGate(std::uint64_t regionBytes, std::uint64_t shadowBytes, std::uint64_t maxBytes) {
+    constexpr std::uint64_t unit = 65536;
+    if (YoloGpu()) return regionBytes != 0 && regionBytes <= maxBytes && shadowBytes >= std::min(unit, regionBytes);
+    return ShadowStageAccepted(regionBytes, shadowBytes, maxBytes);
 }
 
 // How often one region (by its first byte) may flip between in place and staged by a rebuild that a
@@ -2946,6 +2954,7 @@ RestageFlips& Flips() {
 
 // Takes one flip of the region at `begin`; false once its flips are used up.
 bool takeRestageFlip(std::uint64_t begin) {
+    if (YoloGpu()) return true;
     auto& flips = Flips();
     std::lock_guard lock(flips.mutex);
     auto& used = flips.byBegin[begin];
@@ -3102,6 +3111,9 @@ void reportLazy() {
     const auto clearRefreshes = clears.nextClear - clearsLast.nextClear;
     const auto clearBytes = clears.nextClearBytes - clearsLast.nextClearBytes;
     const auto refreshBytes = clears.refreshBytes - clearsLast.refreshBytes;
+    const auto windowedWriteBacks = clears.windowedWriteBacks - clearsLast.windowedWriteBacks;
+    const auto windowsBefore = clears.windowsBefore - clearsLast.windowsBefore;
+    const auto windowsAfter = clears.windowsAfter - clearsLast.windowsAfter;
     clearsLast = clears;
     using R = RoundtripStats;
     const auto u = [&](std::size_t k) { return static_cast<unsigned long long>(t[k]); };
@@ -3109,7 +3121,7 @@ void reportLazy() {
         ShadowCopyBackEnabled() ? "on" : "off", u(R::BuildPublishes), t[R::BuildUnits] * unitMib, u(R::ReusePublishes), t[R::ReuseUnits] * unitMib, u(R::DrawPublishes), t[R::DrawUnits] * unitMib, u(R::Upto32), t[R::Upto32Units] * unitMib, u(R::Upto128), t[R::Upto128Units] * unitMib, u(R::Over128), t[R::Over128Units] * unitMib,
         u(R::CopyBackRegions), t[R::CopyBackSlabBytes] / mib, t[R::CopyBackImportBytes] / mib, u(R::CopyBackSeeds), t[R::CopyBackSeedBytes] / mib, u(R::RebuildToStage), u(R::RebuildToInPlace), u(R::FlipsUsedUp), u(R::RestageRefused), t[R::RestageRefusedBytes] / mib,
         refreshBytes / mib, static_cast<unsigned long long>(clearRefreshes), clearBytes / mib);
-    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) address-based builds after copy-backs %llu: %.1f MiB copied back into slabs since the previous one, %.1f MiB published for them (%s); yolo %s: in-place region flushes skipped %llu\n", u(R::AddressBuildsAfter), t[R::AddressExposedBytes] / mib, t[R::AddressPublishedUnits] * unitMib, copyBackBdaPublish() ? "APS5_SHADOW_COPYBACK_BDA_PUBLISH" : "not published", YoloGpu() ? "on" : "off", u(R::YoloInPlaceSkips));
+    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) address-based builds after copy-backs %llu: %.1f MiB copied back into slabs since the previous one, %.1f MiB published for them (%s); yolo %s: in-place region flushes skipped %llu; windowed write-backs %llu: windows %llu, dispatched %llu\n", u(R::AddressBuildsAfter), t[R::AddressExposedBytes] / mib, t[R::AddressPublishedUnits] * unitMib, copyBackBdaPublish() ? "APS5_SHADOW_COPYBACK_BDA_PUBLISH" : "not published", YoloGpu() ? "on" : "off", u(R::YoloInPlaceSkips), static_cast<unsigned long long>(windowedWriteBacks), static_cast<unsigned long long>(windowsBefore), static_cast<unsigned long long>(windowsAfter));
 }
 
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
@@ -3300,7 +3312,7 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
     for (const auto& source : ShadowSources(context, import, region.begin, std::span(&run, 1), {}, false)) {
         if (source.shadow) shadowBytes += source.end - source.begin;
     }
-    if (!ShadowStageAccepted(bytes, shadowBytes, shadowStageMax())) {
+    if (!shadowStageGate(bytes, shadowBytes, shadowStageMax())) {
         if (profile) {
             stats.refusedFresh.fetch_add(1, std::memory_order_relaxed);
             stats.refusedFreshBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -4219,17 +4231,17 @@ std::uint64_t GuestBufferMemory::freshBytes(const Region& region) const {
 }
 
 bool GuestBufferMemory::restageCandidate(const Region& region) const {
-    if (!ShadowCopyBackEnabled() || !shadowStageEnabled() || !stagingAllowed || builtAddressable || space != nullptr || Recorder::Active() == nullptr) return false;
+    if (!(ShadowCopyBackEnabled() || YoloGpu()) || !shadowStageEnabled() || !stagingAllowed || builtAddressable || space != nullptr || Recorder::Active() == nullptr) return false;
     if (region.direct == nullptr || region.mirror != nullptr || region.sparse || region.unstaged || region.shadowRefused || sparseHeapCandidate(region)) return false;
     const auto bytes = region.end - region.begin;
     // Written regions only: a read-only one's flush publishes once per change and nothing is
-    // copied back, so in place costs no second crossing.
-    return bytes <= shadowStageMax() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+    // copied back, so in place costs no second crossing. APS5_YOLO_GPU: readers too (their
+    // publish is what a staged writer's copy-back would otherwise move to them).
+    return bytes <= shadowStageMax() && (YoloGpu() || WritesOverlap(region.begin, static_cast<std::size_t>(bytes)));
 }
 
 bool GuestBufferMemory::ShadowDecisionStale(std::uint64_t begin, std::uint64_t end) {
-    // APS5_YOLO_GPU: an in-place written region gets no flush at all, so nothing to re-decide.
-    if (!ShadowCopyBackEnabled() || YoloGpu() || !uploaded || committed) return false;
+    if (!(ShadowCopyBackEnabled() || YoloGpu()) || !uploaded || committed) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto* region = const_cast<Region*>(owner(begin));
     if (region == nullptr || region->end < end || !restageCandidate(*region)) return false;
@@ -4240,7 +4252,7 @@ bool GuestBufferMemory::ShadowDecisionStale(std::uint64_t begin, std::uint64_t e
     // them from the slabs, and an in-place use publishes them by the caller's flush.
     StorageTexture::FlushPending(region->begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
     const auto fresh = freshBytes(*region);
-    if (!ShadowStageAccepted(bytes, fresh, shadowStageMax())) {
+    if (!shadowStageGate(bytes, fresh, shadowStageMax())) {
         if (profile && fresh != 0) {
             Roundtrip().Add(RoundtripStats::RestageRefused, 1);
             Roundtrip().Add(RoundtripStats::RestageRefusedBytes, bytes);
@@ -4257,7 +4269,7 @@ bool GuestBufferMemory::ShadowDecisionStale(std::uint64_t begin, std::uint64_t e
 }
 
 bool GuestBufferMemory::ShadowStagedStale() {
-    if (!ShadowCopyBackEnabled() || !uploaded || committed) return false;
+    if (!ShadowCopyBackEnabled() || YoloGpu() || !uploaded || committed) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     for (auto& region : regions) {
         if (!region.shadowStaged || !region.gpuCopy || !region.deviceLocal) continue;
