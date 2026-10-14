@@ -720,10 +720,16 @@ endif()
 
 add_test_executable(agc_scratch_window_union_tests EXCLUDE_FROM_ALL tests/ScratchWindowUnion.cpp)
 target_include_directories(agc_scratch_window_union_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_scratch_window_union_tests PRIVATE libc)
 set_target_properties(agc_scratch_window_union_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_scratch_window_union_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_scratch_window_union_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_scratch_window_union COMMAND agc_scratch_window_union_tests)
+    if(WIN32)
+        set_tests_properties(agc_scratch_window_union PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 add_test_executable(agc_pass_hazards_tests EXCLUDE_FROM_ALL tests/PassHazards.cpp Graphics/src/PassHazards.cpp)
