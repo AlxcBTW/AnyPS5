@@ -1,0 +1,5 @@
+name=gate1-6060
+build_type=Release
+g1=on
+cmake=
+artifact=lab-libs-gate1-6060-db3c80a13f-40585
