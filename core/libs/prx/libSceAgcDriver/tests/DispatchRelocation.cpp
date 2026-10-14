@@ -151,7 +151,7 @@ Scene makeScene(std::uint32_t table, std::uint64_t base, std::uint32_t data = 0x
     scene.profile.pointerWords = SplitRelativeRuns(regions, use, use.asBase, scene.runs, scene.bases, scene.stored);
     scene.compiled = compiledWith({v}, {0x77u}, {2u});
     const std::vector<DescriptorValue> buffers{scene.buffer};
-    FindBufferFields(scene.runs, scene.stored, scene.user, buffers, std::vector<std::uint32_t>{0xabcdu}, scene.compiled, scene.profile);
+    FindBufferFields(scene.runs, scene.stored, scene.user, buffers, scene.compiled, scene.profile);
     scene.profile.forwarded = scene.compiled.shaderDataUserWords;
     return scene;
 }
@@ -159,9 +159,9 @@ Scene makeScene(std::uint32_t table, std::uint64_t base, std::uint32_t data = 0x
 void testBufferFields() {
     const auto scene = makeScene(0x20001000u, 0x1340000000ull);
     check(scene.profile.relocatableBuffers == 1, "the V# copied verbatim from the table is relocatable");
-    check(scene.profile.wordFields == std::vector<AddressField>{{2, BufferBaseLowMask}, {3, BufferBaseHighMask}}, "its word 0 and word 1 are masked fields");
+    check(scene.profile.wordFields == std::vector<AddressField>{{2, BufferBaseLowMask}}, "its word 0 is a masked field (word 1 stays exact)");
     check(scene.profile.patches == std::vector<ElementPatch>{{0, 0, 2, false}}, "the guest-buffer element copying it is patched from position 2");
-    check(scene.profile.maskPositions == std::vector<std::uint32_t>{2, 3}, "mask positions are the field positions");
+    check(scene.profile.maskPositions == std::vector<std::uint32_t>{2}, "mask positions are the field positions");
 
     const auto refused = [](auto&& adjust, const char* what) {
         auto scene = makeScene(0x20001000u, 0x1340000000ull);
@@ -170,12 +170,12 @@ void testBufferFields() {
         RelocationProfile profile;
         profile.userData = scene.user;
         profile.pointerWords = scene.profile.pointerWords;
-        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, std::vector<std::uint32_t>{}, scene.compiled, profile);
+        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, scene.compiled, profile);
         check(profile.relocatableBuffers == 0 && profile.wordFields.empty(), what);
     };
     refused([](Scene& s) { const std::vector<std::uint32_t> copy(s.stored.begin() + 2, s.stored.begin() + 6); s.stored.insert(s.stored.end(), copy.begin(), copy.end()); s.runs.emplace_back(0x30000000, 0x30000010); s.bases.push_back(-1); }, "a V# found twice stays exact");
     refused([](Scene& s) { s.runs.emplace_back(0x1340000020, 0x1340000024); s.stored.push_back(0); s.bases.push_back(-1); }, "a V# whose buffer the walk read stays exact");
-    refused([](Scene& s) { s.compiled.bindings.back().guestDescriptor[0] = s.buffer.dwords[0]; }, "a V# base copied into an unforwarded shader-data slot stays exact");
+    refused([](Scene& s) { s.compiled.bindings[0].role = DescriptorRole::GuestImages; }, "a V# base in an image word stays exact");
     refused([](Scene& s) { s.compiled.bindings[0].role = DescriptorRole::BdaPagetable; }, "a program that reads raw addresses keeps every V# exact");
     refused([](Scene& s) { s.compiled.bindings.push_back(s.compiled.bindings[0]); s.compiled.bindings.back().guestDescriptor[2] = 8; }, "a descriptor sharing the base with other words stays exact");
     {
@@ -183,11 +183,32 @@ void testBufferFields() {
         const std::vector<DescriptorValue> buffers{scene.buffer};
         RelocationProfile profile;
         profile.userData = scene.user;
-        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, std::vector<std::uint32_t>{scene.buffer.dwords[0]}, scene.compiled, profile);
-        check(profile.wordFields.empty(), "a V# base in the flattened SRT stays exact");
+        // The base also in the flattened SRT (the shader reads the table at run time) and in an
+        // unforwarded shader-data slot: both are patched.
+        auto copies = scene.compiled;
+        copies.bindings.back().guestDescriptor[0] = scene.buffer.dwords[0];
+        std::memcpy(copies.pushConstants.data(), &scene.buffer.dwords[0], sizeof(std::uint32_t));
+        ShaderRecompiler::DescriptorBinding flat{};
+        flat.role = DescriptorRole::FlattenedSrt;
+        flat.count = 1;
+        flat.binding = 2;
+        flat.guestDescriptor = {0x1234u, scene.buffer.dwords[0], scene.buffer.dwords[1]};
+        copies.bindings.push_back(flat);
+        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, copies, profile);
+        check(profile.wordFields == std::vector<AddressField>{{2, BufferBaseLowMask}} && profile.patches == std::vector<ElementPatch>{{0, 0, 2, false}, {1, 0, 2, false}, {2, 1, 2, false}, {ElementPatch::PushConstants, 0, 2, false}}, "base copies in shader data, push constants and the flattened SRT are patched");
+        auto patched = copies;
+        auto live = scene.stored;
+        live[2] = 0x80000040u;
+        ApplyRelocation(patched, profile, live, scene.user);
+        std::uint32_t pushed = 0;
+        std::memcpy(&pushed, patched.pushConstants.data(), sizeof(pushed));
+        check(patched.bindings[0].guestDescriptor[0] == 0x80000040u && patched.bindings[1].guestDescriptor[0] == 0x80000040u && patched.bindings[2].guestDescriptor[1] == 0x80000040u && patched.bindings[2].guestDescriptor[2] == scene.buffer.dwords[1] && pushed == 0x80000040u, "every copy of the base gets the live base, word 1 stays");
         const std::vector<DescriptorValue> views{scene.buffer, vsharp(0x1340000100ull, 16, 4)};
-        FindBufferFields(scene.runs, scene.stored, scene.user, views, std::vector<std::uint32_t>{}, scene.compiled, profile);
+        FindBufferFields(scene.runs, scene.stored, scene.user, views, scene.compiled, profile);
         check(profile.wordFields.empty(), "a V# with another descriptor starting inside it stays exact");
+        const std::vector<DescriptorValue> sameBase{scene.buffer, vsharp(0x1340000000ull, 16, 8)};
+        FindBufferFields(scene.runs, scene.stored, scene.user, sameBase, scene.compiled, profile);
+        check(profile.wordFields.empty(), "a V# whose base another descriptor shares stays exact");
     }
     {
         // An inline V# in user words 4..7, forwarded into shader data.
@@ -199,15 +220,15 @@ void testBufferFields() {
         RelocationProfile profile;
         profile.userData = user;
         const std::vector<DescriptorValue> buffers{value};
-        FindBufferFields({}, {}, user, buffers, std::vector<std::uint32_t>{}, compiled, profile);
-        check(profile.userFields == std::vector<AddressField>{{4, BufferBaseLowMask}, {5, BufferBaseHighMask}} && profile.patches == std::vector<ElementPatch>{{0, 0, 4, true}}, "an inline V# in the user words is relocatable when only forwarded slots copy it");
+        FindBufferFields({}, {}, user, buffers, compiled, profile);
+        check(profile.userFields == std::vector<AddressField>{{4, BufferBaseLowMask}} && profile.patches == std::vector<ElementPatch>{{0, 0, 4, true}, {1, 0, 4, true}, {ElementPatch::PushConstants, 0, 4, true}}, "an inline V# in the user words is relocatable, its forwarded base patched");
     }
 }
 
 void testContentKey() {
     const auto first = makeScene(0x20001000u, 0x1340000000ull);
     const auto shape = ShapeOf(first.profile, first.runs, first.bases);
-    check(shape.userMasks.size() == 3 && shape.userMasks[0] == PointerWordMask && shape.userMasks[1] == 0 && shape.reads.size() == 1 && shape.reads[0].offset == 0 && shape.reads[0].masks.size() == 8 && shape.reads[0].masks[2] == BufferBaseLowMask && shape.reads[0].masks[3] == BufferBaseHighMask, "the shape masks the pointer word and the V# base bits behind it");
+    check(shape.userMasks.size() == 3 && shape.userMasks[0] == PointerWordMask && shape.userMasks[1] == 0 && shape.reads.size() == 1 && shape.reads[0].offset == 0 && shape.reads[0].masks.size() == 8 && shape.reads[0].masks[2] == BufferBaseLowMask && shape.reads[0].masks[3] == 0, "the shape masks the pointer word and the V# base bits behind it");
 
     FakeMemory memory;
     const auto place = [&](const Scene& scene) { memory.put(AlignedPointer(scene.user[0]), scene.table); };
@@ -243,10 +264,9 @@ void testFitAndPatch() {
     user[2] = 0x78u;
     check(!UserWordsFit(profile, user), "another value user word does not fit");
 
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>> movedBase{{2, 0x80000000u}, {3, (16u << 16u) | 0x13u}};
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> movedBase{{2, 0x80000000u}};
     check(FieldsFit(profile, first.stored, movedBase), "a moved V# base fits");
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>> otherStride{{3, (32u << 16u) | 0x13u}};
-    check(!FieldsFit(profile, first.stored, otherStride), "another V# stride does not fit");
+    check(!std::binary_search(profile.maskPositions.begin(), profile.maskPositions.end(), 3u), "V# word 1 (stride, high address bits) is compared exactly");
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> nullBase{{2, 0u}};
     check(!FieldsFit(profile, first.stored, nullBase), "a null V# base does not fit");
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> misaligned{{2, 0x80000001u}};
@@ -328,16 +348,16 @@ void testRingLayout() {
         scene.profile.pointerWords = SplitRelativeRuns(regions, use, use.asBase & ~use.asValue, scene.runs, scene.bases, scene.stored);
         scene.compiled = compiledWith({v, t});
         const std::vector<DescriptorValue> buffers{inlineV, scene.buffer};
-        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, std::vector<std::uint32_t>{}, scene.compiled, scene.profile);
+        FindBufferFields(scene.runs, scene.stored, scene.user, buffers, scene.compiled, scene.profile);
         scene.profile.forwarded = scene.compiled.shaderDataUserWords;
         return scene;
     };
     const auto first = layout(0x31bbdcc020ull, 0x30542defd0ull);
     const auto& profile = first.profile;
     check(profile.pointerWords == (1u << 12u), "the ring pointer in user word 12 is relative");
-    check(profile.relocatableBuffers == 2 && profile.userFields.size() == 2 && profile.wordFields.size() == 2, "the inline V# and the table's V# (buffer ending at the table) both relocate");
+    check(profile.relocatableBuffers == 2 && profile.userFields.size() == 1 && profile.wordFields.size() == 1, "the inline V# and the table's V# (buffer ending at the table) both relocate");
     const auto shape = ShapeOf(profile, first.runs, first.bases);
-    check(shape.userMasks.size() == 14 && shape.userMasks[12] == PointerWordMask && shape.userMasks[8] == BufferBaseLowMask && shape.userMasks[9] == BufferBaseHighMask && shape.userMasks[13] == 0, "the shape leaves out the pointer and the inline V# base bits");
+    check(shape.userMasks.size() == 14 && shape.userMasks[12] == PointerWordMask && shape.userMasks[8] == BufferBaseLowMask && shape.userMasks[9] == 0 && shape.userMasks[13] == 0, "the shape leaves out the pointer and the inline V# base bits");
 
     const auto next = layout(0x31bbdcd000ull, 0x30542df000ull);
     FakeMemory memory;

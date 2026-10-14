@@ -41,7 +41,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
             relocation->userData.assign(userData.begin(), userData.end());
             // Same words, runs split where they stop or start being relative to a user word.
             if (pointerCandidates != 0) relocation->pointerWords = SplitRelativeRuns(srtRegions, capture->userDataUse, pointerCandidates, fresh->runs, fresh->runBases, fresh->words);
-            FindBufferFields(fresh->runs, fresh->words, userData, capture->snapshot.buffers, capture->snapshot.flattenedSrt, *compiledResult, *relocation);
+            FindBufferFields(fresh->runs, fresh->words, userData, capture->snapshot.buffers, *compiledResult, *relocation);
             relocation->forwarded = compiledResult->shaderDataUserWords;
         }
 
@@ -120,7 +120,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
                 for (std::size_t i = 0; i + 4 <= userData.size(); ++i) {
                     if (userData[i] != value.dwords[0] || userData[i + 1] != value.dwords[1] || userData[i + 2] != value.dwords[2] || userData[i + 3] != value.dwords[3]) continue;
                     known.userMasks[i] |= BufferBaseLowMask;
-                    known.userMasks[i + 1] |= BufferBaseHighMask;
+                    known.userMasks[i + 1] |= 0x0000ffffu;
                 }
             }
         }

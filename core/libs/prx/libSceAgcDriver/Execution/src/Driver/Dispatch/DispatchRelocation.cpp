@@ -105,7 +105,7 @@ std::uint64_t SplitRelativeRuns(std::span<const ShaderRecompiler::MemoryRegion> 
     return used;
 }
 
-void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::DescriptorValue> buffers, std::span<const std::uint32_t> flattened, const ShaderRecompiler::RecompileResult& compiled, RelocationProfile& profile) {
+void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::DescriptorValue> buffers, const ShaderRecompiler::RecompileResult& compiled, RelocationProfile& profile) {
     profile.wordFields.clear();
     profile.userFields.clear();
     profile.patches.clear();
@@ -188,12 +188,15 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
             ++profile.refused[static_cast<std::size_t>(FieldRefusal::Derived)];
             continue;
         }
-        // Nothing copies the base anywhere but the elements that copy the whole V# (and, for a
-        // user source, the shader-data slots that forward its words).
-        if (std::find(flattened.begin(), flattened.end(), value.dwords[0]) != flattened.end() || std::find(flattened.begin(), flattened.end(), value.dwords[1]) != flattened.end()) {
-            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Flattened)];
+        // Another descriptor with the same base: a copy of the base could be either's.
+        if (std::any_of(buffers.begin(), buffers.end(), [&](const ShaderRecompiler::DescriptorValue& other) { return other.dwordCount == 4u && other.dwords[0] == value.dwords[0] && !(other == value); })) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Sources)];
             continue;
         }
+        // Every word of the compiled result that copies the base is patched from the source: the
+        // guest-buffer elements that copy the whole V#, and the flattened SRT, shader data and push
+        // constants (a forwarded user word, an SRT word the shader reads at run time). A base in an
+        // image or sampler word, or in a guest-buffer element that is not this V#, keeps it exact.
         std::vector<ElementPatch> patches;
         bool copied = false;
         for (std::uint32_t b = 0; b < compiled.bindings.size() && !copied; ++b) {
@@ -202,27 +205,22 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
             if (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && descriptor.size() % 4u == 0u) {
                 for (std::uint32_t e = 0; e + 4 <= descriptor.size(); e += 4) {
                     if (SameWords(descriptor, e, value)) patches.push_back({b, e, source, user});
-                    else if (descriptor[e] == value.dwords[0]) copied = true;
+                    else if (std::find(descriptor.begin() + e, descriptor.begin() + e + 4, value.dwords[0]) != descriptor.begin() + e + 4) copied = true;
                 }
                 continue;
             }
-            if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt || binding.role == ShaderRecompiler::DescriptorRole::ShaderData) {
                 for (std::uint32_t slot = 0; slot < descriptor.size(); ++slot) {
-                    if (descriptor[slot] != value.dwords[0] && descriptor[slot] != value.dwords[1]) continue;
-                    const bool forwardedHere = user && slot < compiled.shaderDataUserWords.size() && (compiled.shaderDataUserWords[slot] == source || compiled.shaderDataUserWords[slot] == source + 1);
-                    if (!forwardedHere) copied = true;
+                    if (descriptor[slot] == value.dwords[0]) patches.push_back({b, slot, source, user});
                 }
                 continue;
             }
             if (std::find(descriptor.begin(), descriptor.end(), value.dwords[0]) != descriptor.end()) copied = true;
         }
-        for (std::size_t at = 0; at + sizeof(std::uint32_t) <= compiled.pushConstants.size() && !copied; at += sizeof(std::uint32_t)) {
+        for (std::size_t at = 0; at + sizeof(std::uint32_t) <= compiled.pushConstants.size(); at += sizeof(std::uint32_t)) {
             std::uint32_t word = 0;
             std::memcpy(&word, compiled.pushConstants.data() + at, sizeof(word));
-            if (word != value.dwords[0] && word != value.dwords[1]) continue;
-            const auto slot = at / sizeof(std::uint32_t);
-            const bool forwardedHere = user && slot < compiled.shaderDataUserWords.size() && (compiled.shaderDataUserWords[slot] == source || compiled.shaderDataUserWords[slot] == source + 1);
-            if (!forwardedHere) copied = true;
+            if (word == value.dwords[0]) patches.push_back({ElementPatch::PushConstants, static_cast<std::uint32_t>(at / sizeof(std::uint32_t)), source, user});
         }
         if (copied) {
             ++profile.refused[static_cast<std::size_t>(FieldRefusal::Copied)];
@@ -231,7 +229,6 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
         (user ? takenUser : taken).push_back(source);
         auto& fields = user ? profile.userFields : profile.wordFields;
         fields.push_back({source, BufferBaseLowMask});
-        fields.push_back({source + 1, BufferBaseHighMask});
         profile.patches.insert(profile.patches.end(), patches.begin(), patches.end());
         ++profile.relocatableBuffers;
     }
@@ -300,11 +297,16 @@ bool FieldsFit(const RelocationProfile& profile, std::span<const std::uint32_t> 
 void ApplyRelocation(ShaderRecompiler::RecompileResult& result, const RelocationProfile& profile, std::span<const std::uint32_t> liveWords, std::span<const std::uint32_t> liveUser) {
     for (const auto& patch : profile.patches) {
         const auto& source = patch.user ? liveUser : liveWords;
-        if (patch.binding >= result.bindings.size() || patch.source + 1 >= source.size()) continue;
+        if (patch.source >= source.size()) continue;
+        const auto value = source[patch.source];
+        if (patch.binding == ElementPatch::PushConstants) {
+            const auto at = static_cast<std::size_t>(patch.word) * sizeof(std::uint32_t);
+            if (at + sizeof(std::uint32_t) <= result.pushConstants.size()) std::memcpy(result.pushConstants.data() + at, &value, sizeof(value));
+            continue;
+        }
+        if (patch.binding >= result.bindings.size()) continue;
         auto& descriptor = result.bindings[patch.binding].guestDescriptor;
-        if (patch.word + 1 >= descriptor.size()) continue;
-        descriptor[patch.word] = source[patch.source];
-        descriptor[patch.word + 1] = source[patch.source + 1];
+        if (patch.word < descriptor.size()) descriptor[patch.word] = value;
     }
     for (std::uint32_t slot = 0; slot < profile.forwarded.size(); ++slot) {
         const auto word = profile.forwarded[slot];
