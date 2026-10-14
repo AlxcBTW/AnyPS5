@@ -859,7 +859,7 @@ void spaceReadAcrossImportsTests(const Context& context, const BdaTestAccess& ac
     SetHostImportWindow(window);
     const auto change = [&](std::uint8_t* range, bool add) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, range == guest + 2 * piece, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
@@ -899,7 +899,7 @@ void spaceReadAcrossImportsWrittenTests(const Context& context) {
     SetHostImportWindow(window);
     const auto change = [&](std::uint8_t* range, bool add) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
-        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, false, true);
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, range, piece, true, range == guest + 2 * piece, true);
         else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, range);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     };
