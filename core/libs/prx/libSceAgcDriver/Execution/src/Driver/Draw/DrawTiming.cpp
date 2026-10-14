@@ -36,7 +36,7 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
     totals.packets = totals.drawn = totals.captures = 0;
     // The GPU SRT fill of GPU-side mesh indirect draws (APS5_NO_GPU_DRAW_INDIRECT=1 turns it off;
     // the hook reads then show what it would take over).
-    const auto captures = TakeSrtFillCaptureCounts();
+    const auto speculation = TakeSrtFillCaptureCounts();
     const auto reads = ShaderMemory::TakeSpeculationCounts();
     const auto fills = Graphics::TakeSrtFillCounts();
     std::string cpuPaths;
@@ -48,8 +48,7 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
         cpuPaths += text;
         cpuWords += fills.words[path];
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[srtfill] (10 s) speculative stage captures %llu: %llu left %llu flattened-SRT words to the draw, %llu repeated without speculation (a speculated word was not only a pure SRT leaf), %llu of refused programs; words speculated %llu; hook reads of pending words in indirect draw captures %llu; draws with fills %llu: words copied on the GPU %llu, read on the CPU %llu (not a lean recorded draw %llu%s%s)
-", static_cast<unsigned long long>(captures.speculative), static_cast<unsigned long long>(captures.filled), static_cast<unsigned long long>(captures.words), static_cast<unsigned long long>(captures.repeated), static_cast<unsigned long long>(captures.refused), static_cast<unsigned long long>(reads.speculated), static_cast<unsigned long long>(reads.syncReads), static_cast<unsigned long long>(fills.draws), static_cast<unsigned long long>(fills.words[static_cast<std::size_t>(Graphics::IndirectDrawPath::Gpu)]), static_cast<unsigned long long>(cpuWords), static_cast<unsigned long long>(fills.notRecorded), cpuPaths.empty() ? "" : ", ", cpuPaths.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[srtfill] (10 s) speculative stage captures %llu: %llu left %llu flattened-SRT words to the draw, %llu repeated without speculation (a speculated word was not only a pure SRT leaf), %llu of refused programs; words speculated %llu; hook reads of pending words in indirect draw captures %llu; draws with fills %llu: words copied on the GPU %llu, read on the CPU %llu (not a lean recorded draw %llu%s%s)\n", static_cast<unsigned long long>(speculation.speculative), static_cast<unsigned long long>(speculation.filled), static_cast<unsigned long long>(speculation.words), static_cast<unsigned long long>(speculation.repeated), static_cast<unsigned long long>(speculation.refused), static_cast<unsigned long long>(reads.speculated), static_cast<unsigned long long>(reads.syncReads), static_cast<unsigned long long>(fills.draws), static_cast<unsigned long long>(fills.words[static_cast<std::size_t>(Graphics::IndirectDrawPath::Gpu)]), static_cast<unsigned long long>(cpuWords), static_cast<unsigned long long>(fills.notRecorded), cpuPaths.empty() ? "" : ", ", cpuPaths.c_str());
 }
 
 void DrawPhaseTiming::Phase(DrawDriverPhase which) {
