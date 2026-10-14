@@ -258,12 +258,6 @@ public:
         if (address % pageBytes != 0 || bytes % pageBytes != 0 || bytes == 0) throw refuse("the range is not made of whole shared pages");
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             const auto found = views.find(address + done);
-            if (found == views.end() || !found->second.resident) continue;
-            const auto run = std::prev(residentRuns.upper_bound(address + done));
-            if (run->first < address || run->second.end > address + bytes) throw refuse("a resident run of direct memory extends outside the range");
-        }
-        for (std::size_t done = 0; done < bytes; done += pageBytes) {
-            const auto found = views.find(address + done);
             if (found != views.end() && found->second.resident) demote(address + done);
         }
         auto view = views.find(address);

@@ -1560,10 +1560,12 @@ void secondMappingImportTests(const Device& device) {
     Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, bytes, 0, &release.physical) == 0, "allocate the second mapping test backing");
     Require(sceKernelMapDirectMemory(&release.mapping, bytes, 0x33, 0, release.physical, bytes) == 0, "map the second mapping test backing");
     const auto address = reinterpret_cast<std::uint64_t>(release.mapping);
-    if (HostImportFor(context, address, bytes) == nullptr) {
+    const auto* imported = HostImportFor(context, address, bytes);
+    if (imported == nullptr) {
         std::cout << "host import of singly mapped direct memory refused: imports after a second mapping not tested\n";
         return;
     }
+    Require(imported->alias != nullptr && !imported->unwatched, "singly mapped direct memory was imported without guest write tracking");
     const auto first = HostImportSerial(context, address, bytes, true);
     Require(first != 0 && HostImportSerial(context, address, bytes, true) == first, "singly mapped direct memory lost its import");
     Require(sceKernelMapDirectMemory(&release.alias, page, 0x33, 0, release.physical, page) == 0, "map the first page a second time");
