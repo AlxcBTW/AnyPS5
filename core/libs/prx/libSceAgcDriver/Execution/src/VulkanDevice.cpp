@@ -4553,6 +4553,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    // The program for the APS5_TRACE_REGION_PUBLISH lines of this dispatch's resources.
+    Graphics::SetTraceProgram(programAddress);
+    struct TraceProgramReset {
+        ~TraceProgramReset() { Graphics::SetTraceProgram(0); }
+    } traceProgramReset;
     PerformanceTimer timing("Vulkan.Dispatch");
     if (recipeOut != nullptr) *recipeOut = nullptr;
     // Group counts for the trace lines; an indirect dispatch does not know them.

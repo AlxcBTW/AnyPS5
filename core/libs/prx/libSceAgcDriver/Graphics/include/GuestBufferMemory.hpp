@@ -66,6 +66,10 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
 // the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// The existing import serving [address, address + bytes) while the registry has not changed since
+// the imports were reconciled, or null: makes none and reconciles none (the shadow copy-back's
+// check that its region's import still serves it).
+const HostImport* HostImportServing(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
@@ -212,6 +216,12 @@ bool LazyWritebackEnabled();
 // the shadow, and at least half of it, so the import part the copy-in reads over the bus never
 // exceeds the publish it replaces.
 bool ShadowStageAccepted(std::uint64_t regionBytes, std::uint64_t shadowBytes, std::uint64_t maxBytes);
+// Shadow copy-back (see GuestBufferMemory.cpp, "shadow copy-back"): on unless
+// APS5_NO_SHADOW_COPYBACK=1, and only with lazy write-back on.
+bool ShadowCopyBackEnabled();
+// The dispatch program whose resources the calling thread builds or revalidates (0 for draws),
+// for the APS5_TRACE_REGION_PUBLISH lines only.
+void SetTraceProgram(std::uint64_t programAddress);
 
 class GuestBufferMemory {
 public:
@@ -311,7 +321,18 @@ public:
     void PublishShadowSourcedEdges() const;
     // [lazywb] census of a region bound in place whose flush published the unit shadow into its
     // import (PublishScope::Whole): units copied, by whether a descriptor writes the region.
-    static void NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units);
+    static void NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units, bool reused = false, bool draw = false, std::uint64_t begin = 0);
+    bool StagingAllowed() const { return stagingAllowed; }
+    // Shadow copy-back, reuse of a cached build (ShaderResources::Revalidate, under
+    // GuestMemory::GpuMutex, before the region flushes): whether the build's decision for
+    // [begin, end) went stale so that the build is to be made anew. A region bound in place whose
+    // written range now lies over enough fresh unit-shadow units to be staged (the pending images
+    // are stored into the shadow first, without a publish), or a region staged from the shadow whose
+    // copy-in would now read more than half of it from the import. Bounded per region (flips).
+    bool ShadowDecisionStale(std::uint64_t begin, std::uint64_t end);
+    // The same check for every region staged from the shadow (they are not among the in-place
+    // regions the caller walks).
+    bool ShadowStagedStale();
     struct CutRegion {
         std::uint64_t begin;
         std::uint64_t end;
@@ -396,7 +417,25 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // Staged from the unit shadow instead of bound in place (stageFromShadow accepted it): with
+        // shadow copy-back its written ranges go back into the shadow's slabs, not the import.
+        bool shadowStaged = false;
+        // The last copy-back of this region went into the shadow (RecordCopyBacks stamped and
+        // marked its ranges itself): MarkDirectWrites leaves them alone.
+        bool shadowCopiedBack = false;
+        // stageFromShadow refused the region for want of device memory or budget: a revalidation
+        // does not ask for a rebuild to stage it again.
+        bool shadowRefused = false;
     };
+    // The written ranges of a shadow-staged region back into its import's unit shadow (slab pieces,
+    // seeded where a piece covers a unit partly), the rest into the import; stamps and marks them.
+    // Returns the bytes that went into slabs.
+    std::uint64_t copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged, VkCommandBuffer commands);
+    // The bytes of [region.begin, region.end) a shadow-sourced copy-in would read from slabs now.
+    std::uint64_t freshBytes(const Region& region) const;
+    bool restageCandidate(const Region& region) const;
+    // UploadFinish's `addressable`, for the revalidation's decision.
+    bool builtAddressable = false;
 
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
