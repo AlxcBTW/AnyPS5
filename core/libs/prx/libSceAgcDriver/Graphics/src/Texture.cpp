@@ -148,7 +148,14 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     reportStorageTraffic(traffic);
 }
 
+// Bytes the calling thread's write-backs stored so far, and whether its last upload took the DCC
+// clear path: the [roundtrip] census of storage-refresh write-backs whose next op is a full clear.
+thread_local std::uint64_t threadWriteBackBytes = 0;
+thread_local bool uploadTookClear = false;
+std::atomic<std::uint64_t> clearCensusRefreshes{0}, clearCensusBytes{0}, refreshWriteBackBytes{0};
+
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
+    threadWriteBackBytes += bytes;
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -1683,7 +1690,10 @@ bool StorageTexture::Refresh() {
         }
     }
     // No publish: the upload below reads the stored units from the unit shadow itself.
+    const auto writtenBefore = threadWriteBackBytes;
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    const auto refreshWritten = threadWriteBackBytes - writtenBefore;
+    if (profile && refreshWritten != 0) refreshWriteBackBytes.fetch_add(refreshWritten, std::memory_order_relaxed);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
@@ -1902,11 +1912,22 @@ bool StorageTexture::Refresh() {
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        uploadTookClear = false;
         upload(&changed);
+        // Census only: the other images' results this refresh stored over the surface were not
+        // read by it (its upload is a DCC clear of the whole image).
+        if (profile && refreshWritten != 0 && uploadTookClear) {
+            clearCensusRefreshes.fetch_add(1, std::memory_order_relaxed);
+            clearCensusBytes.fetch_add(refreshWritten, std::memory_order_relaxed);
+        }
     } else {
         uploadedKeys = keys;
     }
     return false;
+}
+
+StorageTexture::ClearCounts StorageTexture::ClearCensus() {
+    return {clearCensusRefreshes.load(std::memory_order_relaxed), clearCensusBytes.load(std::memory_order_relaxed), refreshWriteBackBytes.load(std::memory_order_relaxed)};
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
@@ -2091,7 +2112,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
     filledKeys = DccKeys::Uncompressed;
     VkClearColorValue clearValue{};
+    uploadTookClear = false;
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
+        uploadTookClear = true;
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms

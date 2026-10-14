@@ -2573,6 +2573,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         return true;
     };
+    // Shadow copy-back (GuestBufferMemory::ShadowDecisionStale): a region staged from the unit
+    // shadow whose copy-in would now read more than half from the import is bound in place again by
+    // a rebuild (freshness can drop without a pending-image change, so outside the epoch gate).
+    if (guestMemory.ShadowStagedStale()) return finish(fast, false, ProofFailure::Other);
     if (EpochRevalidate()) {
         if ((!directRegions.empty() || !guestMemory.Writes().empty()) && !(pendingSerialSeen != 0 && pendingSerialSeen == StorageTexture::PendingSerial())) {
             thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
@@ -2591,9 +2595,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 if (!(region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin)))) continue;
                 const bool lazy = guestMemory.ShadowSourced(region.begin, region.end);
                 anyLazy = anyLazy || lazy;
+                // Shadow copy-back: an in-place written region over enough fresh unit-shadow units
+                // is staged by a rebuild instead of published (its pending images were stored into
+                // the shadow, without a publish, by the check).
+                if (!lazy && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
                 const auto before = profile && !lazy ? ThreadPublishedUnits() : 0;
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", lazy ? PublishScope::None : PublishScope::Whole);
-                if (profile && !lazy) GuestBufferMemory::NoteInPlacePublish(guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.end - region.begin, ThreadPublishedUnits() - before);
+                if (profile && !lazy) GuestBufferMemory::NoteInPlacePublish(guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.end - region.begin, ThreadPublishedUnits() - before, true, !guestMemory.StagingAllowed(), region.begin);
             }
             if (anyLazy) guestMemory.PublishShadowSourcedEdges();
         }
@@ -2606,6 +2614,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } else {
         // As above: regions staged from the unit shadow are stored without a publish, then the
         // edges of their written ranges are published.
+        for (const auto& region : directRegions) {
+            if (!guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
+        }
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", guestMemory.ShadowSourced(begin, end) ? PublishScope::None : PublishScope::Whole);
         guestMemory.PublishShadowSourcedEdges();

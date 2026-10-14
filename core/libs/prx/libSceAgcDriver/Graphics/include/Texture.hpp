@@ -193,6 +193,15 @@ public:
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    // APS5_PROFILE_DRAW census (cumulative, the [roundtrip] line): storage refreshes whose upload
+    // was a DCC clear of the whole image although their flush stored other images' results over it
+    // ("next op full clear": refreshes and bytes), and every storage-refresh write-back's bytes.
+    struct ClearCounts {
+        std::uint64_t nextClear = 0;
+        std::uint64_t nextClearBytes = 0;
+        std::uint64_t refreshBytes = 0;
+    };
+    static ClearCounts ClearCensus();
     // Moves with every change of the pending registry (an image marked dirty, stored, flushed or
     // dropped; after the store for a flush), bumped under the registry's mutex with the change, so
     // a reader that loads it before and after its own reads knows the registry it consulted stayed

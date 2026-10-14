@@ -2907,17 +2907,63 @@ bool shadowStageEnabled() {
     return LazyWritebackEnabled() && !disabled;
 }
 
+// With shadow copy-back the cap is 262144 KiB (256 MiB): the regions whose publishes carry the
+// title's region volume are larger than 32 MiB (~44 MiB published per region at the title, ~50-60
+// MiB in the desert), and their copy-back no longer crosses the bus.
 std::uint64_t shadowStageMax() {
-    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_MAX_KIB", 32768);
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_MAX_KIB", ShadowCopyBackEnabled() ? 262144 : 32768);
     return bytes;
 }
 
 // The device memory the regions staged from the shadow beyond the staging window may hold at once
-// (every cached build keeps its own buffer): APS5_SHADOW_STAGE_BUDGET_MIB (384). Past it a region
-// is bound in place as before (counted as a device refusal).
+// (every cached build keeps its own buffer): APS5_SHADOW_STAGE_BUDGET_MIB (384, 768 with shadow
+// copy-back). Past it a region is bound in place as before (counted as a device refusal).
 std::uint64_t shadowStageBudget() {
-    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", 384) << 10u;
+    static const std::uint64_t bytes = kibSetting("APS5_SHADOW_STAGE_BUDGET_MIB", ShadowCopyBackEnabled() ? 768 : 384) << 10u;
     return bytes;
+}
+
+// How often one region (by its first byte) may flip between in place and staged by a rebuild that a
+// revalidation asked for (ShadowDecisionStale): APS5_SHADOW_RESTAGE_FLIPS (4). A region whose
+// freshness alternates between uses then keeps the decision of its last build.
+std::uint32_t shadowRestageFlips() {
+    static const std::uint32_t flips = [] {
+        const char* value = std::getenv("APS5_SHADOW_RESTAGE_FLIPS");
+        return value != nullptr ? static_cast<std::uint32_t>(std::strtoul(value, nullptr, 10)) : 4u;
+    }();
+    return flips;
+}
+
+struct RestageFlips {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::uint32_t> byBegin;
+};
+
+RestageFlips& Flips() {
+    static RestageFlips flips;
+    return flips;
+}
+
+// Takes one flip of the region at `begin`; false once its flips are used up.
+bool takeRestageFlip(std::uint64_t begin) {
+    auto& flips = Flips();
+    std::lock_guard lock(flips.mutex);
+    auto& used = flips.byBegin[begin];
+    if (used >= shadowRestageFlips()) return false;
+    ++used;
+    return true;
+}
+
+thread_local std::uint64_t traceProgram = 0;
+
+// APS5_TRACE_REGION_PUBLISH=<n>: the first n publishes of a region bound in place over 16 MiB, and
+// the first n restage decisions and shadow copy-backs, with the dispatch program (0: a draw).
+bool takeRegionTrace() {
+    static std::atomic<int> left{[] {
+        const char* value = std::getenv("APS5_TRACE_REGION_PUBLISH");
+        return value != nullptr ? std::max(1, std::atoi(value)) : 0;
+    }()};
+    return left.load(std::memory_order_relaxed) > 0 && left.fetch_sub(1, std::memory_order_relaxed) > 0;
 }
 
 std::atomic<std::uint64_t>& shadowStageLive() {
@@ -2957,6 +3003,77 @@ LazyStats& Lazy() {
     return stats;
 }
 
+// APS5_PROFILE_DRAW: the [roundtrip] line (10 s deltas, printed after [lazywb]). In-place region
+// publishes by path (build / cache reuse), by build kind (draw) and by region size; the shadow
+// copy-backs (bytes into slabs, the import fallback, seeds); the rebuilds revalidations asked for.
+struct RoundtripStats {
+    enum Index : std::size_t {
+        BuildPublishes, BuildUnits, ReusePublishes, ReuseUnits, DrawPublishes, DrawUnits,
+        Upto32, Upto32Units, Upto128, Upto128Units, Over128, Over128Units,
+        CopyBackRegions, CopyBackSlabBytes, CopyBackImportBytes, CopyBackSeeds, CopyBackSeedBytes,
+        RebuildToStage, RebuildToInPlace, FlipsUsedUp, RestageRefused, RestageRefusedBytes,
+        AddressBuildsAfter, AddressExposedBytes, AddressPublishedUnits,
+        Count
+    };
+    std::array<std::atomic<std::uint64_t>, Count> values{};
+    void Add(Index index, std::uint64_t value) { values[index].fetch_add(value, std::memory_order_relaxed); }
+};
+
+RoundtripStats& Roundtrip() {
+    static RoundtripStats stats;
+    return stats;
+}
+
+// The ranges shadow copy-backs left in slabs since the last address-based build: such a build binds
+// the registered heaps in place without a flush (their pending storage results are exempt, see
+// UploadFinish), so a pointer into one of these ranges would read the import's older bytes. Counted
+// at the next address-based build ([roundtrip] "address-based builds after copy-backs"), and with
+// APS5_SHADOW_COPYBACK_BDA_PUBLISH=1 published there (exact for pointer readers, at the cost of
+// the bus crossing the copy-back saved).
+struct CopiedBackRanges {
+    std::mutex mutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+};
+
+CopiedBackRanges& CopiedBack() {
+    static CopiedBackRanges ranges;
+    return ranges;
+}
+
+bool copyBackBdaPublish() {
+    static const bool publish = std::getenv("APS5_SHADOW_COPYBACK_BDA_PUBLISH") != nullptr;
+    return publish;
+}
+
+void noteCopiedBack(std::span<const ShadowedRange> ranges) {
+    auto& copied = CopiedBack();
+    std::lock_guard lock(copied.mutex);
+    // Without address-based builds nothing takes them: the census keeps the newest.
+    if (copied.ranges.size() >= 8192 && !copyBackBdaPublish()) copied.ranges.erase(copied.ranges.begin(), copied.ranges.begin() + 4096);
+    for (const auto& range : ranges) copied.ranges.emplace_back(range.begin, range.end);
+}
+
+// An address-based build is being made (UploadFinish under GuestMemory::GpuMutex).
+void addressBuildAfterCopyBacks() {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    {
+        auto& copied = CopiedBack();
+        std::lock_guard lock(copied.mutex);
+        if (copied.ranges.empty()) return;
+        ranges.swap(copied.ranges);
+    }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::uint64_t bytes = 0, units = 0;
+    for (const auto& [begin, end] : ranges) {
+        bytes += end - begin;
+        if (copyBackBdaPublish()) units += PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, PublishReason::Region);
+    }
+    if (!profile) return;
+    Roundtrip().Add(RoundtripStats::AddressBuildsAfter, 1);
+    Roundtrip().Add(RoundtripStats::AddressExposedBytes, bytes);
+    Roundtrip().Add(RoundtripStats::AddressPublishedUnits, units);
+}
+
 void reportLazy() {
     auto& stats = Lazy();
     constexpr std::size_t Count = 17;
@@ -2972,6 +3089,26 @@ void reportLazy() {
     constexpr double mib = 1048576.0;
     constexpr double unitMib = 65536.0 / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch("[lazywb] (10 s) %s; copy-ins from the unit shadow: %llu regions, %.1f MiB from slabs, %.1f MiB from imports; staged instead of in place: %llu regions (%.1f MiB, %llu written), refused: fresh %llu (%.1f MiB), size %llu (%.1f MiB), device %llu; edge publishes %.1f MiB; in-place region publishes: read-only %llu / %.1f MiB, written %llu / %.1f MiB, regions over 16 MiB %llu / %.1f MiB\n", LazyWritebackEnabled() ? (shadowStageEnabled() ? "on" : "on, window only") : "off", static_cast<unsigned long long>(d[0]), d[1] / mib, d[2] / mib, static_cast<unsigned long long>(d[3]), d[4] / mib, static_cast<unsigned long long>(d[5]), static_cast<unsigned long long>(d[6]), d[7] / mib, static_cast<unsigned long long>(d[8]), d[9] / mib, static_cast<unsigned long long>(d[10]), d[11] * unitMib, static_cast<unsigned long long>(d[12]), d[13] * unitMib, static_cast<unsigned long long>(d[14]), d[15] * unitMib, static_cast<unsigned long long>(d[16]), dLargeUnits * unitMib);
+    auto& trip = Roundtrip();
+    std::array<std::uint64_t, RoundtripStats::Count> tripNow{};
+    for (std::size_t k = 0; k < RoundtripStats::Count; ++k) tripNow[k] = trip.values[k].load(std::memory_order_relaxed);
+    static std::array<std::uint64_t, RoundtripStats::Count> tripLast{};
+    std::array<std::uint64_t, RoundtripStats::Count> t{};
+    for (std::size_t k = 0; k < RoundtripStats::Count; ++k) t[k] = tripNow[k] - tripLast[k];
+    tripLast = tripNow;
+    const auto clears = StorageTexture::ClearCensus();
+    static StorageTexture::ClearCounts clearsLast{};
+    const auto clearRefreshes = clears.nextClear - clearsLast.nextClear;
+    const auto clearBytes = clears.nextClearBytes - clearsLast.nextClearBytes;
+    const auto refreshBytes = clears.refreshBytes - clearsLast.refreshBytes;
+    clearsLast = clears;
+    using R = RoundtripStats;
+    const auto u = [&](std::size_t k) { return static_cast<unsigned long long>(t[k]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) shadow copy-back %s; in-place publishes by path: build %llu / %.1f MiB, reuse %llu / %.1f MiB; of draws %llu / %.1f MiB; by region size: <=32 MiB %llu / %.1f MiB, <=128 MiB %llu / %.1f MiB, >128 MiB %llu / %.1f MiB; copy-backs into the shadow: %llu regions, %.1f MiB into slabs, %.1f MiB to imports (refused), seeds %llu / %.1f MiB; rebuilds: to stage %llu, to in place %llu, flips used up %llu, restage refused %llu (%.1f MiB); storage refresh write-backs %.1f MiB, of them before a full clear (next op full clear) %llu / %.1f MiB\n",
+        ShadowCopyBackEnabled() ? "on" : "off", u(R::BuildPublishes), t[R::BuildUnits] * unitMib, u(R::ReusePublishes), t[R::ReuseUnits] * unitMib, u(R::DrawPublishes), t[R::DrawUnits] * unitMib, u(R::Upto32), t[R::Upto32Units] * unitMib, u(R::Upto128), t[R::Upto128Units] * unitMib, u(R::Over128), t[R::Over128Units] * unitMib,
+        u(R::CopyBackRegions), t[R::CopyBackSlabBytes] / mib, t[R::CopyBackImportBytes] / mib, u(R::CopyBackSeeds), t[R::CopyBackSeedBytes] / mib, u(R::RebuildToStage), u(R::RebuildToInPlace), u(R::FlipsUsedUp), u(R::RestageRefused), t[R::RestageRefusedBytes] / mib,
+        refreshBytes / mib, static_cast<unsigned long long>(clearRefreshes), clearBytes / mib);
+    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) address-based builds after copy-backs %llu: %.1f MiB copied back into slabs since the previous one, %.1f MiB published for them (%s)\n", u(R::AddressBuildsAfter), t[R::AddressExposedBytes] / mib, t[R::AddressPublishedUnits] * unitMib, copyBackBdaPublish() ? "APS5_SHADOW_COPYBACK_BDA_PUBLISH" : "not published");
 }
 
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
@@ -3096,6 +3233,36 @@ bool LazyWritebackEnabled() {
     return enabled;
 }
 
+// Shadow copy-back. A region staged from the unit shadow (stageFromShadow) used to copy its
+// written ranges back into the import: over the bus, so the title's ~44 MiB regions over aliased
+// storage results either stayed in place (over the 32 MiB cap, or a reused build that never
+// re-decided) and published every fresh unit into the import before the dispatch (~217 MiB per
+// present at the title), or would have crossed the bus once on the way back. With copy-back into the
+// shadow, the written ranges go from the staging buffer into the slabs of the import's unit shadow
+// (VRAM to VRAM; a unit a range covers partly and that is not fresh is seeded from the import
+// first, as a retile does), are stamped and marked fresh at the generation after the stamp: the
+// slab is the newest copy, and only a host-facing consumer (the flush hook, a region bound in place,
+// a copy, indirect arguments, a label, scanout, eviction, retirement) publishes it, as with a
+// storage image's results. A slab the budget refuses takes the import copy-back as before.
+// The trade-off is the one storage images already make ("readbacks off"): a guest CPU read that
+// reaches the memory without a driver-side consumer (no flush hook) sees the import, which holds
+// the region's bytes from before the dispatch. Only regions staged from the shadow (at least half of
+// them over fresh storage results, i.e. memory that aliases render targets) take this path; the
+// staging window's regions copy back into the import as before.
+// A reused build re-decides (ShadowDecisionStale): an in-place region that would now be staged, or
+// a staged one that would now read more than half from the import, fails the revalidation, and the
+// rebuild decides anew (at most APS5_SHADOW_RESTAGE_FLIPS times per region).
+// APS5_NO_SHADOW_COPYBACK=1 restores poc/wbfix: copy-back into the import, the 32 MiB cap and the
+// 384 MiB budget, no rebuilds.
+bool ShadowCopyBackEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SHADOW_COPYBACK") == nullptr && LazyWritebackEnabled();
+    return enabled;
+}
+
+void SetTraceProgram(std::uint64_t programAddress) {
+    traceProgram = programAddress;
+}
+
 bool ShadowStageAccepted(std::uint64_t regionBytes, std::uint64_t shadowBytes, std::uint64_t maxBytes) {
     constexpr std::uint64_t unit = 65536;
     return regionBytes != 0 && regionBytes <= maxBytes && shadowBytes <= regionBytes && shadowBytes >= std::min(unit, regionBytes) && shadowBytes * 2 >= regionBytes;
@@ -3143,12 +3310,14 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
     if (live.fetch_add(bytes, std::memory_order_relaxed) + bytes > shadowStageBudget()) {
         live.fetch_sub(bytes, std::memory_order_relaxed);
         if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
+        region.shadowRefused = true;
         return false;
     }
     auto buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable));
     if (buffer == nullptr) {
         live.fetch_sub(bytes, std::memory_order_relaxed);
         if (profile) stats.refusedDevice.fetch_add(1, std::memory_order_relaxed);
+        region.shadowRefused = true;
         return false;
     }
     region.budgetBytes = bytes;
@@ -3158,6 +3327,8 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
     region.gpuCopy = true;
     region.deviceLocal = true;
     region.shadowSourced = true;
+    region.shadowStaged = true;
+    if (takeRegionTrace()) std::fprintf(stderr, "[roundtrip] staged from the shadow: 0x%llx+0x%llx (%.1f MiB, %.1f MiB fresh, %s), program 0x%llx\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, shadowBytes / 1048576.0, WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) ? "written" : "read-only", static_cast<unsigned long long>(traceProgram));
     if (profile) {
         stats.staged.fetch_add(1, std::memory_order_relaxed);
         stats.stagedBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -3194,8 +3365,21 @@ void GuestBufferMemory::PublishShadowSourcedEdges() const {
     }
 }
 
-void GuestBufferMemory::NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units) {
+void GuestBufferMemory::NoteInPlacePublish(bool written, std::uint64_t regionBytes, std::uint64_t units, bool reused, bool draw, std::uint64_t begin) {
     if (units == 0) return;
+    auto& trip = Roundtrip();
+    using R = RoundtripStats;
+    trip.Add(reused ? R::ReusePublishes : R::BuildPublishes, 1);
+    trip.Add(reused ? R::ReuseUnits : R::BuildUnits, units);
+    if (draw) {
+        trip.Add(R::DrawPublishes, 1);
+        trip.Add(R::DrawUnits, units);
+    }
+    constexpr std::uint64_t mib = std::uint64_t{1} << 20u;
+    const auto bucket = regionBytes <= 32 * mib ? R::Upto32 : regionBytes <= 128 * mib ? R::Upto128 : R::Over128;
+    trip.Add(bucket, 1);
+    trip.Add(static_cast<R::Index>(bucket + 1), units);
+    if (regionBytes > 16 * mib && takeRegionTrace()) std::fprintf(stderr, "[roundtrip] in-place publish: 0x%llx+0x%llx (%.1f MiB, %s), %.1f MiB published, %s, %s, program 0x%llx\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(regionBytes), regionBytes / 1048576.0, written ? "written" : "read-only", units / 16.0, reused ? "reused build" : "build", draw ? "draw" : "dispatch", static_cast<unsigned long long>(traceProgram));
     auto& stats = Lazy();
     (written ? stats.inPlaceWritten : stats.inPlaceRead).fetch_add(1, std::memory_order_relaxed);
     (written ? stats.inPlaceWrittenUnits : stats.inPlaceReadUnits).fetch_add(units, std::memory_order_relaxed);
@@ -3377,6 +3561,11 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     uploaded = true;
+    builtAddressable = addressable;
+    if (addressable && ShadowCopyBackEnabled()) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        addressBuildAfterCopyBacks();
+    }
     // Lazy write-back: a written range inside a region that may be staged from the unit shadow is
     // stored without a publish. Whatever path the region takes below publishes before anything
     // reads its import (in place, a copy from it, a CPU copy), or sources its copy-in from the
@@ -3547,7 +3736,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 }
                 const auto before = profile ? ThreadPublishedUnits() : 0;
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
-                if (profile) NoteInPlacePublish(WritesOverlap(region.begin, static_cast<std::size_t>(bytes)), bytes, ThreadPublishedUnits() - before);
+                if (profile) NoteInPlacePublish(WritesOverlap(region.begin, static_cast<std::size_t>(bytes)), bytes, ThreadPublishedUnits() - before, false, !stagingAllowed, region.begin);
             }
             continue;
         }
@@ -3914,6 +4103,169 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
+std::uint64_t GuestBufferMemory::copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pieces, VkCommandBuffer commands) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    HostImport import{};
+    import.base = region.copySourceBase;
+    import.bytes = region.copySourceBytes;
+    import.buffer = region.copySource;
+    // The slabs belong to the import the region was copied in from: only while the registry still
+    // serves the region with it (a retired or replaced import has no shadow to take the bytes, and
+    // the batch keeps its buffer alive for the import copy-back below).
+    const auto* current = HostImportServing(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    const bool shadowable = current != nullptr && current->buffer == import.buffer && current->base == import.base && current->bytes == import.bytes;
+    // A CPU store into the ranges made before now loses against the shader's bytes, as it does
+    // against an import copy-back: collected first, so the stamps below are newer.
+    for (const auto& [from, to] : pieces) GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
+    struct SlabPieces {
+        std::shared_ptr<ShadowSlab> slab;
+        std::shared_ptr<ShadowSlabPin> pin;
+        std::vector<VkBufferCopy> copies;
+    };
+    std::vector<SlabPieces> slabPieces;
+    std::vector<VkBufferCopy> importCopies;
+    std::vector<ShadowedRange> shadowed;
+    std::vector<ShadowedRange> seeds;
+    std::uint64_t slabBytes = 0, importBytes = 0, seedBytes = 0;
+    for (const auto& [from, to] : pieces) {
+        auto at = from;
+        while (at < to) {
+            const auto pieceEnd = std::min(to, SlabBoundary(import, at));
+            const auto destination = shadowable ? ShadowDestinationFor(context, import, at, pieceEnd) : std::nullopt;
+            if (destination.has_value()) {
+                if (slabPieces.empty() || slabPieces.back().slab != destination->slab) slabPieces.push_back({destination->slab, destination->pin, {}});
+                slabPieces.back().copies.push_back({at - region.begin, destination->offset, pieceEnd - at});
+                for (const auto& [seedBegin, seedEnd] : destination->seedUnits) {
+                    if (std::none_of(seeds.begin(), seeds.end(), [&](const ShadowedRange& seed) { return seed.begin == seedBegin; })) seeds.push_back({seedBegin, seedEnd, destination->slab});
+                }
+                if (!shadowed.empty() && shadowed.back().end == at && shadowed.back().slab == destination->slab) shadowed.back().end = pieceEnd;
+                else shadowed.push_back({at, pieceEnd, destination->slab});
+                slabBytes += pieceEnd - at;
+            } else {
+                importCopies.push_back({at - region.begin, at - region.copySourceBase, pieceEnd - at});
+                importBytes += pieceEnd - at;
+            }
+            at = pieceEnd;
+        }
+    }
+    // Every earlier writer of the slabs (a retile) and of the seeded units' import bytes (host
+    // stores included) precedes the seeds and the copies.
+    constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
+    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+    if (!seeds.empty()) {
+        for (const auto& [begin, end, slab] : seeds) {
+            // The piece's own slab (a seeded unit is one a piece covers partly).
+            CopyBuffer(context, commands, import.buffer, begin - import.base, slab->buffer, SlabOffset(import, *slab, begin), end - begin);
+            NoteShadowSeed(begin, end);
+            recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), Recorder::ReadKind::GpuCopy);
+            seedBytes += end - begin;
+        }
+        // The seeded units precede the staged bytes copied over part of them.
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+    }
+    for (const auto& entry : slabPieces) {
+        for (const auto& copy : entry.copies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, entry.slab->buffer, copy.dstOffset, copy.size);
+        recorder.Keep(entry.slab);
+    }
+    for (const auto& copy : importCopies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, region.copySource, copy.dstOffset, copy.size);
+    // Every range is a store into this memory: stamped (images over it re-upload), and the pieces
+    // in slabs are fresh at the generation after the stamps (the slab holds the newest bytes; the
+    // import pieces are the import's, as after MarkDirectWrites).
+    for (const auto& [from, to] : pieces) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
+    if (!shadowed.empty()) {
+        MarkShadowed(import, shadowed, GuestMemory::TrackerGeneration());
+        noteCopiedBack(shadowed);
+    }
+    region.shadowCopiedBack = true;
+    if (takeRegionTrace()) std::fprintf(stderr, "[roundtrip] copy-back into the shadow: region 0x%llx+0x%llx, %zu ranges, %.1f MiB into slabs, %.1f MiB into the import, %zu seeds\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), pieces.size(), slabBytes / 1048576.0, importBytes / 1048576.0, seeds.size());
+    if (profile) {
+        auto& trip = Roundtrip();
+        trip.Add(RoundtripStats::CopyBackRegions, 1);
+        trip.Add(RoundtripStats::CopyBackSlabBytes, slabBytes);
+        trip.Add(RoundtripStats::CopyBackImportBytes, importBytes);
+        trip.Add(RoundtripStats::CopyBackSeeds, seeds.size());
+        trip.Add(RoundtripStats::CopyBackSeedBytes, seedBytes);
+    }
+    return slabBytes;
+}
+
+std::uint64_t GuestBufferMemory::freshBytes(const Region& region) const {
+    if (region.copySource == VK_NULL_HANDLE || region.begin < region.copySourceBase || region.end > region.copySourceBase + region.copySourceBytes) return 0;
+    HostImport import{};
+    import.base = region.copySourceBase;
+    import.bytes = region.copySourceBytes;
+    import.buffer = region.copySource;
+    const std::pair<std::uint64_t, std::uint64_t> run{0, region.end - region.begin};
+    std::uint64_t shadowBytes = 0;
+    for (const auto& source : ShadowSources(context, import, region.begin, std::span(&run, 1), {}, false)) {
+        if (source.shadow) shadowBytes += source.end - source.begin;
+    }
+    return shadowBytes;
+}
+
+bool GuestBufferMemory::restageCandidate(const Region& region) const {
+    if (!ShadowCopyBackEnabled() || !shadowStageEnabled() || !stagingAllowed || builtAddressable || space != nullptr || Recorder::Active() == nullptr) return false;
+    if (region.direct == nullptr || region.mirror != nullptr || region.sparse || region.unstaged || region.shadowRefused || sparseHeapCandidate(region)) return false;
+    const auto bytes = region.end - region.begin;
+    // Written regions only: a read-only one's flush publishes once per change and nothing is
+    // copied back, so in place costs no second crossing.
+    return bytes <= shadowStageMax() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+}
+
+bool GuestBufferMemory::ShadowDecisionStale(std::uint64_t begin, std::uint64_t end) {
+    if (!ShadowCopyBackEnabled() || !uploaded || committed) return false;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto* region = const_cast<Region*>(owner(begin));
+    if (region == nullptr || region->end < end || !restageCandidate(*region)) return false;
+    const auto bytes = region->end - region->begin;
+    const std::pair<std::uint64_t, std::uint64_t> whole{region->begin, region->end};
+    if (!(AnyShadowedOverlaps(region->begin, static_cast<std::size_t>(bytes)) || StorageTexture::AnyPendingOverlaps(std::span(&whole, 1)))) return false;
+    // The pending images go into the shadow first, without a publish: the rebuild's stage reads
+    // them from the slabs, and an in-place use publishes them by the caller's flush.
+    StorageTexture::FlushPending(region->begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
+    const auto fresh = freshBytes(*region);
+    if (!ShadowStageAccepted(bytes, fresh, shadowStageMax())) {
+        if (profile && fresh != 0) {
+            Roundtrip().Add(RoundtripStats::RestageRefused, 1);
+            Roundtrip().Add(RoundtripStats::RestageRefusedBytes, bytes);
+        }
+        return false;
+    }
+    if (!takeRestageFlip(region->begin)) {
+        if (profile) Roundtrip().Add(RoundtripStats::FlipsUsedUp, 1);
+        return false;
+    }
+    if (takeRegionTrace()) std::fprintf(stderr, "[roundtrip] rebuild to stage: 0x%llx+0x%llx (%.1f MiB, %.1f MiB fresh), program 0x%llx\n", static_cast<unsigned long long>(region->begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, fresh / 1048576.0, static_cast<unsigned long long>(traceProgram));
+    if (profile) Roundtrip().Add(RoundtripStats::RebuildToStage, 1);
+    return true;
+}
+
+bool GuestBufferMemory::ShadowStagedStale() {
+    if (!ShadowCopyBackEnabled() || !uploaded || committed) return false;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    for (auto& region : regions) {
+        if (!region.shadowStaged || !region.gpuCopy || !region.deviceLocal) continue;
+        const auto bytes = region.end - region.begin;
+        const std::pair<std::uint64_t, std::uint64_t> whole{region.begin, region.end};
+        if (StorageTexture::AnyPendingOverlaps(std::span(&whole, 1))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region", PublishScope::None);
+        // At least half from the slabs, as when the region was staged; else in place reads less
+        // over the bus than this copy-in would.
+        const auto fresh = freshBytes(region);
+        if (fresh * 2 >= bytes) continue;
+        if (!takeRestageFlip(region.begin)) {
+            if (profile) Roundtrip().Add(RoundtripStats::FlipsUsedUp, 1);
+            continue;
+        }
+        if (takeRegionTrace()) std::fprintf(stderr, "[roundtrip] rebuild to in place: 0x%llx+0x%llx (%.1f MiB, %.1f MiB fresh), program 0x%llx\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), bytes / 1048576.0, fresh / 1048576.0, static_cast<unsigned long long>(traceProgram));
+        if (profile) Roundtrip().Add(RoundtripStats::RebuildToInPlace, 1);
+        return true;
+    }
+    return false;
+}
+
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3932,6 +4284,35 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
                 else merged.push_back(range);
             }
+        }
+        if (ShadowCopyBackEnabled() && region.shadowStaged && region.shadowSourced && region.deviceLocal && region.buffer != nullptr) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) pieces.emplace_back(from, to);
+            }
+            if (!pieces.empty()) {
+                if (!recording) {
+                    commands = recorder.Commands();
+                    timing = recorder.BeginGpuTiming(StagingCopyBackKey);
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                    recording = true;
+                }
+                std::uint64_t pieceBytes = 0;
+                for (const auto& [from, to] : pieces) pieceBytes += to - from;
+                copyBackIntoShadow(recorder, region, pieces, commands);
+                copiedBytes += pieceBytes;
+                recorder.Keep(region.buffer);
+                if (profile) {
+                    Copies().gpuCopyBacks.fetch_add(pieces.size(), std::memory_order_relaxed);
+                    Copies().gpuCopyBackBytes.fetch_add(pieceBytes, std::memory_order_relaxed);
+                    Copies().stagedOutBytes.fetch_add(pieceBytes, std::memory_order_relaxed);
+                }
+            }
+            region.copiedBack = true;
+            continue;
         }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
@@ -4210,6 +4591,9 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto* found = owner(begin);
         if (found == nullptr) continue;
         const auto& region = *found;
+        // A copy-back into the unit shadow stamped and marked its ranges itself (copyBackIntoShadow):
+        // a stamp now would make the slab's newest bytes stale.
+        if (region.gpuCopy && region.copiedBack && region.shadowCopiedBack) continue;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
     }
 }
@@ -4520,6 +4904,7 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         region.copiedBack = false;
+        region.shadowCopiedBack = false;
         copies.push_back(&region);
     }
     if (copies.empty()) return;

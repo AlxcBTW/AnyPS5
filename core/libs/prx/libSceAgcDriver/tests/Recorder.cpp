@@ -2792,6 +2792,107 @@ void shadowStagingTests(const Device& device, Recorder& recorder) {
     std::cout << "shadow-sourced staging verified\n";
 }
 
+// Shadow copy-back: a written region past the staging window over fresh unit-shadow units is staged
+// from the shadow, and its copy-back goes into the slabs: the import keeps its old bytes until a
+// publish, which then brings the shader's bytes (here a fill of the staged buffer) and the slab's.
+void shadowCopyBackTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    const auto& context = device.GetContext();
+    if (!ShadowCopyBackEnabled() || context.hostImportAlignment == 0) {
+        std::cout << "shadow copy-back off or host imports unavailable: not tested\n";
+        return;
+    }
+    constexpr std::uint64_t unit = 65536;
+    constexpr std::size_t bytes = 8u << 20u;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "unit shadows are on without write watching");
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{context, block, address};
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || !Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched: shadow copy-back not tested\n";
+        return;
+    }
+    CollectWritesUncached(address, bytes);
+    const auto* guest = static_cast<const std::uint8_t*>(block);
+    const auto at = [&](std::uint64_t index) { return address + index * unit; };
+    const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    // Units 9..56 retiled with 0x55 (unit 8 stays the import's).
+    {
+        auto destination = ShadowDestinationFor(context, *import, at(9), at(57));
+        if (!destination.has_value()) {
+            std::cout << "the test retile spans two slabs: shadow copy-back not tested\n";
+            return;
+        }
+        auto pattern = std::make_shared<Buffer>(context, static_cast<std::size_t>(48 * unit), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memset(pattern->Bytes().data(), 0x55, pattern->Bytes().size());
+        const auto commands = recorder.Commands();
+        recorder.Keep(pattern);
+        recorder.Keep(destination->slab);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const VkBufferCopy piece{0, destination->offset, 48 * unit};
+        copyBuffer(commands, pattern->Handle(), destination->buffer, 1, &piece);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        const std::vector<ShadowedRange> ranges{{at(9), at(57), destination->slab}};
+        MarkShadowed(*import, ranges, TrackerGeneration());
+    }
+    // Written range [unit 8 + 4096, unit 57 - 4096): over the staging window (3 MiB), units 8 and 56
+    // covered partly, unit 8 not fresh (seeded at the copy-back).
+    const auto begin = at(8) + 4096;
+    const auto end = at(57) - 4096;
+    GuestBufferMemory memory(context);
+    memory.AllowDeviceStaging();
+    memory.AddWritable(begin, static_cast<std::size_t>(end - begin));
+    memory.Upload(false);
+    Require(memory.InPlaceReads().empty() && memory.ShadowSourced(begin, end), "a written region past the staging window over fresh units was not staged from the unit shadow");
+    // The "shader": 0x66 over units 20..21 of the staged buffer.
+    {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(at(20), static_cast<std::size_t>(2 * unit), adjustment);
+        Require(adjustment == 0, "the test view needs an adjustment");
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, view.buffer, view.offset, 2 * unit, 0x66666666u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+    }
+    memory.RecordCopyBacks(recorder);
+    memory.MarkDirectWrites();
+    recorder.Sync();
+    Require(guest[20 * unit] == 0x11 && guest[30 * unit] == 0x11, "the copy-back into the shadow reached the import");
+    Require(AnyShadowedOverlaps(at(20), static_cast<std::size_t>(2 * unit)) && AnyShadowedOverlaps(at(8), static_cast<std::size_t>(unit)), "the copied-back units are not fresh in the shadow");
+    const std::pair<std::uint64_t, std::uint64_t> run{20 * unit, 22 * unit};
+    const auto sources = ShadowSources(context, *import, address, std::span(&run, 1), {}, false);
+    Require(sources.size() == 1 && sources.front().shadow, "a copied-back unit does not read from the slab");
+    {
+        std::lock_guard gpu(GpuMutex());
+        PublishShadow(at(8), static_cast<std::size_t>(49 * unit), PublishScope::Whole, PublishReason::Hook);
+    }
+    recorder.Sync();
+    Require(guest[8 * unit] == 0x11 && guest[8 * unit + 4096] == 0x11 && guest[9 * unit] == 0x55 && guest[20 * unit] == 0x66 && guest[22 * unit - 1] == 0x66 && guest[22 * unit] == 0x55 && guest[57 * unit - 1] == 0x55, "the published copy-back does not hold the slab's and the shader's bytes");
+    std::cout << "shadow copy-back verified\n";
+}
+
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -6169,6 +6270,7 @@ int main(int argc, char** argv) {
             }
             unitShadowTests(device, recorder);
             shadowStagingTests(device, recorder);
+            shadowCopyBackTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cmask-only") {
