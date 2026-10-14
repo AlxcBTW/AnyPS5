@@ -27,17 +27,18 @@ struct DescriptorValue;
 // records which of the stored words only carry an address:
 //   - pointer user words: user-data words the walk used only as the base of raw reads (the
 //     SrtUserDataUse asBase bits without asValue); the runs read through them are kept relative;
-//   - V# base fields: word 0 (bits 2..31) and word 1 (bits 0..15) of a buffer descriptor that the
-//     walk copied verbatim from one place (a run or the user data) into the snapshot, that nothing
-//     else copies, and that no walked run lies inside.
+//   - V# base fields: word 0 bits 2..31 (the low 32 address bits; word 1 with the high bits and
+//     the stride stays exact) of a buffer descriptor that the walk copied verbatim from one place
+//     (a run or the user data) into the snapshot, that no other descriptor shares, that no walked
+//     run lies inside, and that the compiled result copies only where it can be patched.
 // The content key leaves exactly those bits out and hashes the words behind the pointers instead.
 // A hit validates every other word by value at the rebased addresses, then patches the live
 // addresses into a copy of the compiled result (the guest-buffer elements that copy a V#, the
-// shader-data slots that forward a user word).
+// flattened-SRT, shader-data and push-constant words that copy a base, the shader-data slots that
+// forward a user word).
 namespace AgcDriver::DriverDetail {
 
 inline constexpr std::uint32_t BufferBaseLowMask = 0xfffffffcu;
-inline constexpr std::uint32_t BufferBaseHighMask = 0x0000ffffu;
 inline constexpr std::uint32_t PointerWordMask = 0xffffffffu;
 // Bound on the words a content key hashes behind the pointer words.
 inline constexpr std::size_t ContentKeyMaxWords = 256;
@@ -49,10 +50,12 @@ struct AddressField {
     bool operator==(const AddressField& other) const = default;
 };
 
-// One guest-buffer element of the compiled result that copies a relocatable V#: binding index,
-// its first word in the binding's guestDescriptor, and the source of the V#'s word 0 (a position
-// among the variant's words, or a user-data word).
+// One word of the compiled result that copies a relocatable V# base (word 0 of a guest-buffer
+// element, or a flattened-SRT, shader-data or push-constant word): binding index (PushConstants for
+// a push dword), the word in it, and the source of the base (a position among the variant's words,
+// or a user-data word).
 struct ElementPatch {
+    static constexpr std::uint32_t PushConstants = 0xffffffffu;
     std::uint32_t binding = 0;
     std::uint32_t word = 0;
     std::uint32_t source = 0;
@@ -63,7 +66,7 @@ struct ElementPatch {
 
 // Why FindBufferFields keeps a buffer V# exact: the program reads raw addresses (BDA), a null V#,
 // no verbatim source, more than one source, a source inside a pointer word, a walked run inside
-// the buffer, a built descriptor inside it, the base in the flattened SRT, the base copied elsewhere.
+// the buffer, a built descriptor inside it, (unused), the base in an image, sampler or other element.
 enum class FieldRefusal : std::uint8_t { Bda, NotPresent, NoSource, Sources, Pointer, Walked, Derived, Flattened, Copied };
 inline constexpr std::size_t FieldRefusalCount = 9;
 
@@ -112,10 +115,10 @@ inline std::uint64_t AlignedPointer(std::uint32_t word) {
 std::uint64_t SplitRelativeRuns(std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t candidates, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::vector<std::int8_t>& runBases, std::vector<std::uint32_t>& words);
 
 // The V# base fields and the element patches of a profile (see the file comment): `runs`/`words`
-// are the variant's, `buffers` the capture's buffer descriptors, `flattened` its flattened SRT,
+// are the variant's, `buffers` the capture's buffer descriptors,
 // `compiled` the result materialized from it. Fills profile.wordFields, userFields,
 // maskPositions, patches and relocatableBuffers.
-void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::DescriptorValue> buffers, std::span<const std::uint32_t> flattened, const ShaderRecompiler::RecompileResult& compiled, RelocationProfile& profile);
+void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, std::span<const std::uint32_t> userData, std::span<const ShaderRecompiler::DescriptorValue> buffers, const ShaderRecompiler::RecompileResult& compiled, RelocationProfile& profile);
 
 // The dispatch shape a profile implies (empty userMasks when there is nothing to leave out).
 DispatchShape ShapeOf(const RelocationProfile& profile, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::int8_t> runBases);
