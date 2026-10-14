@@ -3758,7 +3758,15 @@ void importWatchTests(const Device& device) {
     const auto& context = device.GetContext();
 #ifdef _WIN32
     Require(PrepareImportWatch(context) == ImportWatch::Unwatch, "Windows host imports stayed watched by default");
-    std::cout << "import watch decisions: Windows host imports use comparisons\n";
+    std::cout << "import watch decisions: Windows host imports through views use comparisons\n";
+    if (context.hostImportAlignment == 0 || !WriteWatched()) {
+        std::cout << "host imports or write watching unavailable: the Windows import probe not tested\n";
+        return;
+    }
+    const auto probe = ProbeImportWriteProtection(context);
+    Require(probe.failure == nullptr, std::string("(w) the Windows import probe failed at ") + (probe.failure != nullptr ? probe.failure : "") + " (" + std::to_string(static_cast<int>(probe.result)) + ")");
+    std::cout << "Windows import probe: " << probe.writtenAtImport << " of " << probe.pages << " scratch pages reported written at the import, " << probe.writtenAfterSubmit << " after the first GPU read, " << probe.writtenAfterSecondSubmit << " after the second, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenByCpu << " after a CPU store\n";
+    Require(probe.writtenByCpu != 0, "(w) a CPU store into a host-imported MEM_WRITE_WATCH range was not collected");
 #else
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
         std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
@@ -7807,6 +7815,10 @@ int main(int argc, char** argv) {
             return 77;
         }
         Device& device = *created;
+        if (argc == 2 && std::string_view(argv[1]) == "--import-watch-only") {
+            importWatchTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
             const auto alignment = device.GetContext().hostImportAlignment;
             if (alignment == 0 || alignment > 65536) {
