@@ -7129,6 +7129,19 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--import-watch-decision-only") {
+            const char* value = std::getenv("APS5_WRITE_WATCH_IMPORTS");
+            const auto decided = PrepareImportWatch(device.GetContext());
+            if (value != nullptr && std::string_view(value) == "watch") Require(decided == ImportWatch::Watch, "APS5_WRITE_WATCH_IMPORTS=watch did not keep host imports watched");
+            else if (value != nullptr && std::string_view(value) == "unwatch") Require(decided == ImportWatch::Unwatch, "APS5_WRITE_WATCH_IMPORTS=unwatch did not compare host imports");
+#ifdef _WIN32
+            else Require(decided == ImportWatch::Unwatch, "the Windows default stopped comparing direct host imports");
+#else
+            else return 77;
+#endif
+            std::cout << "import watch decision tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--writeback-window-union-only") {
             if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
             if (!writeBackPaddingTests(device, recorder, true, true)) return 77;
