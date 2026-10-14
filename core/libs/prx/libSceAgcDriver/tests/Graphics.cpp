@@ -101,6 +101,90 @@ void expectFailure(TAction action, std::string_view reason) {
     throw std::runtime_error("expected graphics rejection: " + std::string(reason));
 }
 
+void inactiveVertexPointSizeTests() {
+    const auto pointSizeState = [] {
+        auto queue = makeState();
+        queue.context[0x1b3] = queue.context[0x1b4] = 2;
+        queue.context[0x207] = 0x01210000;
+        return queue;
+    };
+    for (const auto primitive : {2u, 4u, 5u, 6u, 7u, 17u}) {
+        auto queue = pointSizeState();
+        queue.userConfig[0x242] = primitive;
+        for (const auto raster : {0u, 0x240u, 0x248u}) {
+            queue.context[0x205] = raster;
+            const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+            Require(rejection.empty(), "inactive vertex point size failed the draw precheck: " + rejection);
+            static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+        }
+    }
+    for (const auto raster : {0u, 0x240u, 0x248u}) {
+        auto queue = pointSizeState();
+        queue.userConfig[0x242] = 3;
+        queue.context[0x205] = raster;
+        const auto rejection = AgcDriver::Graphics::DrawRejection(queue, false);
+        Require(rejection.empty(), "inactive line-strip point size failed the draw precheck: " + rejection);
+        const auto state = AgcDriver::Graphics::DecodeState(queue);
+        Require(state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && !state.primitiveRestart, "inactive point size changed line-strip decoding");
+        Require(AgcDriver::Graphics::RasterPrimitiveOf(state) == ShaderRecompiler::RasterPrimitive::Line, "inactive point size changed the line primitive class");
+        queue.userConfig[0x24b] = 1;
+        queue.context[0x103] = 0xffffffffu;
+        const auto indexedRejection = AgcDriver::Graphics::DrawRejection(queue, true);
+        Require(indexedRejection.empty(), "inactive line-strip point size with primitive restart failed the draw precheck: " + indexedRejection);
+        const auto indexedState = AgcDriver::Graphics::DecodeState(queue);
+        Require(indexedState.topology == VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && indexedState.primitiveRestart, "inactive point size changed indexed line-strip decoding");
+    }
+    const auto rejected = [](AgcDriver::QueueState queue) {
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("auxiliary vertex exports") != std::string::npos, "unsupported vertex exports passed the draw precheck");
+        try {
+            static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
+        } catch (const std::runtime_error&) {
+            return;
+        }
+        throw std::runtime_error("potentially active point size passed the state decoder");
+    };
+    for (const auto primitive : {1u, 9u}) {
+        auto queue = pointSizeState();
+        queue.userConfig[0x242] = primitive;
+        rejected(queue);
+    }
+    for (const auto stages : {0x2004u, 0x2020u}) {
+        auto queue = pointSizeState();
+        queue.context[0x2d5] = stages;
+        rejected(queue);
+    }
+    for (const auto raster : {8u, 0x208u, 0x48u}) {
+        auto queue = pointSizeState();
+        queue.context[0x205] = raster;
+        rejected(queue);
+    }
+    for (const auto flag : {1u << 17u, 1u << 20u}) {
+        auto queue = pointSizeState();
+        queue.context[0x207] = 0x01210000 | flag;
+        rejected(queue);
+    }
+    for (const auto distances : {1u, 0x100u, 0x00c000ffu, 0x00c0ff00u}) {
+        auto queue = pointSizeState();
+        queue.context[0x207] |= distances;
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "inactive point size rejected supported clip/cull distances");
+        Require(AgcDriver::Graphics::DecodeState(queue).paClVsOutCntl == queue.context[0x207], "inactive point size discarded clip/cull distance state");
+    }
+    {
+        auto queue = pointSizeState();
+        queue.context[0x207] |= 0x004001ffu;
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).find("more than eight") != std::string::npos, "inactive point size bypassed the clip/cull count limit");
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "more than eight clip and cull distances");
+    }
+    for (const auto offset : {0x2d5u, 0x205u}) {
+        auto queue = pointSizeState();
+        queue.context.erase(offset);
+        rejected(queue);
+    }
+    auto queue = pointSizeState();
+    queue.userConfig.erase(0x242);
+    rejected(queue);
+}
+
 void hdrComponentSwapTests() {
     using namespace AgcDriver::Graphics;
     for (const auto number : {0u, 1u, 4u, 7u}) {
@@ -626,6 +710,34 @@ void ShaderStageTests() {
         fan.userConfig[0x25b] = 0x4020;
         fan.userConfig[0x242] = 3;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(fan); }, "unsupported geometry input or output assembly");
+    }
+    {
+        auto fast = makeState();
+        fast.userConfig[0x242] = 1;
+        fast.context[0x2d5] = 0x482030;
+        fast.userConfig[0x25b] = 0x201;
+        fast.context[0x1ff] = 32;
+        fast.context[0x2ce] = 32;
+        fast.context[0x2d3] = 64;
+        fast.context[0x29b] = 2;
+        fast.context[0x2ab] = 4;
+        fast.shader[0x8a] = 0x022c0245;
+        fast.shader[0x8b] = 0x9002a;
+        const auto state = AgcDriver::Graphics::DecodeState(fast);
+        Require(state.stages.path == AgcDriver::Graphics::ShaderPath::Geometry && state.stages.vertexWaveSize == 32 && state.stages.mesh, "a fast-launch draw did not decode as wave32 geometry");
+        const auto& mesh = *state.stages.mesh;
+        Require(mesh.inputPrimitive == 1 && mesh.primitivesPerGroup == 1 && mesh.verticesPerGroup == 1 && mesh.maxVertices == 32 && mesh.maxPrimitives == 64 && mesh.threadsPerGroup == 64 && mesh.ldsSizeDwords == 128, "a fast-launch subgroup did not decode as one point amplified by PRIM_AMP_FACTOR");
+        fast.context[0x2d5] = 0x502030;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "unsupported geometry routing, fast launch or wave-ID state");
+        fast.context[0x2d5] = 0x482030;
+        fast.userConfig[0x25b] = 0x402;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "fast launch other than one point per subgroup");
+        fast.userConfig[0x25b] = 0x201;
+        fast.userConfig[0x242] = 4;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "fast launch other than one point per subgroup");
+        fast.userConfig[0x242] = 1;
+        fast.context[0x2d3] = 0;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "amplifies to no primitives");
     }
     queue.context[0x2ab] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "invalid VGT_ESGS_RING_ITEMSIZE");
@@ -1446,6 +1558,17 @@ void DepthStencilTests() {
     queue.context[0x207] = (1u << 18u) | (1u << 21u) | (1u << 24u);
     const auto layered = AgcDriver::Graphics::DecodeState(queue);
     Require(layered.color.depthSlice == 1u && layered.color.layers == 3u && layered.renderLayers == 3u && layered.layerExports == (1u << 18u), "a color view of three 3D depth slices did not render three layers from the vertex layer export");
+    {
+        auto pointSize = queue;
+        pointSize.context[0x1b3] = pointSize.context[0x1b4] = 2;
+        Require(AgcDriver::Graphics::DrawRejection(pointSize, false).empty(), "layered volume test state failed the draw precheck");
+        pointSize.context[0x207] |= 1u << 16u;
+        const auto rejection = AgcDriver::Graphics::DrawRejection(pointSize, false);
+        Require(rejection.empty(), "inactive point size rejected a layered volume draw: " + rejection);
+        const auto decoded = AgcDriver::Graphics::DecodeState(pointSize);
+        Require(decoded.color.depthSlice == layered.color.depthSlice && decoded.color.layers == layered.color.layers && decoded.renderLayers == layered.renderLayers && decoded.layerExports == layered.layerExports, "inactive point size changed layered volume routing");
+        Require(decoded.paClVsOutCntl == pointSize.context[0x207], "inactive point size discarded the layered export state");
+    }
     queue.context[0x31b] = 1u | (8u << 13u);
     Require(AgcDriver::Graphics::DecodeState(queue).renderLayers == 3u, "a color view past the 3D surface was not clamped to its last slice");
     queue.context[0x207] = 0;
@@ -5755,6 +5878,7 @@ int main(int argc, char** argv) {
         UnwrittenSampleLocationTests();
         ShaderStageTests();
         NggVertexWorkgroupTests();
+        inactiveVertexPointSizeTests();
         TuningFieldTests();
         PixelInputLayoutTests();
         UnexportedPixelInputTests();
