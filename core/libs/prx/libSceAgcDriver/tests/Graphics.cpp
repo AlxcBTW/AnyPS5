@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
@@ -22,6 +23,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libc/include/GuestHeap.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -2880,6 +2882,32 @@ AgcDriver::Graphics::Context mockContext() {
     return context;
 }
 
+void addressSpaceTeardownTests() {
+#ifdef _WIN32
+    _putenv_s("APS5_NO_LEASE_MIRROR", "1");
+#else
+    setenv("APS5_NO_LEASE_MIRROR", "1", 1);
+#endif
+    auto context = mockContext();
+    context.device = makeHandle<VkDevice>();
+    context.bufferDeviceAddress = true;
+    context.limits.maxStorageBufferRange = 1u << 27;
+    void* block = GuestHeap::GuestHeapAlignForGpu_nid_postfix(16, 64);
+    const auto before = AgcDriver::Graphics::LeaseCounters().cacheDrops;
+    {
+        AgcDriver::Graphics::GuestBufferMemory memory(context);
+        memory.AcquireRegistered();
+        Require(memory.HoldsLease(), "address-based build holds no lease before device teardown");
+        memory.Upload(true);
+        memory.WriteBack();
+        Require(!memory.HoldsLease(), "completed address-based build kept its own lease");
+    }
+    AgcDriver::Graphics::ClearImageMirrors(context.device);
+    GuestHeap::GuestHeapFree_nid_postfix(block);
+    Require(AgcDriver::Graphics::LeaseCounters().cacheDrops == before, "device teardown left the cached address space pinning guest allocations");
+    Require(mock.live == 0, "address-space teardown test leaked Vulkan objects");
+}
+
 using Role = ShaderRecompiler::DescriptorRole;
 using Kind = ShaderRecompiler::DescriptorKind;
 
@@ -5594,6 +5622,11 @@ int main(int argc, char** argv) {
             Require(mock.live == 0, "sparse buffer hole tests leaked Vulkan objects");
             std::cout << "sparse buffer hole tests " << (passed ? "passed" : "failed") << '\n';
             return passed ? 0 : 1;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--address-space-teardown") {
+            addressSpaceTeardownTests();
+            std::cout << "address-space device teardown releases cached guest allocations\n";
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
