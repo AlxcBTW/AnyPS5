@@ -1212,7 +1212,14 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         saved.assign(source, source + (stop - first));
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    if (!import()) return false;
+    bool imported = false;
+    {
+#ifdef __APPLE__
+        const GuestArena::HostWrite open(reinterpret_cast<void*>(first), static_cast<std::size_t>(stop - first));
+#endif
+        imported = import();
+    }
+    if (!imported) return false;
     if (!staysWatched) {
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, address, bytes);

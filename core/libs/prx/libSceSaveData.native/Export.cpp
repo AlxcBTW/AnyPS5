@@ -464,7 +464,6 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr) {
         throw std::runtime_error("sceSaveDataMount3: null argument");
     }
-    std::memset(mount_result, 0, sizeof(*mount_result));
     const bool create = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE) != 0;
     const bool create2 = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_CREATE2) != 0;
     const bool rdonly = (mount->mount_mode & SAVE_DATA_MOUNT_MODE_RDONLY) != 0;
@@ -506,6 +505,7 @@ static int mount3(const SaveDataMount3* mount, SaveDataMountResult* mount_result
     // path resolver maps it to the save directory, whose name may be far longer.
     const std::string mountPoint = "/savedata" + std::to_string(slot);
     AddPathAlias_nid_no_patch(mountPoint.c_str(), std::filesystem::absolute(real_path).string().c_str());
+    std::memset(mount_result, 0, sizeof(*mount_result));
     g_slots[slot].used = true;
     g_slots[slot].mount_point = mountPoint;
     g_slots[slot].real_path = real_path;
