@@ -6047,6 +6047,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-bindings-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "host imports unavailable: draw binding tests skipped\n";
+                return 77;
+            }
             resourceReadTests(device, recorder);
             misalignedSnapshotTests(device, recorder);
             misalignedRegionTests(device, recorder);
