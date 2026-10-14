@@ -409,6 +409,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         timing.Mark("draw_and_resource_release");
         return drawn();
     }
+    // A GPU-side non-indexed mesh draw (Graphics::GpuMeshIndirectDraws) whose record is already
+    // final in guest memory (no deferred label and no unfinished recorded GPU write covers it, so
+    // the read does not wait) reads it here: one that draws nothing is not recorded, exactly as
+    // the CPU loop above ends such a draw. Every other one is recorded and reads its record on the
+    // GPU, so queue 0 never waits for a record's writer. APS5_NO_MESH_INDIRECT_PEEK=1 records all.
+    if (drawParameters.indirect && graphics.stages.mesh && !drawParameters.indexed && meshIndirectPeek() && indirectRecordsFinal(*drawParameters.indirect)) {
+        const auto readStart = std::chrono::steady_clock::now();
+        const auto record = Pm4::ReadDrawArguments(*drawParameters.indirect, 0);
+        if (!IndirectRecordDraws(record, drawParameters)) {
+            Graphics::CountDrawSkip(Graphics::DrawSkip::FinalEmptyIndirect, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - readStart).count());
+            if (traceIndirect) std::fprintf(stderr, "[draw]   GPU-side mesh record final: count %u instances %u draws nothing, not recorded\n", record.count, record.instances);
+            timing.Mark("draw_and_resource_release");
+            return drawn();
+        }
+    }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {

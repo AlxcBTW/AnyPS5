@@ -156,6 +156,12 @@ private:
     void cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming);
     static bool drawPrecheck();
     static bool emptyIndirectSkip();
+    // APS5_NO_MESH_INDIRECT_PEEK unset: a GPU-side non-indexed mesh draw whose record is final
+    // (indirectRecordsFinal) reads it on the CPU and records nothing when it draws nothing.
+    static bool meshIndirectPeek();
+    // Whether an indirect draw's records are final in guest memory for this queue thread: no
+    // deferred label and no recorded, unfinished GPU write covers them, so a read does not wait.
+    static bool indirectRecordsFinal(const Pm4::DrawParameters::IndirectDraw& indirect);
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected);

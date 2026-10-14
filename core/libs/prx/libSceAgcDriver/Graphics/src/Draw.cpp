@@ -525,7 +525,7 @@ struct DrawProfile {
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
-constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown", "empty indirect (no capture)"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown", "empty indirect (no capture)", "empty GPU-side mesh indirect (final record, no wait)"};
 
 DrawProfile& Profile() {
     static DrawProfile profile;
@@ -584,7 +584,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[3072];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {

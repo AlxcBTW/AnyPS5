@@ -375,6 +375,39 @@ int main() {
             drawIndirect(count, instances, first);
             for (std::uint32_t triangle = 0; triangle < Triangles; ++triangle) Require(PixelIs(CellPixel(triangle), Background), "an empty indirect record drew triangle " + std::to_string(triangle));
         }
+        // Non-indexed records (DRAW_INDIRECT, no SGPR locations): the vertices start at the draw's
+        // vertex constant (GE_INDX_OFFSET plus the folded offset); the record's start vertex reaches
+        // no register, so it neither offsets nor bounds them.
+        const auto drawAutoIndirect = [&](std::uint32_t count, std::uint32_t instances, std::uint32_t startVertex, std::uint32_t vertexConstant) {
+            const std::array<std::uint32_t, 4> words{count, instances, startVertex, 0u};
+            std::copy(words.begin(), words.end(), record);
+            AgcDriver::Pm4::DrawParameters draw{0, 0, 0, 1, 0, false, vertexConstant, 0};
+            draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(record), 0x24u, 16u, 16u, 1u, false, 0u, 0x280u, 0x280u, 0x280u, false, vertexConstant};
+            draw.indirect->vertexConstant = vertexConstant;
+            ClearPixels();
+            DrawMesh(device, {WideSubgroup, draw, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size()))});
+        };
+        const auto checkRange = [&](const char* what, std::uint32_t first, std::uint32_t count) {
+            for (std::uint32_t triangle = 0; triangle < Triangles; ++triangle) {
+                const auto offset = CellPixel(triangle);
+                const bool drawn = triangle >= first && triangle < first + count;
+                Require(drawn ? PixelIs(offset, TriangleColor(triangle)) : PixelIs(offset, Background), std::string(what) + ": triangle " + std::to_string(triangle) + " pixel " + PixelText(offset));
+            }
+        };
+        drawAutoIndirect(static_cast<std::uint32_t>(Ordered.size()), 1, 0, 0);
+        CheckTriangles("indirect non-indexed triangle list");
+        drawAutoIndirect(3u * 10u, 1, 0, 0);
+        checkRange("indirect non-indexed count", 0, 10);
+        drawAutoIndirect(3u * 10u, 1, 3u * 5u, 0);
+        checkRange("indirect non-indexed start vertex (reaches no register)", 0, 10);
+        drawAutoIndirect(3u * 10u, 1, 0xffffffffu, 0);
+        checkRange("indirect non-indexed highest start vertex", 0, 10);
+        drawAutoIndirect(3u * 10u, 1, 0, 3u * 5u);
+        checkRange("indirect non-indexed vertex constant", 5, 10);
+        for (const auto& [count, instances] : {std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(Ordered.size()), 0u}, std::array<std::uint32_t, 2>{0u, 1u}, std::array<std::uint32_t, 2>{2u, 1u}}) {
+            drawAutoIndirect(count, instances, 0, 0);
+            for (std::uint32_t triangle = 0; triangle < Triangles; ++triangle) Require(PixelIs(CellPixel(triangle), Background), "an empty non-indexed indirect record drew triangle " + std::to_string(triangle));
+        }
 
         ClearPixels();
         DrawMesh(device, {SmallSubgroup, {0, static_cast<std::uint32_t>(Ordered.size()), 0, 1, 0, false}, VertexBufferDescriptor(Ordered.data(), static_cast<std::uint32_t>(Ordered.size())), 0});

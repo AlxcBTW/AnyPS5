@@ -112,7 +112,10 @@ const char* IndirectDrawPathName(IndirectDrawPath path);
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and
 // Thrown (the decode or the build threw) and EmptyIndirect (a CPU-side indirect draw whose records
 // draw nothing, ended before its stage captures); `us` is the packet's time in the driver.
-enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, EmptyIndirect, Count };
+// FinalEmptyIndirect: a GPU-side non-indexed mesh draw whose record was already final in guest
+// memory, read without a wait after the captures and found empty (nothing recorded); `us` is the
+// read's time.
+enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, EmptyIndirect, FinalEmptyIndirect, Count };
 void CountDrawSkip(DrawSkip kind, double us);
 
 // Recorded draws whose written guest buffers were copied (their results reach guest memory by a CPU

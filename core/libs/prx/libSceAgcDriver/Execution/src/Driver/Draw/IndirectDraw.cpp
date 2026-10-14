@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -26,6 +27,20 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
 bool Driver::emptyIndirectSkip() {
     static const bool skip = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return skip;
+}
+
+bool Driver::meshIndirectPeek() {
+    static const bool peek = std::getenv("APS5_NO_MESH_INDIRECT_PEEK") == nullptr;
+    return peek;
+}
+
+bool Driver::indirectRecordsFinal(const Pm4::DrawParameters::IndirectDraw& indirect) {
+    const auto bytes = indirect.RangeBytes();
+    if (bytes == 0 || indirect.countIndirect) return false;
+    for (const auto& label : deferredLabels().labels) {
+        if (label.address < indirect.arguments + bytes && indirect.arguments < label.address + label.size) return false;
+    }
+    return queryPendingWrite(indirect.arguments, static_cast<std::size_t>(bytes), {}) == ShaderMemory::PendingWrite::None;
 }
 
 std::optional<Graphics::IndirectDrawPath> Driver::IndirectCpuBeforeCapture(const Graphics::ShaderStages& stages, bool rectList, const Pm4::DrawParameters& drawParameters, const VulkanDevice::IndirectDrawSupport& support) {
