@@ -2385,6 +2385,16 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return !shader.srtFills.empty(); })) {
         SrtFillCounts counts;
         counts.draws = 1;
+        const auto readOnCpu = [](std::uint64_t address, std::byte* target) {
+            std::uint32_t word = 0;
+            {
+                const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::SrtFill);
+                GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+            }
+            std::memcpy(target, &word, sizeof(word));
+        };
+        std::vector<std::byte*> copyTargets;
+        bool synced = false;
         for (std::size_t index = 0; index < shaders.size(); ++index) {
             const auto& fills = shaders[index].srtFills;
             auto* buffer = fills.empty() ? nullptr : resources->FlattenedSrtBuffer(index);
@@ -2397,20 +2407,26 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                 if (lean) {
                     const auto path = decide(fill.address, sizeof(std::uint32_t), import);
                     ++counts.words[static_cast<std::size_t>(path)];
+                    synced = synced || path == IndirectDrawPath::PendingImage;
                     if (path == IndirectDrawPath::Gpu) {
                         srtFillCopies.push_back({buffer->Handle(), offset, import, fill.address});
+                        copyTargets.push_back(bytes.data() + offset);
                         continue;
                     }
                 } else {
                     ++counts.notRecorded;
                 }
-                std::uint32_t word = 0;
-                {
-                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::SrtFill);
-                    GuestMemory::Read(fill.address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
-                }
-                std::memcpy(bytes.data() + offset, &word, sizeof(word));
+                readOnCpu(fill.address, bytes.data() + offset);
             }
+        }
+        // A pending-image decision synced the recorder: everything is finished, so the words
+        // decided for the GPU before it are read here without a wait (their imports are not
+        // relied on past that sync).
+        if (synced && !srtFillCopies.empty()) {
+            for (std::size_t copy = 0; copy < srtFillCopies.size(); ++copy) readOnCpu(srtFillCopies[copy].address, copyTargets[copy]);
+            counts.words[static_cast<std::size_t>(IndirectDrawPath::Gpu)] -= srtFillCopies.size();
+            counts.words[static_cast<std::size_t>(IndirectDrawPath::PendingImage)] += srtFillCopies.size();
+            srtFillCopies.clear();
         }
         std::lock_guard lock(srtFillMutex);
         for (std::size_t path = 0; path < counts.words.size(); ++path) srtFillCounts.words[path] += counts.words[path];
