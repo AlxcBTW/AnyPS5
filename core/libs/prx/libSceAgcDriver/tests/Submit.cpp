@@ -718,66 +718,85 @@ void testRegisteredVertexWorkgroupRouting() {
     check(expectFailure([&] { static_cast<void>(VertexWorkgroupRequired(queue, registry)); }).find("reserved graphics program address") != std::string::npos, "reserved NGG program address bits were accepted");
 }
 
-// Address-free dispatch-cache keys: a program that loads its input and output V#s from a table
-// behind user words 0..1 copies 256 words. Every round the table moves (a per-frame ring) and so
-// do both buffers; each dispatch must copy its own input into its own output. With content keys on
-// (the default) the moved rounds hit the cache relocated; a table that names a smaller input must
-// miss (a wrong hit would copy every word). Registered three times: in the agc_driver run, as
-// agc_driver_content_key_verify (APS5_VERIFY_CONTENT_HITS=1: every relocated hit recaptured and
-// compared) and as agc_driver_content_key_off (APS5_NO_DISPATCH_CONTENT_KEY=1: no relocated hits).
+// Address-free dispatch-cache keys, the two SotS layouts: a program that loads its input and output
+// V#s from a table behind user words 0..1, and one that takes both V#s inline in user words 0..7.
+// Each copies 256 words. Every round the table moves (a per-frame ring) and so do both buffers;
+// each dispatch must copy its own input into its own output. With content keys on (the default)
+// the moved rounds of the inline program hit the cache relocated (the table program also does
+// unless it reads its table through raw addresses, which keeps its V#s exact); a round that names
+// a smaller input must miss (a wrong hit would copy every word). Registered three times: in the
+// agc_driver run, as agc_driver_content_key_verify (APS5_VERIFY_CONTENT_HITS=1: every relocated hit
+// recaptured and compared) and as agc_driver_content_key_off (APS5_NO_DISPATCH_CONTENT_KEY=1).
 void testContentKeyDispatch() {
     // s_load_dwordx8 s[4:11], s[0:1]; v0 = (s2 << 6) + v0; buffer_load v1 via s[4:7]; buffer_store v1 via s[8:11].
-    alignas(256) static const std::array<std::uint32_t, 12> code{0xf40c0100u, 0xfa000000u, 0xbf8cc07fu, 0xd7460000u, 0x04010c02u, 0xe0302000u, 0x80010100u, 0xbf8c3f70u, 0xe0702000u, 0x80020100u, 0xbf810000u, 0xbf9f0000u};
+    alignas(256) static const std::array<std::uint32_t, 12> tableCode{0xf40c0100u, 0xfa000000u, 0xbf8cc07fu, 0xd7460000u, 0x04010c02u, 0xe0302000u, 0x80010100u, 0xbf8c3f70u, 0xe0702000u, 0x80020100u, 0xbf810000u, 0xbf9f0000u};
+    // v0 = (s8 << 6) + v0; buffer_load v1 via s[0:3]; buffer_store v1 via s[4:7].
+    alignas(256) static const std::array<std::uint32_t, 9> inlineCode{0xd7460000u, 0x04010c08u, 0xe0302000u, 0x80000100u, 0xbf8c3f70u, 0xe0702000u, 0x80010100u, 0xbf810000u, 0xbf9f0000u};
     constexpr std::uint32_t threads = 256;
     constexpr std::uint32_t rounds = 6;
     constexpr std::uint32_t smallRound = 4;
     const bool contentKeys = std::getenv("APS5_NO_DISPATCH_CONTENT_KEY") == nullptr;
     auto* ring = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 65536));
-    auto* buffers = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 2 * rounds * threads * 4));
+    auto* buffers = static_cast<std::uint32_t*>(GuestHeap::GuestHeapAlignForGpu_nid_postfix(65536, 2 * 2 * rounds * threads * 4));
     std::fill(ring, ring + 16384, 0u);
     const auto descriptor = [](const std::uint32_t* at, std::uint32_t records) {
         const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at));
         return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (4u << 16u), records, 0x31016facu};
     };
-    const auto codeAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(code.data()));
-    const auto before = AgcDriver::DriverDetail::relocatedDispatchHits.load();
     alignas(64) static volatile std::uint32_t landed = 0;
     landed = 0;
-    for (std::uint32_t round = 0; round < rounds; ++round) {
-        auto* table = ring + 64 + round * 96;
-        auto* input = buffers + round * 2 * threads;
-        auto* output = input + threads;
-        for (std::uint32_t i = 0; i < threads; ++i) {
-            input[i] = (round << 24u) | 0x00c0de00u | i;
-            output[i] = 0;
+    std::uint32_t labels = 0;
+    const auto run = [&](bool inlineLayout) {
+        const auto codeAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(inlineLayout ? inlineCode.data() : tableCode.data()));
+        const auto before = AgcDriver::DriverDetail::relocatedDispatchHits.load();
+        for (std::uint32_t round = 0; round < rounds; ++round) {
+            auto* input = buffers + ((inlineLayout ? rounds : 0) + round) * 2 * threads;
+            auto* output = input + threads;
+            for (std::uint32_t i = 0; i < threads; ++i) {
+                input[i] = (round << 24u) | (inlineLayout ? 0x00b0de00u : 0x00c0de00u) | i;
+                output[i] = 0;
+            }
+            const auto records = round == smallRound ? threads / 2 : threads;
+            const auto in = descriptor(input, records);
+            const auto out = descriptor(output, threads);
+            std::vector<std::uint32_t> user;
+            if (inlineLayout) {
+                user.insert(user.end(), in.begin(), in.end());
+                user.insert(user.end(), out.begin(), out.end());
+            } else {
+                auto* table = ring + 64 + round * 96;
+                std::copy(in.begin(), in.end(), table);
+                std::copy(out.begin(), out.end(), table + 4);
+                const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table));
+                user = {static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
+            }
+            const auto userCount = static_cast<std::uint32_t>(user.size());
+            std::vector<std::uint32_t> packets{
+                0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
+                0xc0037600u, 0x207u, 64u, 1u, 1u,
+                0xc0027600u, 0x212u, 0u, (userCount << 1u) | (1u << 7u),
+                0xc0007600u | (userCount << 16u), 0x240u};
+            packets.insert(packets.end(), user.begin(), user.end());
+            packets.insert(packets.end(), {0xc0031500u, threads / 64u, 1u, 1u, 0x8041u});
+            // The copy lands before the label (as the copy tests wait), then the worker goes idle.
+            const auto label = endOfPipeLabel(&landed, ++labels);
+            packets.insert(packets.end(), label.begin(), label.end());
+            submit(0x2a, packets);
+            waitFor(&landed, labels, "the end-of-pipe label after a content-key dispatch never landed");
+            AgcDriverWaitIdle_nid_postfix();
+            for (std::uint32_t i = 0; i < threads; ++i) {
+                const auto expected = i < records ? input[i] : 0u;
+                if (output[i] != expected) throw std::runtime_error(std::string("content-key dispatch (") + (inlineLayout ? "inline" : "table") + ") round " + std::to_string(round) + ": word " + std::to_string(i) + " is " + std::to_string(output[i]) + ", expected " + std::to_string(expected));
+            }
         }
-        const auto records = round == smallRound ? threads / 2 : threads;
-        const auto in = descriptor(input, records);
-        const auto out = descriptor(output, threads);
-        std::copy(in.begin(), in.end(), table);
-        std::copy(out.begin(), out.end(), table + 4);
-        const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table));
-        std::vector<std::uint32_t> packets{
-            0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
-            0xc0037600u, 0x207u, 64u, 1u, 1u,
-            0xc0027600u, 0x212u, 0u, (2u << 1u) | (1u << 7u),
-            0xc0027600u, 0x240u, static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u),
-            0xc0031500u, threads / 64u, 1u, 1u, 0x8041u};
-        // The copy lands before the label (as the copy tests wait), then the worker goes idle.
-        const auto label = endOfPipeLabel(&landed, round + 1);
-        packets.insert(packets.end(), label.begin(), label.end());
-        submit(0x2a, packets);
-        waitFor(&landed, round + 1, "the end-of-pipe label after a content-key dispatch never landed");
-        AgcDriverWaitIdle_nid_postfix();
-        for (std::uint32_t i = 0; i < threads; ++i) {
-            const auto expected = i < records ? input[i] : 0u;
-            if (output[i] != expected) throw std::runtime_error("content-key dispatch round " + std::to_string(round) + ": word " + std::to_string(i) + " is " + std::to_string(output[i]) + ", expected " + std::to_string(expected));
-        }
-    }
-    const auto relocated = AgcDriver::DriverDetail::relocatedDispatchHits.load() - before;
-    std::printf("content-key dispatch: %llu relocated hits over %u rounds (content keys %s)\n", static_cast<unsigned long long>(relocated), rounds, contentKeys ? "on" : "off");
-    if (contentKeys) check(relocated >= 2, "moved tables with the same content did not hit the dispatch cache relocated");
-    else check(relocated == 0, "APS5_NO_DISPATCH_CONTENT_KEY=1 still relocated dispatch-cache hits");
+        const auto relocated = AgcDriver::DriverDetail::relocatedDispatchHits.load() - before;
+        std::printf("content-key dispatch (%s V#s): %llu relocated hits over %u rounds (content keys %s)\n", inlineLayout ? "inline" : "table", static_cast<unsigned long long>(relocated), rounds, contentKeys ? "on" : "off");
+        return relocated;
+    };
+    const auto table = run(false);
+    const auto inlined = run(true);
+    if (contentKeys) check(inlined >= 2, "moved inline V#s with the same content did not hit the dispatch cache relocated");
+    else check(table == 0 && inlined == 0, "APS5_NO_DISPATCH_CONTENT_KEY=1 still relocated dispatch-cache hits");
     GuestHeap::GuestHeapFree_nid_postfix(buffers);
     GuestHeap::GuestHeapFree_nid_postfix(ring);
 }

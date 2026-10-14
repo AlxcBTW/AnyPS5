@@ -4,6 +4,7 @@
 #include "Recompiler.hpp"
 #include "UserDataUse.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -62,6 +63,12 @@ struct ElementPatch {
     bool operator==(const ElementPatch& other) const = default;
 };
 
+// Why FindBufferFields keeps a buffer V# exact: the program reads raw addresses (BDA), a null V#,
+// no verbatim source, more than one source, a source inside a pointer word, a walked run inside
+// the buffer, a built descriptor inside it, the base in the flattened SRT, the base copied elsewhere.
+enum class FieldRefusal : std::uint8_t { Bda, NotPresent, NoSource, Sources, Pointer, Walked, Derived, Flattened, Copied };
+inline constexpr std::size_t FieldRefusalCount = 9;
+
 struct RelocationProfile {
     // User words whose runs are relative to them (a run's base is in DispatchVariant::runBases).
     std::uint64_t pointerWords = 0;
@@ -76,6 +83,8 @@ struct RelocationProfile {
     // The compiled result's shader-data slots that forward user words (RecompileResult::shaderDataUserWords).
     std::vector<std::uint32_t> forwarded;
     std::uint32_t relocatableBuffers = 0;
+    // Buffer V#s kept exact, by FieldRefusal.
+    std::array<std::uint32_t, FieldRefusalCount> refused{};
 
     [[nodiscard]] bool Empty() const { return pointerWords == 0 && wordFields.empty() && userFields.empty(); }
 };

@@ -70,7 +70,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
         // check them (an empty profile requires every user word equal).
         fresh->relocation = relocation;
         if (relocation != nullptr && traceContentKeys()) {
-            std::fprintf(stderr, "[dispatch-content] insert 0x%llx key %016llx: %zu user words, pointer candidates %llx (asBase %llx asValue %llx, %zu reads), relative %llx, %zu runs, %zu buffers of which %u relocate (%zu walked fields, %zu user fields, %zu patches), %zu forwarded, shape %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(key), userData.size(), static_cast<unsigned long long>(pointerCandidates), static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size(), static_cast<unsigned long long>(relocation->pointerWords), fresh->runs.size(), capture->snapshot.buffers.size(), relocation->relocatableBuffers, relocation->wordFields.size(), relocation->userFields.size(), relocation->patches.size(), relocation->forwarded.size(), shape != nullptr ? "learned" : "none");
+            std::fprintf(stderr, "[dispatch-content] insert 0x%llx key %016llx: %zu user words, pointer candidates %llx (asBase %llx asValue %llx, %zu reads), relative %llx, %zu runs, %zu buffers of which %u relocate (%zu walked fields, %zu user fields, %zu patches), %zu forwarded, exact V#s by reason (bda/null/no source/sources/pointer/walked/derived/flattened/copied) %u/%u/%u/%u/%u/%u/%u/%u/%u, shape %s\n",static_cast<unsigned long long>(address), static_cast<unsigned long long>(key), userData.size(), static_cast<unsigned long long>(pointerCandidates), static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), capture->userDataUse.reads.size(), static_cast<unsigned long long>(relocation->pointerWords), fresh->runs.size(), capture->snapshot.buffers.size(), relocation->relocatableBuffers, relocation->wordFields.size(), relocation->userFields.size(), relocation->patches.size(), relocation->forwarded.size(), relocation->refused[0], relocation->refused[1], relocation->refused[2], relocation->refused[3], relocation->refused[4], relocation->refused[5], relocation->refused[6], relocation->refused[7], relocation->refused[8], shape != nullptr ? "learned" : "none");
         }
         bool stable = true;
         if (stampValidate()) {
@@ -105,6 +105,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, std::uint6
             ++(relocation->Empty() ? entryCounters.profilesEmpty : entryCounters.profilesBuilt);
             entryCounters.profilePointerWords += static_cast<std::uint64_t>(std::popcount(relocation->pointerWords));
             entryCounters.profileBuffers += relocation->relocatableBuffers;
+            for (std::size_t reason = 0; reason < FieldRefusalCount; ++reason) entryCounters.fieldRefusals[reason] += relocation->refused[reason];
         }
         // The first shape of an identity stays: a content key must not change under its entries.
         if (shape != nullptr && dispatchShapes.size() < 65536 && dispatchShapes.try_emplace(identity, shape).second) ++entryCounters.shapesLearned;

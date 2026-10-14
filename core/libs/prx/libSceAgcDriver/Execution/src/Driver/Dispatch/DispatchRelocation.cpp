@@ -111,9 +111,13 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
     profile.patches.clear();
     profile.maskPositions.clear();
     profile.relocatableBuffers = 0;
+    profile.refused = {};
     for (const auto& binding : compiled.bindings) {
-        // The shader reaches memory through raw addresses: keep every V# exact.
-        if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) return;
+        // The shader reaches memory through raw addresses (a BDA page table): keep every V# exact.
+        if (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) {
+            profile.refused[static_cast<std::size_t>(FieldRefusal::Bda)] += static_cast<std::uint32_t>(buffers.size());
+            return;
+        }
     }
     // Where each descriptor's four words occur verbatim (positions among the words, then user words).
     std::vector<std::vector<std::uint32_t>> sources(buffers.size()), userSources(buffers.size());
@@ -144,19 +148,34 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
     std::vector<std::uint32_t> takenUser;
     for (std::size_t r = 0; r < buffers.size(); ++r) {
         const auto& value = buffers[r];
-        if (!Present(value)) continue;
+        if (!Present(value)) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::NotPresent)];
+            continue;
+        }
         // One verbatim source, among the walked runs or the user data.
         const auto& positions = sources[r];
         const auto& userPositions = userSources[r];
-        if (positions.size() + userPositions.size() != 1) continue;
+        if (positions.size() + userPositions.size() != 1) {
+            ++profile.refused[static_cast<std::size_t>(positions.empty() && userPositions.empty() ? FieldRefusal::NoSource : FieldRefusal::Sources)];
+            continue;
+        }
         const bool user = !userPositions.empty();
         const auto source = user ? userPositions.front() : positions.front();
-        if ((user ? std::find(takenUser.begin(), takenUser.end(), source) != takenUser.end() : std::find(taken.begin(), taken.end(), source) != taken.end())) continue;
-        if (user && (source >= 60 || ((profile.pointerWords >> source) & 0xfu) != 0)) continue;
+        if ((user ? std::find(takenUser.begin(), takenUser.end(), source) != takenUser.end() : std::find(taken.begin(), taken.end(), source) != taken.end())) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Sources)];
+            continue;
+        }
+        if (user && (source >= 60 || ((profile.pointerWords >> source) & 0xfu) != 0)) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Pointer)];
+            continue;
+        }
         const auto low = BufferBase(value);
         const auto high = low + std::max(BufferBytes(value), MinGuardBytes);
         // The walk read nothing inside the buffer: a read through the V# would follow its base.
-        if (std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first < high && low < run.second; })) continue;
+        if (std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first < high && low < run.second; })) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Walked)];
+            continue;
+        }
         // No descriptor the walk built (found verbatim nowhere) starts inside it: a view it may have
         // derived from the base.
         bool derived = false;
@@ -165,10 +184,16 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
             const auto otherBase = BufferBase(buffers[other]);
             derived = otherBase >= low && otherBase < high;
         }
-        if (derived) continue;
+        if (derived) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Derived)];
+            continue;
+        }
         // Nothing copies the base anywhere but the elements that copy the whole V# (and, for a
         // user source, the shader-data slots that forward its words).
-        if (std::find(flattened.begin(), flattened.end(), value.dwords[0]) != flattened.end() || std::find(flattened.begin(), flattened.end(), value.dwords[1]) != flattened.end()) continue;
+        if (std::find(flattened.begin(), flattened.end(), value.dwords[0]) != flattened.end() || std::find(flattened.begin(), flattened.end(), value.dwords[1]) != flattened.end()) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Flattened)];
+            continue;
+        }
         std::vector<ElementPatch> patches;
         bool copied = false;
         for (std::uint32_t b = 0; b < compiled.bindings.size() && !copied; ++b) {
@@ -199,7 +224,10 @@ void FindBufferFields(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
             const bool forwardedHere = user && slot < compiled.shaderDataUserWords.size() && (compiled.shaderDataUserWords[slot] == source || compiled.shaderDataUserWords[slot] == source + 1);
             if (!forwardedHere) copied = true;
         }
-        if (copied) continue;
+        if (copied) {
+            ++profile.refused[static_cast<std::size_t>(FieldRefusal::Copied)];
+            continue;
+        }
         (user ? takenUser : taken).push_back(source);
         auto& fields = user ? profile.userFields : profile.wordFields;
         fields.push_back({source, BufferBaseLowMask});
