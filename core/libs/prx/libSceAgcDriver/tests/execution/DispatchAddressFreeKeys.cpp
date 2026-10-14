@@ -92,7 +92,7 @@ public:
         };
         results.push_back(std::make_unique<ShaderRecompiler::RecompileResult>(ShaderRecompiler::Recompile(request)));
         const auto& result = *results.back();
-        auto prepared = prepare ? device.PrepareDispatch(result, {}, Threads, codeAddress) : nullptr;
+        auto prepared = prepare ? device.PrepareDispatch(result, {}, Threads) : nullptr;
         device.Dispatch(result, Threads / 64u, 1, 1, {}, codeAddress, std::move(prepared));
         device.WaitIdle();
         const AgcDriver::Graphics::CompiledShader shader{ShaderStage::Compute, &result, 0};
