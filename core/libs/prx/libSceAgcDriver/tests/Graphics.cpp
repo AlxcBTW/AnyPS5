@@ -5628,6 +5628,16 @@ int main(int argc, char** argv) {
             std::cout << "address-space device teardown releases cached guest allocations\n";
             return 0;
         }
+        {
+            AgcDriver::Graphics::PipelineCacheSynchronization synchronization;
+            auto pipelineUse = synchronization.LockForPipelineUse();
+            bool snapshotAcquired = false;
+            std::thread snapshot([&] { snapshotAcquired = synchronization.TryLockForSnapshot().owns_lock(); });
+            snapshot.join();
+            Require(!snapshotAcquired, "pipeline cache snapshot overlapped pipeline creation");
+            pipelineUse.unlock();
+            Require(synchronization.TryLockForSnapshot().owns_lock(), "pipeline cache snapshot stayed blocked after pipeline creation finished");
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-layout-flags") {
             descriptorLayoutFlagTests();
             std::cout << "Descriptor layout native and captured binding flags passed\n";
