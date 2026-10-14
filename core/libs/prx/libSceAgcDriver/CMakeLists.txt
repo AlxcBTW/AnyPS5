@@ -420,6 +420,8 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_draw_input_scan PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
 add_test_executable(agc_driver_dispatch_relocation_tests EXCLUDE_FROM_ALL
         tests/DispatchRelocation.cpp
         Execution/src/Driver/Dispatch/DispatchRelocation.cpp
