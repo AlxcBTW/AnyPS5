@@ -2599,6 +2599,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 // is staged by a rebuild instead of published (its pending images were stored into
                 // the shadow, without a publish, by the check).
                 if (!lazy && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
+                // APS5_YOLO_GPU: a written region bound in place gets neither a write-back nor a publish.
+                if (!lazy && YoloGpu() && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
                 const auto before = profile && !lazy ? ThreadPublishedUnits() : 0;
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", lazy ? PublishScope::None : PublishScope::Whole);
                 if (profile && !lazy) GuestBufferMemory::NoteInPlacePublish(guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.end - region.begin, ThreadPublishedUnits() - before, true, !guestMemory.StagingAllowed(), region.begin);
@@ -2617,8 +2619,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         for (const auto& region : directRegions) {
             if (!guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
         }
-        for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
-        for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", guestMemory.ShadowSourced(begin, end) ? PublishScope::None : PublishScope::Whole);
+        for (const auto& region : directRegions) {
+            if (YoloGpu() && !guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
+        }
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            if (YoloGpu() && !guestMemory.ShadowSourced(begin, end)) continue;
+            StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", guestMemory.ShadowSourced(begin, end) ? PublishScope::None : PublishScope::Whole);
+        }
         guestMemory.PublishShadowSourcedEdges();
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }

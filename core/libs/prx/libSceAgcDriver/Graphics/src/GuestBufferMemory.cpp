@@ -3013,6 +3013,7 @@ struct RoundtripStats {
         CopyBackRegions, CopyBackSlabBytes, CopyBackImportBytes, CopyBackSeeds, CopyBackSeedBytes,
         RebuildToStage, RebuildToInPlace, FlipsUsedUp, RestageRefused, RestageRefusedBytes,
         AddressBuildsAfter, AddressExposedBytes, AddressPublishedUnits,
+        YoloInPlaceSkips,
         Count
     };
     std::array<std::atomic<std::uint64_t>, Count> values{};
@@ -3108,7 +3109,7 @@ void reportLazy() {
         ShadowCopyBackEnabled() ? "on" : "off", u(R::BuildPublishes), t[R::BuildUnits] * unitMib, u(R::ReusePublishes), t[R::ReuseUnits] * unitMib, u(R::DrawPublishes), t[R::DrawUnits] * unitMib, u(R::Upto32), t[R::Upto32Units] * unitMib, u(R::Upto128), t[R::Upto128Units] * unitMib, u(R::Over128), t[R::Over128Units] * unitMib,
         u(R::CopyBackRegions), t[R::CopyBackSlabBytes] / mib, t[R::CopyBackImportBytes] / mib, u(R::CopyBackSeeds), t[R::CopyBackSeedBytes] / mib, u(R::RebuildToStage), u(R::RebuildToInPlace), u(R::FlipsUsedUp), u(R::RestageRefused), t[R::RestageRefusedBytes] / mib,
         refreshBytes / mib, static_cast<unsigned long long>(clearRefreshes), clearBytes / mib);
-    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) address-based builds after copy-backs %llu: %.1f MiB copied back into slabs since the previous one, %.1f MiB published for them (%s)\n", u(R::AddressBuildsAfter), t[R::AddressExposedBytes] / mib, t[R::AddressPublishedUnits] * unitMib, copyBackBdaPublish() ? "APS5_SHADOW_COPYBACK_BDA_PUBLISH" : "not published");
+    AgcDriver::ProfilePrint_nid_no_patch("[roundtrip] (10 s) address-based builds after copy-backs %llu: %.1f MiB copied back into slabs since the previous one, %.1f MiB published for them (%s); yolo %s: in-place region flushes skipped %llu\n", u(R::AddressBuildsAfter), t[R::AddressExposedBytes] / mib, t[R::AddressPublishedUnits] * unitMib, copyBackBdaPublish() ? "APS5_SHADOW_COPYBACK_BDA_PUBLISH" : "not published", YoloGpu() ? "on" : "off", u(R::YoloInPlaceSkips));
 }
 
 VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
@@ -3339,6 +3340,8 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
 
 void GuestBufferMemory::publishEdges(const Region& region) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // APS5_YOLO_GPU: the copy-back goes into the shadow (seeding the units it covers partly).
+    if (YoloGpu() && !region.atomic) return;
     std::uint64_t units = 0;
     for (const auto& [begin, end] : writes) {
         const auto from = std::max(begin, region.begin);
@@ -3578,6 +3581,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         }
         const bool deferred = inside != nullptr && shadowStagingCandidate(*inside, addressable);
         if (deferred) inside->deferredPublish = true;
+        // APS5_YOLO_GPU: a written range outside a region that may be staged from the shadow gets no
+        // write-back (its region is bound in place without a flush below).
+        if (YoloGpu() && !deferred) continue;
         StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", deferred ? PublishScope::None : PublishScope::Whole);
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3733,6 +3739,12 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                         gpuCopies.push_back(&region);
                         continue;
                     }
+                }
+                // APS5_YOLO_GPU: no write-back and no publish for a written region bound in place
+                // (read-only ones still get theirs: index data, constants, sampled inputs).
+                if (YoloGpu() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
+                    if (profile) Roundtrip().Add(RoundtripStats::YoloInPlaceSkips, 1);
+                    continue;
                 }
                 const auto before = profile ? ThreadPublishedUnits() : 0;
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
@@ -4216,7 +4228,8 @@ bool GuestBufferMemory::restageCandidate(const Region& region) const {
 }
 
 bool GuestBufferMemory::ShadowDecisionStale(std::uint64_t begin, std::uint64_t end) {
-    if (!ShadowCopyBackEnabled() || !uploaded || committed) return false;
+    // APS5_YOLO_GPU: an in-place written region gets no flush at all, so nothing to re-decide.
+    if (!ShadowCopyBackEnabled() || YoloGpu() || !uploaded || committed) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto* region = const_cast<Region*>(owner(begin));
     if (region == nullptr || region->end < end || !restageCandidate(*region)) return false;
@@ -4285,7 +4298,9 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 else merged.push_back(range);
             }
         }
-        if (ShadowCopyBackEnabled() && region.shadowStaged && region.shadowSourced && region.deviceLocal && region.buffer != nullptr) {
+        // APS5_YOLO_GPU: every region staged from the shadow (the staging window's too) copies back
+        // into it.
+        if (((YoloGpu() && !region.atomic) || (ShadowCopyBackEnabled() && region.shadowStaged)) && region.shadowSourced && region.deviceLocal && region.buffer != nullptr) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
             for (const auto& [begin, end] : merged) {
                 const auto from = std::max(begin, region.begin);

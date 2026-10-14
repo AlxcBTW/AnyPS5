@@ -43,6 +43,11 @@ struct HostImport;
 // or mutate freshness); the registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending ->
 // Shadows -> tracker).
 bool UnitShadowEnabled();
+// APS5_YOLO_GPU=1 (lab ceiling, inexact on purpose; GuestBufferMemory and ShaderResources): a
+// written region bound in place gets no flush (no write-back, no publish), and every region staged
+// from the shadow but atomic ones copies back into it. Read-only regions, CPU-facing consumers
+// (hook, labels, indirect arguments, copies, scanout) and storage refreshes are unchanged.
+bool YoloGpu();
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,
