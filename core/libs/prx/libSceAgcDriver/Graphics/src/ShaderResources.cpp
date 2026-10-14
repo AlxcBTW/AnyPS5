@@ -2943,6 +2943,8 @@ DescriptorCache::DescriptorCache(const Context& context) : context(context), des
 DescriptorCache::~DescriptorCache() {
     for (const auto& pool : pools) destroyPool(context.device, pool.handle, nullptr);
     for (const auto& pool : updateAfterBindPools) destroyPool(context.device, pool.handle, nullptr);
+    for (const auto& pool : transientPools) destroyPool(context.device, pool.handle, nullptr);
+    for (const auto& pool : transientUpdateAfterBindPools) destroyPool(context.device, pool.handle, nullptr);
     for (const auto pool : dedicated) destroyPool(context.device, pool, nullptr);
     for (const auto& [key, layout] : layouts) destroyLayout(context.device, layout, nullptr);
 }
@@ -2986,7 +2988,13 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolSizes{{{VK_DESCRIPTOR_TYP
 constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096 + 2}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1024}, {VK_DESCRIPTOR_TYPE_SAMPLER, 512}}};
 }
 
-DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind) {
+std::vector<DescriptorCache::Pool>& DescriptorCache::Chain(bool updateAfterBind, bool transient) {
+    static const bool separate = std::getenv("APS5_NO_TRANSIENT_DESCRIPTOR_POOLS") == nullptr;
+    if (transient && separate) return updateAfterBind ? transientUpdateAfterBindPools : transientPools;
+    return updateAfterBind ? updateAfterBindPools : pools;
+}
+
+DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, bool transient) {
     bool fits = true;
     for (const auto& size : sizes) {
         const auto limit = updateAfterBind && size.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers : SetDescriptorLimit(context.limits, size.type);
@@ -3014,7 +3022,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         ++stats.sets;
         return {set, pool};
     }
-    auto& chain = updateAfterBind ? updateAfterBindPools : pools;
+    auto& chain = Chain(updateAfterBind, transient);
     for (std::size_t index = chain.size(); index != 0; --index) {
         auto& pool = chain[index - 1];
         if (pool.exhausted) continue;
@@ -3024,7 +3032,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         if (result == VK_SUCCESS) {
             ++stats.sets;
             ++pool.liveSets;
-            return {set, pool.handle, index - 1, updateAfterBind};
+            return {set, pool.handle, index - 1, updateAfterBind, transient};
         }
         if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
         pool.exhausted = true;
@@ -3043,7 +3051,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     Check(allocate(context.device, &allocation, &set), "vkAllocateDescriptorSets");
     chain.back().liveSets = 1;
     ++stats.sets;
-    return {set, pool, chain.size() - 1, updateAfterBind};
+    return {set, pool, chain.size() - 1, updateAfterBind, transient};
 }
 
 void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
@@ -3054,7 +3062,7 @@ void DescriptorCache::Free(const SetAllocation& allocation) noexcept {
         destroyPool(context.device, allocation.pool, nullptr);
         return;
     }
-    auto& chain = allocation.updateAfterBind ? updateAfterBindPools : pools;
+    auto& chain = Chain(allocation.updateAfterBind, allocation.transient);
     if (allocation.poolIndex >= chain.size()) std::terminate();
     auto& pool = chain[allocation.poolIndex];
     if (pool.handle != allocation.pool || pool.liveSets == 0) std::terminate();
@@ -3790,7 +3798,7 @@ std::optional<ShaderResources::Relocation> ShaderResources::Relocate(const Compi
     for (const auto& binding : bindings) descriptions.push_back(binding.layout);
     auto relocated = std::make_shared<DrawBindings>();
     relocated->cache = context.descriptorCache;
-    relocated->allocation = relocated->cache->Allocate(_layout, PoolSizes(descriptions), updateAfterBind);
+    relocated->allocation = relocated->cache->Allocate(_layout, PoolSizes(descriptions), updateAfterBind, true);
     Require(relocated->allocation.set != VK_NULL_HANDLE, "relocated dispatch descriptor allocation failed");
     Require(descriptorWrites.size() == bindings.size(), "relocated writes disagree with their descriptor bindings");
     auto buffers = descriptorBuffers;
@@ -3934,11 +3942,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (const auto& binding : bindings) descriptions[setOf(binding)].push_back(binding.layout);
     result->cache = context.descriptorCache;
     if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->Allocate(_layout, PoolSizes(descriptions[0]));
+        result->allocation = result->cache->Allocate(_layout, PoolSizes(descriptions[0]), false, true);
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]));
+        result->fragmentAllocation = result->cache->Allocate(fragment.layout, PoolSizes(descriptions[1]), false, true);
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     auto buffers = descriptorBuffers;

@@ -75,8 +75,9 @@ public:
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::size_t poolIndex = 0;
         bool updateAfterBind = false;
+        bool transient = false;
     };
-    SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false);
+    SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, bool transient = false);
     void Free(const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
@@ -102,6 +103,9 @@ private:
     };
     std::vector<Pool> pools;
     std::vector<Pool> updateAfterBindPools;
+    std::vector<Pool> transientPools;
+    std::vector<Pool> transientUpdateAfterBindPools;
+    std::vector<Pool>& Chain(bool updateAfterBind, bool transient);
     std::vector<VkDescriptorPool> dedicated;
     Stats stats;
 };
