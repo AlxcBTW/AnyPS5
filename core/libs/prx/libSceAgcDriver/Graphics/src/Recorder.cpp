@@ -1764,7 +1764,22 @@ std::atomic<std::int64_t> traceBarriersLeft{[] {
 std::atomic<std::uint64_t> timingPresents{0};
 std::atomic<std::uint64_t> presentSerial{0};
 std::atomic<std::uint64_t> timingDropped{0};
-struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t bytes = 0; };
+struct TimingTotals {
+    std::uint64_t count = 0;
+    double ms = 0;
+    std::uint64_t bytes = 0;
+    // Ops carrying bytes, by size (<256 KiB, <1 MiB, <4 MiB, <16 MiB, the rest): the fixed cost
+    // per op against its bytes, on the [gputime] ops-by-size line.
+    std::array<std::uint64_t, 5> bucketCounts{};
+    std::array<double, 5> bucketMs{};
+};
+
+void addTimingBucket(TimingTotals& totals, std::uint64_t bytes, double ms) {
+    if (bytes == 0) return;
+    const std::size_t bucket = bytes < (std::uint64_t{256} << 10u) ? 0 : bytes < (std::uint64_t{1} << 20u) ? 1 : bytes < (std::uint64_t{4} << 20u) ? 2 : bytes < (std::uint64_t{16} << 20u) ? 3 : 4;
+    ++totals.bucketCounts[bucket];
+    totals.bucketMs[bucket] += ms;
+}
 std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
@@ -1909,6 +1924,7 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     ++totals.count;
     totals.ms += nanoseconds / 1e6;
     totals.bytes += bytes;
+    addTimingBucket(totals, bytes, nanoseconds / 1e6);
     timingClassMs += nanoseconds / 1e6;
 }
 
@@ -2410,6 +2426,7 @@ void Recorder::readGpuTiming(Batch& batch) {
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
+        addTimingBucket(totals, batch.timedBytes[i], ns / 1e6);
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
@@ -2428,11 +2445,24 @@ void Recorder::readGpuTiming(Batch& batch) {
     const auto presents = timingPresents.exchange(0, std::memory_order_relaxed);
     const double perPresent = presents != 0 ? 1.0 / static_cast<double>(presents) : 0.0;
     std::vector<std::pair<std::uint64_t, TimingTotals>> hot;
-    std::string classes;
+    std::string classes, buckets;
     for (const auto& [key, totals] : timingByKey) {
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
             char text[160];
             std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
+            if (totals.bucketCounts[0] + totals.bucketCounts[1] + totals.bucketCounts[2] + totals.bucketCounts[3] + totals.bucketCounts[4] != 0) {
+                static constexpr const char* bucketNames[5] = {"<256KiB", "<1MiB", "<4MiB", "<16MiB", ">=16MiB"};
+                buckets += " ";
+                buckets += CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)];
+                buckets += "[";
+                for (std::size_t bucket = 0; bucket < 5; ++bucket) {
+                    if (totals.bucketCounts[bucket] == 0) continue;
+                    char bucketText[96];
+                    std::snprintf(bucketText, sizeof(bucketText), "%s%s %llu/%.1fms", bucket == 0 || buckets.back() == '[' ? "" : ",", bucketNames[bucket], static_cast<unsigned long long>(totals.bucketCounts[bucket]), totals.bucketMs[bucket]);
+                    buckets += bucketText;
+                }
+                buckets += "]";
+            }
             classes += text;
         } else {
             hot.emplace_back(key, totals);
@@ -2443,6 +2473,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    if (!buckets.empty()) AgcDriver::ProfilePrint_nid_no_patch("[gputime] ops by size (10 s, count/ms):%s\n", buckets.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
