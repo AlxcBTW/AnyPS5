@@ -44,9 +44,10 @@ struct HostImport;
 // Shadows -> tracker).
 bool UnitShadowEnabled();
 // APS5_YOLO_GPU=1 (lab ceiling, inexact on purpose; GuestBufferMemory and ShaderResources): a
-// written region bound in place gets no flush (no write-back, no publish), and every region staged
-// from the shadow but atomic ones copies back into it. Read-only regions, CPU-facing consumers
-// (hook, labels, indirect arguments, copies, scanout) and storage refreshes are unchanged.
+// written region bound in place gets no flush (no write-back, no publish), and regions over any
+// fresh unit are staged from the shadow (readers too) and copy back into it. The staging window,
+// CPU-facing consumers (hook, labels, indirect arguments, copies, scanout) and storage refreshes
+// are unchanged.
 bool YoloGpu();
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every

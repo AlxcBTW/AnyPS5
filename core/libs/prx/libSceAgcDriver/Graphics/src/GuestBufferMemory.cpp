@@ -3379,8 +3379,9 @@ bool GuestBufferMemory::stageFromShadow(Region& region, bool addressable) {
 
 void GuestBufferMemory::publishEdges(const Region& region) const {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    // APS5_YOLO_GPU: the copy-back goes into the shadow (seeding the units it covers partly).
-    if (YoloGpu() && !region.atomic) return;
+    // APS5_YOLO_GPU: a region staged from the shadow copies back into it (seeding the units it
+    // covers partly).
+    if (YoloGpu() && region.shadowStaged) return;
     std::uint64_t units = 0;
     for (const auto& [begin, end] : writes) {
         const auto from = std::max(begin, region.begin);
@@ -4337,9 +4338,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 else merged.push_back(range);
             }
         }
-        // APS5_YOLO_GPU: every region staged from the shadow (the staging window's too) copies back
-        // into it.
-        if (((YoloGpu() && !region.atomic) || (ShadowCopyBackEnabled() && region.shadowStaged)) && region.shadowSourced && region.deviceLocal && region.buffer != nullptr) {
+        // Not the staging window's regions, not even under APS5_YOLO_GPU: their small written
+        // buffers include what the guest CPU reads back directly (yg1 crashed on a guest write
+        // 26 s in when they stayed in the shadow).
+        if ((ShadowCopyBackEnabled() || YoloGpu()) && region.shadowStaged && region.shadowSourced && region.deviceLocal && region.buffer != nullptr) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
             for (const auto& [begin, end] : merged) {
                 const auto from = std::max(begin, region.begin);
