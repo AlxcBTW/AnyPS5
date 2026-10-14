@@ -117,6 +117,8 @@ private:
     static bool contentKeys();
     // APS5_VERIFY_CONTENT_HITS=N: every Nth relocated hit is captured and materialized again and must bind the same (aborts otherwise).
     static std::uint64_t verifyContentHits();
+    // APS5_TRACE_DISPATCH_CONTENT=1: one stderr line per content-key insert and per lookup of a variant with a profile.
+    static bool traceContentKeys();
     std::uint64_t dispatchContentKey(std::uint64_t identity, std::span<const std::uint32_t> userData, bool& contentKey);
     void noteKeyMiss(std::uint64_t identity, std::span<const std::uint32_t> userData, bool absent, bool contentKey, EntryCounters& counters);
     void verifyRelocatedHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderRecompiler::RecompileResult& patched);

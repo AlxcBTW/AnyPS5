@@ -1327,7 +1327,7 @@ if(BUILD_TESTING)
     # Address-free dispatch-cache keys: the content-key dispatch test with every relocated hit
     # recaptured and compared, and with the keys turned off.
     add_test(NAME agc_driver_content_key_verify COMMAND agc_driver_tests --content-key)
-    set_tests_properties(agc_driver_content_key_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_CONTENT_HITS=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_content_key_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_CONTENT_HITS=1;APS5_TRACE_DISPATCH_CONTENT=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_content_key_off COMMAND agc_driver_tests --content-key)
     set_tests_properties(agc_driver_content_key_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DISPATCH_CONTENT_KEY=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
