@@ -741,6 +741,8 @@ void testContentKeyDispatch() {
     };
     const auto codeAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(code.data()));
     const auto before = AgcDriver::DriverDetail::relocatedDispatchHits.load();
+    alignas(64) static volatile std::uint32_t landed = 0;
+    landed = 0;
     for (std::uint32_t round = 0; round < rounds; ++round) {
         auto* table = ring + 64 + round * 96;
         auto* input = buffers + round * 2 * threads;
@@ -755,12 +757,17 @@ void testContentKeyDispatch() {
         std::copy(in.begin(), in.end(), table);
         std::copy(out.begin(), out.end(), table + 4);
         const auto tableAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table));
-        submit(0x2a, {
+        std::vector<std::uint32_t> packets{
             0xc0027600u, 0x20cu, static_cast<std::uint32_t>(codeAddress >> 8u), static_cast<std::uint32_t>(codeAddress >> 40u),
             0xc0037600u, 0x207u, 64u, 1u, 1u,
             0xc0027600u, 0x212u, 0u, (2u << 1u) | (1u << 7u),
             0xc0027600u, 0x240u, static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u),
-            0xc0031500u, threads / 64u, 1u, 1u, 0x8041u});
+            0xc0031500u, threads / 64u, 1u, 1u, 0x8041u};
+        // The copy lands before the label (as the copy tests wait), then the worker goes idle.
+        const auto label = endOfPipeLabel(&landed, round + 1);
+        packets.insert(packets.end(), label.begin(), label.end());
+        submit(0x2a, packets);
+        waitFor(&landed, round + 1, "the end-of-pipe label after a content-key dispatch never landed");
         AgcDriverWaitIdle_nid_postfix();
         for (std::uint32_t i = 0; i < threads; ++i) {
             const auto expected = i < records ? input[i] : 0u;
