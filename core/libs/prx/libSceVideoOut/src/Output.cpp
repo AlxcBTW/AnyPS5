@@ -94,7 +94,7 @@ int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* pa
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");
     }
     const int handle = VideoOutDriver::Get().Open(busType);
-    APS5_LAB_DISPLAY_LOG(__func__, "userId=%d busType=%d index=%d -> handle=%d (lab: display1080=%d sdr=%d hz60=%d resolutionCode=%d viewportCensus=%d gpuClockDiv=%llu)", userId, busType, index, handle, LabDisplay::Force1080() ? 1 : 0, LabDisplay::ForceSdr() ? 1 : 0, LabDisplay::Force60Hz() ? 1 : 0, LabDisplay::ResolutionCode(), LabDisplay::ViewportCensus() ? 1 : 0, static_cast<unsigned long long>(LabDisplay::GpuClockDivisor()));
+    APS5_LAB_DISPLAY_LOG(__func__, "userId=%d busType=%d index=%d -> handle=%d (lab: display1080=%d sdr=%d hz60=%d resolutionCode=%d viewportCensus=%d gpuClockScale=%.3f)", userId, busType, index, handle, LabDisplay::Force1080() ? 1 : 0, LabDisplay::ForceSdr() ? 1 : 0, LabDisplay::Force60Hz() ? 1 : 0, LabDisplay::ResolutionCode(), LabDisplay::ViewportCensus() ? 1 : 0, LabDisplay::GpuClockScale());
     if (handle < 0) return VIDEO_OUT_ERROR_RESOURCE_BUSY;
     return handle;
 } catch (const ProcessShutdown&) {
