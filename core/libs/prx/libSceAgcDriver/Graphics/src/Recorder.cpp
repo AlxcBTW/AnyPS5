@@ -2566,6 +2566,20 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
     lock.unlock();
+    if (context.memoryProperties2 != nullptr && context.physical != VK_NULL_HANDLE) {
+        // Lab only: this process's use of each memory heap against the budget the OS gives it (an allocation past the
+        // device-local budget is placed in host memory, Context::DeviceMemoryType).
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        context.memoryProperties2(context.physical, &properties);
+        std::string heaps;
+        for (std::uint32_t heap = 0; heap < properties.memoryProperties.memoryHeapCount && heap < VK_MAX_MEMORY_HEAPS; ++heap) {
+            char text[192];
+            std::snprintf(text, sizeof(text), " heap %u%s: usage %llu of budget %llu MiB (size %llu MiB);", heap, (properties.memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 ? " device-local" : "", static_cast<unsigned long long>(reported.heapUsage[heap] >> 20u), static_cast<unsigned long long>(reported.heapBudget[heap] >> 20u), static_cast<unsigned long long>(properties.memoryProperties.memoryHeaps[heap].size >> 20u));
+            heaps += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[vram]%s\n", heaps.c_str());
+    }
     reportBarriers();
 }
 
