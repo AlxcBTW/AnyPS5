@@ -830,7 +830,13 @@ struct VulkanDevice::State {
     }
 
     ~State() {
-        if (pipelinePreload) pipelinePreload->Stop();
+        if (pipelinePreload) {
+            // A member would be destroyed after this body, i.e. after vkDestroyDevice; the tasks hold
+            // copies of the Graphics::Context (so references to the buffer pool), whose last release
+            // would then free device memory on a destroyed device.
+            pipelinePreload->Stop();
+            pipelinePreload.reset();
+        }
         PublishPipelinePreload({});
         contextReady = false;
         if (compileOnly && device != VK_NULL_HANDLE) {
