@@ -1,0 +1,5 @@
+name=md2-evict
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-md2-evict-b4146fd5b2-17843
