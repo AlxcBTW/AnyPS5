@@ -1,0 +1,5 @@
+name=cpu-resdiag
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-resdiag-e7b007ee7f-85168
