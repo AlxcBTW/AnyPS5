@@ -162,6 +162,16 @@ bool WbDirectSlab() {
     return enabled;
 }
 
+// APS5_WB_MERGE_BARRIERS=1 (lab): a block write-back whose import-ready barrier asks only for
+// accesses the previous command's trailing barrier already covered (Recorder::Commands' covered
+// mask, Recorder::MergeBarriers on) skips it, as the seed barrier already does; and when no copy
+// out of the tiled scratch follows (every window retiled straight into a slab), the scratch-done
+// barrier is skipped into the trailing stored barrier (see writeBackWindows).
+bool WbMergeBarriers() {
+    static const bool enabled = std::getenv("APS5_WB_MERGE_BARRIERS") != nullptr;
+    return enabled;
+}
+
 // Bytes the calling thread's write-backs stored so far, and whether its last upload took the DCC
 // clear path: the [roundtrip] census of storage-refresh write-backs whose next op is a full clear.
 thread_local std::uint64_t threadWriteBackBytes = 0;
@@ -2837,6 +2847,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             if (!directWindows[i].has_value()) addPiece(scratchPositions[i] + (begin - window.tiledBegin), descriptor.baseAddress + begin, descriptor.baseAddress + end);
         }
     }
+    bool mergeLeading = false, mergeScratchDone = false;
     // A direct window's slab destination (APS5_WB_DIRECT_SLAB): the seeds of the units its range
     // covers partly, as a piece's, and its range among the shadowed ones; no copy out of scratch.
     for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -2890,7 +2901,18 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         for (const auto& directWindow : directWindows) if (directWindow.has_value()) recorder->Keep(directWindow->destination.slab);
         for (const auto& slab : padding.slabs) recorder->Keep(slab);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, direct ? 3 : 4);
+        // APS5_WB_MERGE_BARRIERS: the import-ready barrier (and, single-pass, the image barrier
+        // recorded with it: GENERAL to GENERAL, a pure memory barrier) is skipped when the
+        // previous trailing barrier covered the shader accesses it asks for and nothing recorded
+        // by this write-back itself has to be ordered first (its seed and padding copies: those
+        // keep the barrier, as the two-pass path keeps the linear buffer barrier recorded with
+        // it). The scratch-done barrier is skipped when no copy reads the scratch (every window
+        // retiled into a slab under APS5_WB_DIRECT_SLAB): the stored barrier after it orders the
+        // retile and seed writes against everything later, as it did behind the copies.
+        constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        mergeLeading = WbMergeBarriers() && Recorder::MergeBarriers() && seeds.empty() && padding.copies.empty() && (covered & shaderAccess) == shaderAccess;
+        mergeScratchDone = WbMergeBarriers() && Recorder::MergeBarriers() && slabPieces.empty() && importCopies.empty();
+        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, static_cast<std::uint32_t>((direct ? 3 : 4) - (direct && mergeLeading ? 1 : 0) - (mergeScratchDone ? 1 : 0)));
         if (Recorder::BarrierValidate()) {
             const std::pair<VkImage, bool> read{image, false};
             std::vector<std::pair<std::uint64_t, std::uint64_t>> seedReads;
@@ -2938,7 +2960,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         toRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         toRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toRead);
+        if (mergeLeading) Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
+        else context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toRead);
         for (std::size_t i = 0; i < windows.size(); ++i) {
             const auto& window = windows[i];
             auto retile = window.window;
@@ -2957,7 +2980,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         }
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
+        if (mergeLeading) Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, mergeLeading ? 0u : 1u, &importReady, 1, &linearRead, 0, nullptr);
         for (std::size_t i = 0; i < windows.size(); ++i) {
             const auto& window = windows[i];
             auto retile = window.window;
@@ -2970,7 +2994,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         // The retiled scratch (and a seed's slab bytes, which the scratch copies overwrite in
         // part) precede the copies into the slabs and the import.
         const VkMemoryBarrier scratchDone{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
+        if (mergeScratchDone) Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
+        else context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
         const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
         for (const auto& pieces : slabPieces) copyBuffer(commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
         if (!importCopies.empty()) copyBuffer(commands, tiledScratch->Handle(), import.buffer, static_cast<std::uint32_t>(importCopies.size()), importCopies.data());
