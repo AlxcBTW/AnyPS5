@@ -1,0 +1,5 @@
+name=cpu-pr2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-pr2-8b02240e62-97233
