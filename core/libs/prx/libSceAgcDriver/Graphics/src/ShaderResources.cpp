@@ -1077,7 +1077,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 std::uint64_t StorageBudgetCap(const std::uint64_t heapBytes, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t cacheBytes, const std::uint64_t sampledRemaining, const std::uint64_t floor) {
     std::uint64_t cap = heapBytes / 2u;
     if (reportedBudget != 0) {
-        const auto reserve = std::max<std::uint64_t>(2048ull << 20u, reportedBudget / 8u);
+        const auto reserve = std::max<std::uint64_t>(1024ull << 20u, reportedBudget / 8u);
         const auto outside = usage - std::min(usage, cacheBytes);
         const auto pool = reportedBudget > outside + reserve ? reportedBudget - outside - reserve : 0u;
         cap = std::min(cap, pool > sampledRemaining ? pool - sampledRemaining : 0u);
@@ -1106,7 +1106,7 @@ std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
 // and the cap come from the measurement in the storage-cache debt entry.
 std::uint64_t NextStorageBudget(const std::uint64_t current, const std::uint64_t floor, const std::uint64_t cap, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t evictions) {
     if (reportedBudget == 0) return current;
-    const auto reserve = std::max<std::uint64_t>(2048ull << 20u, reportedBudget / 8u);
+    const auto reserve = std::max<std::uint64_t>(1024ull << 20u, reportedBudget / 8u);
     const auto step = std::max<std::uint64_t>(current / 8u, 64ull << 20u);
     if (usage + reserve > reportedBudget) return std::max(floor, current > step ? current - step : floor);
     if (evictions >= 16u && current < cap && usage + step + reserve <= reportedBudget) return std::min(cap, current + step);
