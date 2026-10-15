@@ -1,0 +1,5 @@
+name=lead-capgame
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-capgame-e29002d60b-112202
