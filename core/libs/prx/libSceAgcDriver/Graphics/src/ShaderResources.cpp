@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -4728,9 +4729,18 @@ void ShaderResources::CheckFaults() const {
 }
 
 void ShaderResources::WriteBackBuffers() {
-    if (bda) bda->CheckFault();
-    if (SkipWriteBack()) return;
-    guestMemory.WriteBack();
+    // A fault stops the invocations that hit it; the others ran to the end and their stores sit in
+    // the copied buffers, so the write-back happens before the fault is reported.
+    std::exception_ptr fault;
+    if (bda) {
+        try {
+            bda->CheckFault();
+        } catch (...) {
+            fault = std::current_exception();
+        }
+    }
+    if (!SkipWriteBack()) guestMemory.WriteBack();
+    if (fault) std::rethrow_exception(fault);
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
