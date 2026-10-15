@@ -4663,6 +4663,31 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             else keep.emplace_back(from, to);
         }
     }
+    if (unsavedOutsideWatch) {
+        // The store below refuses this case (see the Require sites); name the image and its units first so a
+        // repro says which write-back it is and why no bytes were compared.
+        static std::atomic<int> unsavedReports{0};
+        if (unsavedReports.fetch_add(1, std::memory_order_relaxed) < 24) {
+            std::uint32_t selectedUnits = 0, pendingUnits = 0, notOriginal = 0, notCompared = 0, shown = 0;
+            std::string detail;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!layers[layer]) continue;
+                ++selectedUnits;
+                if (layerPending[layer]) ++pendingUnits;
+                if (!layerOriginal[layer]) ++notOriginal;
+                if (compared[layer]) continue;
+                ++notCompared;
+                if (shown >= 6) continue;
+                ++shown;
+                char entry[160];
+                std::snprintf(entry, sizeof(entry), " [unit %u at +0x%llx pending %d original %d generation %llu]", layer, static_cast<unsigned long long>(layerBegin(layer) - descriptor.baseAddress), layerPending[layer] ? 1 : 0, layerOriginal[layer] ? 1 : 0, static_cast<unsigned long long>(layerGeneration[layer]));
+                detail += entry;
+            }
+            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d;%s\n",
+                static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.samples, static_cast<unsigned long long>(descriptor.dccAddress),
+                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, detail.c_str());
+        }
+    }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
     }
