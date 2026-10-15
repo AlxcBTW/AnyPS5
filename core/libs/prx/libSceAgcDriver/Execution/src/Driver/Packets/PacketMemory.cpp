@@ -314,6 +314,50 @@ bool Driver::enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32
     return true;
 }
 
+bool Driver::enqueueClockStorePacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
+    static const bool enabled = std::getenv("APS5_NO_PIPELINE_CLOCK_STORES") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr && std::getenv("APS5_CPU_STORES") == nullptr;
+    if (!enabled || opcode != 0x40 || queue != 0 || packet.size() < 6 || !DrawPipeline::Active() || !deferredLabels().labels.empty()) return false;
+    if (Pm4::CopyDataToRegister(packet) || Pm4::CopyDataSource(packet) != Pm4::CopyDataGpuClockSource) return false;
+    const auto bytes = Pm4::CopyDataBytes(packet);
+    const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+    if (address % 4 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes, true)) return false;
+    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    DrawPipeline::Queue0().Enqueue([this, queue, address, bytes, epoch] {
+        DrawPipeline::FollowEpoch(epoch);
+        GuestMemory::SetCurrentPacket(0x40, queue);
+        commitClockStore(queue, address, bytes);
+    }, {{address, address + bytes}});
+    ++clockStoresQueued;
+    return true;
+}
+
+void Driver::commitClockStore(std::uint32_t queue, std::uint64_t address, std::size_t size) {
+    auto bytes = Pm4::GpuClockBytes(size);
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const auto localDevice = device.Load();
+    Graphics::StorageTexture::FlushPending(address, size, nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+    recordDeferredLabels(localDevice.get(), queue);
+    const auto stamp = ++eventSerial;
+    const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+    if (reason == 0 || reason == 5) {
+        noteLabelStore(address, bytes, stamp, queue);
+        if (reason == 0) ++storesOnGpu;
+        else ++storesBehindCompletions;
+    } else {
+        if (reason != 1 && localDevice != nullptr) {
+            localDevice->WaitIdle();
+            GuestMemory::BumpCollectEpoch();
+            bytes = Pm4::GpuClockBytes(size);
+        }
+        GuestMemory::Write(address, bytes, 1);
+        noteLabelStore(address, bytes, stamp, queue);
+        ++storesOnCpu;
+    }
+    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+    submitDueAfterCommit(localDevice.get());
+}
+
 void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
