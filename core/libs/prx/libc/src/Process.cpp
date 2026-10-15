@@ -103,6 +103,7 @@ std::atomic<void (*)()> endFlush{nullptr};
 void (*previousAbortHandler)(int) = SIG_DFL;
 
 void FlushOnAbort(int number) {
+    LibcRunEndFlush_nid_no_patch();
     if (previousAbortHandler == SIG_IGN) return;
     if (previousAbortHandler != SIG_DFL && previousAbortHandler != SIG_ERR) {
         previousAbortHandler(number);
