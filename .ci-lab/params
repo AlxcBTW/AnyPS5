@@ -1,0 +1,5 @@
+name=cpu-pr1b
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-pr1b-3578ff0434-97060
