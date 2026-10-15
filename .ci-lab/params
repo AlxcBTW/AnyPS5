@@ -1,0 +1,5 @@
+name=cpu-pr1
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-pr1-fe8cb47cc1-84430
