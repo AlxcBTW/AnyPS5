@@ -1,0 +1,1 @@
+^agc_driver_(pm4|pipelined_clock_store|pipelined_dma|pipelined_fill|pipelined_predicated_label_order|pipelined_predication_read)$
