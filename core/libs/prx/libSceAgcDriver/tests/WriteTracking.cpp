@@ -793,11 +793,16 @@ void CheckImportWindowOverUnwatchedPart() {
         hookedBegin = address;
         hookedEnd = address + bytes;
     });
-    const bool imported = ImportWatched(base, 3 * Block, [] { return true; });
+    bool hookedBeforeImport = false;
+    const bool imported = ImportWatched(base, 3 * Block, [&] {
+        hookedBeforeImport = hookedEnd != 0;
+        return true;
+    });
     SetUnwatchHook(nullptr);
     Require(imported, "an import over a partly unwatched range failed");
     Require(!Watched(base, Block) && !Watched(base + 2 * Block, Block), "an import over a partly unwatched range left its watched blocks watched");
     Require(hookedBegin <= base && hookedEnd >= base + 3 * Block, "an import that left the write watch did not run the unwatch hook over its range");
+    Require(hookedBeforeImport, "an import over a partly unwatched range ran the unwatch hook after the import");
 }
 
 void CheckImportWindowOtherThread() {
