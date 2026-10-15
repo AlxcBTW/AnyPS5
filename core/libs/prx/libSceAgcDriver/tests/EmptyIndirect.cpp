@@ -8,6 +8,7 @@
 #include <exception>
 #include <optional>
 #include <stdexcept>
+#include <string>
 
 using AgcDriver::DriverDetail::Driver;
 using AgcDriver::Graphics::IndirectDrawPath;
@@ -55,8 +56,30 @@ void testCpuBeforeCapture() {
     // A plain vertex-path draw is decided by the front stage: nothing is known before the capture.
     check(!Driver::IndirectCpuBeforeCapture(vertexStages(), false, indirectDraw(false), full), "a vertex-path draw was sent to the CPU before its capture");
     check(!Driver::IndirectCpuBeforeCapture(vertexStages(), false, indirectDraw(true), full), "an indexed vertex-path draw was sent to the CPU before its capture");
-    // A rect list and a non-vertex path always take the CPU path.
-    check(Driver::IndirectCpuBeforeCapture(vertexStages(), true, indirectDraw(false), full) == IndirectDrawPath::NonVertexPath, "a rect-list indirect draw was not a CPU draw");
+    // A non-vertex path always takes the CPU path; so does a rect list, unless APS5_GPU_INDEXED_INDIRECT is
+    // set (the agc_driver_empty_indirect_gpu_indexed registration), which sends it down the GPU-side path
+    // with the vertex-path draw's remaining checks (draw index SGPR, device gaps).
+    const char* indexedText = std::getenv("APS5_GPU_INDEXED_INDIRECT");
+    const bool gpuIndexed = indexedText != nullptr && indexedText[0] != '\0' && std::string(indexedText) != "0";
+    check(gpuIndexed == AgcDriver::Graphics::GpuIndexedIndirect(), "the GPU indexed indirect switch does not follow APS5_GPU_INDEXED_INDIRECT");
+    check(AgcDriver::Graphics::GpuIndexedIndirectVerify() == (indexedText != nullptr && std::string(indexedText) == "verify"), "the verify mode does not follow APS5_GPU_INDEXED_INDIRECT=verify");
+    for (const bool indexed : {false, true}) {
+        const auto rect = Driver::IndirectCpuBeforeCapture(vertexStages(), true, indirectDraw(indexed), full);
+        if (gpuIndexed) check(!rect, "a rect-list indirect draw stayed on the CPU under APS5_GPU_INDEXED_INDIRECT");
+        else check(rect == IndirectDrawPath::NonVertexPath, "a rect-list indirect draw was not a CPU draw");
+        if (!gpuIndexed) continue;
+        auto drawIndex = indirectDraw(indexed, 4);
+        drawIndex.indirect->drawIndexEnabled = true;
+        drawIndex.indirect->drawIndexSgpr = 7;
+        check(Driver::IndirectCpuBeforeCapture(vertexStages(), true, drawIndex, full) == IndirectDrawPath::DrawIndex, "a rect-list draw with a draw index SGPR stayed on the GPU");
+        auto counted = indirectDraw(indexed, 4);
+        counted.indirect->countIndirect = true;
+        counted.indirect->countAddress = 0x20000;
+        check(!Driver::IndirectCpuBeforeCapture(vertexStages(), true, counted, full), "a counted rect-list draw was sent to the CPU with the count feature");
+        check(Driver::IndirectCpuBeforeCapture(vertexStages(), true, counted, Support{true, false, false}) == IndirectDrawPath::FeatureGap, "a counted rect-list draw stayed on the GPU without the count feature");
+        ShaderStages rectMesh = meshStages();
+        check(Driver::IndirectCpuBeforeCapture(rectMesh, true, indirectDraw(indexed), full) == IndirectDrawPath::NonVertexPath, "a rect-list mesh draw stayed on the GPU");
+    }
     ShaderStages tessellation{ShaderPath::Tessellation, 0, 64, 64, std::nullopt, std::nullopt};
     check(Driver::IndirectCpuBeforeCapture(tessellation, false, indirectDraw(true), full) == IndirectDrawPath::NonVertexPath, "a tessellation indirect draw was not a CPU draw");
     // The single-record mesh draw without SGPR locations runs on the GPU (RecordMeshArguments):

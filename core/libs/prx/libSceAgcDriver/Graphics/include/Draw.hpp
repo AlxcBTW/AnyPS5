@@ -108,6 +108,25 @@ enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVe
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
 const char* IndirectDrawPathName(IndirectDrawPath path);
 
+// Lab switch APS5_GPU_INDEXED_INDIRECT=1 (default off, read once per process): rect-list indirect
+// draws (DRAW_INDIRECT 0x24, DRAW_INDEX_INDIRECT 0x25 and the multi / counted 0x2c, 0x38) take the
+// GPU-side path (vkCmd[Draw|DrawIndexed]Indirect[Count] from the host import, queue 0 never reads
+// their records) like vertex-path draws. A rect list is a patch-list draw of generated stages that
+// read no draw count, so its records are consumed exactly as a vertex-path draw's, with the same
+// per-dimension rules. =verify also reads the records on the CPU when the draw is recorded and
+// again when its batch completed and logs a mismatch. Tessellation, geometry and located mesh
+// draws keep the CPU path.
+bool GpuIndexedIndirect();
+bool GpuIndexedIndirectVerify();
+
+// Where an indirect packet's records were consumed, for the [gpuind] line (every 10 s when
+// APS5_GPU_INDEXED_INDIRECT or APS5_PROFILE_DRAW is set): GpuSide (recorded, not read), EarlySkip
+// (CPU read before the stage captures), CpuLoop (CPU read, the loop of direct draws),
+// RecordFallback (the memory state sent a recorded draw to the CPU read inside Draw) and Peek (the
+// final-record read of a GPU-side non-indexed mesh draw). `path` is why the CPU read them.
+enum class IndirectSite : std::uint8_t { GpuSide, EarlySkip, CpuLoop, RecordFallback, Peek };
+void CountIndirectPacket(IndirectSite site, const State& state, const Pm4::DrawParameters::IndirectDraw& indirect, IndirectDrawPath path, double readMs);
+
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and
 // Thrown (the decode or the build threw) and EmptyIndirect (a CPU-side indirect draw whose records

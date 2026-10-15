@@ -396,8 +396,13 @@ if(BUILD_TESTING)
     # The same checks with non-indexed mesh indirect draws back on the CPU loop.
     add_test(NAME agc_driver_empty_indirect_no_gpu_mesh COMMAND agc_driver_empty_indirect_tests)
     set_tests_properties(agc_driver_empty_indirect_no_gpu_mesh PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_NO_GPU_MESH_INDIRECT=1")
+    # And with rect-list indirect draws on the GPU-side path (APS5_GPU_INDEXED_INDIRECT=1, and its verify mode).
+    add_test(NAME agc_driver_empty_indirect_gpu_indexed COMMAND agc_driver_empty_indirect_tests)
+    set_tests_properties(agc_driver_empty_indirect_gpu_indexed PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_INDEXED_INDIRECT=1")
+    add_test(NAME agc_driver_empty_indirect_gpu_indexed_verify COMMAND agc_driver_empty_indirect_tests)
+    set_tests_properties(agc_driver_empty_indirect_gpu_indexed_verify PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_GPU_INDEXED_INDIRECT=verify")
     if(WIN32)
-        set_tests_properties(agc_driver_empty_indirect agc_driver_empty_indirect_no_gpu_mesh PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_empty_indirect agc_driver_empty_indirect_no_gpu_mesh agc_driver_empty_indirect_gpu_indexed agc_driver_empty_indirect_gpu_indexed_verify PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

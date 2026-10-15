@@ -52,7 +52,10 @@ std::optional<Graphics::IndirectDrawPath> Driver::IndirectCpuBeforeCapture(const
     // indexed, and non-indexed unless APS5_NO_GPU_MESH_INDIRECT=1 (its record's start vertex and
     // start instance reach no register then, so the draw's constants are exact).
     const bool meshGpuSide = meshPath && (drawParameters.indexed || Graphics::GpuMeshIndirectDraws()) && indirect.count == 1 && !indirect.countIndirect && indirect.baseVertexLocation == NoLocation && indirect.startInstanceLocation == NoLocation && (!indirect.drawIndexEnabled || indirect.drawIndexLocation == NoLocation);
-    if ((stages.path != Graphics::ShaderPath::Vertex || rectList) && !meshGpuSide) return Path::NonVertexPath;
+    // APS5_GPU_INDEXED_INDIRECT=1: a rect list (generated patch-list stages that read no draw count)
+    // draws from its records like a vertex-path draw; the checks below still apply to it.
+    const bool rectGpuSide = rectList && stages.path == Graphics::ShaderPath::Vertex && !stages.mesh && !stages.tessellation && Graphics::GpuIndexedIndirect();
+    if ((stages.path != Graphics::ShaderPath::Vertex || rectList) && !meshGpuSide && !rectGpuSide) return Path::NonVertexPath;
     if (indirect.drawIndexEnabled && indirect.drawIndexSgpr >= 0) return Path::DrawIndex;
     if (indirect.countIndirect && !support.count) return Path::FeatureGap;
     if (indirect.countIndirect && indirect.count > 1 && !support.multi) return Path::FeatureGap;

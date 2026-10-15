@@ -917,6 +917,59 @@ void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten) {
     stats.indirectReadUs += readMs * 1000.0;
 }
 
+bool GpuIndexedIndirect() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_GPU_INDEXED_INDIRECT"); return text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+bool GpuIndexedIndirectVerify() {
+    static const bool verify = GpuIndexedIndirect() && std::strcmp(std::getenv("APS5_GPU_INDEXED_INDIRECT"), "verify") == 0;
+    return verify;
+}
+
+namespace {
+// The CPU re-reads of verified GPU-side records (GpuIndexedIndirectVerify), for the [gpuind] line.
+std::atomic<std::uint64_t> verifiedDraws{0};
+std::atomic<std::uint64_t> verifyMismatches{0};
+}
+
+void CountIndirectPacket(IndirectSite site, const State& state, const Pm4::DrawParameters::IndirectDraw& indirect, IndirectDrawPath path, double readMs) {
+    static const bool enabled = GpuIndexedIndirect() || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    constexpr std::uint32_t NoLocation = 0x280u;
+    static constexpr std::array<const char*, 5> siteNames{"gpu-side", "early skip", "cpu loop", "cpu read in Draw", "final-record peek"};
+    static std::mutex mutex;
+    static std::map<std::string, std::pair<std::uint64_t, double>> kinds;
+    static std::array<std::uint64_t, 2> sides{};
+    static double sideMs = 0;
+    static auto last = std::chrono::steady_clock::now();
+    const char* shape = state.stages.mesh ? "mesh" : state.rectList ? "rect" : state.stages.path == ShaderPath::Geometry ? "geometry" : state.stages.path != ShaderPath::Vertex || state.stages.tessellation ? "tessellation" : "vertex";
+    const bool located = indirect.baseVertexLocation != NoLocation || indirect.startInstanceLocation != NoLocation || (indirect.drawIndexEnabled && indirect.drawIndexLocation != NoLocation);
+    char key[160];
+    std::snprintf(key, sizeof(key), "%s 0x%x %s%s%s%s%s%s%s", siteNames[static_cast<std::size_t>(site)], indirect.opcode, shape, indirect.count > 1 ? " multi" : "", indirect.countIndirect ? " counted" : "", located ? " located" : "", path != IndirectDrawPath::Gpu ? " (" : "", path != IndirectDrawPath::Gpu ? IndirectDrawPathName(path) : "", path != IndirectDrawPath::Gpu ? ")" : "");
+    std::lock_guard lock(mutex);
+    auto& entry = kinds[key];
+    ++entry.first;
+    entry.second += readMs;
+    if (site != IndirectSite::Peek) {
+        ++sides[site == IndirectSite::GpuSide ? 0 : 1];
+        sideMs += readMs;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::string line = "[gpuind] 10 s: gpu-side " + std::to_string(sides[0]) + ", cpu-side " + std::to_string(sides[1]) + " (record reads " + std::to_string(sideMs) + " ms); " + (GpuIndexedIndirect() ? (GpuIndexedIndirectVerify() ? "switch on, verify: " + std::to_string(verifiedDraws.load()) + " checked, " + std::to_string(verifyMismatches.load()) + " mismatched" : std::string("switch on")) : std::string("switch off")) + "; by site and kind (packets, read ms):";
+    for (const auto& [name, stats] : kinds) {
+        char item[256];
+        std::snprintf(item, sizeof(item), " | %s: %llu (%.1f)", name.c_str(), static_cast<unsigned long long>(stats.first), stats.second);
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    kinds.clear();
+    sides = {};
+    sideMs = 0;
+}
+
 void CountDrawSkip(DrawSkip kind, double us) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -1110,7 +1163,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
     }
     if (args == nullptr) Require(draw.indexCount != 0 && draw.instanceCount != 0, "zero-count indexed draws are unsupported");
-    else Require(!state.stages.tessellation && !state.rectList, "indirect draw on a non-vertex path must be resolved by the driver");
+    else Require(!state.stages.tessellation && (!state.rectList || GpuIndexedIndirect()), "indirect draw on a non-vertex path must be resolved by the driver");
     inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
@@ -1444,6 +1497,8 @@ struct IndirectRecord {
     const HostImport* countImport = nullptr;
     std::span<const Pm4::DrawArguments> records;
     double readMs = 0;
+    // GPU-side only because of APS5_GPU_INDEXED_INDIRECT (a rect-list draw): the verify mode checks it.
+    bool moved = false;
 };
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
@@ -1578,8 +1633,52 @@ std::shared_ptr<Buffer> recordMeshArguments(const Context& context, VkCommandBuf
 // Debug aid: APS5_CHECK_INDIRECT_ARGS=1 reads the records of a GPU-side draw back on the CPU once
 // its batch completed (the GPU has finished writing them by then) and prints the first 16, counting
 // records whose Constant dimension holds a value the hardware would have ignored. Empty otherwise.
+// APS5_GPU_INDEXED_INDIRECT=verify: a draw that is GPU-side only because of the switch reads its
+// records (and count) on the CPU now, as the CPU path would (this waits for their writer), and
+// again when its batch completed; any difference is logged. A later GPU write over the records
+// before the batch completes shows up as a difference too (the GPU read the earlier bytes).
+std::function<void()> verifyIndirectRecords(const Pm4::DrawParameters::IndirectDraw& args) {
+    struct Snapshot {
+        std::uint32_t count = 0;
+        std::vector<Pm4::DrawArguments> records;
+    };
+    const auto read = [](const Pm4::DrawParameters::IndirectDraw& source) {
+        Snapshot snapshot;
+        snapshot.count = std::min(source.countIndirect ? Pm4::ReadDrawCount(source) : source.count, source.count);
+        for (std::uint32_t record = 0; record < snapshot.count; ++record) snapshot.records.push_back(Pm4::ReadDrawArguments(source, record));
+        return snapshot;
+    };
+    Snapshot before;
+    try {
+        before = read(args);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[gpuind] verify: reading the records failed: %s\n", error.what());
+        return {};
+    }
+    return [args, before = std::move(before), read] {
+        static std::atomic<std::uint64_t> printed{0};
+        ++verifiedDraws;
+        try {
+            const auto after = read(args);
+            bool same = after.count == before.count;
+            for (std::size_t i = 0; same && i < after.records.size(); ++i) {
+                const auto& a = before.records[i];
+                const auto& b = after.records[i];
+                same = a.count == b.count && a.instances == b.instances && a.firstVertexOrIndex == b.firstVertexOrIndex && a.vertexOffset == b.vertexOffset && a.firstInstance == b.firstInstance;
+            }
+            if (same) return;
+            ++verifyMismatches;
+            if (printed.fetch_add(1) < 8) std::fprintf(stderr, "[gpuind] verify: records 0x%llx (opcode 0x%x) changed between recording and completion: count %u -> %u, first record count %u -> %u instances %u -> %u\n", static_cast<unsigned long long>(args.arguments), args.opcode, before.count, after.count, before.records.empty() ? 0u : before.records.front().count, after.records.empty() ? 0u : after.records.front().count, before.records.empty() ? 0u : before.records.front().instances, after.records.empty() ? 0u : after.records.front().instances);
+        } catch (const std::exception& error) {
+            ++verifyMismatches;
+            std::fprintf(stderr, "[gpuind] verify: re-reading the records failed: %s\n", error.what());
+        }
+    };
+}
+
 std::function<void()> indirectRecordCheck(const IndirectRecord* indirect) {
     static const bool checkArguments = std::getenv("APS5_CHECK_INDIRECT_ARGS") != nullptr;
+    if (indirect != nullptr && indirect->moved && indirect->path == IndirectDrawPath::Gpu && GpuIndexedIndirectVerify()) return verifyIndirectRecords(*indirect->args);
     if (indirect == nullptr || indirect->args == nullptr || indirect->path != IndirectDrawPath::Gpu || !checkArguments) return {};
     return [args = *indirect->args] {
         using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
@@ -1912,7 +2011,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
-    if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
+    if (args != nullptr) {
+        CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
+        CountIndirectPacket(record.indirect->path == IndirectDrawPath::Gpu ? IndirectSite::GpuSide : IndirectSite::RecordFallback, state, *args, record.indirect->path, record.indirect->readMs);
+    }
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     std::function<void(VkCommandBuffer)> storeProxies;
@@ -2136,6 +2238,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // buffer is kept while the recorder is busy.
     IndirectRecord indirect;
     indirect.args = args;
+    indirect.moved = args != nullptr && state.rectList && GpuIndexedIndirect();
     std::vector<Pm4::DrawArguments> records;
     if (args != nullptr) {
         static const bool gpuIndirectDraws = std::getenv("APS5_NO_GPU_INDIRECT_DRAW") == nullptr;
@@ -2177,6 +2280,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
             indirect.records = records;
             if (std::none_of(records.begin(), records.end(), [](const Pm4::DrawArguments& record) { return record.count != 0 && record.instances != 0; })) {
                 CountIndirectDraw(indirect.path, indirect.readMs);
+                CountIndirectPacket(IndirectSite::RecordFallback, state, *args, indirect.path, indirect.readMs);
                 report(" indirect draw with empty records");
                 return;
             }
@@ -2420,7 +2524,10 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset);
     }
     if (meshArguments != nullptr && recorded) recorder->Keep(meshArguments);
-    if (args != nullptr) CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
+    if (args != nullptr) {
+        CountIndirectDraw(indirect.path, indirect.readMs, rewritten);
+        CountIndirectPacket(indirect.path == IndirectDrawPath::Gpu ? IndirectSite::GpuSide : IndirectSite::RecordFallback, state, *args, indirect.path, indirect.readMs);
+    }
     auto checkRecords = indirectRecordCheck(args != nullptr ? &indirect : nullptr);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
     if (recorded) recorder->EndPassSamples();

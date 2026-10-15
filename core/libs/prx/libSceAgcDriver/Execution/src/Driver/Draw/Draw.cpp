@@ -151,7 +151,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 bool draws = false;
                 for (std::uint32_t record = 0; record < count && !draws; ++record) draws = IndirectRecordDraws(Pm4::ReadDrawArguments(indirect, record), drawParameters);
                 if (!draws) {
-                    Graphics::CountIndirectDraw(*reason, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+                    const auto readMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+                    Graphics::CountIndirectDraw(*reason, readMs);
+                    Graphics::CountIndirectPacket(Graphics::IndirectSite::EarlySkip, graphics, indirect, *reason, readMs);
                     if (traceIndirect) std::fprintf(stderr, "[draw]   %u records draw nothing: ended before the captures (cpu: %s)\n", count, Graphics::IndirectDrawPathName(*reason));
                     return DrawVerdict::EmptyIndirect;
                 }
@@ -354,7 +356,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
         for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
-        Graphics::CountIndirectDraw(*indirectCpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
+        const auto loopReadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count();
+        Graphics::CountIndirectDraw(*indirectCpu, loopReadMs);
+        Graphics::CountIndirectPacket(Graphics::IndirectSite::CpuLoop, graphics, indirect, *indirectCpu, loopReadMs);
         const auto baseVertexWord = locate(indirect.baseVertexLocation);
         const auto startInstanceWord = locate(indirect.startInstanceLocation);
         const auto drawIndexWord = indirect.drawIndexEnabled ? locate(indirect.drawIndexLocation) : std::nullopt;
@@ -417,6 +421,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (drawParameters.indirect && graphics.stages.mesh && !drawParameters.indexed && meshIndirectPeek() && indirectRecordsFinal(*drawParameters.indirect)) {
         const auto readStart = std::chrono::steady_clock::now();
         const auto record = Pm4::ReadDrawArguments(*drawParameters.indirect, 0);
+        Graphics::CountIndirectPacket(Graphics::IndirectSite::Peek, graphics, *drawParameters.indirect, Graphics::IndirectDrawPath::Gpu, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readStart).count());
         if (!IndirectRecordDraws(record, drawParameters)) {
             Graphics::CountDrawSkip(Graphics::DrawSkip::FinalEmptyIndirect, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - readStart).count());
             if (traceIndirect) std::fprintf(stderr, "[draw]   GPU-side mesh record final: count %u instances %u draws nothing, not recorded\n", record.count, record.instances);
