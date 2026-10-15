@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -67,9 +68,11 @@ void Driver::accountVariant(const DispatchVariant& variant, bool added) {
     if (added) {
         ++dispatchCacheVariants;
         dispatchCacheVariantBytes += variantBytes(variant);
+        HostCommitLog::Count("dispatch-cache", static_cast<std::int64_t>(variantBytes(variant)), 1);
     } else {
         --dispatchCacheVariants;
         dispatchCacheVariantBytes -= variantBytes(variant);
+        HostCommitLog::Count("dispatch-cache", -static_cast<std::int64_t>(variantBytes(variant)), -1);
     }
 }
 

@@ -55,6 +55,8 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         load(initialData);
     }
     VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    HostCommitLog::Meter loadCensus{"pipeline-cache-transient"};
+    loadCensus.Set(initialData.capacity());
     info.initialDataSize = initialData.size();
     info.pInitialData = initialData.empty() ? nullptr : initialData.data();
     const auto create = context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
@@ -69,6 +71,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
+    driverCopy.Set(initialData.size());
     if (!path.empty()) saver = std::thread([this] { run(); });
 }
 
@@ -170,6 +173,7 @@ void PipelineCache::save(bool final) {
     {
         auto synchronizationLock = synchronization.LockForSnapshot();
         if (getData(context.device, cache, &liveBytes, nullptr) != VK_SUCCESS || liveBytes == 0) return;
+        driverCopy.Set(liveBytes);
     }
     if (liveBytes == settledBytes && readHeader() == settledFile) return;
     const auto started = std::chrono::steady_clock::now();
@@ -178,6 +182,8 @@ void PipelineCache::save(bool final) {
         settledFile = file;
     };
     const auto disk = readFile();
+    HostCommitLog::Meter diskCensus{"pipeline-cache-transient"};
+    diskCensus.Set(disk.contents.capacity());
     if (disk.state == FileState::Unreadable) {
         std::fprintf(stderr, "[pipeline-cache] cannot read %s; not saving over it\n", path.string().c_str());
         settle(readHeader());
@@ -217,6 +223,7 @@ void PipelineCache::save(bool final) {
     const auto source = merged != VK_NULL_HANDLE ? merged : cache;
     std::size_t size = 0;
     std::vector<std::byte> file;
+    HostCommitLog::Meter fileCensus{"pipeline-cache-transient"};
     {
         auto synchronizationLock = source == cache ? synchronization.LockForSnapshot() : PipelineCacheSynchronization::SnapshotLock{};
         if (getData(context.device, source, &size, nullptr) != VK_SUCCESS || size == 0) return;
@@ -225,6 +232,7 @@ void PipelineCache::save(bool final) {
             return;
         }
         file.resize(sizeof(FileHeader) + size);
+        fileCensus.Set(file.capacity());
         const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
         if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
         file.resize(sizeof(FileHeader) + size);

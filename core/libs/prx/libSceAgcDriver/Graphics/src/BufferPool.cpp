@@ -253,6 +253,7 @@ std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsag
     if (found->second.empty()) tier.free.erase(found);
     --tier.slots;
     tier.retainedBytes -= result.allocationBytes;
+    census(tier);
     ++tier.hits;
     return result;
 }
@@ -265,6 +266,7 @@ void BufferPool::evictOldest(Tier& tier, std::vector<BufferAllocation>& evicted)
     oldest->second.pop_front();
     if (oldest->second.empty()) tier.free.erase(oldest);
     --tier.slots;
+    census(tier);
     ++tier.evictions;
 }
 
@@ -290,6 +292,7 @@ VkDeviceSize BufferPool::trim() {
             tier->evictions += tier->slots;
             tier->retainedBytes = 0;
             tier->slots = 0;
+            census(*tier);
         }
     }
     VkDeviceSize bytes = 0;
@@ -330,6 +333,7 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
             tier.free[{allocation.bytes, allocation.usage, allocation.properties}].push_back({allocation, ++clock});
             ++tier.slots;
             tier.retainedBytes += allocation.allocationBytes;
+            census(tier);
         }
     } catch (...) {
         destroy(allocation);

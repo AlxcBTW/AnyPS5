@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINECACHE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -54,6 +55,8 @@ private:
     VkPipelineCache cache = VK_NULL_HANDLE;
     PipelineCacheSynchronization synchronization;
     std::filesystem::path path;
+    // The driver's parsed copy of the cache, taken as the size of the data it was given or last returned.
+    HostCommitLog::Meter driverCopy{"pipeline-cache-data"};
     std::size_t loadedBytes = 0;
     std::size_t settledBytes = 0;
     std::optional<FileHeader> settledFile;

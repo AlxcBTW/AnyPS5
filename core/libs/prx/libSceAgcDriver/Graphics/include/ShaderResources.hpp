@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
@@ -633,6 +634,9 @@ public:
 
 private:
     void erase(const Key& key);
+    // Recounts the entries for the host commit census (keys and objects; under mutex).
+    void note();
+    HostCommitLog::Meter census{"resource-cache"};
     void noteMiss(const Key& key);
     struct KeyHash {
         std::size_t operator()(const Key& key) const noexcept {

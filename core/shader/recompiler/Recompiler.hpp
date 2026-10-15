@@ -476,6 +476,8 @@ public:
 
     [[nodiscard]] std::span<const std::uint32_t> Words() const { return words ? std::span<const std::uint32_t>(*words) : view; }
     [[nodiscard]] std::vector<std::uint32_t> Copy() const { return {Words().begin(), Words().end()}; }
+    // The host bytes this holder owns: none for words viewed from a mapped disk cache entry.
+    [[nodiscard]] std::size_t OwnedBytes() const { return words ? words->capacity() * sizeof(std::uint32_t) : 0; }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }

@@ -335,6 +335,7 @@ HoldCounters holdCounters;
 struct DeferredBatch {
     std::vector<std::shared_ptr<void>> kept;
     std::vector<std::function<void()>> completions;
+    HostCommitLog::Meter census;
 };
 struct DeferredBatchesTag {};
 auto& DeferredBatches() { return HostThreadLocal<std::vector<DeferredBatch>, DeferredBatchesTag>(); }
@@ -2513,6 +2514,7 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
     open->keptBytes += bytes;
+    open->census.Add(static_cast<std::int64_t>(bytes), bytes != 0 ? 1 : 0);
 }
 
 void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
@@ -2532,7 +2534,10 @@ void Recorder::dropStaleHoldKept() {
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
-    if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    if (open->keptOwners.insert(owner).second) {
+        open->keptBytes += bytes;
+        open->census.Add(static_cast<std::int64_t>(bytes), 1);
+    }
 }
 
 void Recorder::BoundKeptBytes() {
@@ -2552,17 +2557,23 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
+void Recorder::noteSnapshotCensus() {
+    snapshotCensus.Set(drawSnapshotPools[0].bytes + drawSnapshotPools[1].bytes + unwrittenBytes, static_cast<std::int64_t>(drawSnapshots.size() + unwrittenSnapshots.size()));
+}
+
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
+    noteSnapshotCensus();
 }
 
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     if (stamp == unwrittenStamp) return;
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
+    noteSnapshotCensus();
     unwrittenStamp = stamp;
 }
 
@@ -2578,10 +2589,12 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
         unwrittenBytes -= found->second.bytes;
         unwrittenSnapshots.erase(found);
+        noteSnapshotCensus();
     }
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer)});
     unwrittenBytes += bytes;
+    noteSnapshotCensus();
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation) {
@@ -2669,6 +2682,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
         throw;
     }
     pool.bytes += bytes;
+    noteSnapshotCensus();
 }
 
 bool Recorder::KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest) {
@@ -3879,7 +3893,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         // destroys the batch's objects here, under the mutex, counts nothing the destructor would
         // wait for and must not escape (the rest of finish() releases the fence and command buffer).
         try {
-            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions)});
+            DeferredBatches().push_back({std::move(batch->kept), std::move(batch->completions), std::move(batch->census)});
             deferredPending.fetch_add(1, std::memory_order_acq_rel);
             DeferredBytes() += batch->keptBytes;
         } catch (...) {

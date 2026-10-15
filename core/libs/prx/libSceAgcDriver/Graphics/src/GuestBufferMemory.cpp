@@ -3,6 +3,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -70,7 +71,10 @@ struct ImageMirror {
     std::weak_ptr<const GuestAllocations::Range> range;
     std::shared_ptr<Buffer> buffer;
     // Writable ranges only: the guest bytes the mirror holds, compared on refresh and at write-back.
-    std::vector<std::byte> shadow;
+    HostCommitLog::CountedVector<std::byte> shadow{HostCommitLog::CountingAllocator<std::byte>("image-mirror-shadows")};
+    // The mirror buffer's bytes by kind (heap-mirrors / image-mirrors), counted logically: the buffer is
+    // Vulkan host memory the walk sees as vk-mapped.
+    HostCommitLog::Meter census;
     // Identity for the life of this mirror (see ImageMirrorSerial); the top bit keeps mirror serials
     // apart from host import serials.
     std::uint64_t serial = 0;
@@ -1885,6 +1889,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         state.failed.insert(range->address);
         return nullptr;
     }
+    mirror->census.Track(heap ? "heap-mirrors" : "image-mirrors", static_cast<std::size_t>(mirror->bytes));
     // Read stores GPU results pending in the range first (write-backs of earlier copies of it);
     // named for the [hooksync] attribution like the refresh's flush.
     {

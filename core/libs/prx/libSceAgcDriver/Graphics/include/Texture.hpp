@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -541,9 +542,9 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
-    std::vector<std::byte> original;
+    HostCommitLog::CountedVector<std::byte> original{HostCommitLog::CountingAllocator<std::byte>("storage-image-original")};
     mutable std::array<std::uint64_t, 5> comparedGuestBytes{};
-    std::vector<std::byte> generationBaseline;
+    HostCommitLog::CountedVector<std::byte> generationBaseline{HostCommitLog::CountingAllocator<std::byte>("storage-image-baseline")};
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;
@@ -607,6 +608,7 @@ private:
     std::vector<bool> layerOriginal;
     std::map<std::uint64_t, std::uint64_t> keptAtUnwatch;
     std::shared_ptr<Buffer> savedBytes;
+    HostCommitLog::Meter savedCensus{"storage-image-saved"};
     std::vector<std::uint64_t> savedTicket;
     std::uint64_t lastSaveTicket = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so

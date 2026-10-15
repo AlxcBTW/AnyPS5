@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -537,6 +538,7 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
+        HostCommitLog::Meter census{"recorder-keeps"};
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
@@ -849,6 +851,9 @@ private:
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    // The draw snapshot pools and the unwritten snapshots (Vulkan host buffers), counted logically.
+    HostCommitLog::Meter snapshotCensus{"recorder-snapshots"};
+    void noteSnapshotCensus();
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
