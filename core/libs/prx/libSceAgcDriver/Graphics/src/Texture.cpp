@@ -108,6 +108,8 @@ struct StorageTraffic {
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     // Deferred results stored later, by the reason of the flush that asked (count/bytes).
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> deferPublished;
+    // Storage-refresh write-backs by the shape of the pair (stored image, refreshing image) and why no alias borrow served it.
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> aliasClasses;
     std::uint64_t directWriteBacks = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -143,6 +145,15 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    {
+        std::vector<std::pair<std::string, std::pair<std::uint64_t, std::uint64_t>>> ranked(traffic.aliasClasses.begin(), traffic.aliasClasses.end());
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+        std::uint64_t total = 0;
+        for (const auto& entry : ranked) total += entry.second.second;
+        AgcDriver::ProfilePrint_nid_no_patch("[alias-census] (10 s) storage-refresh write-backs by pair class: %zu classes, %.1f MiB; top by MiB (count/MiB: stored image vs refreshing image | why not borrowed):\n", ranked.size(), total / 1048576.0);
+        for (std::size_t i = 0; i < ranked.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch("[alias-census]   %llu/%.1f %s\n", static_cast<unsigned long long>(ranked[i].second.first), ranked[i].second.second / 1048576.0, ranked[i].first.c_str());
+        traffic.aliasClasses.clear();
+    }
     if (DeferStorageWriteBack()) {
         std::string published;
         for (const auto& [reason, totals] : traffic.deferPublished) {
@@ -1321,6 +1332,10 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // The image being validated by Refresh: its own pending results are what the next dispatch wants,
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
+// Census: the alias candidate of the running Refresh (pendingAlias, before the gates below) and the
+// first gate that dropped it, null when it survived or there was none.
+thread_local const StorageTexture* refreshCandidate = nullptr;
+thread_local const char* refreshGate = nullptr;
 
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
@@ -1705,14 +1720,31 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    struct CensusScope {
+        ~CensusScope() { refreshCandidate = nullptr; refreshGate = nullptr; }
+    } censusScope;
+    refreshCandidate = alias.get();
+    refreshGate = nullptr;
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) {
+        alias = nullptr;
+        refreshGate = "this image's keys not uncompressed or no import";
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) {
+            alias = nullptr;
+            refreshGate = "no write tracking";
+        }
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+            if (alias->layerGeneration[unit] == 0) {
                 alias = nullptr;
+                refreshGate = "alias unit untracked";
+                break;
+            }
+            if (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit]) {
+                alias = nullptr;
+                refreshGate = "unit pending in both";
                 break;
             }
         }
@@ -4092,6 +4124,46 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     return nullptr;
 }
 
+const char* StorageTexture::aliasRefusal(const StorageTexture& stored) const {
+    static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
+    const auto& mine = descriptor;
+    const auto& theirs = stored.descriptor;
+    if (disabled) return "APS5_NO_ALIAS_BORROW";
+    if (!blockUnits) return "this image has no block units";
+    if (!stored.blockUnits) return "stored image has no block units";
+    if (mine.baseAddress != theirs.baseAddress) return "base differs";
+    if (guestBytes != stored.guestBytes) return "size differs";
+    const auto oneSlice = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0); };
+    if (!(mine.dimension == theirs.dimension || (oneSlice(mine) && oneSlice(theirs)))) return "dimension differs";
+    if (mine.width != theirs.width || mine.height != theirs.height) return "width/height differ";
+    if (mine.depthOrLastArray != theirs.depthOrLastArray || mine.baseArray != theirs.baseArray) return "depth/array differ";
+    if (mine.mipCount != theirs.mipCount) return "mips differ";
+    if (mine.tileMode != theirs.tileMode) return "tile mode differs";
+    if (BytesPerElement(mine.format) != BytesPerElement(theirs.format)) return "bytes per texel differ";
+    if (geometry.imageLayers != stored.geometry.imageLayers || geometry.imageDepth != stored.geometry.imageDepth || trackedLayers != stored.trackedLayers) return "layer geometry differs";
+    if (!stored.Cached()) return "stored image not cached";
+    if (stored.uploadedKeys != DccKeys::Uncompressed) return "stored image keys not uncompressed";
+    if (&stored == refreshCandidate && refreshGate != nullptr) return refreshGate;
+    return "shape matches, other gate";
+}
+
+std::string StorageTexture::pairClass(const StorageTexture& stored) const {
+    const auto& mine = descriptor;
+    const auto& theirs = stored.descriptor;
+    const auto aBegin = theirs.baseAddress, aEnd = theirs.baseAddress + stored.guestBytes;
+    const auto bBegin = mine.baseAddress, bEnd = mine.baseAddress + guestBytes;
+    const char* range = aBegin == bBegin && aEnd == bEnd ? "same range" : aBegin >= bBegin && aEnd <= bEnd ? "stored inside" : bBegin >= aBegin && bEnd <= aEnd ? "stored around" : "partial overlap";
+    static const char* const dimensions[] = {"1D", "2D", "2DArray", "Cube", "3D", "1DArray"};
+    const auto dimension = [](TextureDimension value) { return dimensions[static_cast<std::size_t>(value)]; };
+    char text[512];
+    std::snprintf(text, sizeof(text), "%s, %.1f/%.1f MiB; texel %u/%u B fmt %u/%u; tile %d/%d; %ux%u/%ux%u; depth/array %u/%u; mips %u/%u; %s/%s; keys %s/%s | %s",
+        range, stored.guestBytes / 1048576.0, guestBytes / 1048576.0, BytesPerElement(theirs.format), BytesPerElement(mine.format), theirs.format, mine.format,
+        static_cast<int>(theirs.tileMode), static_cast<int>(mine.tileMode), theirs.width, theirs.height, mine.width, mine.height,
+        theirs.depthOrLastArray, mine.depthOrLastArray, theirs.mipCount, mine.mipCount, dimension(theirs.dimension), dimension(mine.dimension),
+        DccKeysName(stored.uploadedKeys), DccKeysName(uploadedKeys), aliasRefusal(stored));
+    return text;
+}
+
 bool StorageTexture::deferOverlappingWriteBacks() {
     deferredOver.clear();
     if (!DeferStorageWriteBack() || !blockUnits || descriptor.dccAddress == 0 || anyLayerPending() || !borrowedUnits.empty()) return false;
@@ -4356,6 +4428,21 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         StorageTexture& texture;
         ~Reconcile() { texture.reconcilePending(); }
     } reconcile{*this};
+    // Census: what this write-back stored for a storage refresh of another image.
+    struct Census {
+        StorageTexture& stored;
+        std::uint64_t before = threadWriteBackBytes;
+        ~Census() {
+            const auto bytes = threadWriteBackBytes - before;
+            if (bytes == 0 || refreshing == nullptr || refreshing == &stored || flushReason == nullptr || std::strcmp(flushReason, "storage refresh") != 0 || !LookupOutcomes::Profiled()) return;
+            auto key = refreshing->pairClass(stored);
+            auto& traffic = Traffic();
+            std::lock_guard lock(traffic.mutex);
+            auto& totals = traffic.aliasClasses[std::move(key)];
+            ++totals.first;
+            totals.second += bytes;
+        }
+    } census{*this};
     storeSerial.fetch_add(1, std::memory_order_relaxed);
     if (deferredOwed.exchange(false, std::memory_order_relaxed) && LookupOutcomes::Profiled()) {
         // Results an earlier refresh left unstored (APS5_DEFER_STORAGE_WB): the flush that asks now.
