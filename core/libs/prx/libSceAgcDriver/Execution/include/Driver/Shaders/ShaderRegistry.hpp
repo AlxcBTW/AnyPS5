@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <array>
 #include <optional>
 #include <span>
@@ -88,6 +89,8 @@ struct ShaderSnapshot {
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::optional<std::uint32_t> userDataTailRegister;
+    // The code and header copies, counted for the host commit census (APS5_HOST_COMMIT_LOG).
+    HostCommitLog::Meter census;
 };
 
 

@@ -102,6 +102,7 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
             if (const auto tail = ShaderRecompiler::FindUserDataTail(decoded, 0u, 106u)) snapshot.userDataTailRegister = tail->userDataRegister;
             const auto& last = decoded.instructions.back();
             snapshot.code.resize(last.programCounter / sizeof(std::uint32_t) + last.wordCount);
+            snapshot.census.Track("shader-raw-code", snapshot.code.capacity() * sizeof(std::uint32_t));
             auto result = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
             std::lock_guard lock(cacheMutex);
             const auto found = std::find_if(cache.begin(), cache.end(), [address](const auto& entry) { return entry->codeAddress == address; });
@@ -1509,6 +1510,7 @@ void Driver::RegisterShader(const Shader* shader) {
         print(fields.sh_registers, fields.num_sh_registers);
         std::fprintf(stderr, "\n");
     }
+    snapshot.census.Track("shader-registry-code", snapshot.code.capacity() * sizeof(std::uint32_t) + snapshot.header.capacity());
     const auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
     std::lock_guard lock(mutex);
     rethrowFailure();

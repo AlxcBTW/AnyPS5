@@ -3301,6 +3301,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         index.erase(entries.back().first);
         entries.pop_back();
     }
+    note();
     if (entries.front().second->TableElements() == 0) return;
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.second->TableElements();
@@ -3315,6 +3316,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         index.erase(it->first);
         it = std::prev(entries.erase(it));
     }
+    note();
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
@@ -3337,6 +3339,7 @@ void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::sh
         index.erase(it->first);
         it = entries.erase(it);
     }
+    note();
 }
 
 bool ResourceCache::Touch(const Key& key) {
@@ -3360,6 +3363,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    note();
 }
 
 std::size_t ResourceCache::Size() const {
@@ -3383,11 +3387,19 @@ std::uint64_t ResourceCache::TableElements() const {
     return tables;
 }
 
+void ResourceCache::note() {
+    if (!HostCommitLog::Active()) return;
+    std::size_t bytes = 0;
+    for (const auto& entry : entries) bytes += entry.first.capacity() * sizeof(std::uint32_t) + sizeof(ShaderResources);
+    census.Set(bytes, static_cast<std::int64_t>(entries.size()));
+}
+
 void ResourceCache::erase(const Key& key) {
     const auto found = index.find(key);
     if (found == index.end()) return;
     entries.erase(found->second);
     index.erase(found);
+    note();
 }
 
 ResourceCache& SharedResourceCache() {

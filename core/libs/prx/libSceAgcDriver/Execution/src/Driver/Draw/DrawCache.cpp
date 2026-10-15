@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <algorithm>
 #include <bit>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -69,9 +70,11 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
     if (added) {
         ++drawCacheVariants;
         drawCacheVariantBytes += variantBytes(variant);
+        HostCommitLog::Count("draw-cache", static_cast<std::int64_t>(variantBytes(variant)), 1);
     } else {
         --drawCacheVariants;
         drawCacheVariantBytes -= variantBytes(variant);
+        HostCommitLog::Count("draw-cache", -static_cast<std::int64_t>(variantBytes(variant)), -1);
     }
 }
 

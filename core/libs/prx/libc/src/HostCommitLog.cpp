@@ -86,7 +86,7 @@ std::map<std::string, Logical>& logicalRegistry() {
     std::sort(sorted.begin(), sorted.end(), [](const auto& first, const auto& second) { return first.second.bytes > second.second.bytes; });
     for (const auto& [name, counter] : sorted) {
         if (counter.count == 0 && counter.bytes == 0) continue;
-        std::fprintf(stderr, "[host-commit]   logical %s: %.2f GiB in %lld allocations (requested from the driver, not walked)\n", name.c_str(), static_cast<double>(counter.bytes) / GiB, static_cast<long long>(counter.count));
+        std::fprintf(stderr, "[host-commit]   logical %s: %.2f GiB in %lld allocations (counted by its owner, not walked; owners backed by Vulkan memory overlap vk-mapped)\n", name.c_str(), static_cast<double>(counter.bytes) / GiB, static_cast<long long>(counter.count));
     }
 }
 

@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/HostCommitLog.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdio>
@@ -509,10 +510,16 @@ private:
     };
     struct Saved {
         unsigned char* bytes;
-        explicit Saved(unsigned char* bytes) : bytes(bytes) {}
+        std::size_t reserved;
+        Saved(unsigned char* bytes, std::size_t reserved) : bytes(bytes), reserved(reserved) {
+            HostCommitLog::HostCommitNote_nid_no_patch("saved-direct-pages", bytes, reserved);
+        }
         Saved(const Saved&) = delete;
         Saved& operator=(const Saved&) = delete;
-        ~Saved() { VirtualFree(bytes, 0, MEM_RELEASE); }
+        ~Saved() {
+            HostCommitLog::HostCommitForget_nid_no_patch(bytes, reserved);
+            VirtualFree(bytes, 0, MEM_RELEASE);
+        }
     };
     struct Physical {
         std::weak_ptr<SharedPage> page;
@@ -668,7 +675,7 @@ private:
                 if (!saved) {
                     auto* bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, stop - start, MEM_RESERVE, PAGE_READWRITE));
                     if (bytes == nullptr) fail("reserve unmapped direct memory");
-                    saved = std::make_shared<Saved>(bytes);
+                    saved = std::make_shared<Saved>(bytes, stop - start);
                 }
                 if (!VirtualAlloc(saved->bytes + (page - start), pageBytes, MEM_COMMIT, PAGE_READWRITE)) fail("keep unmapped direct memory");
                 std::memcpy(saved->bytes + (page - start), reinterpret_cast<const void*>(page), pageBytes);

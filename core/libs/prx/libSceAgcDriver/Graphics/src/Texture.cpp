@@ -3410,7 +3410,10 @@ std::vector<std::uint32_t> StorageTexture::prepareStoredSave(const std::vector<b
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
         if (layers[unit] && !skippedLayer[unit]) units.push_back(unit);
     }
-    if (!units.empty() && !savedBytes) savedBytes = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (!units.empty() && !savedBytes) {
+        savedBytes = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        savedCensus.Set(static_cast<std::size_t>(guestBytes));
+    }
     return units;
 }
 

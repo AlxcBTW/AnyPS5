@@ -1,3 +1,4 @@
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -128,6 +129,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                     dispatchCacheEvictions += dispatchCache.size();
                     dispatchCache.clear();
                     dispatchOrder.clear();
+                    HostCommitLog::Count("dispatch-cache", -static_cast<std::int64_t>(dispatchCacheVariantBytes), -static_cast<std::int64_t>(dispatchCacheVariants));
                     dispatchCacheVariants = 0;
                     dispatchCacheVariantBytes = 0;
                 }

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_BUFFERPOOL_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libc/include/HostCommitMeter.hpp"
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -111,10 +112,14 @@ private:
         std::uint64_t hits = 0;
         std::uint64_t misses = 0;
         std::uint64_t evictions = 0;
+        // The retained bytes and slots as the census owner counts them (host tiers: bufferpool-host).
+        HostCommitLog::Meter census;
+        void Census(const char* owner) { census.Track(owner, static_cast<std::size_t>(retainedBytes), static_cast<std::int64_t>(slots)); }
     };
     // The tier a buffer of `capacity` and `properties` is retained in (the large one for everything
     // when shared; the device tier for device-local memory while it has a budget).
     Tier& tierFor(std::size_t capacity, VkMemoryPropertyFlags properties);
+    void census(Tier& tier) { tier.Census(&tier == &deviceTier ? "bufferpool-device" : "bufferpool-host"); }
     static bool DeviceTierEnabled();
     static bool DeviceTiered(VkMemoryPropertyFlags properties);
     static std::size_t NextCapacity(std::size_t capacity);
