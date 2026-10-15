@@ -4699,6 +4699,7 @@ void ShaderResources::CheckFaults() const {
 }
 
 void ShaderResources::WriteBackBuffers() {
+    std::fprintf(stderr, "[trace-pr6373] WriteBackBuffers\n");
     std::exception_ptr fault;
     if (bda) {
         try {

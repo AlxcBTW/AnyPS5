@@ -3819,6 +3819,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // reaped or synced the batch. Inside them the flush hook makes no pending-write wait (SyncThrough).
     const bool profile = DrawProfiled();
     const auto completionStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (!batch->completions.empty()) std::fprintf(stderr, "[trace-pr6373] finish runs %zu completions\n", batch->completions.size());
     {
         struct InCompletion {
             InCompletion() { ++completionDepth; }
