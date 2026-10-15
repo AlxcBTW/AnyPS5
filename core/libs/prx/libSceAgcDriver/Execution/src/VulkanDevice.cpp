@@ -2224,6 +2224,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // A unit shadow's results in the label's unit reach the import before the store lands over
     // part of it (the store's stamp then makes the unit stale); the deferred label paths call no
     // FlushPending of their own.
+    Graphics::PublishCensusObserve(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (Graphics::AnyShadowedOverlaps(address, bytes.size())) Graphics::PublishShadow(address, bytes.size(), Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     // The store on the GPU, into the open batch: everything recorded so far completes before it,
     // and it is visible to the host after. The barriers belong to the recorder's store run: one
@@ -2283,6 +2284,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
     const auto* import = Graphics::HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) return false;
+    Graphics::PublishCensusObserve(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
     recorder.FlushKeyStoresOverlapping(address, bytes);

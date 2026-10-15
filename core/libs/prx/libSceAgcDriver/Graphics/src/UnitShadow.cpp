@@ -5,9 +5,11 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -68,6 +70,65 @@ Statistics& Stats() {
     return statistics;
 }
 
+// ---- publish census (APS5_PUBLISH_CENSUS=1) ----------------------------------------------------
+constexpr std::size_t ClassCount = 3;
+constexpr std::size_t SiteCount = static_cast<std::size_t>(CensusSite::Count);
+constexpr std::size_t ReadSiteCount = static_cast<std::size_t>(GuestMemory::ReadSite::Count);
+constexpr const char* SiteNames[SiteCount] = {"build-region", "build-write", "reuse-epoch-region", "reuse-region", "reuse-write"};
+constexpr const char* ClassNames[ClassCount] = {"other", "yolo-skippable", "yolo-kept"};
+
+// One unit's published bytes: state 0 = none (or closed), 1 = published and unread, 2 = only bound in
+// place since (a GPU bind may or may not read it), 3 = read by a definite observer.
+struct CensusUnit {
+    std::uint64_t sequence = 0;
+    std::uint32_t present = 0;
+    std::uint32_t bytes = 0;
+    std::uint8_t state = 0;
+    std::uint8_t reason = 0;
+    std::uint8_t klass = 0;
+};
+enum class CensusClose : std::uint8_t { Rewritten, Superseded, Writer, Lapsed };
+
+struct CensusCounts {
+    std::atomic<std::uint64_t> units{0}, bytes{0};
+    void Add(std::uint64_t amount) {
+        units.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(amount, std::memory_order_relaxed);
+    }
+};
+struct CensusRow {
+    CensusCounts published, needed, rewritten, superseded, writer, boundOnly, lapsed;
+};
+struct CensusStats {
+    std::array<CensusRow, ClassCount> rows;
+    std::array<CensusCounts, ReasonCount> neededBy;
+    std::array<std::atomic<std::uint64_t>, ReadSiteCount> hookBySite{};
+    std::array<std::array<CensusCounts, 2>, SiteCount> regions;
+    std::atomic<std::uint64_t> publishes{0}, sequence{0}, ageSum{0}, ageCount{0};
+    std::atomic<std::int64_t> lastReportMs{0};
+};
+
+CensusStats& Census() {
+    static CensusStats statistics;
+    return statistics;
+}
+
+bool CensusOn() {
+    static const bool enabled = std::getenv("APS5_PUBLISH_CENSUS") != nullptr && UnitShadowEnabled();
+    return enabled;
+}
+
+CensusClass& censusClassSlot() {
+    thread_local CensusClass klass = CensusClass::Other;
+    return klass;
+}
+
+// Observers: every reason but the shadow's own lifecycle. Region (a GPU bind in place) may be a
+// write-only bind, so a publish made by one is not counted as read by it.
+bool censusObserver(PublishReason reason) {
+    return reason != PublishReason::Evict && reason != PublishReason::Retire && reason != PublishReason::Teardown;
+}
+
 struct UnitShadow {
     Context context;
     // The import's range and buffer (taken at creation: a publish under the import table's mutex
@@ -80,6 +141,8 @@ struct UnitShadow {
     // whether a slab -> import copy was recorded at that generation.
     std::vector<std::uint64_t> generation;
     std::vector<std::uint8_t> published;
+    // APS5_PUBLISH_CENSUS only (empty otherwise): per unit, what its last publish carried.
+    std::vector<CensusUnit> census;
     // Slab k covers units [k * SlabUnits(), (k + 1) * SlabUnits()), made on demand; a failed
     // allocation is not retried before the noted present.
     std::vector<std::shared_ptr<ShadowSlab>> slabs;
@@ -169,6 +232,7 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
     const auto units = (import.base + import.bytes - shadow->base + UnitBytes - 1) / UnitBytes;
     shadow->generation.assign(static_cast<std::size_t>(units), 0);
     shadow->published.assign(static_cast<std::size_t>(units), 0);
+    if (CensusOn()) shadow->census.assign(static_cast<std::size_t>(units), CensusUnit{});
     const auto slabs = (units + SlabUnits() - 1) / SlabUnits();
     shadow->slabs.assign(static_cast<std::size_t>(slabs), nullptr);
     shadow->slabFailedUntil.assign(static_cast<std::size_t>(slabs), 0);
@@ -187,6 +251,168 @@ void changedUnits(const UnitShadow& shadow, std::uint64_t first, std::uint64_t l
     const auto end = std::min(shadow.UnitBegin(last + 1), shadow.ImportEnd());
     if (end <= begin) return;
     GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), std::span(shadow.generation).subspan(static_cast<std::size_t>(first), count), changed, cpu);
+}
+
+// Census bookkeeping; every function runs with the registry mutex held unless it says otherwise.
+void censusClose(UnitShadow& shadow, std::uint64_t unit, CensusClose how) {
+    if (shadow.census.empty()) return;
+    auto& entry = shadow.census[static_cast<std::size_t>(unit)];
+    if (entry.state == 2) {
+        (how == CensusClose::Lapsed ? Census().rows[entry.klass].lapsed : Census().rows[entry.klass].boundOnly).Add(entry.bytes);
+    } else if (entry.state == 1) {
+        auto& row = Census().rows[entry.klass];
+        switch (how) {
+        case CensusClose::Rewritten: row.rewritten.Add(entry.bytes); break;
+        case CensusClose::Superseded: row.superseded.Add(entry.bytes); break;
+        case CensusClose::Writer: row.writer.Add(entry.bytes); break;
+        case CensusClose::Lapsed: row.lapsed.Add(entry.bytes); break;
+        }
+    }
+    entry.state = 0;
+}
+
+void censusPublished(UnitShadow& shadow, std::uint64_t unit, std::uint64_t bytes, PublishReason reason, std::uint64_t sequence) {
+    if (shadow.census.empty()) return;
+    auto& entry = shadow.census[static_cast<std::size_t>(unit)];
+    entry = CensusUnit{sequence, static_cast<std::uint32_t>(Recorder::Presents()), static_cast<std::uint32_t>(bytes), 1, static_cast<std::uint8_t>(reason), static_cast<std::uint8_t>(censusClassSlot())};
+    Census().rows[entry.klass].published.Add(bytes);
+}
+
+// The units of [address, end) an observer of this scope and reason meets published and unread. After a
+// publish (`after`) only a definite reader counts the units that publish made.
+void censusObserveRange(std::uint64_t address, std::uint64_t end, PublishScope scope, PublishReason reason, bool after) {
+    if (scope == PublishScope::None || end <= address || !censusObserver(reason) || (after && reason == PublishReason::Region)) return;
+    auto& registry = Registry();
+    auto& statistics = Census();
+    std::lock_guard lock(registry.mutex);
+    anyOverlapping(registry, address, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
+        if (shadow->census.empty()) return false;
+        const auto begin = std::max(address, shadow->importBase);
+        const auto stop = std::min(end, shadow->ImportEnd());
+        if (stop <= begin) return false;
+        const auto first = shadow->UnitOf(begin);
+        const auto last = shadow->UnitOf(stop - 1);
+        std::vector<std::uint8_t> changed, cpu;
+        bool queried = false;
+        for (auto unit = first; unit <= last; ++unit) {
+            auto& entry = shadow->census[static_cast<std::size_t>(unit)];
+            if (entry.state == 0 || entry.state == 3 || (entry.state == 2 && reason == PublishReason::Region)) continue;
+            if (!queried) {
+                changedUnits(*shadow, first, last, changed, cpu);
+                queried = true;
+            }
+            // Another writer stamped the unit after the publish: the published bytes were gone before
+            // this observer came.
+            if (changed[static_cast<std::size_t>(unit - first)] == GuestMemory::BlockWritten) {
+                censusClose(*shadow, unit, CensusClose::Superseded);
+                continue;
+            }
+            const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+            if (scope == PublishScope::PartialUnits && address <= unitBegin && end >= unitEnd) {
+                censusClose(*shadow, unit, CensusClose::Writer);
+                continue;
+            }
+            if (reason == PublishReason::Region) {
+                statistics.neededBy[static_cast<std::size_t>(reason)].Add(entry.bytes);
+                entry.state = 2;
+                continue;
+            }
+            statistics.rows[entry.klass].needed.Add(entry.bytes);
+            statistics.neededBy[static_cast<std::size_t>(reason)].Add(entry.bytes);
+            if (reason == PublishReason::Hook) statistics.hookBySite[static_cast<std::size_t>(GuestMemory::CurrentReadSite())].fetch_add(entry.bytes, std::memory_order_relaxed);
+            statistics.ageSum.fetch_add(Recorder::Presents() - entry.present, std::memory_order_relaxed);
+            statistics.ageCount.fetch_add(1, std::memory_order_relaxed);
+            entry.state = 3;
+        }
+        return false;
+    });
+}
+
+// Every 10 s, by whichever census call comes first after the interval.
+void censusReport() {
+    auto& statistics = Census();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto mib = [](unsigned long long bytes) { return bytes / 1048576.0; };
+    // Published units nothing has closed yet, split by whether a later write already stamped them.
+    unsigned long long openUnits = 0, openBytes = 0, deadUnits = 0, deadBytes = 0;
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& [base, shadow] : registry.byBase) {
+            if (shadow->census.empty()) continue;
+            std::vector<std::uint8_t> changed, cpu;
+            bool queried = false;
+            for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) {
+                const auto& entry = shadow->census[static_cast<std::size_t>(unit)];
+                if (entry.state != 1 && entry.state != 2) continue;
+                if (!queried) {
+                    changedUnits(*shadow, 0, shadow->Units() - 1, changed, cpu);
+                    queried = true;
+                }
+                if (changed[static_cast<std::size_t>(unit)] == GuestMemory::BlockWritten) {
+                    ++deadUnits;
+                    deadBytes += entry.bytes;
+                } else {
+                    ++openUnits;
+                    openBytes += entry.bytes;
+                }
+            }
+        }
+    }
+    std::string reasons;
+    char text[320];
+    for (std::size_t i = 0; i < ReasonCount; ++i) {
+        const auto units = take(statistics.neededBy[i].units);
+        const auto bytes = take(statistics.neededBy[i].bytes);
+        if (units == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.2f", ReasonNames[i], units, mib(bytes));
+        reasons += text;
+    }
+    std::string sites;
+    for (std::size_t i = 0; i < ReadSiteCount; ++i) {
+        const auto bytes = take(statistics.hookBySite[i]);
+        if (bytes == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %.2f", GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(i)), mib(bytes));
+        sites += text;
+    }
+    unsigned long long publishedUnits = 0, publishedBytes = 0, neededUnits = 0, neededBytes = 0, rewrittenBytes = 0, supersededBytes = 0, writerBytes = 0, boundBytes = 0, lapsedBytes = 0;
+    std::string classes;
+    for (std::size_t c = 0; c < ClassCount; ++c) {
+        auto& row = statistics.rows[c];
+        const auto published = take(row.published.units), publishedMiB = take(row.published.bytes);
+        const auto needed = take(row.needed.units), neededMiB = take(row.needed.bytes);
+        take(row.rewritten.units), take(row.superseded.units), take(row.writer.units), take(row.boundOnly.units), take(row.lapsed.units);
+        const auto rewritten = take(row.rewritten.bytes), superseded = take(row.superseded.bytes), writer = take(row.writer.bytes), bound = take(row.boundOnly.bytes), lapsed = take(row.lapsed.bytes);
+        std::snprintf(text, sizeof(text), " %s {published %llu/%.1f: needed %.1f, rewritten %.1f, superseded %.1f, writer-overwritten %.1f, bound-only %.1f, lapsed %.1f}", ClassNames[c], published, mib(publishedMiB), mib(neededMiB), mib(rewritten), mib(superseded), mib(writer), mib(bound), mib(lapsed));
+        classes += text;
+        publishedUnits += published, publishedBytes += publishedMiB;
+        neededUnits += needed, neededBytes += neededMiB;
+        rewrittenBytes += rewritten, supersededBytes += superseded, writerBytes += writer, boundBytes += bound, lapsedBytes += lapsed;
+    }
+    const auto ageCount = take(statistics.ageCount), ageSum = take(statistics.ageSum);
+    AgcDriver::ProfilePrint_nid_no_patch("[publish-census] (10 s) %llu publishes, %llu units / %.1f MiB published: needed %llu units / %.1f MiB, wasted %.1f MiB (rewritten by the GPU unread %.1f, superseded by another writer unread %.1f, whole-unit writer %.1f), bound in place only (never read by a definite observer) %.1f MiB, lapsed on evict/retire %.1f MiB; still open %llu units / %.1f MiB (+%llu units / %.1f MiB already superseded); first need after %.2f presents on average\n", take(statistics.publishes), publishedUnits, mib(publishedBytes), neededUnits, mib(neededBytes), mib(rewrittenBytes + supersededBytes + writerBytes), mib(rewrittenBytes), mib(supersededBytes), mib(writerBytes), mib(boundBytes), mib(lapsedBytes), openUnits, mib(openBytes), deadUnits, mib(deadBytes), ageCount != 0 ? static_cast<double>(ageSum) / static_cast<double>(ageCount) : 0.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[publish-census] needed by observer (units/MiB):%s; hook by read site (MiB):%s\n", reasons.empty() ? " none" : reasons.c_str(), sites.empty() ? " none" : sites.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[publish-census] by YOLO class (MiB):%s\n", classes.c_str());
+    std::string regions;
+    for (std::size_t site = 0; site < SiteCount; ++site) {
+        const auto skipCount = take(statistics.regions[site][1].units), skipBytes = take(statistics.regions[site][1].bytes);
+        const auto keepCount = take(statistics.regions[site][0].units), keepBytes = take(statistics.regions[site][0].bytes);
+        std::snprintf(text, sizeof(text), " %s skip %llu/%.1f keep %llu/%.1f;", SiteNames[site], skipCount, mib(skipBytes), keepCount, mib(keepBytes));
+        regions += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[publish-census] APS5_YOLO_GPU %s, regions flushed in place that YOLO skips vs keeps (count/MiB, per use):%s\n", YoloGpu() ? "on (skips are actual)" : "off (skips are potential)", regions.c_str());
+}
+
+void censusMaybeReport() {
+    auto& statistics = Census();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = statistics.lastReportMs.load(std::memory_order_relaxed);
+    if (last == 0) {
+        statistics.lastReportMs.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10000 || !statistics.lastReportMs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    censusReport();
 }
 
 std::shared_ptr<ShadowSlab> makeSlab(const Context& context, std::uint64_t firstUnit, std::uint32_t units) {
@@ -298,6 +524,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    const auto censusSequence = CensusOn() ? Census().sequence.fetch_add(1, std::memory_order_relaxed) + 1 : std::uint64_t{0};
     std::uint64_t bytes = 0;
     std::size_t units = 0;
     {
@@ -349,6 +576,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
                 ranges.emplace_back(begin, end);
             }
             shadow->published[unit] = 1;
+            if (CensusOn()) censusPublished(*shadow, unit, end - begin, reason, censusSequence);
             slab->lastUse = Recorder::Presents();
             bytes += end - begin;
             ++units;
@@ -356,6 +584,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         shadow->Recount();
     }
     if (units == 0) return 0;
+    if (CensusOn()) Census().publishes.fetch_add(1, std::memory_order_relaxed);
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     Stats().publishedBytes[static_cast<std::size_t>(reason)].fetch_add(bytes, std::memory_order_relaxed);
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
@@ -417,6 +646,7 @@ bool evictOne(Shadows& registry) {
     for (auto unit = firstUnit; unit <= lastUnit; ++unit) {
         victim->generation[unit] = 0;
         victim->published[unit] = 0;
+        if (CensusOn()) censusClose(*victim, unit, CensusClose::Lapsed);
     }
     victim->Recount();
     registry.liveBytes -= SlabBytes(*slab);
@@ -473,6 +703,31 @@ ShadowSlabPin::~ShadowSlabPin() {
     slab->pins.fetch_sub(1, std::memory_order_relaxed);
 }
 
+bool PublishCensusEnabled() {
+    return CensusOn();
+}
+
+PublishCensusScope::PublishCensusScope(CensusClass census) : previous(CensusClass::Other), active(CensusOn()) {
+    if (active) previous = std::exchange(censusClassSlot(), census);
+}
+
+PublishCensusScope::~PublishCensusScope() {
+    if (active) censusClassSlot() = previous;
+}
+
+void PublishCensusNoteRegion(CensusSite site, bool skippable, std::uint64_t bytes) {
+    if (!CensusOn()) return;
+    Census().regions[static_cast<std::size_t>(site)][skippable ? 1 : 0].Add(bytes);
+    censusMaybeReport();
+}
+
+void PublishCensusObserve(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason) {
+    if (!CensusOn() || bytes == 0) return;
+    const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+    censusObserveRange(address, end, scope, reason, false);
+    censusMaybeReport();
+}
+
 bool YoloGpu() {
     static const bool enabled = std::getenv("APS5_YOLO_GPU") != nullptr && UnitShadowEnabled();
     return enabled;
@@ -488,6 +743,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     }
     const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
     std::vector<std::shared_ptr<UnitShadow>> shadows;
+    if (CensusOn()) censusObserveRange(address, end, scope, reason, false);
     {
         auto& registry = Registry();
         std::lock_guard lock(registry.mutex);
@@ -495,6 +751,10 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
     }
     std::size_t units = 0;
     for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason);
+    if (CensusOn()) {
+        censusObserveRange(address, end, scope, reason, true);
+        censusMaybeReport();
+    }
     threadPublishedUnits += units;
     return units;
 }
@@ -734,6 +994,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 shadow->generation[unit] = generation;
                 shadow->published[unit] = 0;
                 current->lastUse = present;
+                if (CensusOn()) censusClose(*shadow, unit, CensusClose::Rewritten);
             }
         }
         shadow->Recount();
@@ -743,6 +1004,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[shadow] %llu retiled units of import 0x%llx lost their slab before they were marked\n", static_cast<unsigned long long>(lost), static_cast<unsigned long long>(import.base));
     }
+    if (CensusOn()) censusMaybeReport();
     Stats().retiled.fetch_add(1, std::memory_order_relaxed);
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
@@ -797,6 +1059,9 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
         --registry.liveSlabs;
     }
     ++registry.retired;
+    if (CensusOn()) {
+        for (std::uint64_t unit = 0; unit < shadow->Units(); ++unit) censusClose(*shadow, unit, CensusClose::Lapsed);
+    }
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
 }

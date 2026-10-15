@@ -249,6 +249,7 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     }
     // A unit shadow's results in the key range's edge units reach the import before the fill
     // lands over part of them (the stamp below then makes those units stale).
+    PublishCensusObserve(begin, count, PublishScope::PartialUnits, PublishReason::Keys);
     if (AnyShadowedOverlaps(begin, count)) PublishShadow(begin, count, PublishScope::PartialUnits, PublishReason::Keys);
     // Queued on the open batch and recorded with the batch's other key stores as one run (or before
     // a later command writing the keys; see Recorder::QueueKeyStore).
@@ -350,6 +351,7 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
             break;
         }
     }
+    PublishCensusObserve(begin, count, PublishScope::Whole, PublishReason::Keys);
     if (AnyShadowedOverlaps(begin, count)) {
         PublishShadow(begin, count, PublishScope::Whole, PublishReason::Keys);
         if (AnyShadowedOverlaps(begin, count)) return std::nullopt;
@@ -496,6 +498,7 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
     // Keys under a unit shadow's fresh results (metadata aliased with a surface): under the
     // device lock they are published and waited for; a build's unlocked stage answers "unstable"
     // so its stage B reads them under the lock.
+    PublishCensusObserve(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
     if (AnyShadowedOverlaps(metaAddress, count)) {
         if (!GuestMemory::GpuMutex().HeldByThisThread()) {
             memoized = true;

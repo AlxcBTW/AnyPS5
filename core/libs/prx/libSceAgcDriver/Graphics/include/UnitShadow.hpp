@@ -59,6 +59,34 @@ enum class PublishReason : std::uint8_t { Hook, Region, Indirect, CopySource, Co
 // The reason for a FlushPending reason string ("memory access" -> Hook, ...).
 PublishReason PublishReasonFor(const char* flushReason);
 
+// APS5_PUBLISH_CENSUS=1 (lab, counters only; docs/dev/PUBLISH_CENSUS.md lists the observer sites): every
+// publish stamps its 64 KiB units (sequence, present, reason, YOLO class); each observer site then
+// reports the range it reads (PublishCensusObserve, also called inside PublishShadow and FlushPending),
+// and a published unit is closed as needed (an observer read it first), rewritten (the GPU retiled it
+// again unread), superseded (another writer stamped it unread), writer-overwritten (a writer covered it
+// whole) or lapsed (evicted or retired). Printed every 10 s as [publish-census]. Inert when off.
+bool PublishCensusEnabled();
+// What APS5_YOLO_GPU does with the flush a publish belongs to: the publishes of a flush the switch
+// skips (a written region bound in place) are YoloSkippable, those of a flush it keeps YoloKept.
+enum class CensusClass : std::uint8_t { Other, YoloSkippable, YoloKept };
+class PublishCensusScope {
+public:
+    explicit PublishCensusScope(CensusClass census);
+    ~PublishCensusScope();
+    PublishCensusScope(const PublishCensusScope&) = delete;
+    PublishCensusScope& operator=(const PublishCensusScope&) = delete;
+
+private:
+    CensusClass previous;
+    bool active;
+};
+// The decision sites of APS5_YOLO_GPU: a region (or written range) flushed for the build of a buffer
+// object, or for its reuse (epoch revalidate, plain revalidate, written ranges).
+enum class CensusSite : std::uint8_t { BuildRegion, BuildWrite, ReuseEpochRegion, ReuseRegion, ReuseWrite, Count };
+void PublishCensusNoteRegion(CensusSite site, bool skippable, std::uint64_t bytes);
+// An observer of [address, address + bytes) with the scope and reason its flush publishes by.
+void PublishCensusObserve(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason);
+
 struct ShadowSlab {
     ShadowSlab(const Context& context, VkBuffer buffer, VkDeviceMemory memory, std::uint64_t firstUnit, std::uint32_t units);
     ShadowSlab(const ShadowSlab&) = delete;

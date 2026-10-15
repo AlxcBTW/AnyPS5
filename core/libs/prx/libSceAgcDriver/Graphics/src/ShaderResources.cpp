@@ -3030,7 +3030,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 // the shadow, without a publish, by the check).
                 if (!lazy && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
                 // APS5_YOLO_GPU: a written region bound in place gets neither a write-back nor a publish.
+                const bool censusSkippable = PublishCensusEnabled() && !lazy && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin));
+                if (PublishCensusEnabled() && !lazy) PublishCensusNoteRegion(CensusSite::ReuseEpochRegion, censusSkippable, region.end - region.begin);
                 if (!lazy && YoloGpu() && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+                const PublishCensusScope censusScope(censusSkippable ? CensusClass::YoloSkippable : lazy ? CensusClass::Other : CensusClass::YoloKept);
                 const auto before = profile && !lazy ? ThreadPublishedUnits() : 0;
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", lazy ? PublishScope::None : PublishScope::Whole);
                 if (profile && !lazy) GuestBufferMemory::NoteInPlacePublish(guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)), region.end - region.begin, ThreadPublishedUnits() - before, true, !guestMemory.StagingAllowed(), region.begin);
@@ -3050,11 +3053,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (!guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.ShadowDecisionStale(region.begin, region.end)) return finish(fast, false, ProofFailure::Other);
         }
         for (const auto& region : directRegions) {
+            const bool censusSkippable = PublishCensusEnabled() && !guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin));
+            if (PublishCensusEnabled()) PublishCensusNoteRegion(CensusSite::ReuseRegion, censusSkippable, region.end - region.begin);
             if (YoloGpu() && !guestMemory.ShadowSourced(region.begin, region.end) && guestMemory.WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) continue;
+            const PublishCensusScope censusScope(censusSkippable ? CensusClass::YoloSkippable : CensusClass::YoloKept);
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region", guestMemory.ShadowSourced(region.begin, region.end) ? PublishScope::None : PublishScope::Whole);
         }
         for (const auto& [begin, end] : guestMemory.Writes()) {
+            if (PublishCensusEnabled()) PublishCensusNoteRegion(CensusSite::ReuseWrite, !guestMemory.ShadowSourced(begin, end), end - begin);
             if (YoloGpu() && !guestMemory.ShadowSourced(begin, end)) continue;
+            const PublishCensusScope censusScope(PublishCensusEnabled() && !guestMemory.ShadowSourced(begin, end) ? CensusClass::YoloSkippable : CensusClass::YoloKept);
             StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", guestMemory.ShadowSourced(begin, end) ? PublishScope::None : PublishScope::Whole);
         }
         guestMemory.PublishShadowSourcedEdges();

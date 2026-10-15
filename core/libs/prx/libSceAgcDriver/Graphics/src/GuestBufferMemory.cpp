@@ -3754,6 +3754,7 @@ void GuestBufferMemory::publishEdges(const Region& region) const {
     for (const auto& [begin, end] : writes) {
         const auto from = std::max(begin, region.begin);
         const auto to = std::min(end, region.end);
+        if (from < to) PublishCensusObserve(from, static_cast<std::size_t>(to - from), PublishScope::PartialUnits, PublishReason::Region);
         if (from >= to || !AnyShadowedOverlaps(from, static_cast<std::size_t>(to - from))) continue;
         units += PublishShadow(from, static_cast<std::size_t>(to - from), PublishScope::PartialUnits, PublishReason::Region);
     }
@@ -4014,7 +4015,9 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
         if (deferred) inside->deferredPublish = true;
         // APS5_YOLO_GPU: a written range outside a region that may be staged from the shadow gets no
         // write-back (its region is bound in place without a flush below).
+        if (PublishCensusEnabled()) PublishCensusNoteRegion(CensusSite::BuildWrite, !deferred, end - begin);
         if (YoloGpu() && !deferred) continue;
+        const PublishCensusScope censusScope(deferred ? CensusClass::YoloKept : CensusClass::YoloSkippable);
         StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range", deferred ? PublishScope::None : PublishScope::Whole);
     }
     if (context.hostImportAlignment != 0) {
@@ -4198,11 +4201,14 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
                 }
                 // APS5_YOLO_GPU: no write-back and no publish for a written region bound in place
                 // (read-only ones still get theirs: index data, constants, sampled inputs).
+                const bool censusSkippable = PublishCensusEnabled() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
+                if (PublishCensusEnabled()) PublishCensusNoteRegion(CensusSite::BuildRegion, censusSkippable, bytes);
                 if (YoloGpu() && WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) {
                     if (profile) Roundtrip().Add(RoundtripStats::YoloInPlaceSkips, 1);
                     continue;
                 }
                 const auto before = profile ? ThreadPublishedUnits() : 0;
+                const PublishCensusScope censusScope(censusSkippable ? CensusClass::YoloSkippable : CensusClass::YoloKept);
                 StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
                 if (profile) NoteInPlacePublish(WritesOverlap(region.begin, static_cast<std::size_t>(bytes)), bytes, ThreadPublishedUnits() - before, false, !stagingAllowed, region.begin);
             }

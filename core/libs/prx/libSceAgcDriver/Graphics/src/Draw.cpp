@@ -204,6 +204,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
         Recorder::CountSync(2);
         recorder->SyncThrough(address, bytes);
     }
+    PublishCensusObserve(address, bytes, PublishScope::Whole, PublishReason::Keys);
     if (AnyShadowedOverlaps(address, bytes)) {
         Require(locked, "a CMASK under a unit shadow must be read under the device lock");
         PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Keys);
@@ -254,6 +255,7 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     const auto address = color.cmaskAddress;
     const auto bytes = layout.Bytes();
     StorageTexture::FlushPending(address, bytes, nullptr, "fast-clear materialization");
+    PublishCensusObserve(address, bytes, PublishScope::Whole, PublishReason::Keys);
     if (AnyShadowedOverlaps(address, bytes)) PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Keys);
     recorder.FlushKeyStoresOverlapping(address, bytes);
     const auto commands = recorder.Commands();
