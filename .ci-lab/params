@@ -1,0 +1,5 @@
+name=lead-6490-pr
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-6490-pr-bde6e2f178-66438
