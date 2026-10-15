@@ -940,8 +940,16 @@ void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
 }
 
+bool RoutesToNativeDepthOwner(const DepthTarget& target) {
+    if (target.samples != 1u) return true;
+    if (target.htileAddress == 0 || !anyDepthGuard().load(std::memory_order_acquire)) return false;
+    const auto bytes = static_cast<std::uint64_t>(HtileMetadataBytes(target.extent));
+    std::shared_lock lock(depthGuardMutex());
+    return std::ranges::any_of(depthGuards(), [&](const auto& range) { return range.active->load(std::memory_order_acquire) && target.htileAddress < range.address + range.bytes && range.address < target.htileAddress + bytes; });
+}
+
 VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
-    if (target.htileAddress == 0 || target.samples != 1u) return 0;
+    if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
@@ -1068,7 +1076,7 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
-    const auto htileCleared = storeBackClearedHtile(context, target);
+    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);

@@ -814,6 +814,36 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     std::printf("Native depth format=%u samples=%u clear=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one);
 }
 
+void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments) {
+    const VkExtent2D extent{5u, 3u};
+    const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, fragments));
+    TargetMemory memory(bytes), metadata(65536u), single(65536u);
+    const auto metadataBytes = HtileMetadataBytes(extent);
+    std::memset(metadata.Data(), 0, metadataBytes);
+    const std::vector<std::byte> cleared(metadata.Data(), metadata.Data() + metadataBytes);
+    const auto untouched = [&] { return std::equal(cleared.begin(), cleared.end(), metadata.Data()); };
+    DepthTarget target{memory.Address(), 0u, extent, format, 0.0f, 0u, metadata.Address(), false, fragments};
+    target.depthSwizzle = 24u;
+    target.iterate256 = target.htilePipeAligned = true;
+    Recorder recorder(context);
+    recorder.Activate();
+    struct Cleanup {
+        Recorder& recorder;
+        Context context;
+        ~Cleanup() { recorder.Sync(); ClearCachedTextures(context.device); ClearDepthSurfaces(context.device); }
+    } cleanup{recorder, context};
+    const auto view = DepthSurfaceView(context, target);
+    Require(HasResidentDepthGuards_nid_no_patch(), "the native depth owner installed no guest guard");
+    Require(untouched(), "the first bind of a native depth target stored expanded HTILE words back");
+    Require(DepthSurfaceView(context, target) == view && untouched(), "rebinding a native-owned depth target went through the generic HTILE store-back");
+    auto alias = target;
+    alias.samples = 1u;
+    alias.address = single.Address();
+    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "layout or metadata changed");
+    Require(untouched(), "a single-sample bind over a native owner's HTILE stored expanded words into it");
+    std::printf("Native depth format=%u samples=%u: binds over the owner's HTILE left its words alone\n", static_cast<std::uint32_t>(format), fragments);
+}
+
 void CheckEligibility(Context context) {
     constexpr VkExtent2D extent{129u, 67u};
     constexpr std::uint32_t samples = 4u;
@@ -1115,6 +1145,7 @@ int main(int argc, char** argv) {
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!DepthSupported(context, format, samples)) { unavailable += 2u; continue; }
                 for (const bool one : {false, true}) { CheckDepthTarget(context, format, samples, one); ++checked; }
+                CheckHtileRouting(context, format, samples);
             }
         }
         CheckEligibility(context);
