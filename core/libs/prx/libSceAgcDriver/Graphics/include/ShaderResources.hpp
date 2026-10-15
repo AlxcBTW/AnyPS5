@@ -168,8 +168,27 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
-    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
+    // APS5_LAB_DISPATCH_MOVE: a compute template found under a content key that leaves the base
+    // address and size of read-only guest buffers out (ContentKey with movableBuffers) serves a
+    // dispatch whose such buffers moved. MovedDispatchBuffers proves it the way MovedReadOnlyBuffers
+    // does for a draw (the moved elements are read-only, read in place when the template was built,
+    // inside the storage buffer range, mapped, and no pending write, storage result or unit shadow
+    // overlaps their new range) and lists them; without a `recorder` the pending writes are asked
+    // of the lock-free snapshot (the stage-A prefilter, no mutex). `maxBytes` bounds the bytes the
+    // moved elements are copied to (0: no bound). PrepareDrawBindings(recorder, moved, true) then
+    // makes the descriptor set that binds snapshots of the new ranges and leaves everything else
+    // as the template has it. The data buffers take the dispatch's words by RefreshData as for
+    // any template hit.
+    enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
+    struct MoveProof {
+        MoveRefusal refusal = MoveRefusal::None;
+        std::size_t buffers = 0;
+        std::size_t bytes = 0;
+    };
+    static const char* MoveRefusalName(MoveRefusal refusal);
+    std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
