@@ -1,0 +1,5 @@
+name=cpu-gaps-spin-sq
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-gaps-spin-sq-d98b21fe58-113772
