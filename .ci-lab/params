@@ -1,0 +1,5 @@
+name=gp-lab2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gp-lab2-9f7af6364c-77657
