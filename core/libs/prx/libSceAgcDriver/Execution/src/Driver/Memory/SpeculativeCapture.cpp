@@ -8,7 +8,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -34,8 +34,9 @@ namespace {
 constexpr std::size_t RememberedWords = 4096;
 
 std::mutex refusedMutex;
-std::unordered_set<std::uint64_t>& refusedPrograms() {
-    static std::unordered_set<std::uint64_t> programs;
+// Captures left to skip per refused program.
+std::unordered_map<std::uint64_t, std::uint32_t>& refusedPrograms() {
+    static std::unordered_map<std::uint64_t, std::uint32_t> programs;
     return programs;
 }
 
@@ -54,12 +55,21 @@ std::deque<Remembered>& remembered() {
 
 bool Refused(std::uint64_t program) {
     std::lock_guard lock(refusedMutex);
-    return refusedPrograms().contains(program);
+    auto& programs = refusedPrograms();
+    const auto found = programs.find(program);
+    if (found == programs.end()) return false;
+    if (--found->second == 0) programs.erase(found);
+    return true;
 }
 
-void Refuse(std::uint64_t program) {
-    std::lock_guard lock(refusedMutex);
-    refusedPrograms().insert(program);
+void Refuse(std::uint64_t program, RefusalReason reason) {
+    {
+        std::lock_guard lock(refusedMutex);
+        const bool structural = reason == RefusalReason::NoPureSlots || reason == RefusalReason::PlanUnsafe || reason == RefusalReason::FillsDontFit;
+        refusedPrograms()[program] = structural ? 65536u : 1024u;
+    }
+    std::lock_guard lock(countsMutex);
+    ++totals.refusals[static_cast<std::size_t>(reason)];
 }
 
 void CountVolatile(VolatileReason reason) {
@@ -76,6 +86,11 @@ SpeculationCounts Take() {
     auto taken = totals;
     totals = SpeculationCounts{};
     taken.speculatedWords = ShaderMemory::TakeSpeculatedWords();
+    const auto hooked = ShaderMemory::TakeReadCounts();
+    for (std::size_t kind = 0; kind < taken.hookReads.size(); ++kind) {
+        taken.hookReads[kind] = hooked.reads[kind];
+        taken.hookWaited[kind] = hooked.waited[kind];
+    }
     for (std::size_t reason = 0; reason < volatileReads.size(); ++reason) taken.volatileReads[reason] = volatileReads[reason].exchange(0, std::memory_order_relaxed);
     return taken;
 }

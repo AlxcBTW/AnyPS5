@@ -87,6 +87,19 @@ public:
     std::vector<std::uint64_t> TakeSpeculated(std::vector<std::uint32_t>* values = nullptr);
     // Words speculated by every capture since the previous call.
     static std::uint64_t TakeSpeculatedWords();
+    // A speculating capture reads these addresses exactly (a first attempt found the walk consumed
+    // them); Allow clears the list.
+    void ForbidSpeculation(std::span<const std::uint64_t> addresses);
+    void AllowSpeculation() { forbidden.clear(); }
+    // Counts this memory's hook reads in TakeReadCounts (the draw path sets it): the reads that went
+    // through the flush hook, by kind, and how many of them waited for unfinished GPU work.
+    void CountReads(bool enabled) { counting = enabled; }
+    enum class ReadKind : std::uint8_t { PageWhole, WordNone, WordSync, VolatileNotSpeculating, VolatileForbidden, Count };
+    struct ReadCounts {
+        std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> reads{};
+        std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> waited{};
+    };
+    static ReadCounts TakeReadCounts();
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -116,6 +129,8 @@ private:
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
     bool speculating = false;
+    bool counting = false;
+    std::vector<std::uint64_t> forbidden;
     std::vector<std::uint64_t> speculated;
     std::vector<std::uint32_t> speculatedValues;
 };
@@ -127,6 +142,9 @@ private:
 // snapshot, a specialization read) consumed it. Returns the (flat offset, address) of every
 // such leaf, sorted by flat offset; nullopt when some speculated address fails (the capture must be
 // repeated without speculation).
+// The speculated addresses SpeculatedLeafSlots would refuse (sorted, distinct); `consumed` receives
+// whether one of them is among the walk's other reads.
+std::vector<std::uint64_t> SpeculationFailures(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, bool& consumed);
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

@@ -198,6 +198,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     // APS5_SPECULATIVE_CAPTURE: the stage captures read the words recorded GPU work still writes
     // without waiting for it where only the draw needs them (materializeDrawStage).
+    shaderMemory.CountReads(SpeculativeCaptureMode() != SpeculativeMode::Off);
     shaderMemory.Speculate(SpeculativeCaptureMode() != SpeculativeMode::Off && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0);
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;

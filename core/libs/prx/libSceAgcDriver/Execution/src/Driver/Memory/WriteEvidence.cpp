@@ -95,7 +95,10 @@ std::uint32_t Driver::writeEvidenceSampleEvery() {
 }
 
 std::uint64_t Driver::writeEvidenceMaxBytes() {
-    static const std::uint64_t value = [] { const char* text = std::getenv("APS5_WRITE_EVIDENCE_MAX_KIB"); return (text ? std::strtoull(text, nullptr, 10) : 16ull) << 10u; }();
+    // With APS5_SPECULATIVE_CAPTURE the window is 1 MiB unless the variable says otherwise: the writers
+    // of the title's transient blocks note their whole 64 KiB, and the words the walk consumes cannot
+    // be filled by the GPU, so only their evidence can spare the wait.
+    static const std::uint64_t value = [] { const char* text = std::getenv("APS5_WRITE_EVIDENCE_MAX_KIB"); return (text ? std::strtoull(text, nullptr, 10) : SpeculativeCaptureMode() != SpeculativeMode::Off ? 1024ull : 16ull) << 10u; }();
     return value;
 }
 
@@ -150,11 +153,18 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
         if (bytes == sizeof(std::uint32_t)) Speculation::CountVolatile(why);
         return Policy::Volatile;
     };
+    // Storage image results still pending over the word are stored by the hook, which then waits for
+    // that store: no recorded writer is listed for them. A draw that speculated the word decides again
+    // at record time (Graphics::Draw reads it on the CPU when an image is still pending).
+    if (defer) {
+        const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
+        if (Graphics::StorageTexture::AnyPendingOverlaps(std::span(&range, 1))) return unproven(VolatileReason::PendingImage);
+    }
     if (!pending.Overlaps(address, bytes)) return Policy::None;
 
     if (Graphics::AnyShadowedOverlaps(address, bytes)) {
         reason = &ValidateCounters::syncedShadow;
-        return Policy::Sync;
+        return unproven(VolatileReason::Shadow);
     }
     reason = &ValidateCounters::syncedOff;
     if (!writeEvidenceEnabled()) return Policy::Sync;
@@ -175,11 +185,13 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     const auto limit = address + bytes;
     if (Graphics::Recorder::WideLabelIn(first, static_cast<std::size_t>(limit - first))) {
         reason = &ValidateCounters::syncedLabel;
+        if (defer && bytes == sizeof(std::uint32_t)) Speculation::CountVolatile(VolatileReason::Label);
         return Policy::Sync;
     }
     for (std::uint64_t dword = first; dword < limit; dword += 4) {
         if (Graphics::Recorder::LookupLabelValue(dword, 4, 0).has_value()) {
             reason = &ValidateCounters::syncedLabel;
+            if (defer && bytes == sizeof(std::uint32_t)) Speculation::CountVolatile(VolatileReason::Label);
             return Policy::Sync;
         }
     }
@@ -206,9 +218,10 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     }
     if (sampledRead()) {
         reason = &ValidateCounters::syncedSample;
+        if (defer && bytes == sizeof(std::uint32_t)) Speculation::CountVolatile(VolatileReason::Sample);
         return Policy::Sync;
     }
-    return validateSkipVerify() ? Policy::VerifyRaw : Policy::Raw;
+    return validateSkipVerify() || SpeculativeCaptureMode() == SpeculativeMode::Verify ? Policy::VerifyRaw : Policy::Raw;
 }
 
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
