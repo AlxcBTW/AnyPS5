@@ -1,1 +1,1 @@
-^(agc_driver_dispatch_move|agc_driver_graphics|agc_driver_many_buffers|agc_driver_buffer_unaligned_base)$
+^(agc_driver_dispatch_move|agc_driver_graphics)$
