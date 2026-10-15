@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -288,6 +289,17 @@ struct Context {
         return type;
     }
 
+    // Lab diagnostics ([vram] line): what the device-local budget pushed to host memory, by kind (device buffer, texture,
+    // storage texture, other), cumulative allocations and bytes.
+    struct HostPlacedTotals {
+        std::atomic<std::uint64_t> count[4]{};
+        std::atomic<std::uint64_t> bytes[4]{};
+    };
+    static HostPlacedTotals& HostPlaced() {
+        static HostPlacedTotals totals;
+        return totals;
+    }
+
     std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {
         const auto type = MemoryType(mask, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
@@ -302,6 +314,9 @@ struct Context {
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((mask & (1u << i)) == 0 || (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
             static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+            const std::size_t kind = std::strcmp(what, "device buffer") == 0 ? 0 : std::strcmp(what, "texture") == 0 ? 1 : std::strcmp(what, "storage texture") == 0 ? 2 : 3;
+            HostPlaced().count[kind].fetch_add(1, std::memory_order_relaxed);
+            HostPlaced().bytes[kind].fetch_add(bytes, std::memory_order_relaxed);
             const auto count = placements.fetch_add(1) + 1;
             const auto total = placedBytes.fetch_add(bytes) + bytes;
             if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));

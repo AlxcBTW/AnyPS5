@@ -2578,7 +2578,15 @@ void Recorder::readGpuTiming(Batch& batch) {
             std::snprintf(text, sizeof(text), " heap %u%s: usage %llu of budget %llu MiB (size %llu MiB);", heap, (properties.memoryProperties.memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0 ? " device-local" : "", static_cast<unsigned long long>(reported.heapUsage[heap] >> 20u), static_cast<unsigned long long>(reported.heapBudget[heap] >> 20u), static_cast<unsigned long long>(properties.memoryProperties.memoryHeaps[heap].size >> 20u));
             heaps += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[vram]%s\n", heaps.c_str());
+        // What the budget put in host memory: the live storage textures that sit there now, and every allocation placed there so far by kind.
+        std::uint64_t liveImages = 0, liveImageBytes = 0, hostImages = 0, hostImageBytes = 0;
+        StorageTexture::HostPlacement(liveImages, liveImageBytes, hostImages, hostImageBytes);
+        const auto& placed = Context::HostPlaced();
+        const auto totalOf = [&](int kind) { return static_cast<unsigned long long>(placed.count[kind].load(std::memory_order_relaxed)); };
+        const auto mibOf = [&](int kind) { return static_cast<unsigned long long>(placed.bytes[kind].load(std::memory_order_relaxed) >> 20u); };
+        AgcDriver::ProfilePrint_nid_no_patch("[vram]%s live storage textures %llu (%llu MiB), in host memory now %llu (%llu MiB); placed in host memory so far, allocations and MiB: device buffer %llu %llu, texture %llu %llu, storage texture %llu %llu, other %llu %llu\n", heaps.c_str(),
+            static_cast<unsigned long long>(liveImages), static_cast<unsigned long long>(liveImageBytes >> 20u), static_cast<unsigned long long>(hostImages), static_cast<unsigned long long>(hostImageBytes >> 20u),
+            totalOf(0), mibOf(0), totalOf(1), mibOf(1), totalOf(2), mibOf(2), totalOf(3), mibOf(3));
     }
     reportBarriers();
 }

@@ -354,6 +354,9 @@ public:
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
+    // Lab diagnostics: whether the device-local budget put this image's memory in host memory, and the live images' totals.
+    bool HostPlaced() const { return hostPlaced; }
+    static void HostPlacement(std::uint64_t& textures, std::uint64_t& bytes, std::uint64_t& hostTextures, std::uint64_t& hostBytes);
 
 private:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
@@ -575,6 +578,7 @@ private:
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
+    bool hostPlaced = false;
     VkImageView view = VK_NULL_HANDLE;
     std::uint32_t defaultMip = 0;
     std::map<std::uint32_t, VkImageView> extraViews;

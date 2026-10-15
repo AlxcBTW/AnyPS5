@@ -1136,6 +1136,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size;
         allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
+        hostPlaced = (context.memory.memoryHeaps[context.memory.memoryTypes[allocation.memoryTypeIndex].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
         Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
@@ -4199,8 +4200,22 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 
 std::string StorageTexture::LabText() const {
     char text[256];
-    std::snprintf(text, sizeof(text), "img=0x%llx %ux%u mips=%u layers=%u fmt=%d vk=%d tile=%d bytes=%llu dcc=0x%llx", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned>(descriptor.width), static_cast<unsigned>(descriptor.height), static_cast<unsigned>(descriptor.mipCount), static_cast<unsigned>(arrayLayers), static_cast<int>(descriptor.format), static_cast<int>(storageFormat), static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress));
+    std::snprintf(text, sizeof(text), "img=0x%llx %ux%u mips=%u layers=%u fmt=%d vk=%d tile=%d bytes=%llu dcc=0x%llx mem=%s", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned>(descriptor.width), static_cast<unsigned>(descriptor.height), static_cast<unsigned>(descriptor.mipCount), static_cast<unsigned>(arrayLayers), static_cast<int>(descriptor.format), static_cast<int>(storageFormat), static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), hostPlaced ? "host" : "dev");
     return text;
+}
+
+void StorageTexture::HostPlacement(std::uint64_t& textures, std::uint64_t& bytes, std::uint64_t& hostTextures, std::uint64_t& hostBytes) {
+    textures = bytes = hostTextures = hostBytes = 0;
+    auto& live = Live();
+    std::lock_guard lock(live.mutex);
+    for (const auto* texture : live.textures) {
+        if (texture->released) continue;
+        ++textures;
+        bytes += texture->memoryBytes;
+        if (!texture->hostPlaced) continue;
+        ++hostTextures;
+        hostBytes += texture->memoryBytes;
+    }
 }
 
 void StorageTexture::WriteBack() {
