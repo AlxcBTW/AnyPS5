@@ -1,0 +1,15 @@
+add_library(libSceJson2 SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceJson2 PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceJson2)
+
+if(BUILD_TESTING)
+    add_test_executable(guest_json_tests ${LIBS_INCLUDE_DIR}/tests/GuestJson.cpp)
+    target_include_directories(guest_json_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_json_tests PRIVATE libSceJson2 libc)
+    configure_windows_unwind(guest_json_tests)
+    add_test(NAME guest_json COMMAND guest_json_tests)
+    if(WIN32)
+        set_tests_properties(guest_json PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceJson2>")
+    endif()
+endif()

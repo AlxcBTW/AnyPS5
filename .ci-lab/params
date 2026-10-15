@@ -1,0 +1,5 @@
+name=cpu-base
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-base-44df216321-84108
