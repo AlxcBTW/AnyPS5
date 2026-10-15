@@ -100,6 +100,7 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
 bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count);
+bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count);
 struct DccKeyWaitCounts {
     std::uint64_t calls;
     std::uint64_t noPending;

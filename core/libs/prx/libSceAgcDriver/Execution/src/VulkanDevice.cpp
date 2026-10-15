@@ -4060,7 +4060,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
             bool open = false;
             for (const auto& surface : surfaces) {
                 const auto bytes = static_cast<std::size_t>(surface.bytes);
-                if (surface.dccKeys && !Graphics::DccKeyWritersPending(surface.address, bytes)) continue;
+                if (surface.dccKeys && !Graphics::DccKeyWriterNeedsSync(surface.address, bytes)) continue;
                 const auto info = state->recorder->DescribePendingWrite(surface.address, bytes);
                 if (!info.has_value()) continue;
                 open = open || info->open;

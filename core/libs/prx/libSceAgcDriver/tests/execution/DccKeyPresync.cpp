@@ -201,6 +201,39 @@ void RunPresync(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
     RequireSampledClear(scenario, "a dispatch whose keys were pre-synced");
 }
 
+bool CanFillKeys(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
+    const std::array<std::uint32_t, 4> pattern{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const bool filled = device.FillBuffer(AddressOf(scenario.keys), KeyBytes, pattern);
+    device.WaitIdle();
+    return filled;
+}
+
+void RunKnownKeys(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
+    Reset(scenario);
+    const std::array<std::uint32_t, 4> pattern{0u, 0u, 0u, 0u};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.FillBuffer(AddressOf(scenario.keys), KeyBytes, pattern), "the fill of the keys was not recorded");
+        Require(AgcDriver::Graphics::DccKeyWritersPending(AddressOf(scenario.keys), KeyBytes), "a recorded fill of the keys is not seen as a pending key writer");
+        Require(!AgcDriver::Graphics::DccKeyWriterNeedsSync(AddressOf(scenario.keys), KeyBytes), "the keys of a recorded constant fill need a synchronization");
+    }
+    const auto sample = Compile(device, SampleSecondTexelCode, scenario.sampleData);
+    const auto waits = AgcDriver::Graphics::KeyWaitCounts();
+    const auto before = AgcDriver::VulkanDevice::PresyncCounts();
+    auto prepared = device.PrepareDispatch(sample, {}, Threads, reinterpret_cast<std::uintptr_t>(SampleSecondTexelCode.data()));
+    const auto after = AgcDriver::VulkanDevice::PresyncCounts();
+    Require(after.keyChecks > before.keyChecks, "stage A did not list the DCC keys of the sampled texture for the pre-sync");
+    Require(after.presyncs == before.presyncs, "stage A waited for a fill whose keys the locked lookup derives from the pending stores");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        device.Dispatch(sample, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(SampleSecondTexelCode.data()), std::move(prepared));
+        device.WaitIdle();
+    }
+    Require(AgcDriver::Graphics::KeyWaitCounts().synced == waits.synced, "the dispatch synchronized with the GPU although the pending fill gives the keys");
+    RequireSampledClear(scenario, "a dispatch behind a pending fill of the keys");
+}
+
 void RunNoWriter(AgcDriver::VulkanDevice& device, const Scenario& scenario) {
     const auto sample = Compile(device, SampleSecondTexelCode, scenario.sampleData);
     const auto before = AgcDriver::VulkanDevice::PresyncCounts();
@@ -221,18 +254,26 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!device->CanWaitUnlocked()) {
-            std::puts("the device has no timeline semaphores: the pre-sync is not tested");
-            return 0;
+            std::puts("skipped, the device has no timeline semaphores: the pre-sync is not tested");
+            return VulkanTestSkipped;
         }
         GuestBlock locked;
         GuestBlock lockedOutput;
         GuestBlock presynced;
         GuestBlock presyncedOutput;
+        GuestBlock known;
+        GuestBlock knownOutput;
         const auto control = Prepare(locked.Data(), lockedOutput.Data());
         const auto changed = Prepare(presynced.Data(), presyncedOutput.Data());
+        const auto fills = Prepare(known.Data(), knownOutput.Data());
+        if (!CanFillKeys(*device, control)) {
+            std::puts("skipped, host imports are unavailable: the key writers of the test are copied writers");
+            return VulkanTestSkipped;
+        }
         RunLockedSync(*device, control);
         RunPresync(*device, changed);
         RunNoWriter(*device, changed);
+        RunKnownKeys(*device, fills);
         std::puts("DCC key pre-sync tests passed");
         return 0;
     } catch (const std::exception& error) {
