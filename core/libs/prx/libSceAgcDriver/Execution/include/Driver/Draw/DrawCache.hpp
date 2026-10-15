@@ -88,6 +88,20 @@ struct DataCandidate {
 
 using DrawDataCandidates = std::vector<std::vector<DataCandidate>>;
 
+// Lab diagnostic (APS5_TRACE_DRAW_CACHE): what a stage compiled for changed user words would need to be served from a kept stage.
+enum class RelocClass : std::uint8_t { Equal, DataOnly, Structural, Unclassified, Count };
+enum class RelocReason : std::uint8_t { None, NoKeptStage, ShapeDiffers, NoChange, HiddenWord, NonPointerWord, PointerAlignment, RunStructure, PointerDelta, StructuralWords, Count };
+
+struct RelocVerdict {
+    RelocClass cls = RelocClass::Unclassified;
+    RelocReason reason = RelocReason::NoKeptStage;
+    std::uint64_t words = 0;
+};
+
+const char* RelocClassName(RelocClass cls);
+const char* RelocReasonName(RelocReason reason);
+RelocVerdict ClassifyStageMove(const DispatchVariant& fresh, const DispatchVariant& kept, const std::vector<std::uint32_t>& now, const std::vector<std::uint32_t>& before, std::uint32_t hidden);
+
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
 struct DrawEntryCounters {
@@ -101,6 +115,10 @@ struct DrawEntryCounters {
     std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
     std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0, dataStagesPatched = 0, dataCompiledUserWords = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(RelocClass::Count)> relocStages{};
+    std::array<double, static_cast<std::size_t>(RelocClass::Count)> relocCompileUs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RelocReason::Count)> relocReasons{};
+    std::uint64_t relocDataWords = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

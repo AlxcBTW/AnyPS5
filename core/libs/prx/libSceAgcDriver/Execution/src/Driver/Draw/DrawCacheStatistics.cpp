@@ -23,6 +23,32 @@ void Driver::maybeReportDrawCache(bool profile) {
     counters.lastReport = now;
 }
 
+std::string Driver::relocationClassLines(const DrawEntryCounters& counters) {
+    std::uint64_t stages = 0;
+    double totalUs = 0;
+    for (std::size_t c = 0; c < counters.relocStages.size(); ++c) {
+        stages += counters.relocStages[c];
+        totalUs += counters.relocCompileUs[c];
+    }
+    std::string text;
+    char line[512];
+    std::snprintf(line, sizeof(line), "[draw-relocate-classes] 10 s: %llu stages compiled for changed user words, %.1f ms compile in total", static_cast<unsigned long long>(stages), totalUs / 1000.0);
+    text += line;
+    for (std::size_t c = 0; c < counters.relocStages.size(); ++c) {
+        const auto n = counters.relocStages[c];
+        std::snprintf(line, sizeof(line), "; %s: %llu stages (%.0f%%), %.1f ms saved if served (%.0f us each)", RelocClassName(static_cast<RelocClass>(c)), static_cast<unsigned long long>(n), stages != 0 ? 100.0 * static_cast<double>(n) / static_cast<double>(stages) : 0.0, counters.relocCompileUs[c] / 1000.0, n != 0 ? counters.relocCompileUs[c] / static_cast<double>(n) : 0.0);
+        text += line;
+    }
+    std::snprintf(line, sizeof(line), "; b patches %llu data words; reasons:", static_cast<unsigned long long>(counters.relocDataWords));
+    text += line;
+    for (std::size_t r = 1; r < counters.relocReasons.size(); ++r) {
+        std::snprintf(line, sizeof(line), " %s %llu%s", RelocReasonName(static_cast<RelocReason>(r)), static_cast<unsigned long long>(counters.relocReasons[r]), r + 1 < counters.relocReasons.size() ? "," : "");
+        text += line;
+    }
+    text += "\n";
+    return text;
+}
+
 void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
     const auto miss = [&](DrawMiss reason) { return count(counters.misses[static_cast<std::size_t>(reason)]); };
@@ -33,6 +59,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         for (const auto value : counters.misses) misses += value;
         std::snprintf(line, sizeof(line), "[draw-cache] 10 s: %llu lookups, %llu hits (%.1f%%), %llu stage misses, %llu without an entry, %llu data-only hits (stages: %llu reused, %llu of them with refreshed data words, %llu compiled, %llu of them with changed user words; %llu verified); no entry: new registers %llu, user words/pointers only %llu, evicted %llu, seen but never inserted %llu; stage misses: front differing %llu, fragment differing %llu, other differing %llu, layout %llu, gate %llu, stage count %llu; differing captures: same runs %llu (%.1f words changed each), other runs %llu; %zu entries, %llu evicted\n", count(counters.lookups), count(counters.hits), counters.lookups != 0 ? 100.0 * static_cast<double>(counters.hits) / static_cast<double>(counters.lookups) : 0.0, count(misses), count(counters.absent), count(counters.dataHits), count(counters.dataStagesReused), count(counters.dataStagesPatched), count(counters.dataStagesCompiled), count(counters.dataCompiledUserWords), count(counters.dataVerified), count(counters.absentNewRegisters), count(counters.absentUserWords), count(counters.absentEvicted), count(counters.absentNeverInserted), miss(DrawMiss::FrontDiffering), miss(DrawMiss::FragmentDiffering), miss(DrawMiss::OtherDiffering), miss(DrawMiss::Layout), miss(DrawMiss::Gate), miss(DrawMiss::Stages), count(counters.differingSameRuns), counters.differingSameRuns != 0 ? static_cast<double>(counters.differingWords) / static_cast<double>(counters.differingSameRuns) : 0.0, count(counters.differingRunsChanged), drawCache.size(), count(counters.evictions));
         text += line;
+        text += relocationClassLines(counters);
     }
     if (profile) text += profileDrawCacheLines(counters);
     AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());

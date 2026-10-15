@@ -267,6 +267,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::vector<bool> reused(programs.size(), false);
     std::vector<StageDataHit> stageData(programs.size());
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0, dataStagesPatched = 0, dataCompiledUserWords = 0;
+    DrawEntryCounters relocClasses;
     bool drawHit = false;
     bool verifyHit = false;
     const bool stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
@@ -364,6 +365,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
+            double stageCompileUs = 0;
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.variant->pushOffset == pushCursorBytes; });
             if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
                 matched[i] = candidate->variant;
@@ -385,9 +387,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                         break;
                     }
                 }
+                const auto compileStart = traceDrawCache() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
+                if (traceDrawCache()) stageCompileUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - compileStart).count();
                 if (candidate != dataCandidates[i].end() && candidate->data.compiled != nullptr) {
                     ++dataVerified;
                     verifyStageData(i, *candidate->variant, candidate->data);
@@ -399,7 +403,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) {
                 ++dataStagesCompiled;
-                if (i < dataEntry->decode->programs.size() && programs[i].userData != dataEntry->decode->programs[i].userData) ++dataCompiledUserWords;
+                if (i < dataEntry->decode->programs.size() && programs[i].userData != dataEntry->decode->programs[i].userData) {
+                    ++dataCompiledUserWords;
+                    if (traceDrawCache()) {
+                        const auto verdict = classifyCompiledStage(dataEntry, i, programs[i], stageCaptures[i], decodeReads[i], !vertexInfos[i] || vertexInfos[i]->resourcesNum == 0);
+                        const auto cls = static_cast<std::size_t>(verdict.cls);
+                        ++relocClasses.relocStages[cls];
+                        relocClasses.relocCompileUs[cls] += stageCompileUs;
+                        ++relocClasses.relocReasons[static_cast<std::size_t>(verdict.reason)];
+                        if (verdict.cls == RelocClass::DataOnly) relocClasses.relocDataWords += verdict.words;
+                    }
+                }
             }
         }
         const auto& result = *programResults[i];
@@ -425,6 +439,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataVerified += dataVerified;
         drawEntryCounters.dataStagesPatched += dataStagesPatched;
         drawEntryCounters.dataCompiledUserWords += dataCompiledUserWords;
+        for (std::size_t c = 0; c < relocClasses.relocStages.size(); ++c) {
+            drawEntryCounters.relocStages[c] += relocClasses.relocStages[c];
+            drawEntryCounters.relocCompileUs[c] += relocClasses.relocCompileUs[c];
+        }
+        for (std::size_t r = 0; r < relocClasses.relocReasons.size(); ++r) drawEntryCounters.relocReasons[r] += relocClasses.relocReasons[r];
+        drawEntryCounters.relocDataWords += relocClasses.relocDataWords;
     }
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
     timing.Mark("shader_compile_and_link");
