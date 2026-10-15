@@ -1,0 +1,5 @@
+name=gpu-lab2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-lab2-bd693e7f9a-56949
