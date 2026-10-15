@@ -30,6 +30,7 @@ void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
+std::uint64_t NextStorageBudget(std::uint64_t current, std::uint64_t floor, std::uint64_t cap, std::uint64_t reportedBudget, std::uint64_t usage, std::uint64_t evictions);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 struct TextureCacheUse {
