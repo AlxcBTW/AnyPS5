@@ -1,0 +1,5 @@
+name=cpu-both
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-both-98ed51db45-85651
