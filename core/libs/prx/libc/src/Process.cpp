@@ -102,9 +102,17 @@ namespace {
 std::atomic<void (*)()> endFlush{nullptr};
 void (*previousAbortHandler)(int) = SIG_DFL;
 
-void FlushOnAbort(int signal) {
+void FlushOnAbort(int number) {
     LibcRunEndFlush_nid_no_patch();
-    if (previousAbortHandler != SIG_DFL && previousAbortHandler != SIG_IGN && previousAbortHandler != SIG_ERR) previousAbortHandler(signal);
+    if (previousAbortHandler == SIG_IGN) return;
+    if (previousAbortHandler != SIG_DFL && previousAbortHandler != SIG_ERR) {
+        previousAbortHandler(number);
+        return;
+    }
+#ifndef _WIN32
+    std::signal(number, SIG_DFL);
+    std::raise(number);
+#endif
 }
 
 }
@@ -185,6 +193,7 @@ void APS5_VABI exit_nid_postfix(int code) {
 ) {
     (void)arg0; (void)arg1; (void)arg2;
     (void)arg3; (void)arg4; (void)arg5;
+    LibcRunEndFlush_nid_no_patch();
     std::fprintf(stderr, "[libc] abort() called from %p\n", __builtin_return_address(0));
     std::fflush(nullptr);
     std::abort();

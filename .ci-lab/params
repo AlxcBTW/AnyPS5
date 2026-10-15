@@ -2,4 +2,4 @@ name=pr6371-asynclog
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-pr6371-asynclog-55c7ec1021-68876
+artifact=lab-libs-pr6371-asynclog-e44ab157e0-77017

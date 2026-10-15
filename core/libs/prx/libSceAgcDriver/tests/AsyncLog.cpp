@@ -1,13 +1,17 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -24,6 +28,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using Clock = AgcDriver::AsyncLog::Clock;
 
 void Check(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
@@ -36,6 +41,21 @@ std::string ReadAll(std::FILE* file) {
     char buffer[4096];
     for (std::size_t read = 0; (read = std::fread(buffer, 1, sizeof(buffer), file)) != 0;) text.append(buffer, read);
     return text;
+}
+
+std::string ReadFile(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
+void ClearLogEnvironment() {
+#ifdef _WIN32
+    _putenv("APS5_LOG_SYNC=");
+    _putenv("APS5_LOG_TIMESTAMPS=");
+#else
+    unsetenv("APS5_LOG_SYNC");
+    unsetenv("APS5_LOG_TIMESTAMPS");
+#endif
 }
 
 void LockStream(std::FILE* file) {
@@ -178,6 +198,7 @@ void FullQueueBlocksCaller() {
     constexpr std::size_t lines = 2 * AgcDriver::AsyncLog::Capacity / lineBytes + 4;
     constexpr std::size_t filled = AgcDriver::AsyncLog::Capacity / lineBytes / 2;
     std::atomic<std::size_t> queued{0};
+    bool blocked = false;
     {
         HeldStream held(file);
         std::thread producer([&] {
@@ -187,16 +208,22 @@ void FullQueueBlocksCaller() {
                 queued.store(i + 1);
             }
         });
-        const auto deadline = AgcDriver::AsyncLog::Clock::now() + 10s;
-        while (queued.load() < filled && AgcDriver::AsyncLog::Clock::now() < deadline) std::this_thread::sleep_for(1ms);
-        std::this_thread::sleep_for(300ms);
-        const auto blockedAt = queued.load();
-        std::this_thread::sleep_for(100ms);
-        const bool blocked = blockedAt >= filled && blockedAt < lines && queued.load() == blockedAt;
+        auto last = queued.load();
+        auto changedAt = Clock::now();
+        const auto deadline = changedAt + 10s;
+        while (last < lines && Clock::now() < deadline && (last < filled || Clock::now() - changedAt < 500ms)) {
+            std::this_thread::sleep_for(5ms);
+            const auto now = queued.load();
+            if (now != last) {
+                last = now;
+                changedAt = Clock::now();
+            }
+        }
+        blocked = last >= filled && last < lines && Clock::now() - changedAt >= 500ms;
         held.Release();
         producer.join();
-        Check(blocked, "the caller was not blocked by a full queue");
     }
+    Check(blocked, "the caller was not blocked by a full queue");
     log.Flush();
     std::fflush(file);
     std::rewind(file);
@@ -222,6 +249,10 @@ constexpr int ChildLines = 50;
     const rlimit noCore{0, 0};
     setrlimit(RLIMIT_CORE, &noCore);
 #endif
+    std::thread([] {
+        std::this_thread::sleep_for(8s);
+        std::_Exit(99);
+    }).detach();
     AgcDriver::InstallAsyncLog_nid_no_patch();
     auto& log = AgcDriver::AsyncLog::Get();
     HeldStream held(file);
@@ -230,12 +261,17 @@ constexpr int ChildLines = 50;
         WriteLogLine(file, "plain %d\n", i);
     }
     std::thread releaser([&] {
-        std::this_thread::sleep_for(400ms);
+        std::this_thread::sleep_for(100ms);
         if (mode != "blocked") held.Release();
     });
     if (mode == "terminate") std::terminate();
 #ifdef _WIN32
     if (mode == "fault") RaiseException(EXCEPTION_ACCESS_VIOLATION, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+#else
+    if (mode == "raise") {
+        std::raise(SIGABRT);
+        std::_Exit(0);
+    }
 #endif
     std::abort();
 }
@@ -245,25 +281,23 @@ std::string Quote(const std::string& text) {
 }
 
 void LinesSurviveEnd(const std::string& self, const std::string& mode) {
-    const auto output = std::filesystem::temp_directory_path() / ("aps5-async-log-" + mode + "-" + std::to_string(AgcDriver::AsyncLog::Clock::now().time_since_epoch().count()) + ".txt");
+    const auto output = std::filesystem::temp_directory_path() / ("aps5-async-log-" + mode + "-" + std::to_string(Clock::now().time_since_epoch().count()) + ".txt");
     std::string command = Quote(self) + " child " + mode + " " + Quote(output.string());
 #ifdef _WIN32
     command = Quote(command);
 #endif
-    const auto start = AgcDriver::AsyncLog::Clock::now();
+    const auto start = Clock::now();
     const int status = std::system(command.c_str());
-    const auto lived = AgcDriver::AsyncLog::Clock::now() - start;
-    std::string text;
-    const bool started = std::filesystem::exists(output);
-    if (std::FILE* file = started ? std::fopen(output.string().c_str(), "rb") : nullptr) {
-        text = ReadAll(file);
-        std::fclose(file);
-    }
-    std::filesystem::remove(output);
+    const auto lived = Clock::now() - start;
+    std::error_code error;
+    const bool started = std::filesystem::exists(output, error);
+    const std::string text = started ? ReadFile(output) : std::string();
+    std::filesystem::remove(output, error);
     Check(started, "the child did not start");
     Check(status != 0, "the child did not end abnormally");
-    Check(lived < 20s, "the child took too long to end");
+    Check(lived < 6s, "the child took too long to end");
     if (mode == "blocked") {
+        Check(lived >= 1900ms, "the child ended before the flush gave up");
         Check(text.empty(), "the child wrote through a held stream");
         return;
     }
@@ -276,12 +310,15 @@ void LinesSurviveEnd(const std::string& self, const std::string& mode) {
 
 int main(int argc, char** argv) {
     try {
+        ClearLogEnvironment();
         if (argc == 4 && std::strcmp(argv[1], "child") == 0) EndChild(argv[2], argv[3]);
         if (argc == 2 && std::strcmp(argv[1], "fatal") == 0) {
             LinesSurviveEnd(argv[0], "abort");
             LinesSurviveEnd(argv[0], "terminate");
 #ifdef _WIN32
             LinesSurviveEnd(argv[0], "fault");
+#else
+            LinesSurviveEnd(argv[0], "raise");
 #endif
             LinesSurviveEnd(argv[0], "blocked");
             return 0;

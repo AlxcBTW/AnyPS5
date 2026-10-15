@@ -191,10 +191,10 @@ private:
         statsEnabled = stats == nullptr || std::string(stats) != "0";
         lastStats = Clock::now();
         if (!asynchronous) return;
-        LibcSetEndFlush_nid_no_patch(&AsyncLog::FlushAtEnd);
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
         std::atexit([] { Get().Flush(); });
         std::thread([this] { Run(); }).detach();
+        LibcSetEndFlush_nid_no_patch(&AsyncLog::FlushAtEnd);
     }
 
     static void FlushAtEnd() {
