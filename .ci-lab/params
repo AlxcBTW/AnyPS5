@@ -1,0 +1,5 @@
+name=lead-6490-base
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-6490-base-0029e62f97-66242
