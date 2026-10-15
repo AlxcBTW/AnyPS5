@@ -528,7 +528,7 @@ std::uint64_t storageBudgetCap(const VkPhysicalDeviceMemoryProperties& memory, c
     const auto sampled = SampledTextureMemory();
     const auto caches = sampled + storageCacheBytes();
     const auto sampledBudget = SampledTextureBudget(memory, reported, caches);
-    const auto sampledRemaining = sampledBudget > sampled ? sampledBudget - sampled : 0u;
+    const auto sampledRemaining = std::min(sampledBudget > sampled ? sampledBudget - sampled : 0u, sampled);
     return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, sampledRemaining, floor);
 }
 
