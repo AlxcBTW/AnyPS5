@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostCommitLog.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -412,10 +413,13 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
-    return WindowsMappings::Get().MapAlias(address, bytes);
+    void* alias = WindowsMappings::Get().MapAlias(address, bytes);
+    HostCommitLog::HostCommitNote_nid_no_patch("guest-alias", alias, bytes);
+    return alias;
 }
 
 void GuestArenaUnmapAlias_nid_postfix(void* alias) {
+    HostCommitLog::HostCommitForget_nid_no_patch(alias, 0);
     WindowsMappings::Get().UnmapAlias(alias);
 }
 

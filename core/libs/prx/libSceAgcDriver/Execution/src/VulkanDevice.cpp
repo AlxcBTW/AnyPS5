@@ -36,10 +36,15 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostCommitLog.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_map>
 #include <chrono>
 #include <charconv>
 #include <condition_variable>
@@ -218,6 +223,144 @@ struct ComputePipelineObjects {
         if (module != VK_NULL_HANDLE) destroyModule(device, module, nullptr);
     }
 };
+
+// Lab census (APS5_HOST_COMMIT_LOG=<seconds>): when on, vkGetDeviceProcAddr hands out wrappers for the
+// allocate, free, map and unmap entry points, so every Vulkan allocation made through the device (buffer
+// pool slabs, device buffers, host pointer imports, textures, targets, shadows) is counted per memory
+// type, and every mapped range is tagged for the owner census. Off, the resolver is returned unchanged.
+struct MappedMemoryTags {
+    struct Allocation {
+        VkDeviceSize bytes = 0;
+        std::uint32_t type = 0;
+        bool imported = false;
+    };
+    std::atomic<PFN_vkGetDeviceProcAddr> deviceProc{nullptr};
+    std::atomic<PFN_vkAllocateMemory> allocateMemory{nullptr};
+    std::atomic<PFN_vkFreeMemory> freeMemory{nullptr};
+    std::atomic<PFN_vkMapMemory> mapMemory{nullptr};
+    std::atomic<PFN_vkUnmapMemory> unmapMemory{nullptr};
+    std::mutex mutex;
+    std::unordered_map<VkDeviceMemory, Allocation> allocations;
+    std::unordered_map<VkDeviceMemory, void*> mapped;
+};
+
+MappedMemoryTags& MemoryTags() {
+    static auto* tags = new MappedMemoryTags();
+    return *tags;
+}
+
+constexpr std::uint32_t TaggedMemoryTypes = 32;
+
+// Owner names live for the whole process: the census keeps the pointers.
+const char* TypeOwner(const char* prefix, std::uint32_t type) {
+    static std::mutex mutex;
+    static auto* names = new std::unordered_map<std::string, std::string>();
+    std::lock_guard lock(mutex);
+    const std::string name = std::string(prefix) + (type < TaggedMemoryTypes ? std::to_string(type) : std::string("?"));
+    return names->try_emplace(name, name).first->second.c_str();
+}
+
+const char* MappedMemoryOwner(std::uint32_t type) {
+    return TypeOwner("vk-mapped type ", type);
+}
+
+const char* AllocatedMemoryOwner(std::uint32_t type, bool imported) {
+    return TypeOwner(imported ? "vk-import type " : "vk-alloc type ", type);
+}
+
+bool ImportsHostMemory(const void* chain) {
+    for (const auto* next = static_cast<const VkBaseInStructure*>(chain); next != nullptr; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT || next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR) return true;
+    }
+    return false;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TaggedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+    auto& tags = MemoryTags();
+    const auto result = tags.allocateMemory.load(std::memory_order_acquire)(device, info, allocator, memory);
+    if (result == VK_SUCCESS) {
+        const bool imported = ImportsHostMemory(info->pNext);
+        {
+            std::lock_guard lock(tags.mutex);
+            tags.allocations[*memory] = {info->allocationSize, info->memoryTypeIndex, imported};
+        }
+        const auto* owner = AllocatedMemoryOwner(info->memoryTypeIndex, imported);
+        HostCommitLog::HostCommitCount_nid_no_patch(owner, static_cast<std::int64_t>(info->allocationSize), 1);
+        if (info->allocationSize >= (VkDeviceSize{32} << 20u)) std::fprintf(stderr, "[host-commit] %s: %.1f MiB (vkAllocateMemory)\n", owner, static_cast<double>(info->allocationSize) / (1024.0 * 1024.0));
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TaggedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
+    auto& tags = MemoryTags();
+    {
+        std::lock_guard lock(tags.mutex);
+        if (const auto found = tags.mapped.find(memory); found != tags.mapped.end()) {
+            HostCommitLog::HostCommitForget_nid_no_patch(found->second, 0);
+            tags.mapped.erase(found);
+        }
+        if (const auto found = tags.allocations.find(memory); found != tags.allocations.end()) {
+            HostCommitLog::HostCommitCount_nid_no_patch(AllocatedMemoryOwner(found->second.type, found->second.imported), -static_cast<std::int64_t>(found->second.bytes), -1);
+            tags.allocations.erase(found);
+        }
+    }
+    tags.freeMemory.load(std::memory_order_acquire)(device, memory, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL TaggedMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
+    auto& tags = MemoryTags();
+    const auto result = tags.mapMemory.load(std::memory_order_acquire)(device, memory, offset, size, flags, data);
+    if (result == VK_SUCCESS && *data != nullptr) {
+        std::lock_guard lock(tags.mutex);
+        const auto found = tags.allocations.find(memory);
+        const VkDeviceSize total = found != tags.allocations.end() ? found->second.bytes : 0;
+        const VkDeviceSize bytes = size != VK_WHOLE_SIZE ? size : total > offset ? total - offset : 0;
+        HostCommitLog::HostCommitNote_nid_no_patch(MappedMemoryOwner(found != tags.allocations.end() ? found->second.type : 0xffffffffu), *data, static_cast<std::size_t>(bytes));
+        tags.mapped[memory] = *data;
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL TaggedUnmapMemory(VkDevice device, VkDeviceMemory memory) {
+    auto& tags = MemoryTags();
+    {
+        std::lock_guard lock(tags.mutex);
+        if (const auto found = tags.mapped.find(memory); found != tags.mapped.end()) {
+            HostCommitLog::HostCommitForget_nid_no_patch(found->second, 0);
+            tags.mapped.erase(found);
+        }
+    }
+    tags.unmapMemory.load(std::memory_order_acquire)(device, memory);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TaggedDeviceProc(VkDevice device, const char* name) {
+    auto& tags = MemoryTags();
+    const auto function = tags.deviceProc.load(std::memory_order_acquire)(device, name);
+    if (function == nullptr || name == nullptr) return function;
+    if (std::strcmp(name, "vkAllocateMemory") == 0) {
+        tags.allocateMemory.store(reinterpret_cast<PFN_vkAllocateMemory>(function), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TaggedAllocateMemory);
+    }
+    if (std::strcmp(name, "vkFreeMemory") == 0) {
+        tags.freeMemory.store(reinterpret_cast<PFN_vkFreeMemory>(function), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TaggedFreeMemory);
+    }
+    if (std::strcmp(name, "vkMapMemory") == 0) {
+        tags.mapMemory.store(reinterpret_cast<PFN_vkMapMemory>(function), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TaggedMapMemory);
+    }
+    if (std::strcmp(name, "vkUnmapMemory") == 0) {
+        tags.unmapMemory.store(reinterpret_cast<PFN_vkUnmapMemory>(function), std::memory_order_release);
+        return reinterpret_cast<PFN_vkVoidFunction>(&TaggedUnmapMemory);
+    }
+    return function;
+}
+
+PFN_vkGetDeviceProcAddr TagMappedMemory(PFN_vkGetDeviceProcAddr deviceProc) {
+    if (deviceProc == nullptr || !HostCommitLog::HostCommitLogEnabled_nid_no_patch()) return deviceProc;
+    MemoryTags().deviceProc.store(deviceProc, std::memory_order_release);
+    return &TaggedDeviceProc;
+}
 
 constexpr std::uint64_t WorkgroupMemoryGranule = 1u << 20u;
 
@@ -988,7 +1131,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->window = window->context;
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
-    state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    state->deviceProc = TagMappedMemory(state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr"));
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");

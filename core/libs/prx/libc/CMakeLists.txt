@@ -27,6 +27,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestWriteWatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Interfaces.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/HostCommitLog.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HeapDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Mspace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ApplicationHeap.cpp

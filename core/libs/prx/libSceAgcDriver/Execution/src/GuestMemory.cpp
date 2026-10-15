@@ -5,6 +5,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostCommitLog.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <mutex>
 #include <array>
@@ -368,7 +369,7 @@ struct PageSpan {
     std::uint8_t* pages = nullptr;
 
     // Reserves and commits the table; untouched table pages cost nothing until a guest page is recorded.
-    bool allocate() {
+    bool allocate(const char* owner) {
         if (size == 0) return false;
         const auto count = (size / PageBytes + 8) & ~static_cast<std::size_t>(7);
 #ifdef _WIN32
@@ -377,6 +378,7 @@ struct PageSpan {
         pages = static_cast<std::uint8_t*>(std::calloc(count, 1));
 #endif
         if (pages == nullptr) size = 0;
+        else HostCommitLog::HostCommitNote_nid_no_patch(owner, pages, count);
         return pages != nullptr;
     }
 
@@ -478,7 +480,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 void PageStates::initialize() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
-        const bool arenaCached = arena.allocate();
+        const bool arenaCached = arena.allocate("agc-page-states");
         bool imageCached = false;
 #ifdef _WIN32
         // The image extent is the run of regions sharing the module's allocation base, as the registry
@@ -494,7 +496,7 @@ void PageStates::initialize() {
             }
             image.base = start;
             image.size = cursor - start;
-            imageCached = image.allocate();
+            imageCached = image.allocate("agc-page-states");
         }
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
@@ -813,6 +815,9 @@ struct WriteTracker {
         cpuBlocks.assign(size / WriteBlockBytes + 1, 0);
         coverage.Initialize(base, size);
         hintBlocks.assign(size / WriteBlockBytes + 1, 0);
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", blocks.data(), blocks.size() * sizeof(blocks[0]));
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", cpuBlocks.data(), cpuBlocks.size() * sizeof(cpuBlocks[0]));
+        HostCommitLog::HostCommitNote_nid_no_patch("agc-write-blocks", hintBlocks.data(), hintBlocks.size() * sizeof(hintBlocks[0]));
         pages.resize(1u << 16);
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
 #else
