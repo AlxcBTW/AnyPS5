@@ -3150,6 +3150,17 @@ VkMemoryPropertyFlags copyBufferProperties(bool deviceLocal) {
     return deviceLocal ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 }
 
+// APS5_STAGING_MERGE=1 (lab): a staging copy-in whose leading barrier only asks for a transfer
+// read the previous command's trailing barrier already covered skips it (the seed barrier's
+// pattern in Texture.cpp), and a copy-back into the unit shadow records one vkCmdCopyBuffer per
+// slab (and one for the import) instead of one per piece, and skips its per-region leading
+// barrier behind an earlier region's of the same RecordCopyBacks when it records no seed and
+// every piece covers whole 64 KiB units (see recordGpuCopies and copyBackIntoShadow).
+bool StagingMerge() {
+    static const bool enabled = std::getenv("APS5_STAGING_MERGE") != nullptr;
+    return enabled;
+}
+
 // [gputime] classes (APS5_PROFILE_GPU) of a build's GPU copies, barriers included: the copy-ins
 // of its regions and their copy-backs (staged or host shadows alike).
 constexpr auto StagingCopyInKey = Recorder::CommandClass::StagingIn;
@@ -4024,15 +4035,22 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
-    const auto commands = recorder->Commands();
+    VkAccessFlags covered = 0;
+    const auto commands = recorder->Commands(&covered);
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    // APS5_STAGING_MERGE: the leading barrier is skipped when the previous trailing barrier
+    // already covered the transfer read it asks for, as the seed barrier is in Texture.cpp.
+    if (StagingMerge() && Recorder::MergeBarriers() && (covered & VK_ACCESS_TRANSFER_READ_BIT) != 0) {
+        Recorder::CountMerged(Recorder::CommandClass::StagingIn);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
@@ -4155,7 +4173,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
-std::uint64_t GuestBufferMemory::copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pieces, VkCommandBuffer commands) {
+std::uint64_t GuestBufferMemory::copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& pieces, VkCommandBuffer commands, bool leadingRecorded) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     HostImport import{};
@@ -4202,10 +4220,20 @@ std::uint64_t GuestBufferMemory::copyBackIntoShadow(Recorder& recorder, Region& 
         }
     }
     // Every earlier writer of the slabs (a retile) and of the seeded units' import bytes (host
-    // stores included) precedes the seeds and the copies.
+    // stores included) precedes the seeds and the copies. APS5_STAGING_MERGE: behind an earlier
+    // region's barrier of this RecordCopyBacks the barrier is skipped when this region records
+    // no seed (nothing reads the import) and every piece covers whole 64 KiB units (no unit is
+    // shared with an earlier region's seed or copy: the slab ranges behind that barrier are
+    // disjoint from this region's, and the shader stores the copies read were ordered by the
+    // RecordCopyBacks barrier itself).
     constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+    const bool wholeUnits = std::all_of(pieces.begin(), pieces.end(), [](const auto& piece) { return (piece.first & 65535) == 0 && (piece.second & 65535) == 0; });
+    if (StagingMerge() && Recorder::MergeBarriers() && leadingRecorded && seeds.empty() && wholeUnits) {
+        Recorder::CountMerged(Recorder::CommandClass::StagingOut);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+    }
     if (!seeds.empty()) {
         for (const auto& [begin, end, slab] : seeds) {
             // The piece's own slab (a seeded unit is one a piece covers partly).
@@ -4218,11 +4246,20 @@ std::uint64_t GuestBufferMemory::copyBackIntoShadow(Recorder& recorder, Region& 
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     }
+    // APS5_STAGING_MERGE: one vkCmdCopyBuffer per slab and one for the import (a slab's copies
+    // are disjoint pieces of the same source and destination), not one command per piece.
+    const bool bundle = StagingMerge();
+    const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     for (const auto& entry : slabPieces) {
-        for (const auto& copy : entry.copies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, entry.slab->buffer, copy.dstOffset, copy.size);
+        if (bundle) copyBuffer(commands, region.buffer->Handle(), entry.slab->buffer, static_cast<std::uint32_t>(entry.copies.size()), entry.copies.data());
+        else for (const auto& copy : entry.copies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, entry.slab->buffer, copy.dstOffset, copy.size);
         recorder.Keep(entry.slab);
     }
-    for (const auto& copy : importCopies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, region.copySource, copy.dstOffset, copy.size);
+    if (bundle) {
+        if (!importCopies.empty()) copyBuffer(commands, region.buffer->Handle(), region.copySource, static_cast<std::uint32_t>(importCopies.size()), importCopies.data());
+    } else {
+        for (const auto& copy : importCopies) CopyBuffer(context, commands, region.buffer->Handle(), copy.srcOffset, region.copySource, copy.dstOffset, copy.size);
+    }
     // Every range is a store into this memory: stamped (images over it re-upload), and the pieces
     // in slabs are fresh at the generation after the stamps (the slab holds the newest bytes; the
     // import pieces are the import's, as after MarkDirectWrites).
@@ -4349,6 +4386,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (from < to) pieces.emplace_back(from, to);
             }
             if (!pieces.empty()) {
+                const bool leadingRecorded = recording;
                 if (!recording) {
                     commands = recorder.Commands();
                     timing = recorder.BeginGpuTiming(StagingCopyBackKey);
@@ -4358,7 +4396,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 }
                 std::uint64_t pieceBytes = 0;
                 for (const auto& [from, to] : pieces) pieceBytes += to - from;
-                copyBackIntoShadow(recorder, region, pieces, commands);
+                copyBackIntoShadow(recorder, region, pieces, commands, leadingRecorded);
                 copiedBytes += pieceBytes;
                 recorder.Keep(region.buffer);
                 if (profile) {

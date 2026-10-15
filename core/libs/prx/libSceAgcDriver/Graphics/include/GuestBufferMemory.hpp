@@ -431,7 +431,7 @@ private:
     // The written ranges of a shadow-staged region back into its import's unit shadow (slab pieces,
     // seeded where a piece covers a unit partly), the rest into the import; stamps and marks them.
     // Returns the bytes that went into slabs.
-    std::uint64_t copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged, VkCommandBuffer commands);
+    std::uint64_t copyBackIntoShadow(Recorder& recorder, Region& region, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& merged, VkCommandBuffer commands, bool leadingRecorded);
     // The bytes of [region.begin, region.end) a shadow-sourced copy-in would read from slabs now.
     std::uint64_t freshBytes(const Region& region) const;
     bool restageCandidate(const Region& region) const;
