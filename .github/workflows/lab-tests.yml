@@ -1,6 +1,7 @@
 # Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the AGC driver tests on a hosted Linux runner and
 # runs the ones named in .ci-lab/tests under lavapipe. An optional .ci-lab/repeat ("<regex> <count>") runs one more
-# test count times after them and reports how often it passed.
+# test count times after them and reports how often it passed. An optional .ci-lab/verbose (a regex) prints the
+# full output of the tests it names.
 name: Lab tests
 
 on:
@@ -56,5 +57,8 @@ jobs:
               fi
             done
             echo "repeat $repeat_pattern: $pass passed, $fail failed of $repeat_count"
+          fi
+          if [ -f .ci-lab/verbose ]; then
+            ctest --test-dir build -V --timeout 120 -R "$(cat .ci-lab/verbose)" || true
           fi
           exit $status
