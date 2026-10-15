@@ -1,0 +1,42 @@
+# Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the AGC driver tests on a hosted Linux runner and
+# runs the ones named in .ci-lab/tests under lavapipe.
+name: Lab tests
+
+on:
+  push:
+    branches: ['ci/test/**']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache libvulkan1 libvulkan-dev mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxss-dev libudev-dev libdbus-1-dev
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-tests
+          max-size: 3G
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_ENABLE_SPIRV_TOOLS=ON
+      - name: Build
+        run: cmake --build build --parallel 4
+      - name: Test
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          pattern=$(cat .ci-lab/tests)
+          ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
