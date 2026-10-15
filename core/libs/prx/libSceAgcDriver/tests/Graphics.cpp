@@ -766,6 +766,12 @@ void ShaderStageTests() {
     auto stages = AgcDriver::Graphics::DecodeState(queue).stages;
     Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->verticesPerGroup == 63, "geometry assembly changed");
     Require(stages.mesh->maxVertices == 64 && stages.mesh->maxPrimitives == 21 && stages.mesh->threadsPerGroup == 64 && stages.mesh->esgsItemSize == 4, "geometry subgroup outputs changed");
+    queue.shader[0x8a] = 0x222c0007u;
+    queue.shader[0x8b] = 0x00c00010u;
+    stages = AgcDriver::Graphics::DecodeState(queue).stages;
+    Require(stages.path == AgcDriver::Graphics::ShaderPath::Geometry && stages.mesh && stages.mesh->primitivesPerGroup == 21 && stages.mesh->esgsItemSize == 4, "a geometry program with fewer GS and ES input VGPRs did not decode");
+    queue.shader[0x8a] = 3u << 29u;
+    queue.shader[0x8b] = 3u << 16u;
     {
         auto fan = makeState();
         fan.userConfig[0x242] = 5;
@@ -1331,6 +1337,11 @@ void DisabledColorTests() {
     queue.context[0x00b] = std::bit_cast<std::uint32_t>(1.0f);
     const auto depthOnly = AgcDriver::Graphics::DecodeState(queue);
     Require(!depthOnly.hasColorTarget && depthOnly.depth && depthOnly.depthTest && depthOnly.depthWrite && depthOnly.renderExtent.height == 64, "COLOR_INVALID discarded a depth-only draw");
+    Require(depthOnly.depth->firstSlice == 0, "a depth view of slice 0 decoded another slice");
+    queue.context[0x002] = 3;
+    const auto thirdSlice = AgcDriver::Graphics::DecodeState(queue);
+    Require(thirdSlice.depth && thirdSlice.depth->firstSlice == 3 && thirdSlice.depth->address == depthOnly.depth->address + 3u * AgcDriver::Graphics::DepthSliceBytes(depthOnly.depth->extent, 4u), "a depth view of slice 3 lost its slice or its Z offset");
+    queue.context[0x002] = 0;
     for (const auto colorControl : {0x0u, 0xcc0000u}) {
         queue = makeState();
         queue.context[0x202] = colorControl;

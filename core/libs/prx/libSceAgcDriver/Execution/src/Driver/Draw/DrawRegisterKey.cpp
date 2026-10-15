@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -130,7 +131,8 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
 void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
     if (!traceDrawCache()) return;
     struct Previous { std::array<std::uint64_t, 4> parts{}; };
-    thread_local std::unordered_map<std::uint64_t, Previous> previous;
+    struct PreviousStorage {};
+    auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, Previous>, PreviousStorage>();
     const auto shaderSet = components[4];
     if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
     const auto [it, inserted] = previous.try_emplace(shaderSet);

@@ -1253,6 +1253,7 @@ target_include_directories(agc_driver_pm4_tests PRIVATE
 
 target_link_libraries(agc_driver_pm4_tests PRIVATE
         libSceAgcDriver
+        shader_recompiler_agc_driver
         libc
         libkernel
 )
@@ -1527,8 +1528,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_native_multisample_depth PROPERTIES TIMEOUT 30)
     add_test(NAME agc_driver_native_depth_retirement COMMAND agc_driver_native_multisample_depth_tests --retirement)
     set_tests_properties(agc_driver_native_depth_retirement PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_native_depth_clears COMMAND agc_driver_native_multisample_depth_tests --clears)
+    add_test(NAME agc_driver_native_depth_clear_refusals COMMAND agc_driver_native_multisample_depth_tests --clear-refusals)
+    set_tests_properties(agc_driver_native_depth_clears agc_driver_native_depth_clear_refusals PROPERTIES TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_driver_native_depth_retirement PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        set_tests_properties(agc_driver_native_depth_clears agc_driver_native_depth_clear_refusals PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_sparse_buffer_holes PROPERTIES TIMEOUT 30)
     set_tests_properties(agc_driver_sparse_buffer_holes PROPERTIES TIMEOUT 30)

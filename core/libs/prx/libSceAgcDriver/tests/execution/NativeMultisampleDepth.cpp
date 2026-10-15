@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -599,17 +600,67 @@ void CheckDrawFeedback() {
     std::puts("Native depth feedback refused through the draw resource path");
 }
 
-void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one) {
+enum class ClearFault { None, PartialStore, CpuWrite, DepthWrite, BadMetadata, UnprovenDispatch, PendingWrite, Overlap };
+
+void CheckClearDispatch() {
+    const std::array<std::uint32_t, 17> code{
+        0xd7460000, 0x04010c06, 0x34000084, 0xdc388000, 0x04020000,
+        0xbf8c3f70, 0xd7710008, 0x00120805, 0xd7710009, 0x00120a05,
+        0xd771000a, 0x00120c05, 0xd771000b, 0x00120e05,
+        0xdc788000, 0x00020800, 0xbf810000,
+    };
+    const std::array<std::uint32_t, 6> userData{0u, 0u, 65536u, 0u, 0xf0u, 0xf0u};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{64u, 1u, 1u}, 0u, {true, false, false}, false, 1u};
+    const std::array<std::uint32_t, 5> packet{0u, 32u, 1u, 1u, 1u};
+    Require(HtileDepthClearBytes_nid_no_patch(code, userData, compute, packet, 0u) == 32768u, "complete HTILE mask dispatch was not recognized");
+    for (const auto groups : {0x3fffffu, 0x400000u, 0x400001u}) {
+        auto boundary = packet;
+        boundary[1] = groups;
+        const auto expected = groups > 0x400000u ? 0u : static_cast<std::uint64_t>(groups) * 1024u;
+        Require(HtileDepthClearBytes_nid_no_patch(code, userData, compute, boundary, 0u) == expected, "HTILE mask extent crossed its 32-bit byte-offset bound");
+    }
+    Require(HtileDepthClearBytes_nid_no_patch(code, userData, compute, packet, 65536u) == 0u, "indirect HTILE clear was accepted");
+    Require(HtileDepthClearBytes_nid_no_patch(code, userData, compute, std::span(packet).first(4u), 0u) == 0u, "short HTILE dispatch packet was accepted");
+    Require(HtileDepthClearBytes_nid_no_patch(code, std::span(userData).first(5u), compute, packet, 0u) == 0u, "short HTILE user data was accepted");
+    auto changedCode = code;
+    changedCode[0] ^= 1u;
+    Require(HtileDepthClearBytes_nid_no_patch(changedCode, userData, compute, packet, 0u) == 0u, "another HTILE producer was accepted");
+    for (std::uint32_t fault = 0u; fault < 14u; ++fault) {
+        auto changedCompute = compute;
+        auto changedPacket = packet;
+        auto changedUserData = userData;
+        switch (fault) {
+            case 0u: changedCompute.partialThreads[0] = 1u; break;
+            case 1u: changedCompute.groupIdEnable[0] = false; break;
+            case 2u: changedCompute.threadIdComponentCount = 0u; break;
+            case 3u: changedCompute.threadIdComponentCount = 4u; break;
+            case 4u: changedCompute.numThreads[0] = 32u; break;
+            case 5u: changedCompute.numThreads[1] = 2u; break;
+            case 6u: changedPacket[1] = 0u; break;
+            case 7u: changedPacket[2] = 2u; break;
+            case 8u: changedPacket[3] = 2u; break;
+            case 9u: changedPacket[4] = 0u; break;
+            case 10u: changedPacket[4] = 0x21u; break;
+            case 11u: changedUserData[2] = 65537u; break;
+            case 12u: changedUserData[4] = 1u; break;
+            case 13u: changedUserData[2] = 0xfffffff0u; changedUserData[3] = 0xffffffffu; break;
+        }
+        Require(HtileDepthClearBytes_nid_no_patch(code, changedUserData, changedCompute, changedPacket, 0u) == 0u, "unproven HTILE mask dispatch was accepted");
+    }
+}
+
+void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments, bool one, bool clearing = false, std::optional<bool> depthOnlyOverride = std::nullopt, ClearFault fault = ClearFault::None) {
     const VkExtent2D extent{5u, 3u};
     const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, fragments));
     TargetMemory memory(bytes), metadata(65536u);
     const auto metadataBytes = HtileMetadataBytes(extent);
-    const std::uint32_t pattern = one ? 0xfffffff0u : 0u;
+    const bool depthOnly = depthOnlyOverride.value_or(one);
+    const std::uint32_t pattern = one ? (depthOnly ? 0xfffffff0u : 0xfffc00f0u) : 0u;
     for (std::size_t i = 0u; i < metadataBytes / 4u; ++i) std::memcpy(metadata.Data() + i * 4u, &pattern, 4u);
     DepthTarget target{memory.Address(), 0u, extent, format, one ? 1.0f : 0.0f, 0u, metadata.Address(), false, fragments};
     target.depthSwizzle = 24u;
     target.pipeBankXor = one ? 0x8c00u : 0u;
-    target.htileDepthOnly = one;
+    target.htileDepthOnly = depthOnly;
     target.iterate256 = target.htilePipeAligned = true;
     Recorder recorder(context);
     recorder.Activate();
@@ -680,6 +731,40 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
             batch.SubmitAndWait();
             check(true, offset);
         }
+        if (clearing) {
+            for (std::uint32_t iteration = 0u; iteration < 3u; ++iteration) {
+                {
+                    CommandBatch batch(context);
+                    raster.Run(batch.Handle(), static_cast<float>(iteration) / 16.0f);
+                    batch.SubmitAndWait();
+                }
+                const bool clearOne = iteration == 1u ? !one : one;
+                target.clearDepth = clearOne ? 1.0f : 0.0f;
+                Require(DepthSurfaceView(context, target) == view, "updating the native clear value replaced its attachment");
+                const std::uint32_t clearPattern = clearOne ? (depthOnly ? 0xfffffff0u : 0xfffc00f0u) : 0u;
+                const auto nativeBytes = fault == ClearFault::UnprovenDispatch ? 0u : static_cast<std::size_t>(metadataBytes);
+                NoteHtileDepthClear(target.htileAddress, static_cast<std::size_t>(metadataBytes), nativeBytes);
+                if (fault == ClearFault::Overlap) NoteHtileDepthClear(target.htileAddress, static_cast<std::size_t>(metadataBytes), nativeBytes);
+                const auto storedBytes = fault == ClearFault::PartialStore ? 4u : static_cast<std::size_t>(metadataBytes);
+                AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, storedBytes, [&] {
+                    for (std::size_t i = 0u; i < storedBytes / 4u; ++i) std::memcpy(metadata.Data() + i * 4u, &clearPattern, 4u);
+                    if (fault == ClearFault::BadMetadata) metadata.Data()[0] = std::byte{0x0f};
+                });
+                if (fault == ClearFault::CpuWrite) metadata.Data()[metadataBytes - 1u] ^= std::byte{0x01};
+                if (fault == ClearFault::DepthWrite) memory.Data()[bytes - 1u] ^= std::byte{0x01};
+                if (fault == ClearFault::PendingWrite) QueueTargetByteWrite(context, recorder, target.htileAddress, std::byte{0});
+                Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "completed native depth clear lost its sampled view");
+                recorder.Sync();
+                Require(DepthSurfaceView(context, target) == view && CachedSampledTexture(context, words) == texture, "completed native depth clear replaced an attachment or cached view");
+                std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+                CommandBatch batch(context);
+                fetch.Run(batch.Handle(), count);
+                RecordMemoryBarrier(context, batch.Handle(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+                batch.SubmitAndWait();
+                check(false, 0.0f);
+            }
+            std::printf("Native depth completed clear format=%d samples=%u depthOnly=%u value=%u cycles=3\n", format, fragments, depthOnly, one);
+        }
     }
     Require(std::all_of(memory.Data(), memory.Data() + bytes, [](auto value) { return value == std::byte{0xa5}; }), "native depth sampling silently published guest memory");
     std::array<std::byte, 1> probe{};
@@ -727,6 +812,36 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { DepthSurfaceHolds(context, resource, texture.get()); }, "guest writes");
     texture.reset();
     std::printf("Native depth format=%u samples=%u clear=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one);
+}
+
+void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments) {
+    const VkExtent2D extent{5u, 3u};
+    const auto bytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, fragments));
+    TargetMemory memory(bytes), metadata(65536u), single(65536u);
+    const auto metadataBytes = HtileMetadataBytes(extent);
+    std::memset(metadata.Data(), 0, metadataBytes);
+    const std::vector<std::byte> cleared(metadata.Data(), metadata.Data() + metadataBytes);
+    const auto untouched = [&] { return std::equal(cleared.begin(), cleared.end(), metadata.Data()); };
+    DepthTarget target{memory.Address(), 0u, extent, format, 0.0f, 0u, metadata.Address(), false, fragments};
+    target.depthSwizzle = 24u;
+    target.iterate256 = target.htilePipeAligned = true;
+    Recorder recorder(context);
+    recorder.Activate();
+    struct Cleanup {
+        Recorder& recorder;
+        Context context;
+        ~Cleanup() { recorder.Sync(); ClearCachedTextures(context.device); ClearDepthSurfaces(context.device); }
+    } cleanup{recorder, context};
+    const auto view = DepthSurfaceView(context, target);
+    Require(HasResidentDepthGuards_nid_no_patch(), "the native depth owner installed no guest guard");
+    Require(untouched(), "the first bind of a native depth target stored expanded HTILE words back");
+    Require(DepthSurfaceView(context, target) == view && untouched(), "rebinding a native-owned depth target went through the generic HTILE store-back");
+    auto alias = target;
+    alias.samples = 1u;
+    alias.address = single.Address();
+    TargetRefuses([&] { DepthSurfaceView(context, alias); }, "layout or metadata changed");
+    Require(untouched(), "a single-sample bind over a native owner's HTILE stored expanded words into it");
+    std::printf("Native depth format=%u samples=%u: binds over the owner's HTILE left its words alone\n", static_cast<std::uint32_t>(format), fragments);
 }
 
 void CheckEligibility(Context context) {
@@ -985,6 +1100,34 @@ int main(int argc, char** argv) {
         const auto context = device->GetContext();
         const std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         Require(DepthSupported(context, VK_FORMAT_D32_SFLOAT, 4u), "the native depth regression requires sampled D32 with four samples");
+        if (argc == 2 && std::string_view(argv[1]) == "--clear-refusals") {
+            for (const auto& [fault, expected] : std::array{
+                     std::pair{ClearFault::PartialStore, "no complete tracked HTILE store"},
+                     std::pair{ClearFault::CpuWrite, "CPU writes raced"},
+                     std::pair{ClearFault::DepthWrite, "guest writes"},
+                     std::pair{ClearFault::BadMetadata, "does not prove its clear value"},
+                     std::pair{ClearFault::UnprovenDispatch, "incomplete or unproven"},
+                     std::pair{ClearFault::PendingWrite, "external GPU writes"},
+                     std::pair{ClearFault::Overlap, "overlapping native multisample depth"}}) {
+                TargetRefuses([&] { CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, fault); }, expected);
+                std::printf("Native depth clear fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+            }
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--clears") {
+            CheckClearDispatch();
+            std::uint32_t checked = 0u, unavailable = 0u;
+            for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT}) {
+                for (const auto samples : {2u, 4u, 8u}) {
+                    if (!DepthSupported(context, format, samples)) { unavailable += 4u; continue; }
+                    for (const bool depthOnly : {false, true}) {
+                        for (const bool one : {false, true}) { CheckDepthTarget(context, format, samples, one, true, depthOnly); ++checked; }
+                    }
+                }
+            }
+            std::printf("Native depth completed clear cases checked=%u unavailable=%u\n", checked, unavailable);
+            return 0;
+        }
         Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--retirement"), "invalid native depth fixture arguments");
         if (argc == 2) {
             std::uint32_t checked = 0u, unavailable = 0u;
@@ -1002,6 +1145,7 @@ int main(int argc, char** argv) {
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!DepthSupported(context, format, samples)) { unavailable += 2u; continue; }
                 for (const bool one : {false, true}) { CheckDepthTarget(context, format, samples, one); ++checked; }
+                CheckHtileRouting(context, format, samples);
             }
         }
         CheckEligibility(context);

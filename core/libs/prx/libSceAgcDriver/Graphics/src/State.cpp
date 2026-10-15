@@ -884,7 +884,6 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
-        validate(vertexWorkgroup || fastLaunch || (((read(queue.shader, 0x8a, RegisterBank::Shader) >> 29u) & 3u) == 3 && ((resources >> 16u) & 3u) == 3), "unsupported geometry VGPR allocation");
         const auto esgsItemSize = read(queue.context, 0x2ab);
         validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
         const auto amplification = fastLaunch ? read(queue.context, 0x2d3) & 0x1ffu : verticesPerPrimitive - 2u;
