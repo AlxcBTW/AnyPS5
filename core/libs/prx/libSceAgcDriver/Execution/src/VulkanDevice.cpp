@@ -3845,6 +3845,7 @@ constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderRe
 
 struct DispatchMoveCounters {
     std::atomic<std::uint64_t> checked{0}, exact{0}, moved{0}, buffers{0}, bytes{0};
+    std::atomic<std::uint64_t> revalidateNs{0}, proofNs{0}, overlayNs{0};
     std::array<std::atomic<std::uint64_t>, 5> sizes{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refused{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> filtered{};
@@ -3885,6 +3886,11 @@ void reportDispatchMove() {
     for (std::size_t i = 0; i < 5; ++i) sizes[i] = take(moves.sizes[i]);
     const auto refused = list(moves.refused);
     const auto filtered = list(moves.filtered);
+    const auto times = Graphics::ShaderResources::TakeMoveTimes();
+    const auto revalidateNs = take(moves.revalidateNs);
+    const auto proofNs = take(moves.proofNs);
+    const auto overlayNs = take(moves.overlayNs);
+    if (checked != 0) AgcDriver::ProfilePrint_nid_no_patch("[dispmove] per checked hit (10 s): Revalidate %.1f us, proof %.1f us, overlay %.1f us (per overlay of %llu: snapshots %.1f us, descriptors %.1f us)\n", revalidateNs / 1000.0 / static_cast<double>(checked), proofNs / 1000.0 / static_cast<double>(checked), overlayNs / 1000.0 / static_cast<double>(checked), static_cast<unsigned long long>(times.calls), times.calls != 0 ? times.snapshotNs / 1000.0 / static_cast<double>(times.calls) : 0.0, times.calls != 0 ? times.descriptorNs / 1000.0 / static_cast<double>(times.calls) : 0.0);
     AgcDriver::ProfilePrint_nid_no_patch("[dispmove] (10 s) %llu template hits checked: %llu with every read-only buffer where it was built, %llu with %llu moved ones (%.2f MiB snapshotted; per dispatch up to 1 KiB %llu, 16 KiB %llu, 256 KiB %llu, 4 MiB %llu, more %llu); refused %s; stage A dropped cached objects: %s\n", checked, exact, moved, buffers, static_cast<double>(bytes) / 1048576.0, sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], refused.c_str(), filtered.c_str());
 }
 
@@ -4740,19 +4746,30 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
-            if (cached->Revalidate(shaders[0])) {
+            const auto revalidateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool valid = cached->Revalidate(shaders[0]);
+            const auto revalidated = profile ? std::chrono::steady_clock::now() : revalidateStart;
+            if (valid) {
                 bool usable = true;
                 if (DispatchMove()) {
                     auto& moves = DispatchMoves();
                     Graphics::ShaderResources::MoveProof proof;
                     auto moved = cached->MovedDispatchBuffers(shaders[0], state->recorder.get(), DispatchMoveBytes(), proof);
                     moves.checked.fetch_add(1, std::memory_order_relaxed);
+                    const auto proved = profile ? std::chrono::steady_clock::now() : revalidated;
                     if (moved.has_value() && !moved->empty()) {
                         overlay = cached->PrepareDrawBindings(*state->recorder, *moved, true);
                         if (overlay == nullptr) {
                             proof.refusal = Graphics::ShaderResources::MoveRefusal::Bindings;
                             moved.reset();
                         }
+                    }
+                    if (profile) {
+                        const auto overlaid = std::chrono::steady_clock::now();
+                        const auto nanoseconds = [](auto from, auto to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
+                        moves.revalidateNs.fetch_add(nanoseconds(revalidateStart, revalidated), std::memory_order_relaxed);
+                        moves.proofNs.fetch_add(nanoseconds(revalidated, proved), std::memory_order_relaxed);
+                        moves.overlayNs.fetch_add(nanoseconds(proved, overlaid), std::memory_order_relaxed);
                     }
                     if (!moved.has_value()) {
                         usable = false;

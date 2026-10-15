@@ -197,6 +197,10 @@ public:
         std::size_t bytes = 0;
     };
     static const char* MoveRefusalName(MoveRefusal refusal);
+    struct MoveTimes {
+        std::uint64_t calls, snapshotNs, descriptorNs;
+    };
+    static MoveTimes TakeMoveTimes();
     std::optional<std::vector<MovedBuffer>> MovedDispatchBuffers(const CompiledShader& shader, Recorder* recorder, std::size_t maxBytes, MoveProof& proof) const;
     static std::size_t MaxDrawSnapshotBytes();
     void WriteBack();
