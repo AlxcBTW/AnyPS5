@@ -1,0 +1,67 @@
+# Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the AGC driver tests on a hosted Linux runner twice, with
+# main's GuestMemory.cpp (.ci-lab/GuestMemory.main.cpp) and with the branch's, and runs the ctest entries matching
+# .ci-lab/tests under lavapipe after each build.
+name: Lab tests
+
+on:
+  push:
+    branches: ['ci/test/**']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      CCACHE_MAXSIZE: 3G
+      ANYPS5_REQUIRE_VULKAN: 1
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
+      GUEST_MEMORY: core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+      KEY_TESTS: '^(agc_write_tracking|agc_storage_unwalked_import|agc_driver_store_over_untracked)$'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build ccache libvulkan1 libvulkan-dev mesa-vulkan-drivers libpipewire-0.3-dev libpulse-dev libasound2-dev libxrandr-dev libwayland-dev libxkbcommon-dev libegl-dev libdecor-0-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxss-dev libudev-dev libdbus-1-dev
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-tests
+          max-size: 3G
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_ENABLE_SPIRV_TOOLS=ON
+      - name: Build with main's GuestMemory.cpp
+        run: |
+          cp "$GUEST_MEMORY" "$RUNNER_TEMP/GuestMemory.branch.cpp"
+          cp .ci-lab/GuestMemory.main.cpp "$GUEST_MEMORY"
+          git diff --stat -- "$GUEST_MEMORY" | tail -n 3
+          cmake --build build --parallel 4
+      - name: Test with main's GuestMemory.cpp (the new tests are expected to fail)
+        run: |
+          set +e
+          pattern=$(cat .ci-lab/tests)
+          ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern" 2>&1 | tee "$RUNNER_TEMP/ctest-main.log"
+          echo "ctest with main's GuestMemory.cpp exit ${PIPESTATUS[0]}"
+          echo "::group::summary with main's GuestMemory.cpp"
+          grep -E "Test +#[0-9]+:|tests passed|tests failed" "$RUNNER_TEMP/ctest-main.log"
+          echo "::endgroup::"
+          ctest --test-dir build -V --timeout 120 -R "$KEY_TESTS" 2>&1 | tail -n 400
+          exit 0
+      - name: Build with the branch's GuestMemory.cpp
+        run: |
+          cp "$RUNNER_TEMP/GuestMemory.branch.cpp" "$GUEST_MEMORY"
+          git diff --stat -- "$GUEST_MEMORY" | tail -n 3
+          cmake --build build --parallel 4
+      - name: Test with the branch's GuestMemory.cpp
+        run: |
+          pattern=$(cat .ci-lab/tests)
+          ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Verbose output of the key tests with the branch's GuestMemory.cpp
+        if: always()
+        run: ctest --test-dir build -V --timeout 120 -R "$KEY_TESTS" 2>&1 | tail -n 400
