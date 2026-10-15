@@ -1,0 +1,5 @@
+name=gp-diag
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gp-diag-800cb897b1-38996
