@@ -3183,6 +3183,44 @@ CopyStats& Copies() {
     return stats;
 }
 
+// APS5_STAGING_REFRESH=1 (recordGpuCopies, SyncStaging): a reused staging region copies in only the
+// 64 KiB blocks stamped since its buffer was last in sync. The census counts the same under
+// APS5_PROFILE_DRAW with the switch off: staged uses, those with a sync proof, blocks total and
+// unchanged, the bytes the changed blocks read from slabs and imports, the bytes the proof saves,
+// and the full copies by reason.
+bool StagingRefresh() {
+    static const bool enabled = std::getenv("APS5_STAGING_REFRESH") != nullptr;
+    return enabled;
+}
+
+struct RefreshStats {
+    enum Reason { FirstUse, BufferRecreated, Unfinished, NotCopiedBack, SourceChanged, PlainPath, ReasonCount };
+    std::atomic<std::uint64_t> uses{0}, proved{0}, applied{0};
+    std::atomic<std::uint64_t> blocks{0}, unchanged{0};
+    std::atomic<std::uint64_t> slabBytes{0}, importBytes{0}, savedBytes{0}, regionBytes{0};
+    std::atomic<std::uint64_t> fallbacks[ReasonCount]{};
+};
+
+RefreshStats& RefreshCensus() {
+    static RefreshStats stats;
+    return stats;
+}
+
+void reportRefresh() {
+    auto& stats = RefreshCensus();
+    constexpr std::size_t count = 9 + RefreshStats::ReasonCount;
+    std::array<std::uint64_t, count> now{{stats.uses.load(), stats.proved.load(), stats.applied.load(), stats.blocks.load(), stats.unchanged.load(), stats.slabBytes.load(), stats.importBytes.load(), stats.savedBytes.load(), stats.regionBytes.load()}};
+    for (std::size_t k = 0; k < RefreshStats::ReasonCount; ++k) now[9 + k] = stats.fallbacks[k].load();
+    static std::array<std::uint64_t, count> last{};
+    std::array<std::uint64_t, count> d{};
+    for (std::size_t k = 0; k < count; ++k) d[k] = now[k] - last[k];
+    last = now;
+    constexpr double mib = 1048576.0;
+    const auto u = [&](std::size_t k) { return static_cast<unsigned long long>(d[k]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-refresh] (10 s) APS5_STAGING_REFRESH %s: %llu staged uses, %llu with a sync proof (%llu applied); blocks of those %llu, unchanged %llu (%.1f%%); changed blocks read %.1f MiB from slabs + %.1f MiB from imports; saved %.1f MiB of %.1f MiB staged; full copies by reason: first use %llu, buffer recreated %llu, previous use unfinished %llu, previous use not copied back %llu, source or mapping changed %llu, plain copy path %llu\n",
+        StagingRefresh() ? "on" : "off (census only)", u(0), u(1), u(2), u(3), u(4), d[3] != 0 ? 100.0 * d[4] / d[3] : 0.0, d[5] / mib, d[6] / mib, d[7] / mib, d[8] / mib, u(9), u(10), u(11), u(12), u(13), u(14));
+}
+
 // A shadow the device cannot provide (device memory or the allocation count exhausted: every
 // shadow is its own VkDeviceMemory, retained by cached builds) is no error: nullptr, and the
 // region takes the path it would take without staging (Region::unstaged).
@@ -3224,6 +3262,7 @@ void reportStaging() {
     lastIn = in;
     lastOut = out;
     reportLazy();
+    reportRefresh();
 }
 
 }
@@ -4035,9 +4074,62 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
+    const bool refresh = StagingRefresh();
+    // The blocks of a staged region that may differ from its buffer: whole region unless the buffer
+    // was last brought in sync by an earlier use of this very region and source (SyncStaging), then
+    // the 64 KiB tracker blocks stamped since (the range collected first, so game stores count).
+    struct Plan {
+        bool active = false;
+        bool proved = false;
+        std::size_t blocks = 0;
+        std::size_t changed = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    };
+    const auto plan = [&](Region& r, bool freshBuffer) {
+        Plan p;
+        p.active = true;
+        const auto size = r.end - r.begin;
+        const auto firstBlock = r.begin / 65536;
+        p.blocks = static_cast<std::size_t>((r.end - 1) / 65536 - firstBlock + 1);
+        const auto seen = GuestMemory::CollectWritesUncached(r.begin, static_cast<std::size_t>(size));
+        const auto allocations = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        auto reason = RefreshStats::ReasonCount;
+        if (freshBuffer) reason = RefreshStats::BufferRecreated;
+        else if (r.stageState == Region::StageState::None) reason = RefreshStats::FirstUse;
+        else if (r.stageState == Region::StageState::Pending) reason = RefreshStats::Unfinished;
+        else if (r.stageState == Region::StageState::Broken) reason = RefreshStats::NotCopiedBack;
+        else if (r.stageBuffer.lock() != r.buffer) reason = RefreshStats::BufferRecreated;
+        else if (r.stageSource != r.copySource || r.stageSourceBase != r.copySourceBase || r.stageSourceBytes != r.copySourceBytes || r.stageAllocations != allocations || r.stageSync.size() != p.blocks) reason = RefreshStats::SourceChanged;
+        if (reason == RefreshStats::ReasonCount) {
+            std::vector<std::uint8_t> changed(p.blocks, 1);
+            GuestMemory::ChangedBlocks(r.begin, static_cast<std::size_t>(size), r.stageSync, changed);
+            for (std::size_t k = 0; k < p.blocks; ++k) {
+                if (changed[k] == GuestMemory::BlockUnchanged) continue;
+                ++p.changed;
+                const auto from = std::max(r.begin, (firstBlock + k) * 65536) - r.begin;
+                const auto to = std::min(r.end, (firstBlock + k + 1) * 65536) - r.begin;
+                if (!p.runs.empty() && p.runs.back().second == from) p.runs.back().second = to;
+                else p.runs.emplace_back(from, to);
+            }
+            p.proved = true;
+        } else {
+            p.changed = p.blocks;
+            p.runs.emplace_back(0, size);
+            if (profile) RefreshCensus().fallbacks[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        r.stageSeen = seen;
+        r.stageState = Region::StageState::Pending;
+        r.stageBuffer = r.buffer;
+        r.stageSource = r.copySource;
+        r.stageSourceBase = r.copySourceBase;
+        r.stageSourceBytes = r.copySourceBytes;
+        r.stageAllocations = allocations;
+        return p;
+    };
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
+        const bool freshBuffer = region->buffer == nullptr;
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
@@ -4050,6 +4142,14 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
         }
+        Plan staged;
+        if (region->deviceLocal && (refresh || profile) && bytes != 0) {
+            staged = plan(*region, freshBuffer);
+            if (profile) {
+                RefreshCensus().uses.fetch_add(1, std::memory_order_relaxed);
+                if (!region->shadowSourced) RefreshCensus().fallbacks[RefreshStats::PlainPath].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (region->shadowSourced && region->deviceLocal) {
             // Shadow-sourced staging: each fresh unit of the import's unit shadow from its slab
             // (nothing was published for this use), the rest from the import, as a storage upload
@@ -4058,9 +4158,21 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             import.base = region->copySourceBase;
             import.bytes = region->copySourceBytes;
             import.buffer = region->copySource;
-            const std::pair<std::uint64_t, std::uint64_t> run{0, bytes};
-            std::uint64_t slabBytes = 0, importBytes = 0;
-            for (const auto& source : ShadowSources(context, import, region->begin, std::span(&run, 1), {}, false)) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            const bool skipping = refresh && staged.proved;
+            if (skipping) runs = staged.runs;
+            else runs.emplace_back(0, bytes);
+            std::uint64_t slabBytes = 0, importBytes = 0, wouldSlab = 0, wouldImport = 0;
+            const auto within = [&](std::uint64_t from, std::uint64_t to) {
+                std::uint64_t total = 0;
+                for (const auto& [runFrom, runTo] : staged.runs) {
+                    const auto low = std::max(runFrom, from), high = std::min(runTo, to);
+                    if (low < high) total += high - low;
+                }
+                return total;
+            };
+            for (const auto& source : runs.empty() ? std::vector<ShadowRun>{} : ShadowSources(context, import, region->begin, runs, {}, false)) {
+                if (staged.proved) (source.shadow ? wouldSlab : wouldImport) += within(source.begin, source.end);
                 CopyBuffer(context, commands, source.buffer, source.offset, region->buffer->Handle(), source.begin, source.end - source.begin);
                 if (source.slab != nullptr) recorder->Keep(source.slab);
                 if (source.shadow) {
@@ -4073,12 +4185,26 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             recorder->Keep(region->buffer);
             region->snapshot.clear();
             traceStaged(region->begin, region->end, region->atomic);
+            // What the copy-in moved: the whole region unless the refresh skipped blocks.
+            const auto movedBytes = skipping ? slabBytes + importBytes : bytes;
+            copiedBytes -= bytes - movedBytes;
+            if (profile && staged.proved) {
+                auto& census = RefreshCensus();
+                census.proved.fetch_add(1, std::memory_order_relaxed);
+                if (skipping) census.applied.fetch_add(1, std::memory_order_relaxed);
+                census.blocks.fetch_add(staged.blocks, std::memory_order_relaxed);
+                census.unchanged.fetch_add(staged.blocks - staged.changed, std::memory_order_relaxed);
+                census.slabBytes.fetch_add(wouldSlab, std::memory_order_relaxed);
+                census.importBytes.fetch_add(wouldImport, std::memory_order_relaxed);
+                census.savedBytes.fetch_add(bytes - wouldSlab - wouldImport, std::memory_order_relaxed);
+                census.regionBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
             if (profile) {
                 stagedAny = true;
                 Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
-                Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+                Copies().gpuCopyBytes.fetch_add(movedBytes, std::memory_order_relaxed);
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
+                Copies().stagedInBytes.fetch_add(movedBytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
                 Lazy().sourced.fetch_add(1, std::memory_order_relaxed);
                 Lazy().slabBytes.fetch_add(slabBytes, std::memory_order_relaxed);
@@ -4640,6 +4766,46 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
         return true;
     }
     return false;
+}
+
+void GuestBufferMemory::SyncStaging() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!(StagingRefresh() || profile) || !uploaded || committed) return;
+    // The written ranges, merged: a block wholly inside one was stamped by this use's copy-back and
+    // holds the shader's bytes, which the copy-back put into guest memory.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (auto& region : regions) {
+        if (region.stageState != Region::StageState::Pending) continue;
+        if (!region.gpuCopy || !region.deviceLocal || region.buffer == nullptr || !region.copiedBack) {
+            region.stageState = Region::StageState::Broken;
+            continue;
+        }
+        if (merged.empty() && !writes.empty()) {
+            auto sorted = writes;
+            std::sort(sorted.begin(), sorted.end());
+            for (const auto& range : sorted) {
+                if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+                else merged.push_back(range);
+            }
+        }
+        const auto size = static_cast<std::size_t>(region.end - region.begin);
+        const auto firstBlock = region.begin / 65536;
+        const auto blocks = static_cast<std::size_t>((region.end - 1) / 65536 - firstBlock + 1);
+        // Collected first: a game store since the copy-in becomes a stamp newer than `seen`.
+        const auto now = GuestMemory::CollectWritesUncached(region.begin, size);
+        std::vector<std::uint64_t> seen(blocks, region.stageSeen);
+        std::vector<std::uint8_t> changed(blocks, 1);
+        GuestMemory::ChangedBlocks(region.begin, size, seen, changed);
+        region.stageSync.assign(blocks, now);
+        for (std::size_t k = 0; k < blocks; ++k) {
+            if (changed[k] == GuestMemory::BlockUnchanged) continue;
+            const auto from = std::max(region.begin, (firstBlock + k) * 65536);
+            const auto to = std::min(region.end, (firstBlock + k + 1) * 65536);
+            const bool covered = std::any_of(merged.begin(), merged.end(), [&](const auto& range) { return range.first <= from && to <= range.second; });
+            if (!covered) region.stageSync[k] = 0;
+        }
+        region.stageState = Region::StageState::Synced;
+    }
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {

@@ -291,6 +291,9 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    // After MarkDirectWrites: records which 64 KiB blocks of each staged region's buffer now equal
+    // guest memory (APS5_STAGING_REFRESH, and the [staging-refresh] census under APS5_PROFILE_DRAW).
+    void SyncStaging();
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -427,6 +430,22 @@ private:
         // stageFromShadow refused the region for want of device memory or budget: a revalidation
         // does not ask for a rebuild to stage it again.
         bool shadowRefused = false;
+        // Resident refresh of the staging buffer (APS5_STAGING_REFRESH, see recordGpuCopies and
+        // SyncStaging): None before the first copy-in, Pending from a copy-in until the use's
+        // SyncStaging, Synced when the buffer holds what guest memory (import and slabs) held at
+        // stageSync, Broken when the use ended without a copy-back. stageSync is the tracker
+        // generation per 64 KiB block the buffer is in sync at (0: copy that block in again),
+        // stageSeen the generation the last copy-in was recorded at, and the source and
+        // allocation generation it was taken from.
+        enum class StageState : std::uint8_t { None, Pending, Synced, Broken };
+        StageState stageState = StageState::None;
+        std::uint64_t stageSeen = 0;
+        std::vector<std::uint64_t> stageSync;
+        VkBuffer stageSource = VK_NULL_HANDLE;
+        std::uint64_t stageSourceBase = 0;
+        std::uint64_t stageSourceBytes = 0;
+        std::uint64_t stageAllocations = 0;
+        std::weak_ptr<Buffer> stageBuffer;
     };
     // The written ranges of a shadow-staged region back into its import's unit shadow (slab pieces,
     // seeded where a piece covers a unit partly), the rest into the import; stamps and marks them.
