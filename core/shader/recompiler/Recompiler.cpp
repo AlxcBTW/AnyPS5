@@ -9,7 +9,6 @@
 #include "CacheKey.hpp"
 #include "ShaderSwitches.hpp"
 #include "CompiledVariant.hpp"
-#include "prx/libc/include/HostCommitMeter.hpp"
 #include "VertexInputSpecialization.hpp"
 #include "FragmentOutputSpecialization.hpp"
 #include "SpirvBackend/SpirvSpecialization.hpp"
@@ -351,10 +350,6 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::exception_ptr planFailure;
     std::unique_ptr<IrProgram> program;
     std::vector<std::shared_ptr<const CompiledVariant>> variants;
-    // Host memory of the entry for the host commit census (APS5_HOST_COMMIT_LOG).
-    HostCommitLog::Meter codeCensus{"shader-source-code"};
-    HostCommitLog::Meter planCensus{"shader-plans"};
-    HostCommitLog::Meter spirvCensus{"shader-artifact-spirv"};
     std::vector<EmissionFailure> emissionFailures;
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
@@ -406,27 +401,6 @@ struct SourceKeyHash {
     }
 };
 
-template<class T>
-std::size_t vectorBytes(const std::vector<T>& values) {
-    return values.capacity() * sizeof(T);
-}
-
-// The host bytes a cached resource plan holds (its vectors, value arena and blocks), for the host
-// commit census.
-std::size_t planHostBytes(const IrResourcePlan& plan) {
-    return plan.valueStorage.Size() * sizeof(IrValue) + plan.blockStorage.capacity() * (sizeof(std::unique_ptr<IrBlock>) + sizeof(IrBlock)) +
-        vectorBytes(plan.memoryInfo) + vectorBytes(plan.descriptorSources) + vectorBytes(plan.controlFlow) + vectorBytes(plan.materializationSources) +
-        vectorBytes(plan.srtReads) + vectorBytes(plan.guardedSrtSlots) + vectorBytes(plan.cleanFlatSlots) + vectorBytes(plan.pureFlatSlots) +
-        vectorBytes(plan.compact.values) + vectorBytes(plan.compact.arguments) + vectorBytes(plan.compact.sourceDwords) + vectorBytes(plan.compact.srtReads) + vectorBytes(plan.compact.conditions);
-}
-
-// The host bytes a compiled variant owns: its SPIR-V when it is not viewed from the disk cache, and the artifact's vectors.
-std::size_t variantHostBytes(const CompiledVariant& variant) {
-    const auto& artifact = variant.artifact;
-    return sizeof(CompiledVariant) + artifact.spirv.OwnedBytes() + vectorBytes(artifact.vertexInputPatches) + vectorBytes(artifact.runtimeImageResources) +
-        vectorBytes(artifact.vertexInputs) + vectorBytes(artifact.parameterExports) + vectorBytes(artifact.fragmentParameters) + vectorBytes(artifact.stencilReferences);
-}
-
 bool FailureMemo() {
     static const bool memo = std::getenv("APS5_NO_FAILURE_MEMO") == nullptr;
     return memo;
@@ -468,7 +442,6 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
             source = std::make_shared<SourceEntry>();
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
             source->linkedCallFallbacks.assign(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end());
-            source->codeCensus.Set((source->code.capacity() + source->linkedCallFallbacks.capacity()) * sizeof(std::uint32_t));
             auto& bucket = sources[key];
             if (!bucket.empty()) {
                 // A second entry under one key is a code hash collision (or the unhashed key with
@@ -506,7 +479,6 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 }
                 if (disk) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
             }
-            if (source->plan != nullptr) source->planCensus.Set(planHostBytes(*source->plan));
         }
     }
     return source;
@@ -1120,7 +1092,6 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
         }
     }
     source.program.reset();
-    source.spirvCensus.Add(static_cast<std::int64_t>(variantHostBytes(*variant)));
     source.variants.push_back(variant);
     return variant;
 }
