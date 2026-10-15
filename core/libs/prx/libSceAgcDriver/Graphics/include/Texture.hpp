@@ -457,6 +457,19 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    // APS5_DEFER_STORAGE_WB=1 (Refresh): when this image is about to be fast-cleared over memory
+    // that other pending images lie wholly inside (and this surface's texels fully cover), those
+    // images' results are not stored first: the clear reads no guest bytes, and this image's own
+    // next write supersedes them exactly (supersedeDeferred). True when every overlapping pending
+    // image qualified and `deferredOver` names them; otherwise nothing is recorded and the caller
+    // stores as before.
+    bool deferOverlappingWriteBacks();
+    // This image's results are about to be pending over [first, first + count) tracked layers:
+    // drops the deferred images' results (never stored, dead under these) for a write of the whole
+    // surface, and stores them first for one that does not cover it.
+    void supersedeDeferred(std::uint32_t first, std::uint32_t count);
+    // Stores the deferred images' results now (the old order) and forgets the deferral.
+    void publishDeferred();
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
     static std::vector<std::shared_ptr<StorageTexture>> overlappingPending(std::uint64_t address, std::size_t bytes);
@@ -541,6 +554,20 @@ private:
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.
     bool lent = false;
+    // Deferred write-backs (APS5_DEFER_STORAGE_WB, see deferOverlappingWriteBacks): the pending images
+    // whose results this image's clear left unstored, each with its storeSerial then; `clearDeferred`
+    // is set while Refresh uploads under such a deferral (the upload must not read guest bytes).
+    // On the deferred image: how many write-backs stored it, the generation of the last one, and
+    // whether results of it are still owed to guest memory by a deferral.
+    struct DeferredOver {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t serial;
+    };
+    std::vector<DeferredOver> deferredOver;
+    bool clearDeferred = false;
+    std::atomic<std::uint64_t> storeSerial{0};
+    std::atomic<std::uint64_t> lastStoreGeneration{0};
+    std::atomic<bool> deferredOwed{false};
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;
