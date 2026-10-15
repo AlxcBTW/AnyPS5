@@ -1297,14 +1297,30 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
-void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
-    if (!tracker.watched) return;
+// Diagnostics (RecentUnwatches): the last ranges that really left the write watch, guarded by the tracker lock.
+struct UnwatchRecord {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t serial = 0;
+    const char* path = nullptr;
+};
+std::array<UnwatchRecord, 32> unwatchRing;
+std::size_t unwatchRingNext = 0;
+
+// The caller holds the tracker lock; `path` names the caller for the diagnostics ring. Whether the range really left the watch
+// (some of it was covered) is the answer.
+bool unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, const char* path) {
+    if (!tracker.watched) return false;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
-    if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
+    const bool changed = tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix());
 #else
-    if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) unwatchSerial.fetch_add(1, std::memory_order_release);
+    const bool changed = GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
 #endif
+    if (!changed) return false;
+    const auto serial = unwatchSerial.fetch_add(1, std::memory_order_release) + 1;
+    unwatchRing[unwatchRingNext++ % unwatchRing.size()] = {address, bytes, serial, path};
+    return true;
 }
 
 }
@@ -1313,13 +1329,30 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
     unwatchHook.store(hook, std::memory_order_release);
 }
 
+std::string RecentUnwatches(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    std::string text;
+    int shown = 0;
+    for (std::size_t back = 1; back <= unwatchRing.size() && shown < 8; ++back) {
+        const auto& record = unwatchRing[(unwatchRingNext + unwatchRing.size() - back) % unwatchRing.size()];
+        if (record.path == nullptr) break;
+        if (record.address >= address + bytes || address >= record.address + record.bytes) continue;
+        char entry[192];
+        std::snprintf(entry, sizeof(entry), " [#%llu %s 0x%llx+0x%llx]", static_cast<unsigned long long>(record.serial), record.path, static_cast<unsigned long long>(record.address), static_cast<unsigned long long>(record.bytes));
+        text += entry;
+        ++shown;
+    }
+    return text;
+}
+
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    unwatchLocked(tracker, address, bytes);
+    unwatchLocked(tracker, address, bytes, "Unwatch");
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
@@ -1367,8 +1400,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (!imported) return false;
     if (!staysWatched) {
-        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
-        unwatchLocked(tracker, address, bytes);
+        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), "import (page walk incomplete)");
+        unwatchLocked(tracker, address, bytes, "import (leaves the watch)");
         return true;
     }
     const WindowCopy window{first, saved, slots};
@@ -1377,19 +1410,25 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         // other two paths that unwatch (Unwatch, and the import that does not stay watched) first let pending storage results over
         // the range save the guest bytes they will be compared with (beforeUnwatch); this one did not, so a pending unit lost its
         // way to tell CPU writes from its own results and the write-back refused it. APS5_LAB_SAVE_AT_UNWATCH=1 saves them here too
-        // (the hook takes the GPU mutex, so it runs outside the tracker lock); off by default. Either way the event is reported
-        // (16 at most), to tell whether this path is the one a refused write-back came through.
+        // (the hook takes the GPU mutex, so it runs outside the tracker lock); off by default. Either way the events that really
+        // take coverage away are reported (the first 16, then each power of two), with the number of fallbacks that changed
+        // nothing (memory the watch never covered), to tell whether this path is the one a refused write-back came through.
         static const bool saveAtUnwatch = std::getenv("APS5_LAB_SAVE_AT_UNWATCH") != nullptr;
-        static std::atomic<int> fallbackReports{0};
-        if (fallbackReports.fetch_add(1, std::memory_order_relaxed) < 16) {
-            std::fprintf(stderr, "[write-watch] range 0x%llx+0x%llx leaves the write watch after its import (covered before %d, first walk %d)%s\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first), covered ? 1 : 0, before ? 1 : 0, saveAtUnwatch ? "; pending storage results over it save their guest bytes first (APS5_LAB_SAVE_AT_UNWATCH)" : "");
-        }
+        static std::atomic<std::uint64_t> fallbackChangedNothing{0};
+        static std::atomic<std::uint64_t> fallbackLeft{0};
         if (saveAtUnwatch) {
             lock.unlock();
             beforeUnwatch(first, static_cast<std::size_t>(stop - first));
             lock.lock();
         }
-        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+        if (!unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), "import fallback (page walk could not vouch)")) {
+            fallbackChangedNothing.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const auto eventNumber = fallbackLeft.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (eventNumber <= 16 || (eventNumber & (eventNumber - 1)) == 0) {
+                std::fprintf(stderr, "[write-watch] range 0x%llx+0x%llx leaves the write watch after its import (covered before %d, first walk %d); event %llu, %llu fallbacks changed nothing so far%s\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first), covered ? 1 : 0, before ? 1 : 0, static_cast<unsigned long long>(eventNumber), static_cast<unsigned long long>(fallbackChangedNothing.load(std::memory_order_relaxed)), saveAtUnwatch ? "; pending storage results over it saved their guest bytes first (APS5_LAB_SAVE_AT_UNWATCH)" : "");
+            }
+        }
     }
     return true;
 }
@@ -1522,7 +1561,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
-            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst), "MarkWritten (page walk incomplete)");
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
         }
