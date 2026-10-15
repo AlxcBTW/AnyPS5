@@ -1,0 +1,25 @@
+add_library(libSceContentExport SHARED EXCLUDE_FROM_ALL Export.cpp)
+target_include_directories(libSceContentExport PRIVATE ${LIBS_INCLUDE_DIR})
+configure_windows_unwind(libSceContentExport)
+
+if(BUILD_TESTING)
+    add_test_executable(guest_content_export_tests ${LIBS_INCLUDE_DIR}/tests/GuestContentExport.cpp)
+    target_include_directories(guest_content_export_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_content_export_tests PRIVATE libSceContentExport libc)
+    configure_windows_unwind(guest_content_export_tests)
+    add_test(NAME guest_content_export COMMAND guest_content_export_tests)
+    if(WIN32)
+        set_tests_properties(guest_content_export PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    add_test_executable(guest_content_unimplemented_tests ${LIBS_INCLUDE_DIR}/tests/GuestContentUnimplemented.cpp)
+    target_include_directories(guest_content_unimplemented_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_content_unimplemented_tests PRIVATE libSceContentDelete libc)
+    configure_windows_unwind(guest_content_unimplemented_tests)
+    add_test(NAME guest_content_unimplemented COMMAND guest_content_unimplemented_tests)
+    if(WIN32)
+        set_tests_properties(guest_content_unimplemented PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
