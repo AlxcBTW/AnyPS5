@@ -151,6 +151,7 @@ inline std::uint32_t CopyDataSource(std::span<const std::uint32_t> packet) { ret
 inline bool CopyDataImmediate(std::uint32_t source) { return source >= 10 && source != CopyDataGpuClockSource; }
 inline bool CopyDataToRegister(std::span<const std::uint32_t> packet) { return ((packet[1] >> 8u) & 0xfu) == 0; }
 inline std::size_t CopyDataBytes(std::span<const std::uint32_t> packet) { return (packet[1] & 0x10000u) != 0 ? 8 : 4; }
+std::vector<std::byte> GpuClockBytes(std::size_t bytes);
 inline constexpr std::uint32_t RewindValid = 0x80000000u;
 struct WaitFields {
     std::uint32_t function;
