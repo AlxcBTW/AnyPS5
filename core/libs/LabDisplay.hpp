@@ -76,6 +76,14 @@ inline double GpuClockScale() {
     return value;
 }
 
+inline long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+inline unsigned long long ThreadTag() {
+    return static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffffull);
+}
+
 inline std::atomic<std::uint64_t>& GpuClockReads(int kind) {
     static std::atomic<std::uint64_t> counts[3];
     return counts[kind];
@@ -88,9 +96,27 @@ struct StampGaps {
     std::atomic<std::uint64_t> count;
 };
 
-inline StampGaps& Gaps(int kind) {
-    static StampGaps gaps[3];
-    return gaps[kind];
+struct StampSlot {
+    std::atomic<std::uint64_t> tag;
+    StampGaps gaps[3];
+};
+
+constexpr int StampSlots = 16;
+
+inline StampSlot* AllStampSlots() {
+    static StampSlot slots[StampSlots];
+    return slots;
+}
+
+inline StampSlot& MyStampSlot() {
+    static std::atomic<int> used{0};
+    thread_local StampSlot* mine = nullptr;
+    if (mine == nullptr) {
+        const int index = used.fetch_add(1, std::memory_order_relaxed);
+        mine = &AllStampSlots()[index < StampSlots ? index : StampSlots - 1];
+        mine->tag.store(ThreadTag() + 1, std::memory_order_relaxed);
+    }
+    return *mine;
 }
 
 inline void NoteStamp(int kind, std::uint64_t ticks) {
@@ -102,7 +128,7 @@ inline void NoteStamp(int kind, std::uint64_t ticks) {
     static constexpr std::uint64_t limits[7] = {1000, 10000, 100000, 500000, 1667000, 5000000, 15000000};
     std::size_t bucket = 0;
     while (bucket < 7 && gap >= limits[bucket]) ++bucket;
-    StampGaps& gaps = Gaps(kind);
+    StampGaps& gaps = MyStampSlot().gaps[kind];
     gaps.buckets[bucket].fetch_add(1, std::memory_order_relaxed);
     gaps.count.fetch_add(1, std::memory_order_relaxed);
     gaps.sumTicks.fetch_add(gap, std::memory_order_relaxed);
@@ -123,14 +149,6 @@ inline std::uint64_t GpuClock(int kind, std::uint64_t ticks) {
     GpuClockReads(kind).fetch_add(1, std::memory_order_relaxed);
     NoteStamp(kind, ticks);
     return ScaleTicks(ticks);
-}
-
-inline long long NowMs() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-inline unsigned long long ThreadTag() {
-    return static_cast<unsigned long long>(std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xffffffull);
 }
 
 inline void Log(const char* function, std::atomic<std::uint64_t>& calls, std::uintptr_t caller, const char* format, ...) {
@@ -164,15 +182,19 @@ inline void NoteDraw(std::uint32_t renderWidth, std::uint32_t renderHeight, floa
     std::fprintf(stderr, "[lab-census] t=%lld window=%lld ms draws=%llu (render targets >= 256 px; render extent / viewport / scissor)\n", now, now - windowStart, static_cast<unsigned long long>(windowDraws));
     std::fprintf(stderr, "[lab-census]   GPU clock reads by the title in the window: copy-data %llu, release-mem (queued) %llu, release-mem (executed) %llu\n", static_cast<unsigned long long>(GpuClockReads(0).exchange(0)), static_cast<unsigned long long>(GpuClockReads(1).exchange(0)), static_cast<unsigned long long>(GpuClockReads(2).exchange(0)));
     static const char* const kindNames[3] = {"copy-data clock", "release-mem timestamp (queued)", "release-mem timestamp (executed)"};
-    for (int kind = 0; kind < 3; ++kind) {
-        StampGaps& gaps = Gaps(kind);
-        const std::uint64_t count = gaps.count.exchange(0);
-        std::uint64_t b[8];
-        for (int i = 0; i < 8; ++i) b[i] = gaps.buckets[i].exchange(0);
-        const double maxMs = static_cast<double>(gaps.maxTicks.exchange(0)) / 100000.0;
-        const double meanMs = count != 0 ? static_cast<double>(gaps.sumTicks.exchange(0)) / 100000.0 / static_cast<double>(count) : 0.0;
-        if (count == 0) continue;
-        std::fprintf(stderr, "[lab-census]   %s: gaps between consecutive stamps of one thread (real time, clock scale %.3f) n=%llu mean %.2f ms max %.2f ms; <10us %llu <100us %llu <1ms %llu <5ms %llu <16.7ms %llu <50ms %llu <150ms %llu >=150ms %llu\n", kindNames[kind], GpuClockScale(), static_cast<unsigned long long>(count), meanMs, maxMs, static_cast<unsigned long long>(b[0]), static_cast<unsigned long long>(b[1]), static_cast<unsigned long long>(b[2]), static_cast<unsigned long long>(b[3]), static_cast<unsigned long long>(b[4]), static_cast<unsigned long long>(b[5]), static_cast<unsigned long long>(b[6]), static_cast<unsigned long long>(b[7]));
+    for (int slot = 0; slot < StampSlots; ++slot) {
+        StampSlot& owner = AllStampSlots()[slot];
+        const std::uint64_t tag = owner.tag.load(std::memory_order_relaxed);
+        for (int kind = 0; kind < 3; ++kind) {
+            StampGaps& gaps = owner.gaps[kind];
+            const std::uint64_t count = gaps.count.exchange(0);
+            std::uint64_t b[8];
+            for (int i = 0; i < 8; ++i) b[i] = gaps.buckets[i].exchange(0);
+            const double maxMs = static_cast<double>(gaps.maxTicks.exchange(0)) / 100000.0;
+            const double meanMs = count != 0 ? static_cast<double>(gaps.sumTicks.exchange(0)) / 100000.0 / static_cast<double>(count) : 0.0;
+            if (count == 0) continue;
+            std::fprintf(stderr, "[lab-census]   %s: gaps between consecutive stamps of one thread tid=%06llx (real time, clock scale %.3f) n=%llu mean %.2f ms max %.2f ms; <10us %llu <100us %llu <1ms %llu <5ms %llu <16.7ms %llu <50ms %llu <150ms %llu >=150ms %llu\n", kindNames[kind], static_cast<unsigned long long>(tag - 1), GpuClockScale(), static_cast<unsigned long long>(count), meanMs, maxMs, static_cast<unsigned long long>(b[0]), static_cast<unsigned long long>(b[1]), static_cast<unsigned long long>(b[2]), static_cast<unsigned long long>(b[3]), static_cast<unsigned long long>(b[4]), static_cast<unsigned long long>(b[5]), static_cast<unsigned long long>(b[6]), static_cast<unsigned long long>(b[7]));
+        }
     }
     for (std::size_t i = 0; i < sorted.size() && i < 14; ++i) {
         const auto& key = sorted[i].second;
