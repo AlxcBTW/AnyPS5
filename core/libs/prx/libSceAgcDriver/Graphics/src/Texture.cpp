@@ -148,6 +148,20 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     reportStorageTraffic(traffic);
 }
 
+// APS5_WB_DIRECT_SLAB=1 (lab): windows of a block write-back that are fully covered by kept bytes
+// (no padding seed of their own) and land in one unit-shadow slab piece are retiled straight into
+// the slab, skipping the tiled scratch and the scratch-to-slab copy (see writeBackWindows). The
+// test override wins over the environment (-1: environment, 0: off, 1: on).
+std::atomic<std::uint64_t> directSlabWindows{0};
+std::atomic<int> directSlabForTest{-1};
+
+bool WbDirectSlab() {
+    const auto test = directSlabForTest.load(std::memory_order_relaxed);
+    if (test >= 0) return test != 0;
+    static const bool enabled = std::getenv("APS5_WB_DIRECT_SLAB") != nullptr;
+    return enabled;
+}
+
 // Bytes the calling thread's write-backs stored so far, and whether its last upload took the DCC
 // clear path: the [roundtrip] census of storage-refresh write-backs whose next op is a full clear.
 thread_local std::uint64_t threadWriteBackBytes = 0;
@@ -2685,6 +2699,14 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     return uploadedBytes;
 }
 
+void SetWbDirectSlabForTest(bool on) {
+    directSlabForTest.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
+std::uint64_t WbDirectSlabWindows() {
+    return directSlabWindows.load(std::memory_order_relaxed);
+}
+
 std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -2710,6 +2732,48 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     windowCensusWriteBacks.fetch_add(1, std::memory_order_relaxed);
     windowCensusBefore.fetch_add(windowsBefore, std::memory_order_relaxed);
     windowCensusAfter.fetch_add(windows.size(), std::memory_order_relaxed);
+    // APS5_WB_DIRECT_SLAB: a window whose every tiled byte a retile writes (no byte of it is
+    // uncovered, so no padding seed into scratch is needed for it), that APS5_YOLO_BATCH's merge
+    // did not widen past the kept runs (a retile into a slab would store the gaps too), that no
+    // other window overlaps (the shared tail regions included: dispatches to one slab range are
+    // unordered against each other) and whose guest range lies in one slab piece is retiled
+    // straight into that slab below; its scratch region and copy are skipped. The destinations
+    // are chosen with the pieces' below, before anything is recorded (a chosen slab stays pinned
+    // by its destination, as there).
+    struct DirectSlabWindow {
+        ShadowDestination destination;
+    };
+    std::vector<std::optional<DirectSlabWindow>> directWindows(windows.size());
+    if (WbDirectSlab() && UnitShadowEnabled()) {
+        const auto uncovered = uncoveredBytes(runs);
+        const auto overlapsUncovered = [&](std::uint64_t begin, std::uint64_t end) {
+            return std::any_of(uncovered.begin(), uncovered.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
+        };
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> sortedRuns(runs.begin(), runs.end());
+        std::sort(sortedRuns.begin(), sortedRuns.end());
+        const auto coveredByRuns = [&](std::uint64_t begin, std::uint64_t end) {
+            auto at = begin;
+            for (const auto& [from, to] : sortedRuns) {
+                if (to <= at) continue;
+                if (from > at) return false;
+                at = to;
+                if (at >= end) return true;
+            }
+            return at >= end;
+        };
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& window = windows[i];
+            if (window.tiledBegin >= window.tiledEnd || overlapsUncovered(window.tiledBegin, window.tiledEnd) || !coveredByRuns(window.tiledBegin, window.tiledEnd)) continue;
+            bool overlapped = false;
+            for (std::size_t j = 0; j < windows.size() && !overlapped; ++j) overlapped = j != i && window.tiledBegin < windows[j].tiledEnd && windows[j].tiledBegin < window.tiledEnd;
+            if (overlapped) continue;
+            const auto guestBegin = descriptor.baseAddress + window.tiledBegin;
+            const auto guestEnd = descriptor.baseAddress + window.tiledEnd;
+            if (SlabBoundary(import, guestBegin) < guestEnd) continue;
+            auto destination = ShadowDestinationFor(context, import, guestBegin, guestEnd);
+            if (destination.has_value()) directWindows[i] = DirectSlabWindow{std::move(*destination)};
+        }
+    }
     // The linear rows and the tiled bytes of every window, each at a 256-byte position; the tail
     // levels of a layer retile into one scratch region (their block is shared).
     std::vector<std::uint64_t> linearPositions, scratchPositions;
@@ -2770,8 +2834,22 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             const auto begin = std::max(from, window.tiledBegin);
             const auto end = std::min(to, window.tiledEnd);
             if (begin >= end) continue;
-            addPiece(scratchPositions[i] + (begin - window.tiledBegin), descriptor.baseAddress + begin, descriptor.baseAddress + end);
+            if (!directWindows[i].has_value()) addPiece(scratchPositions[i] + (begin - window.tiledBegin), descriptor.baseAddress + begin, descriptor.baseAddress + end);
         }
+    }
+    // A direct window's slab destination (APS5_WB_DIRECT_SLAB): the seeds of the units its range
+    // covers partly, as a piece's, and its range among the shadowed ones; no copy out of scratch.
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        if (!directWindows[i].has_value()) continue;
+        const auto& directWindow = *directWindows[i];
+        for (const auto& [seedBegin, seedEnd] : directWindow.destination.seedUnits) {
+            if (std::none_of(seeds.begin(), seeds.end(), [&](const ShadowedRange& seed) { return seed.begin == seedBegin; })) seeds.push_back({seedBegin, seedEnd, directWindow.destination.slab});
+        }
+        const auto guestBegin = descriptor.baseAddress + windows[i].tiledBegin;
+        const auto guestEnd = descriptor.baseAddress + windows[i].tiledEnd;
+        if (!shadowed.empty() && shadowed.back().end == guestBegin && shadowed.back().slab == directWindow.destination.slab) shadowed.back().end = guestEnd;
+        else shadowed.push_back({guestBegin, guestEnd, directWindow.destination.slab});
+        directSlabWindows.fetch_add(1, std::memory_order_relaxed);
     }
     std::sort(seeds.begin(), seeds.end(), [](const ShadowedRange& a, const ShadowedRange& b) { return a.begin < b.begin; });
     std::vector<CopiedBytes> copied;
@@ -2809,6 +2887,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         if (linear) recorder->Keep(linear, linear->Size());
         recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
+        for (const auto& directWindow : directWindows) if (directWindow.has_value()) recorder->Keep(directWindow->destination.slab);
         for (const auto& slab : padding.slabs) recorder->Keep(slab);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, direct ? 3 : 4);
@@ -2864,7 +2943,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             const auto& window = windows[i];
             auto retile = window.window;
             retile.pipeBankXor = descriptor.pipeBankXor;
-            detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, tiledScratch->Handle(), scratchPositions[i], elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, retile);
+            const auto& directWindow = directWindows[i];
+            detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, directWindow.has_value() ? directWindow->destination.buffer : tiledScratch->Handle(), directWindow.has_value() ? directWindow->destination.offset : scratchPositions[i], elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, retile);
         }
         singlePassMoves.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -2882,7 +2962,8 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             const auto& window = windows[i];
             auto retile = window.window;
             retile.pipeBankXor = descriptor.pipeBankXor;
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, retile);
+            const auto& directWindow = directWindows[i];
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], directWindow.has_value() ? directWindow->destination.buffer : tiledScratch->Handle(), directWindow.has_value() ? directWindow->destination.offset : scratchPositions[i], mips[window.level], true, window.layer, false, retile);
         }
     }
     {

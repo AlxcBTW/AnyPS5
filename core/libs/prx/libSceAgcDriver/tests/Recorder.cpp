@@ -3687,6 +3687,96 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
     std::cout << "write-back padding" << (watched ? " (watched)" : "") << ": ok\n";
 }
 
+// APS5_WB_DIRECT_SLAB (writeBackWindows): the same cleared image over watched memory is stored
+// twice, once through the tiled scratch and once retiled straight into the unit shadow's slab;
+// the guest bytes afterwards (read through the flush hook, which publishes the slab) are equal
+// over the whole allocation, and the second store took the direct path. The surface is whole
+// 64 KiB tile blocks (256x256 at 4 bytes: 2x2 blocks, no padding byte of its own) in one slab.
+void directSlabWriteBackTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (!UnitShadowEnabled() || base.hostImportAlignment == 0) {
+        std::cout << "unit shadows or host imports unavailable: direct slab write-back not tested\n";
+        return;
+    }
+    GuestTextureResource resource{};
+    resource.width = 256;
+    resource.height = 256;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    const auto surfaceBytes = static_cast<std::size_t>(geometry.guestBytes);
+    const auto bytes = (surfaceBytes + 65535) / 65536 * 65536 + 65536;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: direct slab write-back not tested\n";
+        return;
+    }
+    const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
+    auto* memory = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block, address, bytes};
+    if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host import of the direct slab block refused or unwatched: direct slab write-back not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    resource.baseAddress = address;
+    const auto store = [&](bool direct) {
+        for (std::size_t i = 0; i < bytes; ++i) memory[i] = pattern(i);
+        SetWbDirectSlabForTest(direct);
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        const VkClearColorValue value{{1.0f, 0.0f, 0.0f, 1.0f}};
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        image->MarkDirty();
+        image->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        std::vector<std::byte> read(bytes);
+        AgcDriver::GuestMemory::Read(address, read);
+        return read;
+    };
+    const auto before = WbDirectSlabWindows();
+    const auto scratch = store(false);
+    Require(WbDirectSlabWindows() == before, "a window was retiled into the slab with the direct path off");
+    const auto direct = store(true);
+    SetWbDirectSlabForTest(false);
+    Require(WbDirectSlabWindows() > before, "no window was retiled straight into the slab with the direct path on");
+    Require(scratch == direct, "the direct slab write-back left different guest bytes than the scratch path");
+    recorder.Sync();
+    std::cout << "direct slab write-back: ok\n";
+}
+
 void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0 || !base.singlePassStorage) {
@@ -6375,6 +6465,7 @@ int main(int argc, char** argv) {
         static_cast<void>(writtenBufferOrderTests(device, recorder));
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);
+        directSlabWriteBackTests(device, recorder);
         singlePassTests(device, recorder, false);
         singlePassTests(device, recorder, true);
         unchangedCpuStampTests(device, recorder);

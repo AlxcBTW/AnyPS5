@@ -25,6 +25,12 @@ namespace AgcDriver::Graphics {
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
+
+// APS5_WB_DIRECT_SLAB=1 (lab, StorageTexture::writeBackWindows): a window fully covered by kept
+// bytes that lands in one slab piece is retiled straight into the slab, without the tiled scratch
+// and its copy. Tests: force the switch either way and read how many windows took the direct path.
+void SetWbDirectSlabForTest(bool on);
+std::uint64_t WbDirectSlabWindows();
 struct HostImport;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
