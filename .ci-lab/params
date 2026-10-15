@@ -1,0 +1,5 @@
+name=cpu-lab1
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-lab1-9258040a23-34520
