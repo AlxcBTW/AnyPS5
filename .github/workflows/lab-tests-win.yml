@@ -1,6 +1,6 @@
 # Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the write tracking tests on a Windows runner twice, with
 # main's GuestMemory.cpp (.ci-lab/GuestMemory.main.cpp) and with the branch's, and runs them after each build. The
-# driver test is only compiled and run (it skips without a Vulkan device).
+# recorder test is only compiled and run (it skips without a Vulkan device).
 name: Lab tests windows
 
 on:
@@ -72,6 +72,6 @@ jobs:
         run: |
           cp "$RUNNER_TEMP/GuestMemory.branch.cpp" "$GUEST_MEMORY"
           git diff --stat -- "$GUEST_MEMORY" | tail -n 3
-          cmake --build build --target agc_write_tracking_tests agc_write_watch_coverage_tests agc_driver_store_over_untracked_tests --parallel 4
+          cmake --build build --target agc_write_tracking_tests agc_write_watch_coverage_tests agc_driver_recorder_tests --parallel 4
       - name: Test with the branch's GuestMemory.cpp
-        run: ctest --test-dir build -V --timeout 120 -R '^(agc_write_tracking|agc_write_watch_coverage|agc_driver_store_over_untracked)$'
+        run: ctest --test-dir build -V --timeout 120 -R '^(agc_write_tracking|agc_write_watch_coverage|agc_import_watch)$'

@@ -811,8 +811,13 @@ void CheckUnwalkedImport() {
     unwatchCalls.clear();
     unwatchProbe = base + Block;
     unwatchProbeBytes = 3 * Block;
-    Require(ImportWatched(base, 4 * Block, [] { return true; }), "an import over a range with an unwatched block failed");
+    bool hookedBeforeImport = false;
+    Require(ImportWatched(base, 4 * Block, [&] {
+        hookedBeforeImport = unwatchCalls.size() == 1;
+        return true;
+    }), "an import over a range with an unwatched block failed");
     Require(unwatchCalls.size() == 1, "an import whose page walk could not vouch for its pages did not run the unwatch hook once");
+    Require(hookedBeforeImport, "the unwatch hook of an import whose page walk could not vouch for its pages ran after the import");
     const auto& call = unwatchCalls.front();
     Require(call.address <= base && base + 4 * Block <= call.address + call.bytes, "the unwatch hook did not get the imported range");
     Require(call.watched, "the unwatch hook ran after the imported range left the write watch");
