@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#include "prx/libc/include/WindowsDescriptor.hpp"
 #endif
 
 #include "prx/libc/include/FileStream.hpp"
@@ -244,6 +245,11 @@ FileStream* APS5_VABI fdopen_nid_postfix(int descriptor, const char* mode) {
         const auto release = [](void* pointer) { ::operator delete(pointer); };
         std::unique_ptr<void, decltype(release)> storage(::operator new(sizeof(FileStream)), release);
 #ifdef _WIN32
+        const auto handle = WindowsDescriptorHandle_nid_no_patch(descriptor);
+        if (handle == INVALID_HANDLE_VALUE) { errno = 9; return nullptr; }
+        const int access = WindowsDescriptorAccess_nid_no_patch(handle, descriptor, "fdopen");
+        const int requested = nativeMode.find('+') != std::string::npos ? 2 : nativeMode[0] == 'r' ? 0 : 1;
+        if (access != 2 && access != requested) { errno = 22; return nullptr; }
         if (parsed->append && !AppendThroughDescriptor(descriptor)) return nullptr;
         auto* native = ::_fdopen(descriptor, nativeMode.c_str());
 #else
@@ -439,8 +445,9 @@ int APS5_VABI fflush_nid_postfix(FileStream* stream) {
 #ifdef __linux__
     if (native && !__fwriting(native)) return 0;
 #endif
-    if (std::fflush(native) != 0) throw std::runtime_error("fflush: flush failed");
-    return 0;
+    const int result = std::fflush(native);
+    if (stream) stream->SyncStatus();
+    return result;
 }
 
 int APS5_VABI malloc_stats_fast_nid_postfix(void* stats) {
