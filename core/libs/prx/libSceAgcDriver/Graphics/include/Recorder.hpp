@@ -17,6 +17,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -65,6 +66,8 @@ public:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
+        // Lab only (APS5_LAB_RANGELOG note): why the draw did not continue the open pass.
+        const char* reason = "";
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
@@ -453,6 +456,15 @@ public:
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    // Lab only (gpu agent): APS5_LAB_RANGELOG=<firstPresent>:<count> (with APS5_PROFILE_GPU=1) annotates every
+    // timed range recorded while Presents() is inside the window and prints each one as a [labrange] line when its
+    // batch's stamps are read: batch serial, index, start (us from the batch's first stamp), duration, class or
+    // program, bytes, and the notes the recording site made. LabLogging(): the window is open now. LabNote appends
+    // to range `timing` of the open batch; LabNotePass to the range of the draw pass `beginTiming` opened, or of the
+    // open pass when the draw continued it (NoTiming). Both do nothing outside the window.
+    static bool LabLogging();
+    void LabNote(std::uint32_t timing, const std::string& text);
+    void LabNotePass(std::uint32_t passTiming, const std::string& text);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -570,6 +582,10 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Lab only: the notes of the timed ranges (see LabNote) and whether the batch was recorded inside the window.
+        std::vector<std::string> labNotes;
+        bool labWindow = false;
+        std::uint64_t labPresent = 0;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

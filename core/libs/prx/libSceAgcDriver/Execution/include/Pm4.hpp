@@ -60,6 +60,10 @@ struct DrawParameters {
         std::uint32_t InstanceDwordOffset() const { return recordBytes == 20 ? 16u : 12u; }
     };
     std::optional<IndirectDraw> indirect;
+    // Lab only (APS5_LAB_RANGELOG): the guest code addresses of the draw's first vertex-side and its pixel program,
+    // for the notes of the draw's [labrange] line; set by Driver::draw, never read for behaviour.
+    std::uint64_t labVertex = 0;
+    std::uint64_t labFragment = 0;
 };
 
 // One indirect draw record as the CP reads it (firstVertexOrIndex is startVertex for the

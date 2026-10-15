@@ -2247,6 +2247,11 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
+    if (Graphics::Recorder::LabLogging()) {
+        char text[200];
+        std::snprintf(text, sizeof(text), "FILL addr=0x%llx bytes=%zu uniform=%d pattern=%08x import=0x%llx+0x%llx", static_cast<unsigned long long>(address), bytes, uniform ? 1 : 0, pattern[0], static_cast<unsigned long long>(import->base), static_cast<unsigned long long>(import->bytes));
+        recorder.LabNote(timing, text);
+    }
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
         recorder.NoteAccess(CommandClass::Fill, Graphics::Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -2512,6 +2517,11 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const auto commands = recorder.Commands(&covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
+    if (Graphics::Recorder::LabLogging()) {
+        char text[224];
+        std::snprintf(text, sizeof(text), "COPYBUF src=0x%llx dst=0x%llx bytes=%zu q=0x%x prog=0x%llx", static_cast<unsigned long long>(source), static_cast<unsigned long long>(destination), bytes, queue, static_cast<unsigned long long>(programAddress));
+        recorder.LabNote(classTiming, text);
+    }
     if (Graphics::Recorder::BarrierValidate()) {
         const std::pair<std::uint64_t, std::uint64_t> read{source, source + bytes}, written{destination, destination + bytes};
         recorder.NoteAccess(CommandClass::Copy, Graphics::Recorder::Access{std::span(&read, 1), std::span(&written, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -4375,6 +4385,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (Graphics::Recorder::LabLogging()) {
+        // Lab only (APS5_LAB_RANGELOG): the dispatch's shape and where its inputs live, for the [labrange] line.
+        std::uint64_t inPlaceBytes = 0;
+        if (!resources.HoldsLease()) {
+            for (const auto& [begin, end] : resources.InPlaceReads()) inPlaceBytes += end - begin;
+        }
+        char text[384];
+        std::snprintf(text, sizeof(text), "DISPATCH prog=0x%llx grp=%ux%ux%u sg=%u lds=%u ind=%d inplace=%.2fMiB imgs=%zu lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.shader->program->hostSubgroupSize, record.shader->program->workgroupMemoryDwords, argumentImport != nullptr ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, resources.StorageImages().size(), resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
+        recorder.LabNote(gpuTiming, text);
+    }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     if (argumentImport != nullptr) {
         context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);

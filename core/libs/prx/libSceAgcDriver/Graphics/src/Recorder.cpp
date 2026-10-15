@@ -1378,20 +1378,22 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        const char* why = !pass.open ? "none-open" : forced ? "forced" : "samples";
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
-        return {commands, false, true};
+        return {commands, false, true, why};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    const char* why = hazard != PassHazard::None ? (pass.key == key ? "hazard-samekey" : "hazard-newkey") : "newkey";
     endOpenRenderPass(!merge);
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
-    return {commands, false, !elide};
+    return {commands, false, !elide, why};
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -1892,6 +1894,48 @@ std::uint64_t Recorder::Presents() {
     return presentSerial.load(std::memory_order_relaxed);
 }
 
+namespace {
+// APS5_LAB_RANGELOG=<firstPresent>:<count> (see Recorder::LabLogging).
+struct LabWindow {
+    bool configured = false;
+    std::uint64_t first = 0;
+    std::uint64_t count = 0;
+};
+const LabWindow& LabWindowConfig() {
+    static const LabWindow window = [] {
+        LabWindow parsed;
+        const char* text = std::getenv("APS5_LAB_RANGELOG");
+        if (text == nullptr) return parsed;
+        char* end = nullptr;
+        parsed.first = std::strtoull(text, &end, 10);
+        parsed.count = (end != nullptr && *end == ':') ? std::strtoull(end + 1, nullptr, 10) : 1;
+        parsed.configured = parsed.count != 0;
+        return parsed;
+    }();
+    return window;
+}
+}
+
+bool Recorder::LabLogging() {
+    const auto& window = LabWindowConfig();
+    if (!window.configured || !GpuTimingEnabled()) return false;
+    const auto now = presentSerial.load(std::memory_order_relaxed);
+    return now >= window.first && now < window.first + window.count;
+}
+
+void Recorder::LabNote(std::uint32_t timing, const std::string& text) {
+    if (timing == NoTiming || open == nullptr || !open->labWindow || text.empty()) return;
+    auto& notes = open->labNotes;
+    if (notes.size() <= timing) notes.resize(static_cast<std::size_t>(timing) + 1);
+    if (!notes[timing].empty()) notes[timing] += " ; ";
+    notes[timing] += text;
+}
+
+void Recorder::LabNotePass(std::uint32_t passTiming, const std::string& text) {
+    if (open == nullptr) return;
+    LabNote(passTiming != NoTiming ? passTiming : open->renderPass.timing, text);
+}
+
 void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes) {
     std::lock_guard lock(timingMutex);
     auto& totals = timingByKey[ClassKey(which)];
@@ -1934,6 +1978,10 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    if (full && LabLogging()) {
+        open->labWindow = true;
+        if (open->labPresent == 0) open->labPresent = Presents();
+    }
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2423,6 +2471,22 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+    }
+    if (batch.labWindow) {
+        // Lab only (APS5_LAB_RANGELOG): every range of the batch with its notes, start relative to the batch's first stamp.
+        double base = static_cast<double>(stamps[0]) * period;
+        if (batch.batchTiming != NoTiming && batch.batchTiming < batch.timedKeys.size()) base = static_cast<double>(stamps[batch.batchTiming * 2]) * period;
+        for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+            const auto key = batch.timedKeys[i];
+            char name[48];
+            if (i == batch.batchTiming) std::snprintf(name, sizeof(name), "batch");
+            else if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+            else std::snprintf(name, sizeof(name), "prog 0x%llx", static_cast<unsigned long long>(key));
+            const double startUs = (static_cast<double>(stamps[i * 2]) * period - base) / 1e3;
+            const double durationUs = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period / 1e3;
+            const char* note = i < batch.labNotes.size() ? batch.labNotes[i].c_str() : "";
+            std::fprintf(stderr, "[labrange] p=%llu b=%llu n=%zu t=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), i, startUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
+        }
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;

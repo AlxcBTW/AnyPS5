@@ -47,6 +47,9 @@ std::atomic<std::int64_t> tracePublishesLeft{[] {
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
 }()};
 std::atomic<std::int64_t> traceSeedsLeft{64};
+// Lab only (APS5_LAB_RANGELOG): the range the publish in progress was asked for (PublishShadow's), for its note.
+thread_local std::uint64_t labRequestAddress = 0;
+thread_local std::uint64_t labRequestBytes = 0;
 
 bool TraceEnabled() {
     static const bool enabled = std::getenv("APS5_TRACE_SHADOW") != nullptr;
@@ -222,7 +225,7 @@ struct SlabCopies {
 
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
-void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, const std::string& labNote) {
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
@@ -233,6 +236,11 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     if (recorder != nullptr) {
         commands = recorder->Commands(&covered);
         timing = recorder->BeginGpuTiming(CommandClass::ShadowPublish);
+        if (!labNote.empty()) {
+            std::size_t regions = 0;
+            for (const auto& entry : copies) regions += entry.regions.size();
+            recorder->LabNote(timing, labNote + " slabs=" + std::to_string(copies.size()) + " regions=" + std::to_string(regions) + " bytes=" + std::to_string(bytes));
+        }
         if (Recorder::BarrierValidate()) recorder->NoteAccess(CommandClass::ShadowPublish, Recorder::Access{{}, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     } else {
         batch = std::make_unique<CommandBatch>(context);
@@ -359,7 +367,22 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto packet = GuestMemory::CurrentPacket();
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
-    recordCopies(*shadow, copies, ranges, bytes);
+    std::string labNote;
+    if (Recorder::LabLogging()) {
+        // Lab only (APS5_LAB_RANGELOG): who asked for the publish (reason, read site, packet, driver callers as module offsets).
+        const auto packet = GuestMemory::CurrentPacket();
+        unsigned long long frames[8] = {};
+        const auto captured = GuestMemory::CaptureCallerOffsets(std::span<unsigned long long>(frames), 1);
+        char text[352];
+        std::snprintf(text, sizeof(text), "PUBLISH reason=%s site=%s pkt=0x%x q=0x%x units=%zu ranges=%zu first=[0x%llx+0x%llx] req=[0x%llx+0x%llx] callers=", ReasonNames[static_cast<std::size_t>(reason)], GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()), static_cast<unsigned>(packet.opcode), static_cast<unsigned>(packet.queue), units, ranges.size(), static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), static_cast<unsigned long long>(labRequestAddress), static_cast<unsigned long long>(labRequestBytes));
+        labNote = text;
+        for (std::size_t i = 0; i < captured && i < 8; ++i) {
+            char piece[32];
+            std::snprintf(piece, sizeof(piece), "%s0x%llx", i == 0 ? "" : ",", frames[i]);
+            labNote += piece;
+        }
+    }
+    recordCopies(*shadow, copies, ranges, bytes, labNote);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }
@@ -486,7 +509,11 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
         shadows = overlapping(registry, address, end);
     }
     std::size_t units = 0;
+    labRequestAddress = address;
+    labRequestBytes = bytes;
     for (const auto& shadow : shadows) units += publishRange(shadow, address, end, scope, reason);
+    labRequestAddress = 0;
+    labRequestBytes = 0;
     return units;
 }
 

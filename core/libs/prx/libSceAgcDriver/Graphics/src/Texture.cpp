@@ -2202,6 +2202,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (recorder != nullptr) {
             commands = recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
+            if (Recorder::LabLogging()) recorder->LabNote(timing, "DCCCLEAR(upload) " + LabText());
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
             ++Profile().storageRecordedClears;
             Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
@@ -2292,6 +2293,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
             commands = recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+            if (Recorder::LabLogging()) recorder->LabNote(timing, std::string("UPLOAD(import") + (direct ? ",direct" : ",linear") + ") " + LabText());
             if (linear) recorder->Keep(linear, linear->Size());
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -2718,6 +2720,13 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         for (const auto& [begin, end] : reads) recorder->FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
         commands = recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        if (Recorder::LabLogging()) {
+            std::size_t shadowPieces = 0;
+            for (const auto& source : sources) shadowPieces += source.shadow ? 1u : 0u;
+            char counts[128];
+            std::snprintf(counts, sizeof(counts), "UPLOAD(windows,%s) sources=%zu shadow=%zu bytes=%llu ", direct ? "direct" : "linear", sources.size(), shadowPieces, static_cast<unsigned long long>(uploadedBytes));
+            recorder->LabNote(timing, counts + LabText());
+        }
         if (linear) recorder->Keep(linear, linear->Size());
         for (const auto& source : sources) {
             if (source.slab != nullptr) recorder->Keep(source.slab);
@@ -2922,6 +2931,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         recorder->FlushStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
         commands = recorder->Commands(&covered);
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+        if (Recorder::LabLogging()) recorder->LabNote(timing, std::string("WRITEBACK(shadow") + (direct ? ",direct" : ",linear") + ") slabs=" + std::to_string(slabPieces.size()) + " reason=" + std::string(flushReason != nullptr ? flushReason : "?") + " " + LabText());
         if (linear) recorder->Keep(linear, linear->Size());
         recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
@@ -3981,6 +3991,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     }
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
+    if (Recorder::LabLogging()) recorder->LabNote(timing, "DCCCLEAR(keys fill " + std::string(DccKeysName(keys)) + ") " + LabText());
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
     if (Recorder::BarrierValidate()) {
@@ -4115,6 +4126,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     GuestMemory::MarkWritten(begin, bytes);
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
+    if (Recorder::LabLogging()) recorder->LabNote(timing, "FILLCLEAR " + LabText());
     Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (Recorder::BarrierValidate()) {
@@ -4177,6 +4189,12 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     forgetBorrowed(0, trackedLayers);
     MarkDirty();
     return true;
+}
+
+std::string StorageTexture::LabText() const {
+    char text[256];
+    std::snprintf(text, sizeof(text), "img=0x%llx %ux%u mips=%u layers=%u fmt=%d vk=%d tile=%d bytes=%llu dcc=0x%llx", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned>(descriptor.width), static_cast<unsigned>(descriptor.height), static_cast<unsigned>(descriptor.mipCount), static_cast<unsigned>(arrayLayers), static_cast<int>(descriptor.format), static_cast<int>(storageFormat), static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress));
+    return text;
 }
 
 void StorageTexture::WriteBack() {
@@ -4242,6 +4260,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+    if (Recorder::LabLogging()) recorder->LabNote(timing, "COPYIMG src=[" + source.LabText() + "] dst=[" + LabText() + "]");
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
@@ -4421,6 +4440,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     if (recorder != nullptr) {
         commands = recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        if (Recorder::LabLogging()) recorder->LabNote(timing, "UPLOAD(from image) src=[" + source.LabText() + "] dst=[" + LabText() + "]");
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
         Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 2);
@@ -4719,6 +4739,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->FlushStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             commands = recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+            if (Recorder::LabLogging()) recorder->LabNote(timing, "WRITEBACK(import) stored=" + std::to_string(storedBytes) + " reason=" + std::string(flushReason != nullptr ? flushReason : "?") + " " + LabText());
             if (linear) recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
             for (const auto& slab : padding.slabs) recorder->Keep(slab);

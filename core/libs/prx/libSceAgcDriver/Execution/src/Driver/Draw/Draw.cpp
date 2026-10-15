@@ -165,6 +165,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto line = FormatDrawProgramTrace(submission.serial, submission.queue, identities);
         std::fprintf(stderr, "%s\n", line.c_str());
     }
+    // Lab only (see Pm4::DrawParameters::labVertex): the guest code addresses behind the draw's [labrange] note.
+    for (std::size_t i = 0; i < programs.size(); ++i) {
+        if (programs[i].binary.stage == Stage::Fragment) drawParameters.labFragment = programs[i].binary.codeAddress;
+        else if (drawParameters.labVertex == 0 && roles[i] != Role::GeometryBack) drawParameters.labVertex = programs[i].binary.codeAddress;
+    }
     phaseTiming.Phase(DrawRowDecode);
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {

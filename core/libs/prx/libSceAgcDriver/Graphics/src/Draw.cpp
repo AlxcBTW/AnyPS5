@@ -1761,6 +1761,34 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (Recorder::LabLogging()) {
+        // Lab only (APS5_LAB_RANGELOG): what the pass (first draw) and every draw of it are, for the [labrange] line.
+        std::string note;
+        char text[480];
+        if (!continued) {
+            std::snprintf(text, sizeof(text), "PASS why=%s readsTarget=%d gpuInd=%d meshInd=%d capture=%d fenced=%d barrier=%d extent=%ux%u spp=%u layers=%u", start.reason, readsTarget ? 1 : 0, gpuIndirect ? 1 : 0, meshIndirect ? 1 : 0, capture ? 1 : 0, fenced ? 1 : 0, start.barrier ? 1 : 0, state.renderExtent.width, state.renderExtent.height, state.samples, state.renderLayers);
+            note += text;
+            for (const auto& color : state.colors) {
+                std::snprintf(text, sizeof(text), " rt=0x%llx:%ux%u:f%d:b%zu%s", static_cast<unsigned long long>(color.address), color.extent.width, color.extent.height, static_cast<int>(color.format), color.bytes, color.dccAddress != 0 ? ":dcc" : "");
+                note += text;
+            }
+            if (state.depth.has_value()) {
+                std::snprintf(text, sizeof(text), " depth=0x%llx:%ux%u:f%d", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format));
+                note += text;
+            }
+            note += " | ";
+        }
+        std::uint64_t inPlaceBytes = 0, deviceBytes = 0;
+        if (!resources.HoldsLease()) {
+            for (const auto& [begin, end] : resources.InPlaceReads()) inPlaceBytes += end - begin;
+            for (const auto& [begin, end] : resources.DeviceReads()) deviceBytes += end - begin;
+        }
+        std::uint32_t blends = 0;
+        for (const auto& blend : state.blends) blends += blend.blendEnable == VK_TRUE ? 1u : 0u;
+        std::snprintf(text, sizeof(text), "DRAW vs=0x%llx ps=0x%llx %s=%u inst=%u ind=%d topo=%d rect=%d blend=%u dtest=%d dwrite=%d inplace=%.2fMiB dev=%.2fMiB imgs=%zu lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(draw.labVertex), static_cast<unsigned long long>(draw.labFragment), draw.indexed ? "idx" : "vtx", draw.indexCount, draw.instanceCount, draw.indirect ? 1 : 0, static_cast<int>(state.topology), state.rectList ? 1 : 0, blends, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, static_cast<double>(deviceBytes) / 1048576.0, resources.StorageImages().size(), resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
+        note += text;
+        recorder->LabNotePass(drawTiming, note);
+    }
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());

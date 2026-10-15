@@ -3881,6 +3881,18 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    if (Recorder::LabLogging()) {
+        // Lab only (APS5_LAB_RANGELOG): the regions staged into device memory by this range.
+        std::string text = "STAGEIN regions=" + std::to_string(copies.size());
+        std::size_t shown = 0;
+        for (const auto* region : copies) {
+            if (shown++ >= 4) break;
+            char piece[112];
+            std::snprintf(piece, sizeof(piece), " [0x%llx+%llu%s%s]", static_cast<unsigned long long>(region->begin), static_cast<unsigned long long>(region->end - region->begin), region->deviceLocal ? " dev" : "", region->writable ? " w" : "");
+            text += piece;
+        }
+        recorder->LabNote(timing, text);
+    }
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
         for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
@@ -4030,6 +4042,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
+    if (Recorder::LabLogging()) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "STAGEOUT ranges=%zu bytes=%llu first=[0x%llx+%llu]", merged.size(), static_cast<unsigned long long>(copiedBytes), merged.empty() ? 0ull : static_cast<unsigned long long>(merged.front().first), merged.empty() ? 0ull : static_cast<unsigned long long>(merged.front().second - merged.front().first));
+        recorder.LabNote(timing, text);
+    }
     recorder.EndGpuTiming(timing, copiedBytes);
 }
 
