@@ -312,6 +312,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
 
 void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("guest submit");
+    PerformanceTimer submitTiming("Driver.Submit");
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < 0x58), "unsupported compute queue");
     GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
@@ -330,12 +332,17 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
+    submitTiming.Mark("copy");
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
+    submitTiming.Mark("validate");
     waitForFlipRoom(submission);
+    submitTiming.Mark("flip_room");
     holdFlipBehindWorker(submission);
+    submitTiming.Mark("flip_hold");
     AwaitRegistrationPreparation();
+    submitTiming.Mark("registration");
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));
@@ -369,6 +376,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue) {
         ++accepted;
     }
     changed.notify_all();
+    submitTiming.Mark("enqueue");
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
 }
 
