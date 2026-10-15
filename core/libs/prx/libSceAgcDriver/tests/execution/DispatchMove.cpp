@@ -124,7 +124,7 @@ void Reset(std::uint32_t* output) {
     std::fill(output, output + Words, Sentinel);
 }
 
-void Run(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint32_t inputBytes, const std::uint32_t* output, bool wait) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint32_t inputBytes, const std::uint32_t* output) {
     const auto in = BufferDescriptor(input, inputBytes);
     const auto out = BufferDescriptor(output, Bytes);
     std::copy(in.begin(), in.end(), Table.begin());
@@ -142,8 +142,22 @@ void Run(AgcDriver::VulkanDevice& device, const std::uint32_t* input, std::uint3
         {0, 0, 0, 128}
     };
     request.useCache = false;
-    const auto result = ShaderRecompiler::Recompile(request);
-    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
+    return ShaderRecompiler::Recompile(request);
+}
+
+void Run(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& compiled, const std::uint32_t* input, std::uint32_t inputBytes, const std::uint32_t* output, bool wait) {
+    auto result = compiled;
+    std::size_t elements = 0;
+    for (auto& binding : result.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+        Require(binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u && binding.bufferWritten.size() == binding.count, "dispatch move: the program's buffer bindings have another shape");
+        for (std::uint32_t element = 0; element < binding.count; ++element, ++elements) {
+            const auto words = binding.bufferWritten[element] ? BufferDescriptor(output, Bytes) : BufferDescriptor(input, inputBytes);
+            std::copy(words.begin(), words.end(), binding.guestDescriptor.begin() + static_cast<std::ptrdiff_t>(element) * 4);
+        }
+    }
+    Require(elements == 2, "dispatch move: the program does not bind an input and an output");
+    device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(Code.data()));
     if (wait) device.WaitIdle();
 }
 
@@ -172,19 +186,20 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Fill(guest.InputB(), 0xb000u);
     Fill(guest.InputC(), 0xc000u);
 
+    const auto compiled = Compile(device, guest.InputA(), Bytes, guest.OutputO());
     Reset(guest.OutputO());
-    Run(device, guest.InputA(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
     Expect(guest.InputA(), guest.OutputO(), Constant, "the first dispatch");
     const auto start = AgcDriver::VulkanDevice::DispatchMoveCounts();
 
     Reset(guest.OutputO());
-    Run(device, guest.InputB(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputB(), Bytes, guest.OutputO(), true);
     Expect(guest.InputB(), guest.OutputO(), Constant, "an input moved to another block");
     Reset(guest.OutputO());
-    Run(device, guest.InputA(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
     Expect(guest.InputA(), guest.OutputO(), Constant, "the input back where the template was built");
     Reset(guest.OutputO());
-    Run(device, guest.InputC(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputC(), Bytes, guest.OutputO(), true);
     Expect(guest.InputC(), guest.OutputO(), Constant, "an input moved to a third block");
     const auto repeats = Since(start);
     Print("an exact repeat between two moved ones", repeats);
@@ -196,19 +211,19 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     }
 
     Reset(guest.OutputO());
-    Run(device, guest.InputB(), 192, guest.OutputO(), true);
+    Run(device, compiled, guest.InputB(), 192, guest.OutputO(), true);
     Expect(guest.InputB(), guest.OutputO(), Constant, "an input moved and shortened");
 
     std::array<std::uint32_t, Words> changed{};
     for (std::uint32_t index = 0; index < Words; ++index) changed[index] = 0xd000u + index * 3u;
     AgcDriver::GuestMemory::Write(reinterpret_cast<std::uintptr_t>(guest.InputB()), std::as_bytes(std::span(changed)));
     Reset(guest.OutputO());
-    Run(device, guest.InputB(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputB(), Bytes, guest.OutputO(), true);
     Expect(changed.data(), guest.OutputO(), Constant, "an input moved to a range the driver stored over");
 
     const auto refusals = AgcDriver::VulkanDevice::DispatchMoveCounts();
     for (std::uint32_t index = 0; index < Words; ++index) guest.OutputO()[index] = 0x7000u + index;
-    Run(device, guest.OutputO() + Threads, Bytes / 2, guest.OutputO(), true);
+    Run(device, compiled, guest.OutputO() + Threads, Bytes / 2, guest.OutputO(), true);
     for (std::uint32_t tid = 0; tid < Threads; ++tid) {
         const auto expected = 0x7000u + Threads + tid + Constant;
         Require(guest.OutputO()[tid] == expected, "dispatch move: an input moved into the unwritten half of the dispatch's own output: lane " + std::to_string(tid) + " is " + Hex(guest.OutputO()[tid]) + ", expected " + Hex(expected));
@@ -216,15 +231,15 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
 
     Reset(guest.OutputO());
     Reset(guest.OutputP());
-    Run(device, guest.InputA(), Bytes, guest.OutputP(), false);
-    Run(device, guest.OutputP(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputA(), Bytes, guest.OutputP(), false);
+    Run(device, compiled, guest.OutputP(), Bytes, guest.OutputO(), true);
     Expect(guest.InputA(), guest.OutputO(), 2u * Constant, "an input moved onto a range a recorded dispatch still writes");
     const auto refused = Since(refusals);
     Print("two inputs moved onto written ranges", refused);
     if (templates) Require(refused.refused == 2, "dispatch move: the inputs moved onto written ranges were not both refused");
 
     Reset(guest.OutputO());
-    Run(device, guest.InputA(), Bytes, guest.OutputO(), true);
+    Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
     Expect(guest.InputA(), guest.OutputO(), Constant, "the input moved back after the refusals");
     const auto total = AgcDriver::VulkanDevice::DispatchMoveCounts();
     std::printf("dispatch move: in total: checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", static_cast<unsigned long long>(total.checked), static_cast<unsigned long long>(total.exact), static_cast<unsigned long long>(total.moved), static_cast<unsigned long long>(total.refused), static_cast<unsigned long long>(total.filtered));
