@@ -4260,7 +4260,10 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
-    if (Recorder::LabLogging()) recorder->LabNote(timing, "COPYIMG src=[" + source.LabText() + "] dst=[" + LabText() + "]");
+    // Lab only (APS5_LAB_COPYLAYOUT=1): the transfer layouts around the copy instead of GENERAL (content kept, so the
+    // result is the same; whether the driver copies faster in them is the question).
+    const bool optimalLayouts = Recorder::LabLever(Recorder::LabLeverId::CopyLayout);
+    if (Recorder::LabLogging()) recorder->LabNote(timing, std::string("COPYIMG layouts=") + (optimalLayouts ? "transfer" : "general") + " src=[" + source.LabText() + "] dst=[" + LabText() + "]");
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
@@ -4283,6 +4286,10 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[1].image = image;
+    if (optimalLayouts) {
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    }
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     std::vector<VkImageCopy> regions;
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -4297,11 +4304,26 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
             regions.push_back(region);
         }
     }
-    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    // Lab only: the transfer itself in a range of its own inside the class range (the barriers around it are the rest).
+    const auto copyTiming = Recorder::LabLogging() ? recorder->BeginGpuTiming(std::uint64_t{0xC0DE0001}) : Recorder::NoTiming;
+    context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, optimalLayouts ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL, image, optimalLayouts ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    recorder->EndGpuTiming(copyTiming, guestBytes);
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
+    if (optimalLayouts) {
+        // Both images go back to GENERAL, where every other command expects them.
+        VkImageMemoryBarrier after[2] = {barriers[0], copied};
+        after[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        after[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        after[0].srcAccessMask = 0;
+        after[0].dstAccessMask = copied.dstAccessMask;
+        after[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        after[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, after);
+    } else {
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
+    }
     recorder->EndGpuTiming(timing, guestBytes);
     // As after a clear: the image holds the surface, guest memory follows at the write-back (which
     // keeps the 64 KiB blocks the CPU writes from now on; the collect is uncached for the reason

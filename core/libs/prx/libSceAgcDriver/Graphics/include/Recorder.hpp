@@ -465,6 +465,23 @@ public:
     static bool LabLogging();
     void LabNote(std::uint32_t timing, const std::string& text);
     void LabNotePass(std::uint32_t passTiming, const std::string& text);
+    // Lab only: levers that change how a command is recorded, each switched by APS5_LAB_<NAME>=1 (CopyLayout:
+    // APS5_LAB_COPYLAYOUT, DrawRanges: APS5_LAB_DRAWRANGES). With APS5_LAB_PARITY=1 a lever applies on even presents
+    // only, so one row measures both sides (the [labrange] notes say which side a range was recorded on).
+    enum class LabLeverId : std::uint8_t { CopyLayout = 0, DrawRanges, Count };
+    static bool LabLever(LabLeverId id);
+    // Lab only and NOT exact: APS5_LAB_NOBARRIER=dispatch,draw (or all) leaves out the barriers around compute dispatches
+    // and around render passes, to measure what the full barriers cost; the rendered image is wrong while it is on
+    // (measure with APS5_PROFILE_DRAW only: the stamps of APS5_PROFILE_GPU drain the pipeline at every range). Even
+    // presents only under APS5_LAB_PARITY=1.
+    enum class LabBarrierKind : std::uint8_t { Dispatch = 0, Draw };
+    static bool LabNoBarrier(LabBarrierKind kind);
+    // A timed range inside an open render pass (BeginGpuTiming closes the pass first); the key of a draw's range is
+    // LabDrawKey. Both return NoTiming without APS5_PROFILE_GPU.
+    std::uint32_t BeginGpuTimingInPass(std::uint64_t key);
+    static constexpr std::uint64_t LabDrawKey(std::uint64_t vertexAddress, std::uint64_t fragmentAddress) {
+        return fragmentAddress != 0 ? (std::uint64_t{3} << 60) | (fragmentAddress & 0x0fffffffffffffffull) : (std::uint64_t{2} << 60) | (vertexAddress & 0x0fffffffffffffffull);
+    }
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;

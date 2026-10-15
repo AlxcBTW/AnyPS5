@@ -1415,7 +1415,7 @@ void Recorder::endOpenRenderPass(bool barrier) {
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
-    if (barrier) {
+    if (barrier && !LabNoBarrier(LabBarrierKind::Draw)) {
         recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         CountBarriers(CommandClass::Draw);
     }
@@ -1914,13 +1914,17 @@ const LabWindow& LabWindowConfig() {
     }();
     return window;
 }
+// Whether the window is open now (APS5_PROFILE_GPU or not: without it only the per-batch [labbatch] lines exist).
+bool LabWindowOpen() {
+    const auto& window = LabWindowConfig();
+    if (!window.configured) return false;
+    const auto now = presentSerial.load(std::memory_order_relaxed);
+    return now >= window.first && now < window.first + window.count;
+}
 }
 
 bool Recorder::LabLogging() {
-    const auto& window = LabWindowConfig();
-    if (!window.configured || !GpuTimingEnabled()) return false;
-    const auto now = presentSerial.load(std::memory_order_relaxed);
-    return now >= window.first && now < window.first + window.count;
+    return GpuTimingEnabled() && LabWindowOpen();
 }
 
 void Recorder::LabNote(std::uint32_t timing, const std::string& text) {
@@ -1934,6 +1938,42 @@ void Recorder::LabNote(std::uint32_t timing, const std::string& text) {
 void Recorder::LabNotePass(std::uint32_t passTiming, const std::string& text) {
     if (open == nullptr) return;
     LabNote(passTiming != NoTiming ? passTiming : open->renderPass.timing, text);
+}
+
+bool Recorder::LabLever(LabLeverId id) {
+    static const std::array<bool, static_cast<std::size_t>(LabLeverId::Count)> enabled = [] {
+        std::array<bool, static_cast<std::size_t>(LabLeverId::Count)> result{};
+        const char* const names[] = {"APS5_LAB_COPYLAYOUT", "APS5_LAB_DRAWRANGES"};
+        for (std::size_t i = 0; i < result.size(); ++i) {
+            const char* text = std::getenv(names[i]);
+            result[i] = text != nullptr && text[0] != '\0' && text[0] != '0';
+        }
+        return result;
+    }();
+    static const bool parity = std::getenv("APS5_LAB_PARITY") != nullptr;
+    if (!enabled[static_cast<std::size_t>(id)]) return false;
+    return !parity || (presentSerial.load(std::memory_order_relaxed) % 2) == 0;
+}
+
+bool Recorder::LabNoBarrier(LabBarrierKind kind) {
+    static const std::array<bool, 2> enabled = [] {
+        std::array<bool, 2> result{};
+        const char* text = std::getenv("APS5_LAB_NOBARRIER");
+        if (text == nullptr) return result;
+        const std::string list(text);
+        const bool all = list.find("all") != std::string::npos;
+        result[0] = all || list.find("dispatch") != std::string::npos;
+        result[1] = all || list.find("draw") != std::string::npos;
+        return result;
+    }();
+    static const bool parity = std::getenv("APS5_LAB_PARITY") != nullptr;
+    if (!enabled[static_cast<std::size_t>(kind)]) return false;
+    return !parity || (presentSerial.load(std::memory_order_relaxed) % 2) == 0;
+}
+
+std::uint32_t Recorder::BeginGpuTimingInPass(std::uint64_t key) {
+    if (!GpuTimingEnabled() || open == nullptr) return NoTiming;
+    return beginTiming(key);
 }
 
 void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes) {
@@ -1978,7 +2018,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
-    if (full && LabLogging()) {
+    if (LabWindowOpen()) {
         open->labWindow = true;
         if (open->labPresent == 0) open->labPresent = Presents();
     }
@@ -2444,6 +2484,8 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
+            // Lab only (APS5_LAB_RANGELOG without APS5_PROFILE_GPU): the batch's own stamps, absolute, for per-frame busy and gaps.
+            if (batch.labWindow) std::fprintf(stderr, "[labbatch] p=%llu b=%llu start=%.1f dur=%.1f\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), batch.gpuStartNs / 1e3, (batch.gpuEndNs - batch.gpuStartNs) / 1e3);
         }
         return;
     }
@@ -2481,11 +2523,13 @@ void Recorder::readGpuTiming(Batch& batch) {
             char name[48];
             if (i == batch.batchTiming) std::snprintf(name, sizeof(name), "batch");
             else if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+            else if ((key >> 60) == 3 || (key >> 60) == 2) std::snprintf(name, sizeof(name), "%s 0x%llx", (key >> 60) == 3 ? "drawps" : "drawvs", static_cast<unsigned long long>(key & 0x0fffffffffffffffull));
             else std::snprintf(name, sizeof(name), "prog 0x%llx", static_cast<unsigned long long>(key));
             const double startUs = (static_cast<double>(stamps[i * 2]) * period - base) / 1e3;
+            const double absoluteUs = static_cast<double>(stamps[i * 2]) * period / 1e3;
             const double durationUs = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period / 1e3;
             const char* note = i < batch.labNotes.size() ? batch.labNotes[i].c_str() : "";
-            std::fprintf(stderr, "[labrange] p=%llu b=%llu n=%zu t=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), i, startUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
+            std::fprintf(stderr, "[labrange] p=%llu b=%llu n=%zu t=%.1f a=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), i, startUs, absoluteUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
         }
     }
     std::sort(intervals.begin(), intervals.end());

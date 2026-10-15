@@ -1761,6 +1761,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    std::string labDrawNote;
     if (Recorder::LabLogging()) {
         // Lab only (APS5_LAB_RANGELOG): what the pass (first draw) and every draw of it are, for the [labrange] line.
         std::string note;
@@ -1786,6 +1787,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         std::uint32_t blends = 0;
         for (const auto& blend : state.blends) blends += blend.blendEnable == VK_TRUE ? 1u : 0u;
         std::snprintf(text, sizeof(text), "DRAW vs=0x%llx ps=0x%llx %s=%u inst=%u ind=%d topo=%d rect=%d blend=%u dtest=%d dwrite=%d inplace=%.2fMiB dev=%.2fMiB imgs=%zu lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(draw.labVertex), static_cast<unsigned long long>(draw.labFragment), draw.indexed ? "idx" : "vtx", draw.indexCount, draw.instanceCount, draw.indirect ? 1 : 0, static_cast<int>(state.topology), state.rectList ? 1 : 0, blends, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, static_cast<double>(deviceBytes) / 1048576.0, resources.StorageImages().size(), resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
+        labDrawNote = text;
         note += text;
         recorder->LabNotePass(drawTiming, note);
     }
@@ -1815,7 +1817,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
             countBarrier(2);
         }
-        if (start.barrier) {
+        if (start.barrier && !Recorder::LabNoBarrier(Recorder::LabBarrierKind::Draw)) {
             const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
             context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
             countBarrier(1);
@@ -1844,6 +1846,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty());
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    // Lab only (APS5_LAB_DRAWRANGES=1, needs APS5_PROFILE_GPU=1): the draw's own commands in a timed range keyed by its
+    // pixel program (its vertex program for a depth-only draw), inside the pass's range. The stamps drain the pipeline
+    // around each draw, so these ranges add up to more than the same draws take inside a pass; they rank draws.
+    const auto labDrawTiming = Recorder::LabLever(Recorder::LabLeverId::DrawRanges) ? recorder->BeginGpuTimingInPass(Recorder::LabDrawKey(draw.labVertex, draw.labFragment)) : Recorder::NoTiming;
+    if (labDrawTiming != Recorder::NoTiming) recorder->LabNote(labDrawTiming, labDrawNote);
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
@@ -1857,6 +1864,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
+    recorder->EndGpuTiming(labDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
