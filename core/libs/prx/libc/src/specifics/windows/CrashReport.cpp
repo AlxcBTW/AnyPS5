@@ -532,7 +532,6 @@ void ReportStackCandidates(std::uint64_t rsp, int limit, std::uint64_t span) {
 // abort() and the UCRT's invalid-parameter path end the process with a silent fast fail
 // (0xc0000409); both are reported with the calling thread's stack first.
 void ReportBacktrace(const char* what, bool reportThreads) {
-    LibcRunEndFlush_nid_no_patch();
     void* frames[48];
     const auto count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
     Report("FATAL: %s on thread %lu\n", what, static_cast<unsigned long>(GetCurrentThreadId()));
