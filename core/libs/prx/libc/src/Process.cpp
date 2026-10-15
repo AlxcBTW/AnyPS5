@@ -109,10 +109,6 @@ void FlushOnAbort(int number) {
         previousAbortHandler(number);
         return;
     }
-#ifndef _WIN32
-    std::signal(number, SIG_DFL);
-    std::raise(number);
-#endif
 }
 
 }

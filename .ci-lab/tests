@@ -1,1 +1,1 @@
-^(agc_async_log|guest_exit_order|guest_system_exit|guest_quick_exit|guest_immediate_exit|guest_return_from_main|guest_system_relaunch|guest_nested_exit)
+^agc_async_log
