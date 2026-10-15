@@ -1,0 +1,5 @@
+name=pr6372
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr6372-e37e5f0aba-19828
