@@ -1308,6 +1308,12 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 #endif
 }
 
+void saveUnlocked(std::unique_lock<std::mutex>& lock, std::uint64_t address, std::size_t bytes) {
+    lock.unlock();
+    beforeUnwatch(address, bytes);
+    lock.lock();
+}
+
 }
 
 void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -1359,13 +1365,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         }
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    const auto saveBytes = [&] {
-        lock.unlock();
-        beforeUnwatch(first, static_cast<std::size_t>(stop - first));
-        lock.lock();
-    };
     const bool savedEarly = staysWatched && !before;
-    if (savedEarly) saveBytes();
+    if (savedEarly) saveUnlocked(lock, first, static_cast<std::size_t>(stop - first));
     bool imported = false;
     {
 #ifdef __APPLE__
@@ -1381,7 +1382,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     const WindowCopy window{first, saved, slots};
     if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
-        if (!savedEarly) saveBytes();
+        if (!savedEarly) saveUnlocked(lock, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     }
     return true;
@@ -1497,7 +1498,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
@@ -1515,6 +1516,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
+            if (GpuMutex().HeldByThisThread()) saveUnlocked(lock, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
