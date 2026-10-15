@@ -1,0 +1,5 @@
+name=cpu-dispmove
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-dispmove-e0d494be3a-102986
