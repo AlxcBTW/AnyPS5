@@ -1,0 +1,5 @@
+name=prunwatch-fix
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-prunwatch-fix-b39e42e239-80876
