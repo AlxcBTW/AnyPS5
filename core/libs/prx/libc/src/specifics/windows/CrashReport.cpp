@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -304,6 +305,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
         // Another thread is already reporting; let it finish before this fault ends the process.
         Sleep(INFINITE);
     }
+    LibcRunEndFlush_nid_no_patch();
     const auto* context = info->ContextRecord;
     char line[MAX_PATH + 64];
     char threadName[128] = "";
@@ -530,6 +532,7 @@ void ReportStackCandidates(std::uint64_t rsp, int limit, std::uint64_t span) {
 // abort() and the UCRT's invalid-parameter path end the process with a silent fast fail
 // (0xc0000409); both are reported with the calling thread's stack first.
 void ReportBacktrace(const char* what, bool reportThreads) {
+    LibcRunEndFlush_nid_no_patch();
     void* frames[48];
     const auto count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
     Report("FATAL: %s on thread %lu\n", what, static_cast<unsigned long>(GetCurrentThreadId()));
