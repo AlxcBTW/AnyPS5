@@ -72,12 +72,19 @@ struct DrawEntry {
     std::uint64_t shape = 0;
 };
 
-using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
-
 struct StageDataHit {
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
 };
+
+// A kept stage variant that still matches a draw of the same shape; `data.compiled` is set when only its data words changed (its regions then view `data.words`).
+struct DataCandidate {
+    std::shared_ptr<DispatchVariant> variant;
+    std::vector<ShaderRecompiler::MemoryRegion> regions;
+    StageDataHit data;
+};
+
+using DrawDataCandidates = std::vector<std::vector<DataCandidate>>;
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, Layout, Gate, Stages, Count };
 
@@ -91,7 +98,7 @@ struct DrawEntryCounters {
     double keyUs = 0;
     std::uint64_t absentNewRegisters = 0, absentUserWords = 0, absentEvicted = 0, absentNeverInserted = 0, evictions = 0;
     std::uint64_t differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
-    std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
+    std::uint64_t dataHits = 0, dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0, dataStagesPatched = 0, dataCompiledUserWords = 0;
     std::uint64_t stageDataHits = 0, stageDataWords = 0, stageDataVerified = 0, stageDataInserts = 0, stageDataPositions = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

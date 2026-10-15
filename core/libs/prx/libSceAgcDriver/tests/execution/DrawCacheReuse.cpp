@@ -59,7 +59,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
     commands.insert(commands.end(), payload);
 }
 
-std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, std::uint32_t vertexUserSgprs, const std::uint32_t* pixelCode, std::uint32_t pixelUserSgprs, const std::vector<std::vector<std::uint32_t>>& pixelWords) {
+std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, std::uint32_t vertexUserSgprs, const std::uint32_t* pixelCode, std::uint32_t pixelUserSgprs, const std::vector<std::vector<std::uint32_t>>& pixelWords, std::uint32_t vertexWord = 0) {
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
@@ -86,7 +86,7 @@ std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, s
         {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
-        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, vertexUserSgprs << 1u}, {0x8c, 0},
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, vertexUserSgprs << 1u}, {0x8c, vertexWord},
         {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, pixelUserSgprs << 1u},
     };
     std::vector<std::uint32_t> commands;
@@ -117,6 +117,12 @@ AgcDriver::DriverDetail::DrawEntryCounters SubmitConstantDraws(std::size_t draws
     const auto constant = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
     const std::vector<std::vector<std::uint32_t>> words(draws, {static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)});
     return Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, words));
+}
+
+AgcDriver::DriverDetail::DrawEntryCounters SubmitVertexWordDraw(std::uint32_t vertexWord) {
+    const auto constant = reinterpret_cast<std::uintptr_t>(PixelConstant.data());
+    const std::vector<std::vector<std::uint32_t>> words{{static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)}};
+    return Submit(Draws(32.0f, TriangleVertexCode.data(), 1, ConstantPixelCode.data(), 2, words, vertexWord));
 }
 
 unsigned BrightestColorByte() {
@@ -182,6 +188,35 @@ void StageDataHitsRefreshTheirWords(bool libraries) {
     Require(BrightestColorByte() == 255, mode + ": the draw of constant 1.0 wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
 }
 
+void DataOnlyHitsRefreshStageData(bool libraries) {
+    if (std::getenv("APS5_NO_DRAW_DATA_HITS") != nullptr) return;
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
+    const bool enabled = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr;
+    Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    ColorMemory.fill(std::byte{0});
+    PixelConstant[0] = 0.25f;
+    // Only the vertex stage's user word differs between these keys, so the pixel stage keeps its user words and the constant behind them.
+    SubmitVertexWordDraw(11);
+    SubmitVertexWordDraw(12);
+    const auto cached = SubmitVertexWordDraw(13);
+    Require(BrightestColorByte() == 64, mode + ": the draws of constant 0.25 wrote " + std::to_string(BrightestColorByte()) + ", expected 64");
+    PixelConstant[0] = 1.0f;
+    const auto refreshed = SubmitVertexWordDraw(14);
+    Require(refreshed.dataHits - cached.dataHits == 1, mode + ": the draw with a new vertex user word made " + std::to_string(refreshed.dataHits - cached.dataHits) + " data-only hits, expected 1");
+    Require(refreshed.dataCompiledUserWords - cached.dataCompiledUserWords == 1, mode + ": " + std::to_string(refreshed.dataCompiledUserWords - cached.dataCompiledUserWords) + " stages were compiled for changed user words, expected the vertex stage");
+    const auto patched = refreshed.dataStagesPatched - cached.dataStagesPatched;
+    if (!enabled) {
+        Require(patched == 0, mode + ": with stage data hits off, a data-only hit patched " + std::to_string(patched) + " stages");
+    } else if (verify) {
+        Require(refreshed.stageDataVerified - cached.stageDataVerified == 1, mode + ": the patched pixel stage of the data-only hit was verified " + std::to_string(refreshed.stageDataVerified - cached.stageDataVerified) + " times, expected once");
+    } else {
+        Require(patched == 1 && refreshed.dataStagesReused - cached.dataStagesReused == 1, mode + ": the data-only hit patched " + std::to_string(patched) + " stages and reused " + std::to_string(refreshed.dataStagesReused - cached.dataStagesReused) + ", expected the pixel stage, whose constant changed");
+    }
+    Require(BrightestColorByte() == 255, mode + ": the draw of constant 1.0 wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
+}
+
 void RetainedPixelCacheTransitions() {
     auto commands = Draws(32.0f, VertexCode.data(), 1, PixelCode.data(), 1, {});
     Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(1.0f)});
@@ -241,6 +276,7 @@ int main() {
         ThirdDrawHitsTheCache(libraries);
         UserDataDrawsReuseTheirShape(libraries);
         StageDataHitsRefreshTheirWords(libraries);
+        DataOnlyHitsRefreshStageData(libraries);
         RetainedPixelCacheTransitions();
         AgcDriverShutdown_nid_postfix();
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";

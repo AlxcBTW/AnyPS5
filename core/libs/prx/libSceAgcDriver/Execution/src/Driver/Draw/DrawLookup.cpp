@@ -206,12 +206,25 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 if (roles[i] == Role::GeometryBack || programs[i].userData != dataEntry->decode->programs[i].userData) continue;
                 auto& candidates = dataCandidates[i];
                 for (const auto& variant : dataEntry->stages[i]) {
-                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
+                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.variant->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
+                    std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+                    auto* live = drawStageDataHits() ? &liveData : nullptr;
+                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling, live);
+                    if (result == EntryOutcome::Equal) {
+                        candidates.push_back({variant, std::move(regions), {}});
+                    } else if (result == EntryOutcome::EqualData) {
+                        // As in a draw hit: only words that reach the flattened descriptor changed, so refresh them in a copy of the kept stage.
+                        StageDataHit hit;
+                        hit.words = variant->words;
+                        for (const auto& [position, value] : liveData) hit.words[position] = value;
+                        regions.clear();
+                        appendEntryRegions(*variant, regions, &hit.words);
+                        hit.compiled = patchDataWords(*variant, hit.words);
+                        candidates.push_back({variant, std::move(regions), std::move(hit)});
+                    }
                 }
             }
         }
