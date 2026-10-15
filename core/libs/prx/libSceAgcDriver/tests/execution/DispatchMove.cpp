@@ -181,7 +181,7 @@ void Print(const char* what, const Step& step) {
     std::printf("dispatch move: %s: checked %llu, exact %llu, moved %llu, refused %llu\n", what, static_cast<unsigned long long>(step.checked), static_cast<unsigned long long>(step.exact), static_cast<unsigned long long>(step.moved), static_cast<unsigned long long>(step.refused));
 }
 
-void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Fill(guest.InputA(), 0xa000u);
     Fill(guest.InputB(), 0xb000u);
     Fill(guest.InputC(), 0xc000u);
@@ -243,6 +243,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Expect(guest.InputA(), guest.OutputO(), Constant, "the input moved back after the refusals");
     const auto total = AgcDriver::VulkanDevice::DispatchMoveCounts();
     std::printf("dispatch move: in total: checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", static_cast<unsigned long long>(total.checked), static_cast<unsigned long long>(total.exact), static_cast<unsigned long long>(total.moved), static_cast<unsigned long long>(total.refused), static_cast<unsigned long long>(total.filtered));
+    return templates;
 }
 
 }
@@ -257,7 +258,7 @@ int main() {
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        RunTests(*device, guest);
+        if (!RunTests(*device, guest)) return VulkanTestSkipped;
         std::puts("dispatch move tests passed");
         return 0;
     } catch (const std::exception& error) {
