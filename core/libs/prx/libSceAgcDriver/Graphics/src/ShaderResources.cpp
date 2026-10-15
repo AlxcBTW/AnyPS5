@@ -4779,6 +4779,22 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedD
     return moved;
 }
 
+namespace {
+struct MoveTimeTotals {
+    std::atomic<std::uint64_t> calls{0}, snapshotNs{0}, descriptorNs{0};
+};
+
+MoveTimeTotals& MoveTotals() {
+    static MoveTimeTotals totals;
+    return totals;
+}
+}
+
+ShaderResources::MoveTimes ShaderResources::TakeMoveTimes() {
+    auto& totals = MoveTotals();
+    return {totals.calls.exchange(0, std::memory_order_relaxed), totals.snapshotNs.exchange(0, std::memory_order_relaxed), totals.descriptorNs.exchange(0, std::memory_order_relaxed)};
+}
+
 std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     const char* text = std::getenv("APS5_DRAW_SNAPSHOT_MAX_MIB");
     const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 64ull;
@@ -4787,7 +4803,9 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
+    const bool timed = movedOnly && BuildProfiled();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto reads = movedOnly ? std::decay_t<decltype(guestMemory.InPlaceReads())>{} : guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
     auto result = std::make_shared<DrawBindings>();
@@ -4862,6 +4880,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    const auto snapshotsDone = timed ? std::chrono::steady_clock::now() : started;
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
@@ -4914,6 +4933,13 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    if (timed) {
+        const auto finished = std::chrono::steady_clock::now();
+        auto& totals = MoveTotals();
+        totals.calls.fetch_add(1, std::memory_order_relaxed);
+        totals.snapshotNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(snapshotsDone - started).count()), std::memory_order_relaxed);
+        totals.descriptorNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(finished - snapshotsDone).count()), std::memory_order_relaxed);
+    }
     return result;
 }
 
