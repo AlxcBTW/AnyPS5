@@ -19,7 +19,9 @@ class PipelineCache {
 public:
     static constexpr int SaveIntervalSeconds = 10;
 
-    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties);
+    // loadFromFile=false starts empty (no parsed copy of the file is kept); the object still merges its own
+    // pipelines into the file when it saves.
+    PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile = true);
     ~PipelineCache();
 
     PipelineCache(const PipelineCache&) = delete;
