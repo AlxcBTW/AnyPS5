@@ -207,11 +207,12 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Expect(changed.data(), guest.OutputO(), Constant, "an input moved to a range the driver stored over");
 
     const auto refusals = AgcDriver::VulkanDevice::DispatchMoveCounts();
-    std::array<std::uint32_t, Words> original{};
-    for (std::uint32_t index = 0; index < Words; ++index) original[index] = 0x7000u + index;
-    std::copy(original.begin(), original.end(), guest.OutputO());
-    Run(device, guest.OutputO(), Bytes, guest.OutputO(), true);
-    Expect(original.data(), guest.OutputO(), Constant, "an input moved onto the dispatch's own output");
+    for (std::uint32_t index = 0; index < Words; ++index) guest.OutputO()[index] = 0x7000u + index;
+    Run(device, guest.OutputO() + Threads, Bytes / 2, guest.OutputO(), true);
+    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+        const auto expected = 0x7000u + Threads + tid + Constant;
+        Require(guest.OutputO()[tid] == expected, "dispatch move: an input moved into the unwritten half of the dispatch's own output: lane " + std::to_string(tid) + " is " + Hex(guest.OutputO()[tid]) + ", expected " + Hex(expected));
+    }
 
     Reset(guest.OutputO());
     Reset(guest.OutputP());
