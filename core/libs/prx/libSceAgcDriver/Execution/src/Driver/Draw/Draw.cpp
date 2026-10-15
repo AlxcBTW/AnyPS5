@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/SpeculativeCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -192,10 +193,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     // pending is filled by the draw on the GPU instead of waited for here (materializeDrawStage,
     // APS5_NO_GPU_DRAW_INDIRECT=1 waits as before). Every indirect draw's captures count their hook
     // reads of pending words for the [srtfill] line.
+    // APS5_SPECULATIVE_CAPTURE=1|verify extends this to every other draw that is recorded in one
+    // piece (not an indirect draw read on the CPU) and counts why capture reads waited ([speccap]).
+    const bool speculative = SpeculativeCaptureMode() != SpeculativeMode::Off;
+    shaderMemory.CountReads(speculative);
     if (drawParameters.indirect) {
         shaderMemory.CountSyncReads(true);
         const bool gpuSideMesh = graphics.stages.mesh.has_value() && !graphics.stages.tessellation && !graphics.rectList && !IndirectCpuBeforeCapture(graphics.stages, graphics.rectList, drawParameters, localDevice->DrawIndirectSupport());
         shaderMemory.Speculate(gpuSideMesh && gpuSrtFills() && !drawRelocationEnabled() && dumpTarget == 0 && dumpSlot1 == 0);
+    } else {
+        shaderMemory.Speculate(speculative && !drawRelocationEnabled() && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0);
     }
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<Graphics::CompiledShader> stages;
@@ -459,7 +466,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    const bool anyFills = std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return !stage.srtFills.empty(); });
+    if (registerKey && !drawParameters.indirect && !anyFills && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

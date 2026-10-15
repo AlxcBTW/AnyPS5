@@ -224,7 +224,11 @@ private:
     void observeRange(std::uint64_t address, std::span<const std::byte> before);
     static void observePendingWrite(std::uint64_t address, bool unchanged);
     static bool knownValueCurrent(const WrittenBuffer& writer);
-    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
+    // `defer`: a word whose bytes cannot be proven stable is answered Volatile (a capture that
+    // speculates reads it without waiting, see SpeculativeCapture.hpp) instead of Sync.
+    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {}, bool defer = false);
+    static void resolveSpeculations();
+    static void reportSpeculation();
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);

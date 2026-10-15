@@ -56,6 +56,8 @@ struct CaptureProfile {
     // never profile-gated.
     std::atomic<std::uint64_t> speculated{0};
     std::atomic<std::uint64_t> syncReads{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderMemory::ReadKind::Count)> hookReads{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderMemory::ReadKind::Count)> hookWaited{};
 };
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -113,7 +115,12 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
             return page;
         }
         const auto started = CaptureProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto waitsBefore = counting && hookWaits != nullptr ? hookWaits() : 0;
         GuestMemory::Read(base, std::as_writable_bytes(std::span(page.words)), sizeof(std::uint32_t));
+        if (counting) {
+            ++CaptureTotals().hookReads[static_cast<std::size_t>(ReadKind::PageWhole)];
+            if (hookWaits != nullptr && hookWaits() != waitsBefore) ++CaptureTotals().hookWaited[static_cast<std::size_t>(ReadKind::PageWhole)];
+        }
         if (CaptureProfiled()) CaptureTotals().pageReadNanoseconds += NanosecondsSince(started);
         page.valid.set();
     }
@@ -144,18 +151,27 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     if (!page.valid.test(index)) {
         std::uint32_t word = 0;
         auto policy = PendingWrite::Sync;
+        auto kind = ReadKind::WordSync;
         if (page.wordwise) {
             policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
             if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
-            if (policy == PendingWrite::Sync && self.speculating && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) {
-                // The bytes before the writer ran; the caller proves the walk never consumed them
-                // (SpeculatedLeafSlots) or captures again. Not cached: no valid, read or recent bit.
-                std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
-                self.speculated.push_back(address);
-                ++CaptureTotals().speculated;
-                return true;
+            if (policy == PendingWrite::Sync || policy == PendingWrite::Volatile) {
+                const bool isForbidden = std::binary_search(self.forbidden.begin(), self.forbidden.end(), address);
+                if (self.speculating && !isForbidden && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) {
+                    // The bytes before the writer ran; the caller proves the walk never consumed them
+                    // (SpeculatedLeafSlots) or captures again. Not cached: no valid, read or recent bit.
+                    std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+                    self.speculated.push_back(address);
+                    self.speculatedValues.push_back(*value);
+                    ++CaptureTotals().speculated;
+                    return true;
+                }
+                if (self.countSyncReads) ++CaptureTotals().syncReads;
+                if (policy == PendingWrite::Volatile) kind = self.speculating ? ReadKind::VolatileForbidden : ReadKind::VolatileNotSpeculating;
+                policy = PendingWrite::Sync;
+            } else if (policy == PendingWrite::None) {
+                kind = ReadKind::WordNone;
             }
-            if (policy == PendingWrite::Sync && self.countSyncReads) ++CaptureTotals().syncReads;
         }
         // A read is evidence only when the hook waited for unfinished GPU work across it.
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
@@ -193,9 +209,13 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
             std::uint32_t before = 0;
             if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
-            const auto waitsBefore = observed ? hookWaits() : 0;
+            const auto waitsBefore = observed || (self.counting && self.hookWaits != nullptr) ? hookWaits() : 0;
             const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::Read(address, std::as_writable_bytes(std::span(&word, 1)), alignof(std::uint32_t));
+            if (self.counting) {
+                ++CaptureTotals().hookReads[static_cast<std::size_t>(kind)];
+                if (self.hookWaits != nullptr && hookWaits() != waitsBefore) ++CaptureTotals().hookWaited[static_cast<std::size_t>(kind)];
+            }
             if (page.wordwise) {
                 const auto nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                 if (nanoseconds >= WordWaitNanoseconds) {
@@ -242,8 +262,46 @@ ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};
 }
 
-std::vector<std::uint64_t> ShaderMemory::TakeSpeculated() {
+std::vector<std::uint64_t> ShaderMemory::TakeSpeculated(std::vector<std::uint32_t>* values) {
+    auto taken = std::exchange(speculatedValues, {});
+    if (values != nullptr) *values = std::move(taken);
     return std::exchange(speculated, {});
+}
+
+void ShaderMemory::ForbidSpeculation(std::span<const std::uint64_t> addresses) {
+    forbidden.assign(addresses.begin(), addresses.end());
+    std::sort(forbidden.begin(), forbidden.end());
+}
+
+ShaderMemory::ReadCounts ShaderMemory::TakeReadCounts() {
+    ReadCounts counts;
+    auto& totals = CaptureTotals();
+    for (std::size_t kind = 0; kind < counts.reads.size(); ++kind) {
+        counts.reads[kind] = totals.hookReads[kind].exchange(0, std::memory_order_relaxed);
+        counts.waited[kind] = totals.hookWaited[kind].exchange(0, std::memory_order_relaxed);
+    }
+    return counts;
+}
+
+std::vector<std::uint64_t> SpeculationFailures(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, bool& consumed) {
+    std::vector<std::uint64_t> addresses(speculated.begin(), speculated.end());
+    std::sort(addresses.begin(), addresses.end());
+    std::vector<std::uint64_t> failing;
+    consumed = false;
+    for (std::size_t first = 0; first < addresses.size();) {
+        const auto address = addresses[first];
+        std::size_t last = first;
+        while (last < addresses.size() && addresses[last] == address) ++last;
+        std::size_t named = 0;
+        for (const auto& leaf : leaves) named += leaf.second == address ? 1u : 0u;
+        const bool walked = std::binary_search(otherReads.begin(), otherReads.end(), address);
+        if (walked || last - first > named) {
+            failing.push_back(address);
+            consumed = consumed || walked;
+        }
+        first = last;
+    }
+    return failing;
 }
 
 ShaderMemory::SpeculationCounts ShaderMemory::TakeSpeculationCounts() {
@@ -252,16 +310,13 @@ ShaderMemory::SpeculationCounts ShaderMemory::TakeSpeculationCounts() {
 }
 
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads) {
+    bool consumed = false;
+    if (!SpeculationFailures(speculated, leaves, otherReads, consumed).empty()) return std::nullopt;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> slots;
     for (const auto address : speculated) {
-        if (std::binary_search(otherReads.begin(), otherReads.end(), address)) return std::nullopt;
-        bool leaf = false;
         for (const auto& [slot, leafAddress] : leaves) {
-            if (leafAddress != address) continue;
-            leaf = true;
-            slots.emplace_back(slot, address);
+            if (leafAddress == address) slots.emplace_back(slot, address);
         }
-        if (!leaf) return std::nullopt;
     }
     std::sort(slots.begin(), slots.end());
     slots.erase(std::unique(slots.begin(), slots.end()), slots.end());

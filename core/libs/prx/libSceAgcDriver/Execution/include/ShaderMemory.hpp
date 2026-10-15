@@ -36,7 +36,11 @@ public:
     // destination, Driver.cpp's known-value ring entries), copied into `known` when the caller
     // passes a span of exactly `bytes` (empty: the answer alone); VerifyKnownValue serves them and
     // reads through the hook too, counting a difference.
-    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue };
+    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue, Volatile };
+    // Volatile: recorded work writes the word and the driver has no evidence the bytes stay (or the
+    // write range is too large to hold any); a Sync for a capture that does not speculate, a word a
+    // speculating capture reads without waiting (Speculate below). The driver answers it only with
+    // APS5_SPECULATIVE_CAPTURE set.
     using PendingWriteQuery = PendingWrite (*)(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     // Words served from known values by every capture, and the verified ones and their mismatches
     // (APS5_VERIFY_KNOWN_VALUES=1), for Driver.cpp's [copy] line.
@@ -72,14 +76,28 @@ public:
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
     // Speculation (the draw path's GPU fill of flattened-SRT words, see Driver::materializeDrawStage):
-    // while on, a word that recorded GPU work still writes (the query says Sync) is not read through
-    // the flush hook; the read returns the bytes guest memory holds now, without waiting, and its
+    // while on, a word that recorded GPU work still writes (the query says Volatile, or Sync for a
+    // driver that has no Volatile answer) is not read through the flush hook; the read returns the bytes guest memory holds now, without waiting, and its
     // address is listed for TakeSpeculated. Such a word is never cached as read: it joins no region,
     // and a later read (speculating or not) asks again. Off by default (dispatches never speculate).
     void Speculate(bool enabled) { speculating = enabled; }
     bool Speculating() const { return speculating; }
-    // The addresses speculated since the previous call (or construction), in read order.
-    std::vector<std::uint64_t> TakeSpeculated();
+    // The addresses speculated since the previous call (or construction), in read order, a word read
+    // twice listed twice; with `values`, the bytes each read returned.
+    std::vector<std::uint64_t> TakeSpeculated(std::vector<std::uint32_t>* values = nullptr);
+    // A speculating capture reads these addresses exactly (a first attempt found the walk consumed
+    // them); Allow clears the list.
+    void ForbidSpeculation(std::span<const std::uint64_t> addresses);
+    void AllowSpeculation() { forbidden.clear(); }
+    // Counts this memory's hook reads in TakeReadCounts (the draw path sets it): the reads that went
+    // through the flush hook, by kind, and how many of them waited for unfinished GPU work.
+    void CountReads(bool enabled) { counting = enabled; }
+    enum class ReadKind : std::uint8_t { PageWhole, WordNone, WordSync, VolatileNotSpeculating, VolatileForbidden, Count };
+    struct ReadCounts {
+        std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> reads{};
+        std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> waited{};
+    };
+    static ReadCounts TakeReadCounts();
     // Counters for the [srtfill] line: words speculated, and hook reads of pending words a
     // speculating capture could not avoid (none: every Sync read speculates) or that a non-speculating
     // draw capture made (`counted` captures, see CountSyncReads).
@@ -117,7 +135,10 @@ private:
     HookWaitCounter hookWaits = nullptr;
     bool speculating = false;
     bool countSyncReads = false;
+    bool counting = false;
+    std::vector<std::uint64_t> forbidden;
     std::vector<std::uint64_t> speculated;
+    std::vector<std::uint32_t> speculatedValues;
 };
 
 // The GPU fills a speculative capture needs (Driver::materializeDrawStage): every speculated
@@ -126,6 +147,9 @@ private:
 // walk consumed none of the speculated words and only those slots hold a stale value. Returns the
 // (flat offset, address) of every such leaf, sorted by flat offset; nullopt when some speculated
 // address fails (the capture must be repeated without speculation).
+// The speculated addresses SpeculatedLeafSlots would refuse (sorted, distinct); `consumed` receives
+// whether one of them is among the walk's other reads.
+std::vector<std::uint64_t> SpeculationFailures(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, bool& consumed);
 std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
