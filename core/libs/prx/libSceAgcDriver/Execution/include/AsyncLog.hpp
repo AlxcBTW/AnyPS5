@@ -86,6 +86,8 @@ class AsyncLog {
 public:
     using Clock = std::chrono::steady_clock;
 
+    static constexpr std::size_t Capacity = 16u * 1024u * 1024u;
+
     static AsyncLog& Get() {
         static AsyncLog* const instance = new AsyncLog();
         return *instance;
@@ -163,7 +165,6 @@ private:
         std::uint64_t suppressed;
     };
 
-    static constexpr std::size_t Capacity = 16u * 1024u * 1024u;
     static constexpr std::size_t CoalesceKeys = 128;
     static constexpr std::uint64_t PrintedRepeats = 3;
     static constexpr std::chrono::seconds CoalesceWindow{10};
