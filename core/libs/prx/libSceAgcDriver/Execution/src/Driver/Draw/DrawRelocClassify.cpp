@@ -1,6 +1,7 @@
 // Lab diagnostic (APS5_TRACE_DRAW_CACHE): classifies stages that were compiled because the draw's user words changed,
 // to tell which reuse design would pay off. See RelocClass in DrawCache.hpp.
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
 
