@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/SpeculativeCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,8 @@ std::unordered_set<std::uint64_t>& refusedPrograms() {
 
 std::mutex countsMutex;
 SpeculationCounts totals;
+// Per word read, so lock free.
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(VolatileReason::Count)> volatileReads{};
 
 std::mutex rememberedMutex;
 std::deque<Remembered>& remembered() {
@@ -60,8 +63,7 @@ void Refuse(std::uint64_t program) {
 }
 
 void CountVolatile(VolatileReason reason) {
-    std::lock_guard lock(countsMutex);
-    ++totals.volatileReads[static_cast<std::size_t>(reason)];
+    volatileReads[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void Count(std::uint64_t SpeculationCounts::*field, std::uint64_t amount) {
@@ -74,6 +76,7 @@ SpeculationCounts Take() {
     auto taken = totals;
     totals = SpeculationCounts{};
     taken.speculatedWords = ShaderMemory::TakeSpeculatedWords();
+    for (std::size_t reason = 0; reason < volatileReads.size(); ++reason) taken.volatileReads[reason] = volatileReads[reason].exchange(0, std::memory_order_relaxed);
     return taken;
 }
 
