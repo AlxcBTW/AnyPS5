@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -33,10 +34,23 @@ inline std::uint32_t StagePushOffset(std::uint32_t cursor, ShaderRecompiler::Sha
     return fixedSlots && stage == ShaderRecompiler::ShaderStage::Fragment ? PipelinePushSlotBytes : cursor;
 }
 
+// A word of a stage's FlattenedSrt binding that its capture did not read because recorded GPU work
+// still writes it (APS5_SPECULATIVE_CAPTURE, see Driver::materializeDrawStage): the draw fills
+// binding word `word` from guest `address` before the stage runs, on the GPU when the bytes can be
+// read in place (Graphics::Draw).
+struct SrtFill {
+    std::uint32_t word;
+    std::uint64_t address;
+    bool operator==(const SrtFill&) const = default;
+};
+
 struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
+    // Empty for every stage whose capture read all its words (always, without
+    // APS5_SPECULATIVE_CAPTURE).
+    std::vector<SrtFill> srtFills{};
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

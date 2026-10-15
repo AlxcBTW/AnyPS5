@@ -1541,8 +1541,10 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         Require(!shaders.empty() && context.limits.maxBoundDescriptorSets >= 1, "shader descriptor set exceeds device limits");
         if (shaders.size() == 1u) refreshResourceKey = ContentKey(shaders.front(), false, true);
         std::set<std::uint32_t> occupied;
+        flattenedSrtAllocations.assign(shaders.size(), std::numeric_limits<std::size_t>::max());
         for (const auto& shader : shaders) {
             Require(shader.program != nullptr, "missing compiled shader");
+            const auto shaderIndex = static_cast<std::size_t>(&shader - shaders.data());
             ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
             const VkShaderStageFlags flags = VulkanStage(shader.stage);
             std::uint64_t stageStorageBuffers = 0;
@@ -1642,8 +1644,10 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) {
                         ValidateRuntimeResources(shader, binding.guestDescriptor);
                     }
-                    item.allocations.push_back(addDataBuffer(binding.guestDescriptor));
+                    const bool flattened = binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt;
+                    item.allocations.push_back(addDataBuffer(binding.guestDescriptor, flattened && !shader.srtFills.empty()));
                     if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) shaderData = static_cast<std::int64_t>(item.allocations.back());
+                    if (flattened) flattenedSrtAllocations[shaderIndex] = item.allocations.back();
                 }
                 bindings.push_back(std::move(item));
             }
@@ -2090,8 +2094,9 @@ void ShaderResources::noteReusable() {
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
+    // A stage with SrtFills: the draw writes its own FlattenedSrt buffer, which no later draw may share.
     return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+        return !shader.srtFills.empty() || (shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); }));
     });
 }
 
@@ -3594,17 +3599,22 @@ std::string ShaderResources::Describe() const {
     return text;
 }
 
-std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words) {
+std::size_t ShaderResources::addDataBuffer(std::span<const std::uint32_t> words, bool transferDestination) {
     const auto size = words.size() * sizeof(std::uint32_t);
     Require(size <= context.limits.maxStorageBufferRange, "shader data buffer exceeds descriptor range limit");
     const bool refreshable = TemplateDataRefresh() && size <= MaxRefreshBytes;
-    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
+    auto buffer = std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (refreshable || transferDestination ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : 0u));
     std::memcpy(buffer->Bytes().data(), words.data(), size);
     Allocation allocation{0, size, false, std::move(buffer)};
     if (refreshable) allocation.dataWords.assign(words.begin(), words.end());
     allocations.push_back(std::move(allocation));
     mixDataWords(dataWordsHash, allocations.back().dataWords);
     return allocations.size() - 1;
+}
+
+Buffer* ShaderResources::FlattenedSrtBuffer(std::size_t shader) const {
+    if (shader >= flattenedSrtAllocations.size() || flattenedSrtAllocations[shader] >= allocations.size()) return nullptr;
+    return allocations[flattenedSrtAllocations[shader]].buffer.get();
 }
 
 void ShaderResources::rehashDataWords() {

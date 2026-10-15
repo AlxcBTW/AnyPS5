@@ -12,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver {
@@ -51,6 +52,9 @@ struct CaptureProfile {
     // The driver's per-shader source handle memo: captures served from it, and resolves it made.
     std::atomic<std::uint64_t> handleHits{0};
     std::atomic<std::uint64_t> handleMisses{0};
+    // Words a speculating capture read without the flush hook (ShaderMemory::TakeSpeculatedWords),
+    // never profile-gated.
+    std::atomic<std::uint64_t> speculated{0};
 };
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
@@ -142,6 +146,18 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         if (page.wordwise) {
             policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
             if (policy != PendingWrite::None && policy != PendingWrite::Sync && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) policy = PendingWrite::Sync;
+            if (policy == PendingWrite::Volatile) {
+                if (self.speculating && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word))) {
+                    // The bytes before the writer ran; the caller proves the walk never consumed them
+                    // (SpeculatedLeafSlots) or captures again. Not cached: no valid, read or recent bit.
+                    std::memcpy(value, reinterpret_cast<const void*>(address), sizeof(*value));
+                    self.speculated.push_back(address);
+                    self.speculatedValues.push_back(*value);
+                    ++CaptureTotals().speculated;
+                    return true;
+                }
+                policy = PendingWrite::Sync;
+            }
         }
         // A read is evidence only when the hook waited for unfinished GPU work across it.
         const auto hookWaits = [&] { return self.hookWaits != nullptr ? self.hookWaits() : 0; };
@@ -227,9 +243,16 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
             page->recent |= mask;
             CaptureTotals().reads += words;
         } else {
+            // A bulk read (an image table's records) is consumed by the walk, whose reads the trace
+            // does not list: it never speculates.
+            const bool speculating = std::exchange(self.speculating, false);
             for (std::size_t word = 0; word < words; ++word) {
-                if (!read(context, address + word * sizeof(std::uint32_t), values + word)) return false;
+                if (!read(context, address + word * sizeof(std::uint32_t), values + word)) {
+                    self.speculating = speculating;
+                    return false;
+                }
             }
+            self.speculating = speculating;
         }
         address += bytes;
         values += words;
@@ -264,12 +287,45 @@ bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t b
     const auto& self = *static_cast<const ShaderMemory*>(context);
     if (self.pendingWrite == nullptr || bytes == 0) return false;
     const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
-    return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    return policy == PendingWrite::Sync || policy == PendingWrite::Volatile || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
 }
 
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {
     auto& totals = CaptureTotals();
     return {totals.wordsKnown.load(std::memory_order_relaxed), totals.wordsKnownVerified.load(std::memory_order_relaxed), totals.wordsKnownMismatches.load(std::memory_order_relaxed)};
+}
+
+std::vector<std::uint64_t> ShaderMemory::TakeSpeculated(std::vector<std::uint32_t>* values) {
+    auto taken = std::exchange(speculatedValues, {});
+    if (values != nullptr) *values = std::move(taken);
+    return std::exchange(speculated, {});
+}
+
+std::uint64_t ShaderMemory::TakeSpeculatedWords() {
+    return CaptureTotals().speculated.exchange(0, std::memory_order_relaxed);
+}
+
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads) {
+    std::vector<std::uint64_t> addresses(speculated.begin(), speculated.end());
+    std::sort(addresses.begin(), addresses.end());
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> slots;
+    for (std::size_t first = 0; first < addresses.size();) {
+        const auto address = addresses[first];
+        std::size_t last = first;
+        while (last < addresses.size() && addresses[last] == address) ++last;
+        if (std::binary_search(otherReads.begin(), otherReads.end(), address)) return std::nullopt;
+        std::size_t named = 0;
+        for (const auto& [slot, leafAddress] : leaves) {
+            if (leafAddress != address) continue;
+            ++named;
+            slots.emplace_back(slot, address);
+        }
+        if (last - first > named) return std::nullopt;
+        first = last;
+    }
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+    return slots;
 }
 
 void ShaderMemory::CountHandleMemo(bool hit) {

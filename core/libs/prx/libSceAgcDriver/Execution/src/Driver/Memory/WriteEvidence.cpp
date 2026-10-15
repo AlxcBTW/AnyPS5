@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/SpeculativeCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
@@ -140,8 +141,15 @@ bool Driver::knownValueCurrent(const WrittenBuffer& writer) {
     return GuestMemory::UnchangedSince(writer.begin, bytes, writer.generation);
 }
 
-ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known) {
+ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known, bool defer) {
     using Policy = ShaderMemory::PendingWrite;
+    // A word nothing proves stable: Volatile for a caller that can defer it, else the wait. Counted
+    // per word read (the page-wide queries ask about 4 KiB).
+    const auto unproven = [&](VolatileReason why) {
+        if (!defer) return Policy::Sync;
+        if (bytes == sizeof(std::uint32_t)) Speculation::CountVolatile(why);
+        return Policy::Volatile;
+    };
     if (!pending.Overlaps(address, bytes)) return Policy::None;
 
     if (Graphics::AnyShadowedOverlaps(address, bytes)) {
@@ -153,15 +161,15 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     const auto writer = newestWriter(address, address + bytes);
     if (!writer) {
         reason = &ValidateCounters::syncedNoWriter;
-        return Policy::Sync;
+        return unproven(VolatileReason::NoWriter);
     }
     if (writer->program == 0) {
         reason = &ValidateCounters::syncedForeign;
-        return Policy::Sync;
+        return unproven(VolatileReason::Foreign);
     }
     if (writer->end - writer->begin > writeEvidenceMaxBytes() || writer->begin < 4 || pending.Overlaps(writer->begin - 4, 4) || pending.Overlaps(writer->end, 4)) {
         reason = &ValidateCounters::syncedLargeRange;
-        return Policy::Sync;
+        return unproven(VolatileReason::LargeRange);
     }
     const auto first = address & ~3ull;
     const auto limit = address + bytes;
@@ -188,11 +196,11 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
             const auto found = dwordEvidence.find(dword);
             if (found == dwordEvidence.end() || found->second.streak < writeEvidenceAfter()) {
                 reason = &ValidateCounters::syncedEvidence;
-                return Policy::Sync;
+                return unproven(VolatileReason::EvidenceShort);
             }
             if (writerKeyedEvidence() && (found->second.program != writer->program || found->second.begin != writer->begin || found->second.end != writer->end)) {
                 reason = &ValidateCounters::syncedWriterChanged;
-                return Policy::Sync;
+                return unproven(VolatileReason::WriterChanged);
             }
         }
     }
@@ -207,7 +215,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    return Get().classifyPendingWrite(address, bytes, reason, pending, known, SpeculativeCaptureMode() != SpeculativeMode::Off);
 }
 
 }

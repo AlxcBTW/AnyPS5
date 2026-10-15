@@ -219,6 +219,10 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    // The data buffer of the FlattenedSrt binding of `shader` (its index in the build's shaders),
+    // null when the stage binds none. A stage with SrtFills gets a buffer a transfer may write
+    // (Graphics::Draw fills those words on the GPU or through the CPU before the draw runs).
+    Buffer* FlattenedSrtBuffer(std::size_t shader) const;
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
@@ -370,7 +374,7 @@ private:
     // same way but is left out of the write set (no write-back, no pending-write note). `atomic`
     // is its bufferAtomic (see GuestBufferMemory::AddWritable).
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read);
-    std::size_t addDataBuffer(std::span<const std::uint32_t> words);
+    std::size_t addDataBuffer(std::span<const std::uint32_t> words, bool transferDestination = false);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);
@@ -557,6 +561,8 @@ private:
     void rehashDataWords();
     std::vector<std::pair<std::uint32_t, std::uint32_t>> pushPatches;
     std::vector<DataPatch> dataPatches;
+    // Per shader of the build: its FlattenedSrt data allocation (FlattenedSrtBuffer), or npos.
+    std::vector<std::size_t> flattenedSrtAllocations;
     BuildTiming timing;
     // Build state carried from stage A to stage B: the bindings in plan order, the image bindings
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),

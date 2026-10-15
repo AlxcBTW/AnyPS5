@@ -154,6 +154,7 @@ private:
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
     void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
+    static void reportSpeculation();
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
     bool storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer = nullptr);
     static void traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue);
@@ -199,7 +200,10 @@ private:
     void observeRange(std::uint64_t address, std::span<const std::byte> before);
     static void observePendingWrite(std::uint64_t address, bool unchanged);
     static bool knownValueCurrent(const WrittenBuffer& writer);
-    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
+    // `defer`: a word whose bytes cannot be proven stable is answered Volatile (a capture that
+    // speculates reads it without waiting, see SpeculativeCapture.hpp) instead of Sync.
+    ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {}, bool defer = false);
+    static void resolveSpeculations();
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     template<typename TVisit>
     static void forEachWrittenBuffer(const ShaderRecompiler::RecompileResult& compiled, TVisit&& visit);

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/SpeculativeCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -195,10 +196,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // APS5_SPECULATIVE_CAPTURE: the stage captures read the words recorded GPU work still writes
+    // without waiting for it where only the draw needs them (materializeDrawStage).
+    shaderMemory.Speculate(SpeculativeCaptureMode() != SpeculativeMode::Off && !ShaderRecompiler::DebugProbeActive() && dumpTarget == 0 && dumpSlot1 == 0);
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
     compiledStages.reserve(programs.size());
     std::vector<Graphics::CompiledShader> stages;
+    // Per program: the FlattenedSrt words its stage leaves to the draw (Graphics::SrtFill).
+    std::vector<std::vector<Graphics::SrtFill>> stageFills(programs.size());
     results.reserve(programs.size() + 2u);
     stages.reserve(programs.size());
     std::uint32_t pushCursorBytes = 0;
@@ -335,8 +341,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
         require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
         stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes});
+        stageFills[i] = recompiled[i] ? stageCaptures[i].srtFills : matched[i] != nullptr ? matched[i]->srtFills : std::vector<Graphics::SrtFill>{};
+        stages.back().srtFills = stageFills[i];
         pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
     }
+    const bool anyFills = std::any_of(stageFills.begin(), stageFills.end(), [](const std::vector<Graphics::SrtFill>& fills) { return !fills.empty(); });
 
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -355,7 +364,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (const auto& read : reads) memory.push_back({read.address, std::as_bytes(std::span(read.bytes))});
     }
 
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(queue, packet, submission, rejected);
+    // A queued label over a word a stage leaves to the draw is recorded now, like one over a word the
+    // capture read: the retry then finds the word pending behind a label and reads it exactly.
+    static constexpr std::array<std::byte, sizeof(std::uint32_t)> fillWord{};
+    std::vector<ShaderRecompiler::MemoryRegion> labelRegions;
+    if (anyFills) {
+        labelRegions = memory;
+        for (const auto& fills : stageFills) {
+            for (const auto& fill : fills) labelRegions.push_back({fill.address, std::span<const std::byte>(fillWord)});
+        }
+    }
+    if (recordQueuedLabelsAfterCapture(submission.queue, anyFills ? labelRegions : memory)) return draw(queue, packet, submission, rejected);
 
     bool rectListBuilt = false;
 
@@ -421,6 +440,27 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             programResults[i] = &results[resultIndex[i]];
         }
         recordQueuedLabelsBeforeRead(submission.queue);
+        if (anyFills) {
+            // The records are read on the CPU and every record re-materializes its stages: the
+            // words the captures left to the draw are read now, exactly (they wait for their writers
+            // as the capture would have), into this draw's copies of the stage results.
+            shaderMemory.Speculate(false);
+            std::uint64_t words = 0;
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (programResults[i] == nullptr || stageFills[i].empty()) continue;
+                auto& result = results[resultIndex[i]];
+                auto flat = std::find_if(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt; });
+                require(flat != result.bindings.end(), "a stage with SRT fills binds no flattened SRT");
+                for (const auto& fill : stageFills[i]) {
+                    require(fill.word < flat->guestDescriptor.size(), "an SRT fill lies outside its flattened SRT");
+                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::SrtFill);
+                    GuestMemory::Read(fill.address, std::as_writable_bytes(std::span(&flat->guestDescriptor[fill.word], 1)), alignof(std::uint32_t));
+                    ++words;
+                }
+            }
+            for (auto& stage : stages) stage.srtFills.clear();
+            Speculation::Count(&SpeculationCounts::indirectCpu, words);
+        }
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
@@ -487,7 +527,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !patchedStages && !anyFills && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

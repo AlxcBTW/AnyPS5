@@ -4670,6 +4670,107 @@ bool RegionsTouch(const std::vector<ShaderRecompiler::MemoryRegion>& regions, st
     return std::any_of(regions.begin(), regions.end(), [&](const ShaderRecompiler::MemoryRegion& region) { return region.guestAddress < address + bytes && address < region.guestAddress + region.bytes.size(); });
 }
 
+// The pending-write query of verifySpeculativeCapture: recorded GPU work writes [begin, end), and
+// the driver has no evidence the bytes stay (Volatile).
+std::uint64_t speculationPendingBegin = 0;
+std::uint64_t speculationPendingEnd = 0;
+AgcDriver::ShaderMemory::PendingWrite speculationQuery(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+    return address < speculationPendingEnd && speculationPendingBegin < address + bytes ? AgcDriver::ShaderMemory::PendingWrite::Volatile : AgcDriver::ShaderMemory::PendingWrite::None;
+}
+
+// The draw path's speculative capture (GPU SRT fill, Driver::materializeDrawStage): a word whose
+// writer is pending is read without the hook, listed with the bytes read and never captured as a
+// region; a capture whose speculated words are only pure-slot leaves is accepted with those slots,
+// one that speculated a word the walk consumed (the table pointer) is refused; without speculation
+// the pending words are read like any others.
+void verifySpeculativeCapture() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 8> code{0xf4040004u, 0xfa000000u, 0xf4000080u, 0xfa000000u, 0x7e000202u, 0xf80008cfu, 0u, 0xbf810000u};
+    struct alignas(4096) GuestTables {
+        std::uint32_t payload = 0;
+        std::uint64_t table = 0;
+    };
+    static GuestTables guest;
+    guest.payload = 0x40a00000u;
+    guest.table = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    const auto tableAddress = reinterpret_cast<std::uintptr_t>(&guest.table);
+    const auto payloadAddress = reinterpret_cast<std::uintptr_t>(&guest.payload);
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u)};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    request.target = BufferTarget();
+    request.context.waveSize = 64;
+    request.context.userDataBaseRegister = 8;
+    request.context.userData = userData;
+    request.context.vertex = ShaderVertexStageInfo{};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 64;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    static_cast<void>(AgcDriver::ShaderMemory::TakeSpeculatedWords());
+    {
+        // The payload (the pure slot's leaf) is pending: speculated, accepted for its slot.
+        speculationPendingBegin = payloadAddress;
+        speculationPendingEnd = payloadAddress + sizeof(std::uint32_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        memory.Speculate(true);
+        const auto capture = memory.Capture(request);
+        std::vector<std::uint32_t> values;
+        const auto speculated = memory.TakeSpeculated(&values);
+        require(speculated.size() == 1 && speculated[0] == payloadAddress, "the pending payload was not speculated");
+        require(values.size() == 1 && values[0] == guest.payload, "the speculated bytes were not kept");
+        require(memory.TakeSpeculated().empty(), "TakeSpeculated did not clear its list");
+        const auto slots = AgcDriver::SpeculatedLeafSlots(speculated, capture->readTrace.leaves, capture->readTrace.otherReads);
+        require(slots.has_value() && slots->size() == 1 && slots->front().second == payloadAddress && slots->front().first == capture->readTrace.leaves.at(0).first, "a speculated pure leaf was not accepted for its slot");
+        require(capture->snapshot.flattenedSrt.at(slots->front().first) == guest.payload, "the speculated slot does not hold the bytes guest memory held");
+        const auto regions = memory.Regions();
+        require(!RegionsTouch(regions, payloadAddress, sizeof(std::uint32_t)), "a speculated word joined the captured regions");
+        require(RegionsTouch(regions, tableAddress, sizeof(std::uint64_t)), "the table pointer was not captured");
+        require(AgcDriver::ShaderMemory::TakeSpeculatedWords() == 1, "the speculated word counter disagrees with the capture");
+    }
+    {
+        // The table pointer (consumed by the walk as the payload's address) is pending: refused.
+        speculationPendingBegin = tableAddress;
+        speculationPendingEnd = tableAddress + sizeof(std::uint64_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        memory.Speculate(true);
+        const auto capture = memory.Capture(request);
+        const auto speculated = memory.TakeSpeculated();
+        require(!speculated.empty() && std::all_of(speculated.begin(), speculated.end(), [&](std::uint64_t address) { return address >= tableAddress && address < tableAddress + sizeof(std::uint64_t); }), "the pending table pointer was not speculated");
+        require(!AgcDriver::SpeculatedLeafSlots(speculated, capture->readTrace.leaves, capture->readTrace.otherReads).has_value(), "a speculated word the walk consumed was accepted");
+        static_cast<void>(AgcDriver::ShaderMemory::TakeSpeculatedWords());
+    }
+    {
+        // Without speculation a volatile word is read like a synced one and captured.
+        speculationPendingBegin = payloadAddress;
+        speculationPendingEnd = payloadAddress + sizeof(std::uint32_t);
+        AgcDriver::ShaderMemory memory({}, &speculationQuery);
+        const auto capture = memory.Capture(request);
+        require(memory.TakeSpeculated().empty(), "a capture without speculation speculated");
+        require(RegionsTouch(memory.Regions(), payloadAddress, sizeof(std::uint32_t)), "a payload read without speculation was not captured");
+        require(capture->snapshot.flattenedSrt.at(capture->readTrace.leaves.at(0).first) == guest.payload, "the read payload did not reach its slot");
+        require(AgcDriver::ShaderMemory::TakeSpeculatedWords() == 0, "a word was counted as speculated without speculation");
+    }
+    speculationPendingBegin = speculationPendingEnd = 0;
+    {
+        // The rule alone: every speculated address must be a leaf and no other read, and be read no
+        // more often than leaves name it.
+        using Leaves = std::vector<std::pair<std::uint32_t, std::uint64_t>>;
+        const Leaves leaves{{3u, 0x1000u}, {1u, 0x2000u}, {5u, 0x1000u}};
+        const std::vector<std::uint64_t> other{0x3000u};
+        const auto twice = AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x1000u, 0x1000u}, leaves, other);
+        require(twice.has_value() && *twice == Leaves{{3u, 0x1000u}, {5u, 0x1000u}}, "a word speculated twice did not fill each of its leaves once");
+        require(AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x2000u, 0x1000u}, leaves, other) == std::optional(Leaves{{1u, 0x2000u}, {3u, 0x1000u}, {5u, 0x1000u}}), "the slots are not sorted by flat offset");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x3000u}, leaves, other).has_value(), "a word only the walk read was accepted");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x4000u}, leaves, other).has_value(), "an untraced word was accepted");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x2000u}, leaves, std::vector<std::uint64_t>{0x2000u}).has_value(), "a leaf the walk also read was accepted");
+        require(!AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x2000u, 0x2000u}, leaves, other).has_value(), "a word read more often than its leaves name it was accepted");
+        require(AgcDriver::SpeculatedLeafSlots(std::vector<std::uint64_t>{0x1000u}, leaves, other) == std::optional(Leaves{{3u, 0x1000u}, {5u, 0x1000u}}), "a word read once for two leaves did not fill both");
+        require(AgcDriver::SpeculatedLeafSlots({}, leaves, other) == std::optional(Leaves{}), "nothing speculated needs fills");
+    }
+}
+
 bool GuardRecords(const ShaderRecompiler::ResourceCapture& capture) {
     const auto& plan = *capture.plan;
     const auto& flat = capture.snapshot.flattenedSrt;
@@ -4959,6 +5060,11 @@ int main(int argc, char** argv) {
             std::cout << "Image table keys, maps, records and registration passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--speculative-capture") {
+            verifySpeculativeCapture();
+            std::cout << "Speculative captures leave only pure SRT leaves to the GPU\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--srt-read-patching") {
             verifySrtReadPatching();
             std::cout << "SRT read patching replaces repeated and multiple uses\n";
@@ -5012,6 +5118,7 @@ int main(int argc, char** argv) {
         verifyFunctionLdsBound();
         verifyFunctionLdsUpdates();
         verifySrtReadPatching();
+        verifySpeculativeCapture();
         verifyGuardedNullPointers();
         verifyCubeDepthCompareMode();
         verifyVolumeArrayLoadMode();

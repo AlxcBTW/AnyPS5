@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -41,6 +42,9 @@ struct DispatchVariant {
 
     std::uint32_t pushOffset = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
+    // Draw stages: the FlattenedSrt words a hit's draw fills (StageCapture::srtFills; empty for
+    // dispatches).
+    std::vector<Graphics::SrtFill> srtFills;
 
     std::shared_ptr<ShaderMemory> memory;
     std::vector<ShaderRecompiler::MemoryRegion> captured;

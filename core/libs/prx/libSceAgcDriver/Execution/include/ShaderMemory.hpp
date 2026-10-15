@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -34,8 +35,11 @@ public:
     // KnownValue: recorded work writes it with bytes the driver already knows (a copy HLE's
     // destination, Driver.cpp's known-value ring entries), copied into `known` when the caller
     // passes a span of exactly `bytes` (empty: the answer alone); VerifyKnownValue serves them and
-    // reads through the hook too, counting a difference.
-    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue };
+    // reads through the hook too, counting a difference. Volatile: recorded work writes it and the
+    // driver has no evidence the bytes stay (or the write range is too large to hold any); it is a
+    // Sync for a capture that does not speculate, and a word a speculating capture reads without
+    // waiting (Speculate below). The driver answers it only with APS5_SPECULATIVE_CAPTURE set.
+    enum class PendingWrite : std::uint8_t { None, Sync, Raw, VerifyRaw, KnownValue, VerifyKnownValue, Volatile };
     using PendingWriteQuery = PendingWrite (*)(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     // Words served from known values by every capture, and the verified ones and their mismatches
     // (APS5_VERIFY_KNOWN_VALUES=1), for Driver.cpp's [copy] line.
@@ -70,6 +74,19 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // Speculation (the draw path's GPU fill of flattened-SRT words, see Driver::materializeDrawStage):
+    // while on, a word the query calls Volatile (recorded GPU work still writes it) is not read
+    // through the flush hook; the read returns the bytes guest memory holds now, without waiting,
+    // and its address is listed for TakeSpeculated. Such a word is never cached as read: it joins
+    // no region, and a later read (speculating or not) asks again. Off by default; only the walk's
+    // single-dword reads speculate, never the bulk reads of image tables.
+    void Speculate(bool enabled) { speculating = enabled; }
+    bool Speculating() const { return speculating; }
+    // The addresses speculated since the previous call (or construction), in read order, a word
+    // read twice listed twice; with `values`, the bytes each read returned.
+    std::vector<std::uint64_t> TakeSpeculated(std::vector<std::uint32_t>* values = nullptr);
+    // Words speculated by every capture since the previous call.
+    static std::uint64_t TakeSpeculatedWords();
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -98,7 +115,19 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    bool speculating = false;
+    std::vector<std::uint64_t> speculated;
+    std::vector<std::uint32_t> speculatedValues;
 };
+
+// The GPU fills a speculative capture needs (Driver::materializeDrawStage): every speculated
+// address must be read only as the leaf of pure flat-SRT slots (ShaderRecompiler::SrtReadTrace
+// `leaves`, as (flat offset, address)): it is in none of the walk's other reads (`otherReads`,
+// sorted) and was read no more often than leaves name it, so no read the trace did not see (a table
+// snapshot, a specialization read) consumed it. Returns the (flat offset, address) of every
+// such leaf, sorted by flat offset; nullopt when some speculated address fails (the capture must be
+// repeated without speculation).
+std::optional<std::vector<std::pair<std::uint32_t, std::uint64_t>>> SpeculatedLeafSlots(std::span<const std::uint64_t> speculated, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads);
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a
 // capture read (ShaderRecompiler::SrtReadTrace), for a hit that differs only there. `runs` are the

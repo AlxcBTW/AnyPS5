@@ -117,6 +117,8 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+    // The FlattenedSrt words the capture left to the draw (Graphics::SrtFill).
+    std::vector<Graphics::SrtFill> srtFills;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
