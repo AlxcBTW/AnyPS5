@@ -1,0 +1,5 @@
+name=gpu-lab6
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-lab6-f1d615ede2-108800
