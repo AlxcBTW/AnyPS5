@@ -525,11 +525,14 @@ std::uint64_t storageBudgetCap(const VkPhysicalDeviceMemoryProperties& memory, c
     const auto heap = largestDeviceLocalHeap(memory);
     const auto heapBytes = heap ? memory.memoryHeaps[*heap].size : 0u;
     if (reported == nullptr || !heap) return StorageBudgetCap(heapBytes, 0u, 0u, 0u, 0u, floor);
+    static std::atomic<std::uint64_t> sampledPeak{0};
     const auto sampled = SampledTextureMemory();
+    const auto previousPeak = sampledPeak.load(std::memory_order_relaxed);
+    const auto peak = std::max(sampled, previousPeak - previousPeak / 64u);
+    sampledPeak.store(peak, std::memory_order_relaxed);
     const auto caches = sampled + storageCacheBytes();
     const auto sampledBudget = SampledTextureBudget(memory, reported, caches);
-    const auto sampledRemaining = std::min(sampledBudget > sampled ? sampledBudget - sampled : 0u, sampled);
-    return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, sampledRemaining, floor);
+    return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, SampledCacheHeadroom(sampledBudget, sampled, peak), floor);
 }
 
 std::uint64_t storageBudget(const Context& context) {
@@ -1086,6 +1089,11 @@ std::uint64_t StorageBudgetCap(const std::uint64_t heapBytes, const std::uint64_
     return std::max(cap, floor);
 }
 
+std::uint64_t SampledCacheHeadroom(const std::uint64_t sampledBudget, const std::uint64_t sampled, const std::uint64_t sampledPeak) {
+    const auto expected = std::min(sampledBudget, sampledPeak + std::max<std::uint64_t>(sampledPeak / 8u, 64ull << 20u));
+    return expected > sampled ? expected - sampled : 0u;
+}
+
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory) {
     const auto heap = largestDeviceLocalHeap(memory);
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
@@ -1110,6 +1118,7 @@ std::uint64_t NextStorageBudget(const std::uint64_t current, const std::uint64_t
     const auto reserve = std::max<std::uint64_t>(1024ull << 20u, reportedBudget / 8u);
     const auto step = std::max<std::uint64_t>(current / 8u, 64ull << 20u);
     if (usage + reserve > reportedBudget) return std::max(floor, current > step ? current - step : floor);
+    if (current > cap) return std::max({floor, cap, current > step ? current - step : floor});
     if (evictions >= 16u && current < cap && usage + step + reserve <= reportedBudget) return std::min(cap, current + step);
     return current;
 }
