@@ -8887,6 +8887,17 @@ int main(int argc, char** argv) {
             Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, 0u, 0u, 1000u) == floor, "a storage budget without a reported budget does not change");
             Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, reported, 13000u * MiB, 16u) == floor, "a storage budget without growth headroom does not grow");
         }
+        {
+            constexpr std::uint64_t MiB = 1ull << 20u;
+            const std::uint64_t floor = 3807u * MiB;
+            const std::uint64_t heap = 16384u * MiB;
+            const std::uint64_t reported = 15229u * MiB;
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == 8181u * MiB, "a storage cap leaves the sampled budget and the reserve out of the device budget");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 5000u * MiB, floor) == 4181u * MiB, "a storage cap shrinks as the other usage grows");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 9181u * MiB, floor) == floor, "a storage cap never falls below the floor");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, 12288u * MiB) == 12288u * MiB, "a storage cap keeps a floor above the computed cap");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, 0u, 0u, 0u, 0u, floor) == heap / 2u, "a storage cap without a reported budget is half the heap");
+        }
         std::cout << "Graphics validation tests passed\n";
         return 0;
     } catch (const std::exception& error) {
