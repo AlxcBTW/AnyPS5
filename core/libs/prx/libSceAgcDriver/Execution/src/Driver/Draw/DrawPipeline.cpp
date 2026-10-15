@@ -1,13 +1,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <immintrin.h>
 
 namespace AgcDriver::DriverDetail {
 
@@ -17,6 +21,14 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainRe
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+}
+
+std::chrono::nanoseconds SpinWindow() {
+    static const std::chrono::nanoseconds window = [] {
+        const char* text = std::getenv("APS5_LAB_SPIN_US");
+        return std::chrono::nanoseconds(text != nullptr ? static_cast<std::int64_t>(std::strtoull(text, nullptr, 10)) * 1000 : 0);
+    }();
+    return window;
 }
 
 }
@@ -129,9 +141,20 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    PinWorkerThread("draw committer");
+    try {
+        RaiseWorkerThreadPriority("draw committer");
+    } catch (...) {
+        Driver::Get().ReportFailure(std::current_exception());
+        return;
+    }
     if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
+        if (const auto window = SpinWindow(); window.count() != 0 && outstanding.load(std::memory_order_acquire) == 0) {
+            const auto until = std::chrono::steady_clock::now() + window;
+            while (outstanding.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until) _mm_pause();
+        }
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -182,6 +205,10 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const auto start = std::chrono::steady_clock::now();
     const auto index = static_cast<std::size_t>(reason);
     PerformanceTimer drainTiming("Draw.Drain");
+    if (const auto window = SpinWindow() * 2; window.count() != 0) {
+        const auto until = start + window;
+        while (outstanding.load(std::memory_order_acquire) != 0 && std::chrono::steady_clock::now() < until) _mm_pause();
+    }
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });

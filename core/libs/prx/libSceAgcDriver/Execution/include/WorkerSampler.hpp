@@ -3,8 +3,7 @@
 
 namespace AgcDriver {
 
-// Starts sampling the calling thread when APS5_SAMPLE_WORKER names an output file.
-void StartWorkerSampler();
+void StartWorkerSampler(const char* variable = "APS5_SAMPLE_WORKER");
 void StopWorkerSampler();
 
 }

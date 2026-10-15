@@ -1861,6 +1861,30 @@ const void* ThreadToken() {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+namespace {
+
+std::chrono::nanoseconds LockSpin() {
+    static const std::chrono::nanoseconds window = [] {
+        const char* text = std::getenv("APS5_LAB_SPIN_US");
+        return std::chrono::nanoseconds(text != nullptr ? static_cast<std::int64_t>(std::strtoull(text, nullptr, 10)) * 1000 : 0);
+    }();
+    return window;
+}
+
+void LockSpinning(std::recursive_mutex& mutex) {
+    const auto window = LockSpin();
+    if (window.count() != 0) {
+        const auto until = std::chrono::steady_clock::now() + window;
+        do {
+            _mm_pause();
+            if (mutex.try_lock()) return;
+        } while (std::chrono::steady_clock::now() < until);
+    }
+    mutex.lock();
+}
+
+}
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
@@ -1933,12 +1957,12 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            mutex.lock();
+            LockSpinning(mutex);
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
-                mutex.lock();
+                LockSpinning(mutex);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -1956,7 +1980,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        mutex.lock();
+        LockSpinning(mutex);
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);

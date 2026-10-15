@@ -27,6 +27,7 @@ namespace {
 
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
+std::jthread computeSamplerThread;
 
 // Debug aid: APS5_SAMPLE_WORKER=<file> samples the calling thread every millisecond and, every 20 s,
 // writes "module+offset self inclusive" lines to <file> for offline symbolization with nm.
@@ -287,10 +288,12 @@ void StartProcessSampler() {
 
 }
 
-void StartWorkerSampler() {
-    StartProcessSampler();
-    const char* path = std::getenv("APS5_SAMPLE_WORKER");
+void StartWorkerSampler(const char* variable) {
+    static std::once_flag processStarted;
+    std::call_once(processStarted, StartProcessSampler);
+    const char* path = std::getenv(variable);
     if (path == nullptr) return;
+    auto& samplerThread = std::strcmp(variable, "APS5_SAMPLE_WORKER") == 0 ? workerSamplerThread : computeSamplerThread;
     auto sampler = std::make_unique<Sampler>();
     sampler->path = path;
     sampler->depth = Sampler::WorkerDepth;
@@ -302,7 +305,7 @@ void StartWorkerSampler() {
         sampler->stackHigh = reinterpret_cast<std::uint64_t>(block->StackBase);
     }
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &sampler->target, THREAD_ALL_ACCESS, FALSE, 0)) throw std::system_error(GetLastError(), std::system_category(), "Duplicating sampler thread handle");
-    workerSamplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
+    samplerThread = std::jthread([sampler = std::move(sampler)](std::stop_token token) {
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -319,11 +322,13 @@ void StartWorkerSampler() {
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
+    computeSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
+    if (computeSamplerThread.joinable()) computeSamplerThread.join();
 }
 #else
-void StartWorkerSampler() {}
+void StartWorkerSampler(const char*) {}
 void StopWorkerSampler() {}
 #endif
 

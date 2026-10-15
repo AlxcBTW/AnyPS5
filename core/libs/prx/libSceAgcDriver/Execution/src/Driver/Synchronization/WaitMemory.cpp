@@ -326,7 +326,11 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
-    const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);
+    static const auto computeSpin = [] {
+        const char* text = std::getenv("APS5_LAB_WAIT_SPIN_US");
+        return std::chrono::microseconds(text != nullptr ? std::strtoll(text, nullptr, 10) : 100);
+    }();
+    const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : computeSpin;
     const auto spinStart = std::chrono::steady_clock::now();
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
