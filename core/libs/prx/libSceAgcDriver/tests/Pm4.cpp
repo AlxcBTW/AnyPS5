@@ -524,6 +524,12 @@ void testCopies() {
     check(clock32[0] != 0 && clock32[1] == 0xdeadbeef, "32-bit GPU clock COPY_DATA did not write only the low half");
     const auto clockStore =AgcDriver::Pm4::ResolveStore(clockCopy(&clock[0]), state, 64);
     check(clockStore.has_value() && clockStore->Bytes().size() == 8, "GPU clock COPY_DATA did not resolve as an 8-byte store");
+    const auto firstStamp = AgcDriver::Pm4::GpuClockBytes(8);
+    const auto secondStamp = AgcDriver::Pm4::GpuClockBytes(8);
+    std::uint64_t firstValue = 0, secondValue = 0;
+    std::memcpy(&firstValue, firstStamp.data(), sizeof(firstValue));
+    std::memcpy(&secondValue, secondStamp.data(), sizeof(secondValue));
+    check(firstStamp.size() == 8 && firstValue != 0 && secondValue >= firstValue && AgcDriver::Pm4::GpuClockBytes(4).size() == 4, "the GPU clock bytes are not a non-decreasing 64-bit value");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x40, {0x1020a, 0, 0, low(&clock[0]), high(&clock[0])}), 0); }, "reference-clock");
     alignas(8) std::array<std::uint32_t, 2> fromRegister{0xdeadbeef, 0xdeadbeef};
     const auto registerCopy = [&](std::uint32_t control, std::uint32_t offset) { return makePacket(0x40, {control, offset, 0, low(fromRegister.data()), high(fromRegister.data())}); };
