@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include "SceTypes.hpp"
+#include "LabDisplay.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
@@ -166,6 +167,7 @@ int APS5_VABI sceKernelDlsym(KernelModule handle, const char* symbol, void** add
  void* module = handle == 0 ? dlopen_nid_postfix(nullptr, kRtldNow) : reinterpret_cast<void*>(static_cast<intptr_t>(handle));
  void* found = dlsym_nid_postfix(module, symbol);
  if (handle == 0 && module) dlclose_nid_postfix(module);
+ APS5_LAB_DISPLAY_LOG(__func__, "handle=%d symbol=%s -> %s", static_cast<int>(handle), symbol, found ? "found" : "not found");
  if (!found) return SCE_KERNEL_ERROR_ESRCH;
  *addr = found;
  return 0;

@@ -17,6 +17,7 @@
 #include <unistd.h>
 #endif
 #include "prx/libc/include/Shutdown.hpp"
+#include "LabDisplay.hpp"
 #include "SceTypes.hpp"
 #include "LoadExec.hpp"
 #include "prx/libc/include/General.hpp"
@@ -223,6 +224,7 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
  }
  *info = SystemServiceDisplaySafeAreaInfo{};
  info->ratio = 1.0f;
+ APS5_LAB_DISPLAY_LOG(__func__, "-> ratio=%.3f", static_cast<double>(info->ratio));
  return SYSTEM_SERVICE_OK;
 }
 
@@ -230,11 +232,12 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- const auto hdr = AgcDriver::CurrentHostHdr();
+ const auto hdr = LabDisplay::ForceSdr() ? AgcDriver::HostHdrStatus{} : AgcDriver::CurrentHostHdr();
  luminance->max_tone_map_luminance = AgcDriver::ToneMapPeakNits(hdr);
  luminance->max_full_frame_tone_map_luminance = hdr.available ? hdr.display.maxFullFrameLuminance : AgcDriver::SdrToneMapLuminanceNits;
  luminance->min_tone_map_luminance = hdr.available ? hdr.display.minLuminance : 0.0f;
  AgcDriverNoteReportedToneMapPeak_nid_postfix(luminance->max_tone_map_luminance);
+ APS5_LAB_DISPLAY_LOG(__func__, "-> hdrAvailable=%d max=%.1f maxFullFrame=%.1f min=%.4f", hdr.available ? 1 : 0, static_cast<double>(luminance->max_tone_map_luminance), static_cast<double>(luminance->max_full_frame_tone_map_luminance), static_cast<double>(luminance->min_tone_map_luminance));
  return SYSTEM_SERVICE_OK;
 }
 
@@ -251,10 +254,12 @@ int APS5_VABI sceSystemServiceGetStatus(SystemServiceStatus* status) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
  *status = SystemServiceStatus{};
+ APS5_LAB_DISPLAY_LOG(__func__, "-> eventNum=%d", static_cast<int>(status->event_num));
  return SYSTEM_SERVICE_OK;
 }
 
 int APS5_VABI sceSystemServiceHideSplashScreen(void) {
+ APS5_LAB_DISPLAY_LOG(__func__, "called");
  return SYSTEM_SERVICE_OK;
 }
 
@@ -273,6 +278,7 @@ int APS5_VABI sceSystemServiceParamGetInt(int paramId, int* value) {
   case SYSTEM_SERVICE_PARAM_ID_ENTER_BUTTON_ASSIGN: *value = SYSTEM_SERVICE_PARAM_ENTER_BUTTON_CROSS; break;
   default: *value = 0; break;
  }
+ APS5_LAB_DISPLAY_LOG(__func__, "paramId=%d -> %d", paramId, *value);
  return SYSTEM_SERVICE_OK;
 }
 
@@ -299,6 +305,7 @@ int APS5_VABI sceSystemServiceReceiveEvent(SystemServiceEvent* event) {
  if (event == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
+ APS5_LAB_DISPLAY_LOG(__func__, "-> no event");
  return SYSTEM_SERVICE_ERROR_NO_EVENT;
 }
 

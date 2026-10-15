@@ -11,6 +11,7 @@
 #endif
 
 #include "SceTypes.hpp"
+#include "LabDisplay.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/HostEntropy.hpp"
@@ -613,6 +614,7 @@ int APS5_VABI getdtablesize_nid_postfix(void) {
 }
 
 int APS5_VABI sceKernelIsTrinityMode(void) {
+    APS5_LAB_DISPLAY_LOG(__func__, "-> 0");
     return 0;
 }
 
@@ -621,6 +623,7 @@ void APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
         throw std::invalid_argument("sceKernelGetOperationMode: null output");
     *mode = 2;
     *submode = 0;
+    APS5_LAB_DISPLAY_LOG(__func__, "-> mode=%d submode=%d", *mode, *submode);
 }
 
 int APS5_VABI seteuid_nid_postfix(std::uint32_t euid) {

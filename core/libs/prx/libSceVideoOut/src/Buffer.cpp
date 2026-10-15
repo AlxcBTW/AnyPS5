@@ -5,6 +5,7 @@
 #include <string>
 
 #include "SceTypes.hpp"
+#include "LabDisplay.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -60,6 +61,7 @@ void APS5_VABI sceVideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribut
     attribute->pixel_format = pixelFormat;
     attribute->dcc_cb_register_clear_color = dccCbRegisterClearColor;
     attribute->dcc_control = dccControl;
+    APS5_LAB_DISPLAY_LOG(__func__, "pixelFormat=0x%llx tilingMode=%u width=%u height=%u option=0x%llx dccControl=0x%x", static_cast<unsigned long long>(pixelFormat), tilingMode, width, height, static_cast<unsigned long long>(option), dccControl);
 }
 
 void APS5_VABI sceVideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* attribute, uint64_t option) {
@@ -122,6 +124,7 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
         auto& label = cfg->bufferLabels[bufferIndexStart + i];
         AgcDriverStoreGuestLabel_nid_postfix(&label, 0);
     }
+    APS5_LAB_DISPLAY_LOG(__func__, "handle=%d setIndex=%d bufferIndexStart=%d bufferNum=%d category=%d -> %ux%u pixelFormat=0x%llx tilingMode=%u option=0x%llx", handle, setIndex, bufferIndexStart, bufferNum, category, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format), attribute->tiling_mode, static_cast<unsigned long long>(attribute->option));
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -155,6 +158,7 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
         AgcDriverCheckGuestMemory_nid_postfix(reinterpret_cast<const void*>(display.address), AgcDriverDisplayBufferSize_nid_postfix(display), 65536);
     }
     cfg->groups[setIndex] = group;
+    APS5_LAB_DISPLAY_LOG(__func__, "handle=%d setIndex=%d -> %ux%u pixelFormat=0x%llx", handle, setIndex, attribute->width, attribute->height, static_cast<unsigned long long>(attribute->pixel_format));
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
@@ -185,6 +189,7 @@ int APS5_VABI sceVideoOutUnregisterBuffers(int handle, int setIndex) try {
             buf = VideoOutBuffer{};
         }
     }
+    APS5_LAB_DISPLAY_LOG(__func__, "handle=%d setIndex=%d", handle, setIndex);
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

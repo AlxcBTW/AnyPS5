@@ -11,6 +11,7 @@
 
 #include "SDL.h"
 #include "SDL_vulkan.h"
+#include "LabDisplay.hpp"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AspectFit.hpp"
@@ -95,6 +96,7 @@ void resolveFlipBuffer(FlipRequest& request, const VideoOutConfig& cfg) {
     static_cast<void>(DescribeVideoOutBuffer(request.buffer, request.group));
     request.width = request.group.attribute.width;
     request.height = request.group.attribute.height;
+    APS5_LAB_DISPLAY_LOG("flip", "handle=%u index=%d buffer=%ux%u config=%ux%u", request.outputHandle, request.index, request.width, request.height, cfg.width, cfg.height);
 }
 
 class RenderingWait final : public AgcDriver::IRenderingWait {
