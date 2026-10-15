@@ -4650,9 +4650,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 std::snprintf(entry, sizeof(entry), " [unit %u at +0x%llx pending %d original %d generation %llu]", layer, static_cast<unsigned long long>(layerBegin(layer) - descriptor.baseAddress), layerPending[layer] ? 1 : 0, layerOriginal[layer] ? 1 : 0, static_cast<unsigned long long>(layerGeneration[layer]));
                 detail += entry;
             }
-            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d;%s%s\n",
+            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d, flush reason %s;%s%s\n",
                 static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.samples, static_cast<unsigned long long>(descriptor.dccAddress),
-                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, detail.c_str(), LabStoreUnsaved() ? " [stored whole: APS5_LAB_STORE_UNSAVED]" : "");
+                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, flushReason != nullptr ? flushReason : "-", detail.c_str(), LabStoreUnsaved() ? " [stored whole: APS5_LAB_STORE_UNSAVED]" : "");
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
