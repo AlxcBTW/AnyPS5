@@ -1,0 +1,5 @@
+name=pr6373-fix
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr6373-fix-a47474294a-66870
