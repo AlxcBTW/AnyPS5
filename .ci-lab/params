@@ -2,4 +2,4 @@ name=hd-display
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-hd-display-fe384517af-30963
+artifact=lab-libs-hd-display-25e7c92a1f-53897
