@@ -167,12 +167,16 @@ std::vector<std::byte> copyDataSource(std::span<const std::uint32_t> packet, con
         return data;
     }
     if (source != CopyDataGpuClockSource) return copySource(address(packet[2], packet[3]), bytes, CopyDataImmediate(source));
+    return GpuClockBytes(bytes);
+}
+
+}
+
+std::vector<std::byte> GpuClockBytes(std::size_t bytes) {
     const auto value = gpuClockCount();
     std::vector<std::byte> data(bytes);
     for (std::size_t i = 0; i < bytes; ++i) data[i] = static_cast<std::byte>(value >> (i * 8));
     return data;
-}
-
 }
 
 std::string_view KnownName(std::uint32_t header) {
