@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <string>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -464,6 +465,11 @@ private:
     // image qualified and `deferredOver` names them; otherwise nothing is recorded and the caller
     // stores as before.
     bool deferOverlappingWriteBacks();
+    // Census (APS5_PROFILE_DRAW, the [alias-census] line): why `stored`, an image a storage refresh of
+    // this image had to store, was not served by pendingAlias / borrowUnits (the first condition that
+    // fails, in their order), and the pair's shape in one line.
+    const char* aliasRefusal(const StorageTexture& stored) const;
+    std::string pairClass(const StorageTexture& stored) const;
     // This image's results are about to be pending over [first, first + count) tracked layers:
     // drops the deferred images' results (never stored, dead under these) for a write of the whole
     // surface, and stores them first for one that does not cover it.
