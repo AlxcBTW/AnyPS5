@@ -2243,6 +2243,49 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
     return at == end;
 }
 
+bool MovableDispatchForm(std::span<const std::uint32_t> key, std::vector<std::uint32_t>& form) {
+    form.assign(key.begin(), key.end());
+    if (key.size() < 5) return false;
+    const bool dataWords = key[0] != 0;
+    const auto bindings = key[4];
+    std::size_t at = 5;
+    for (std::uint32_t binding = 0; binding < bindings; ++binding) {
+        if (at + 8 > key.size()) return false;
+        const auto role = static_cast<ShaderRecompiler::DescriptorRole>(key[at + 1]);
+        const auto count = static_cast<std::size_t>(key[at + 4]);
+        const auto size = static_cast<std::size_t>(key[at + 7]);
+        at += 8;
+        const auto words = DataRole(role) && !dataWords ? std::size_t{0} : size;
+        if (at + words > key.size()) return false;
+        const auto descriptor = at;
+        at += words;
+        std::size_t writtenAt = 0;
+        for (int flags = 0; flags < 9; ++flags) {
+            if (at >= key.size()) return false;
+            if (flags == 8) writtenAt = at;
+            at += 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            if (at > key.size()) return false;
+        }
+        for (int lists = 0; lists < 2; ++lists) {
+            if (at >= key.size()) return false;
+            at += 1 + static_cast<std::size_t>(key[at]);
+            if (at > key.size()) return false;
+        }
+        if (role != ShaderRecompiler::DescriptorRole::GuestBuffers || words != count * 4u) continue;
+        const std::size_t writtenBits = key[writtenAt];
+        for (std::size_t element = 0; element < count; ++element) {
+            const bool written = element >= writtenBits || ((key[writtenAt + 1 + element / 32u] >> (element % 32u)) & 1u) != 0;
+            const auto base = descriptor + element * 4u;
+            const bool empty = key[base + 2] == 0 || (key[base] == 0 && (key[base + 1] & 0xffffu) == 0);
+            if (written || empty) continue;
+            form[base] = 0;
+            form[base + 1] &= 0xffff0000u;
+            form[base + 2] = 0;
+        }
+    }
+    return true;
+}
+
 bool LabelContentKey(std::span<const std::uint32_t> key, bool draw, bool movable, std::vector<std::uint8_t>& labels) {
     labels.assign(key.size(), static_cast<std::uint8_t>(Component::Layout));
     if (!draw) {
@@ -3044,6 +3087,8 @@ struct KeyMissWindow {
     std::uint64_t noCandidate = 0;
     std::uint64_t unlabelled = 0;
     std::uint64_t identical = 0;
+    std::uint64_t bufferBaseOnly = 0;
+    std::uint64_t movableEqual = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ContentKeyComponent::Count)> differing{};
 };
 
@@ -3216,6 +3261,12 @@ void ResourceCache::noteMiss(const Key& key) {
                 anyPart = true;
             }
             if (!anyPart) ++counts.window.identical;
+            if (!draw) {
+                const auto at = [&](ContentKeyComponent component) { return parts[static_cast<std::size_t>(component)]; };
+                if ((at(ContentKeyComponent::BufferWord0) || at(ContentKeyComponent::BufferWord1) || at(ContentKeyComponent::BufferWord2)) && !at(ContentKeyComponent::Layout) && !at(ContentKeyComponent::BufferWord3) && !at(ContentKeyComponent::Image) && !at(ContentKeyComponent::Sampler) && !at(ContentKeyComponent::ShaderData) && !at(ContentKeyComponent::Other) && !at(ContentKeyComponent::DrawTarget)) ++counts.window.bufferBaseOnly;
+                std::vector<std::uint32_t> before, after;
+                if (MovableDispatchForm(previous, before) && MovableDispatchForm(key, after) && before == after) ++counts.window.movableEqual;
+            }
             traceMiss(churn, draw, variants, &parts);
         }
         found->second = key;
@@ -3250,6 +3301,7 @@ void ResourceCache::noteMiss(const Key& key) {
         const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
         const auto part = [&](ContentKeyComponent component) { return count(window.differing[static_cast<std::size_t>(component)]); };
         AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s (10 s): misses %llu; differing: layout %llu, V# word0 %llu, V# word1 %llu, V# word2 %llu, V# word3 %llu, image %llu, sampler %llu, shader-data %llu, other %llu, draw target/index %llu; no-candidate %llu; identical %llu; not comparable %llu\n", what, count(window.compared + window.noCandidate), part(ContentKeyComponent::Layout), part(ContentKeyComponent::BufferWord0), part(ContentKeyComponent::BufferWord1), part(ContentKeyComponent::BufferWord2), part(ContentKeyComponent::BufferWord3), part(ContentKeyComponent::Image), part(ContentKeyComponent::Sampler), part(ContentKeyComponent::ShaderData), part(ContentKeyComponent::Other), part(ContentKeyComponent::DrawTarget), count(window.noCandidate), count(window.identical), count(window.unlabelled));
+        AgcDriver::ProfilePrint_nid_no_patch("[keymiss] resource-content %s (10 s): differing only in buffer V# base/size words %llu; equal once the base and size of read-only buffers leave the key %llu (of %llu compared)\n", what, count(window.bufferBaseOnly), count(window.movableEqual), count(window.compared));
         window = KeyMissWindow{};
     };
     if (trace) {
