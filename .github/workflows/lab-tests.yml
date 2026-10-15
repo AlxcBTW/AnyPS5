@@ -40,3 +40,14 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Repeat under load
+        run: |
+          pids=()
+          for i in 1 2 3; do
+            ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R '^agc_async_log' --repeat until-fail:15 > "ctest-$i.log" 2>&1 &
+            pids+=($!)
+          done
+          rc=0
+          for p in "${pids[@]}"; do wait "$p" || rc=1; done
+          tail -n 8 ctest-1.log ctest-2.log ctest-3.log
+          exit $rc
