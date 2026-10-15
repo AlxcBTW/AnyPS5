@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <vector>
 #include <span>
 
 namespace AgcDriver::DriverDetail {
@@ -94,11 +95,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     const auto captureStage = [&](bool speculating) {
         shaderMemory.Speculate(speculating);
+        shaderMemory.AllowSpeculation();
         stageCapture.srtFills.clear();
         speculated.clear();
         speculatedValues.clear();
         const auto exact = [&] {
             shaderMemory.Speculate(false);
+            shaderMemory.AllowSpeculation();
             const SampledReadScope sampling(evidenceReads);
             return shaderMemory.Capture(invocation);
         };
@@ -106,29 +109,61 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         resolveSpeculations();
         Speculation::Count(&SpeculationCounts::captures);
         reportSpeculation();
-        std::shared_ptr<const ShaderRecompiler::ResourceCapture> speculative;
-        try {
-            const SampledReadScope sampling(evidenceReads);
-            speculative = shaderMemory.Capture(invocation);
-        } catch (...) {
-            if (shaderMemory.TakeSpeculated().empty()) {
-                shaderMemory.Speculate(wasSpeculating);
-                throw;
+        // A first attempt speculates every word the query calls volatile. If some of them were
+        // consumed by the walk (or are no pure leaf), a second attempt reads just those exactly and
+        // keeps the others speculated; only a capture where nothing could stay speculated is
+        // repeated whole, and its program then skips speculation for a while.
+        std::vector<std::uint64_t> forbidden;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            shaderMemory.ForbidSpeculation(forbidden);
+            std::shared_ptr<const ShaderRecompiler::ResourceCapture> speculative;
+            bool threw = false;
+            try {
+                const SampledReadScope sampling(evidenceReads);
+                speculative = shaderMemory.Capture(invocation);
+            } catch (...) {
+                speculated = shaderMemory.TakeSpeculated(&speculatedValues);
+                if (speculated.empty()) {
+                    shaderMemory.Speculate(wasSpeculating);
+                    throw;
+                }
+                threw = true;
             }
-        }
-        if (speculative != nullptr) {
-            speculated = shaderMemory.TakeSpeculated(&speculatedValues);
-            if (speculated.empty()) return speculative;
-            const auto& plan = *speculative->plan;
-            const bool unsafe = plan.requiresSpecializationMemory || std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; });
-            const auto slots = unsafe ? std::nullopt : SpeculatedLeafSlots(speculated, speculative->readTrace.leaves, speculative->readTrace.otherReads);
-            if (slots.has_value()) {
+            if (!threw) {
+                speculated = shaderMemory.TakeSpeculated(&speculatedValues);
+                if (speculated.empty()) return speculative;
+            }
+            std::optional<RefusalReason> structural;
+            std::vector<std::uint64_t> failing;
+            bool consumed = false;
+            if (threw) {
+                failing = speculated;
+            } else {
+                const auto& plan = *speculative->plan;
+                if (plan.requiresSpecializationMemory || std::any_of(plan.cleanFlatSlots.begin(), plan.cleanFlatSlots.end(), [](std::uint8_t clean) { return clean != 0u; })) structural = RefusalReason::PlanUnsafe;
+                else if (speculative->readTrace.leaves.empty()) structural = RefusalReason::NoPureSlots;
+                else failing = SpeculationFailures(speculated, speculative->readTrace.leaves, speculative->readTrace.otherReads, consumed);
+            }
+            if (!threw && !structural && failing.empty()) {
+                const auto slots = SpeculatedLeafSlots(speculated, speculative->readTrace.leaves, speculative->readTrace.otherReads);
                 for (const auto& [slot, address] : *slots) stageCapture.srtFills.push_back({slot, address});
+                if (attempt != 0) Speculation::Count(&SpeculationCounts::partial);
                 return speculative;
             }
+            std::vector<std::uint64_t> distinct = speculated;
+            std::sort(distinct.begin(), distinct.end());
+            distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+            if (attempt == 0 && !threw && !structural && failing.size() < distinct.size()) {
+                forbidden = std::move(failing);
+                continue;
+            }
+            const auto reason = structural ? *structural : consumed || threw ? RefusalReason::ConsumedByWalk : RefusalReason::NotALeaf;
+            static std::atomic<std::uint64_t> reports{0};
+            if (reports.fetch_add(1) < 32 && speculative != nullptr) std::fprintf(stderr, "[speccap] refused program 0x%llx stage %zu (reason %u: 0=no pure slots 1=plan unsafe 2=consumed by the walk 3=not a leaf): %zu words speculated, first 0x%llx, %zu leaves, %zu walk reads\n", static_cast<unsigned long long>(program.binary.codeAddress), i, static_cast<unsigned>(reason), speculated.size(), static_cast<unsigned long long>(speculated.front()), speculative->readTrace.leaves.size(), speculative->readTrace.otherReads.size());
+            Speculation::Count(&SpeculationCounts::repeated);
+            Speculation::Refuse(program.binary.codeAddress, reason);
+            break;
         }
-        Speculation::Count(&SpeculationCounts::repeated);
-        Speculation::Refuse(program.binary.codeAddress);
         stageCapture.srtFills.clear();
         speculated.clear();
         speculatedValues.clear();
@@ -181,7 +216,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     // The binding the fills target must hold them, or the stage is captured exactly.
     if (stageCapture.srtFills.empty() || FillsFit(*stageCapture.compiled, stageCapture.srtFills)) break;
     Speculation::Count(&SpeculationCounts::repeated);
-    Speculation::Refuse(program.binary.codeAddress);
+    Speculation::Refuse(program.binary.codeAddress, RefusalReason::FillsDontFit);
     capture = captureStage(false);
     }
     shaderMemory.Speculate(wasSpeculating);

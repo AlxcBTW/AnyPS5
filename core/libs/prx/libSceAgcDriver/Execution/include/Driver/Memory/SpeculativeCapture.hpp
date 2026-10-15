@@ -19,8 +19,13 @@ enum class SpeculativeMode : std::uint8_t { Off, On, Verify };
 SpeculativeMode SpeculativeCaptureMode();
 bool SpeculativeCaptureAbort();
 
-// Why the evidence query answered Volatile for a word (WriteEvidence.cpp), for the counter line.
-enum class VolatileReason : std::uint8_t { NoWriter, Foreign, LargeRange, EvidenceShort, WriterChanged, Count };
+// Why the query for a word answered Volatile (or, for Label and Sample, still Sync) with speculation
+// on (WriteEvidence.cpp), for the counter line.
+enum class VolatileReason : std::uint8_t { NoWriter, Foreign, LargeRange, EvidenceShort, WriterChanged, PendingImage, Shadow, Label, Sample, Count };
+
+// Why a stage left speculation: its capture had to be repeated exactly, and its program skips
+// speculation for a while (Speculation::Refuse).
+enum class RefusalReason : std::uint8_t { NoPureSlots, PlanUnsafe, ConsumedByWalk, NotALeaf, FillsDontFit, Count };
 
 struct SpeculationCounts {
     std::uint64_t captures = 0;        // stage captures that speculated
@@ -33,14 +38,20 @@ struct SpeculationCounts {
     std::uint64_t observedUnchanged = 0, observedChanged = 0; // evidence from completed speculations
     std::uint64_t verified = 0, verifyMismatches = 0, verifyStale = 0, verifyFresh = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(VolatileReason::Count)> volatileReads{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RefusalReason::Count)> refusals{};
+    std::uint64_t partial = 0;         // captures that kept their pure leaves speculated and re-read only the consumed words
+    // Draw captures' reads through the flush hook by kind (ShaderMemory::ReadKind), and how many waited.
+    std::array<std::uint64_t, 5> hookReads{};
+    std::array<std::uint64_t, 5> hookWaited{};
 };
 
 namespace Speculation {
 
-// Programs whose speculative capture failed once stay exact: a stale entry (the address reused by
-// other code) only costs that code its speculation.
+// A program whose speculative capture failed skips speculation for its next captures (structural
+// reasons for many, the others for a thousand), then tries again; the address reused by other code
+// only costs that code its speculation for a while.
 bool Refused(std::uint64_t program);
-void Refuse(std::uint64_t program);
+void Refuse(std::uint64_t program, RefusalReason reason);
 void CountVolatile(VolatileReason reason);
 void Count(std::uint64_t SpeculationCounts::*field, std::uint64_t amount = 1);
 SpeculationCounts Take();
