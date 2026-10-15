@@ -153,7 +153,7 @@ public:
     void Flush() {
         if (!asynchronous) return;
         std::unique_lock lock(mutex);
-        idle.wait_for(lock, std::chrono::seconds(2), [&] { return pending.empty() && !writing; });
+        idle.wait(lock, [&] { return pending.empty() && !writing; });
     }
 
 private:
