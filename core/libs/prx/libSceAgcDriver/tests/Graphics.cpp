@@ -8805,7 +8805,7 @@ int main(int argc, char** argv) {
             const std::uint64_t floor = 3807u * MiB;
             const std::uint64_t heap = 16384u * MiB;
             const std::uint64_t reported = 15229u * MiB;
-            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == 8181u * MiB, "a storage cap leaves the sampled budget and the reserve out of the device budget");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == 8181u * MiB, "a storage cap leaves the sampled cache's remaining headroom and the reserve out of the device budget");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 5000u * MiB, floor) == 4181u * MiB, "a storage cap shrinks as the other usage grows");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 9181u * MiB, floor) == floor, "a storage cap never falls below the floor");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, 12288u * MiB) == 12288u * MiB, "a storage cap keeps a floor above the computed cap");

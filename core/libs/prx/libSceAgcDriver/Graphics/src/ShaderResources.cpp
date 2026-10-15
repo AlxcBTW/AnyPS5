@@ -525,9 +525,11 @@ std::uint64_t storageBudgetCap(const VkPhysicalDeviceMemoryProperties& memory, c
     const auto heap = largestDeviceLocalHeap(memory);
     const auto heapBytes = heap ? memory.memoryHeaps[*heap].size : 0u;
     if (reported == nullptr || !heap) return StorageBudgetCap(heapBytes, 0u, 0u, 0u, 0u, floor);
-    const auto caches = SampledTextureMemory() + storageCacheBytes();
+    const auto sampled = SampledTextureMemory();
+    const auto caches = sampled + storageCacheBytes();
     const auto sampledBudget = SampledTextureBudget(memory, reported, caches);
-    return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, sampledBudget, floor);
+    const auto sampledRemaining = sampledBudget > sampled ? sampledBudget - sampled : 0u;
+    return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, sampledRemaining, floor);
 }
 
 std::uint64_t storageBudget(const Context& context) {
@@ -1066,17 +1068,19 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 }
 
 // The storage cache's cap: half the heap, and no more than what is left of the device budget once
-// the space outside both texture caches, the sampled cache's own budget and the reserve the growth
-// check keeps are taken out. Growing into that space pushes the heap to its budget, and the
-// allocations that follow (sampled textures, device buffers, staging) fail before the next budget
-// read can shrink this cache again.
-std::uint64_t StorageBudgetCap(const std::uint64_t heapBytes, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t cacheBytes, const std::uint64_t sampledBudget, const std::uint64_t floor) {
+// the space outside both texture caches, the headroom the sampled cache may still claim and the
+// reserve the growth check keeps are taken out. Growing into that space pushes the heap to its
+// budget, and the allocations that follow (sampled textures, device buffers, staging) fail before
+// the next budget read can shrink this cache again. The sampled cache's budget covers both caches,
+// so only its remaining headroom is held back; a sampled cache at or over its budget holds back
+// nothing and the storage cache may take the space.
+std::uint64_t StorageBudgetCap(const std::uint64_t heapBytes, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t cacheBytes, const std::uint64_t sampledRemaining, const std::uint64_t floor) {
     std::uint64_t cap = heapBytes / 2u;
     if (reportedBudget != 0) {
         const auto reserve = std::max<std::uint64_t>(2048ull << 20u, reportedBudget / 8u);
         const auto outside = usage - std::min(usage, cacheBytes);
         const auto pool = reportedBudget > outside + reserve ? reportedBudget - outside - reserve : 0u;
-        cap = std::min(cap, pool > sampledBudget ? pool - sampledBudget : 0u);
+        cap = std::min(cap, pool > sampledRemaining ? pool - sampledRemaining : 0u);
     }
     return std::max(cap, floor);
 }
