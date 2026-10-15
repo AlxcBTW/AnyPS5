@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
