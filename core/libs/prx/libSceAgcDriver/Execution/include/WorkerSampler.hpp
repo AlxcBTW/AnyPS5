@@ -1,0 +1,11 @@
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_WORKERSAMPLER_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_WORKERSAMPLER_HPP
+
+namespace AgcDriver {
+
+void StartWorkerSampler(const char* variable = "APS5_SAMPLE_WORKER");
+void StopWorkerSampler();
+
+}
+
+#endif
