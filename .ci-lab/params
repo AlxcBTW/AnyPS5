@@ -1,0 +1,5 @@
+name=cpu-main
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-main-44df216321-85910
