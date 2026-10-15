@@ -913,8 +913,6 @@ void CheckMarkWrittenUnwatch() {
     Require(hookCalls.empty() && !Watched(base + Block, Block), "a driver store outside the GPU lock ran the unwatch hook or kept its block watched");
 #ifdef _WIN32
     GuestArena::GuestArenaReset_nid_postfix(memory, 2 * Block);
-    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base), 2 * Block);
-    GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * Block);
     CloseHandle(section);
 #endif
 }
