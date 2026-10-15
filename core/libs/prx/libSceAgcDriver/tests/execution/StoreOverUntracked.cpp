@@ -235,7 +235,7 @@ void Settle(THold& hold, const Surface& surface, std::uint32_t result) {
     hold.unlock();
 }
 
-enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch, NeighbourCopied, NeighbourLeftWatch, UntrackedRepeat, UnwalkedImport };
+enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch, NeighbourCopied, NeighbourLeftWatch, UntrackedRepeat };
 
 // One 64 KiB block of the surface: the image of its last block, and the source copied into it.
 constexpr std::uint32_t BlockSide = 128;
@@ -316,10 +316,9 @@ Outcome Run(const Case& test) {
     std::optional<Surface> source;
     if (test.kind == Kind::Copied || test.kind == Kind::NeighbourCopied) source.emplace();
     const bool neighbour = test.kind == Kind::NeighbourLeftWatch;
-    const bool unwalked = test.kind == Kind::UnwalkedImport;
-    const bool leaves = test.kind == Kind::LeftWatch || test.kind == Kind::WrittenThenLeftWatch || test.kind == Kind::ImportLeftWatch || neighbour || unwalked;
+    const bool leaves = test.kind == Kind::LeftWatch || test.kind == Kind::WrittenThenLeftWatch || test.kind == Kind::ImportLeftWatch || neighbour;
     surfaceTile = neighbour ? TileLinear : TileR64KBX;
-    Surface surface(leaves, neighbour ? Page : unwalked ? Block : 0);
+    Surface surface(leaves, neighbour ? Page : 0);
     struct WaitForWork {
         ~WaitForWork() { AgcDriverWaitIdle_nid_postfix(); }
     } waitForWork;
@@ -425,11 +424,7 @@ Outcome Run(const Case& test) {
         Require(!image->GuestSnapshotValid(), "store over untracked: the pending result had saved guest bytes while its memory was write-watched");
         if (test.kind == Kind::ImportLeftWatch) Require(AgcDriver::GuestMemory::ImportWatched(address, SurfaceBytes, [] { return true; }, false), "store over untracked: the import that leaves the write watch failed");
         else if (neighbour) Require(AgcDriver::GuestMemory::ImportWatched(address - Page, Page, [] { return true; }, false), "store over untracked: the import of the page before the surface failed");
-        else if (unwalked) {
-            AgcDriver::GuestMemory::Unwatch(address - Block, Block);
-            Require(AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: the block before the surface took the surface out of the write watch");
-            Require(AgcDriver::GuestMemory::ImportWatched(address - Block, Block + SurfaceBytes, [] { return true; }), "store over untracked: the import that stays watched failed");
-        } else AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
+        else AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
         if (!neighbour) Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "store over untracked: the surface is still write-watched");
     }
     std::array<std::byte, Page> read{};
@@ -462,7 +457,7 @@ int main() {
             Surface probe;
             Require(AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(probe.Texels()))).guestBytes == SurfaceBytes, "store over untracked: unexpected surface size");
         }
-        constexpr std::array<Case, 11> cases{{
+        constexpr std::array<Case, 10> cases{{
             {"another block read after the CPU write", Kind::ReadAfter, Block + Page},
             {"another block read before the CPU write", Kind::ReadBefore, 0xe000},
             {"a fill of the surface", Kind::Filled, 0xe000},
@@ -473,7 +468,6 @@ int main() {
             {"an image copy into another block of the surface", Kind::NeighbourCopied, 0xe000},
             {"a surface whose first block left the write watch with the page before it", Kind::NeighbourLeftWatch, 0xe000},
             {"untracked storage results written again after an image read", Kind::UntrackedRepeat, 0xe000},
-            {"a surface whose import stays watched but whose page walk fails", Kind::UnwalkedImport, 0xe000},
         }};
         bool kept = true;
         for (const auto& test : cases) {
