@@ -100,6 +100,14 @@ bool DeferStorageWriteBack() {
     return enabled;
 }
 std::atomic<std::uint64_t> deferClears{0}, deferImages{0}, deferBytes{0}, deferSuperseded{0}, deferUploadFlushes{0}, deferRebased{0}, deferLost{0};
+// Why a refresh over pending images of others did not defer (the first failing precondition), by
+// DeferRefusal: this image ineligible (no keys, no block units, borrowed units), this image has
+// pending layers, another thread storing, a pending image not block-unit or lent, one that shares
+// part of a 64 KiB unit with this surface, a key range overlap, bytes of the overlap this surface's
+// texels do not cover, keys that are not a clear code.
+enum DeferRefusal { RefusedSelf, RefusedPending, RefusedFlushing, RefusedImage, RefusedStraddle, RefusedKeyOverlap, RefusedUncovered, RefusedKeys, DeferRefusalCount };
+const char* const DeferRefusalNames[DeferRefusalCount] = {"this image ineligible", "this image pending", "another thread storing", "pending image not block units or lent", "pending image shares part of a unit", "key range overlap", "overlap not covered by texels", "keys not a clear code"};
+std::atomic<std::uint64_t> deferRefused[DeferRefusalCount]{};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -162,6 +170,12 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         }
         AgcDriver::ProfilePrint_nid_no_patch("[defer-wb] (10 s) clears that left results unstored: %llu (%llu images, %.1f MiB pending instead of stored), %.1f MiB superseded by the clearing image's own write (never stored), stored later by reason (count/MiB):%s; stored at the clear's upload (keys moved) %llu, generation rebased %llu, not rebased %llu\n", take(deferClears), take(deferImages), take(deferBytes) / 1048576.0, take(deferSuperseded) / 1048576.0, published.c_str(), take(deferUploadFlushes), take(deferRebased), take(deferLost));
         traffic.deferPublished.clear();
+        std::string refused;
+        for (std::size_t k = 0; k < DeferRefusalCount; ++k) {
+            std::snprintf(text, sizeof(text), " %s %llu,", DeferRefusalNames[k], take(deferRefused[k]));
+            refused += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[defer-wb] refused (10 s, first failing precondition):%s\n", refused.c_str());
     }
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
@@ -4166,7 +4180,12 @@ std::string StorageTexture::pairClass(const StorageTexture& stored) const {
 
 bool StorageTexture::deferOverlappingWriteBacks() {
     deferredOver.clear();
-    if (!DeferStorageWriteBack() || !blockUnits || descriptor.dccAddress == 0 || anyLayerPending() || !borrowedUnits.empty()) return false;
+    if (!DeferStorageWriteBack()) return false;
+    const auto refuse = [](DeferRefusal reason) {
+        deferRefused[reason].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (!blockUnits || descriptor.dccAddress == 0 || !borrowedUnits.empty()) return false;
     const auto base = descriptor.baseAddress;
     const auto top = base + guestBytes;
     const auto keyBase = descriptor.dccAddress;
@@ -4181,7 +4200,7 @@ bool StorageTexture::deferOverlappingWriteBacks() {
         if (!pending.textures.MayOverlap(base, static_cast<std::size_t>(guestBytes))) return false;
         // Another thread is storing one: wait for it as before.
         for (const auto* texture : pending.flushing) {
-            if (texture != this && texture->overlaps(base, static_cast<std::size_t>(guestBytes))) return false;
+            if (texture != this && texture->overlaps(base, static_cast<std::size_t>(guestBytes))) return refuse(RefusedFlushing);
         }
         for (auto* texture : pending.textures) {
             if (texture == this || !texture->overlaps(base, static_cast<std::size_t>(guestBytes)) || !texture->pendingUnitInside(base, static_cast<std::size_t>(guestBytes))) continue;
@@ -4192,30 +4211,41 @@ bool StorageTexture::deferOverlappingWriteBacks() {
         }
     }
     if (overlapping.empty()) return false;
-    // Each qualifies only when its whole surface lies inside this one's texels (so a write of this
-    // image covers every byte its results could occupy, padding included) and neither storing it
-    // nor storing this image's keys could move the other's keys, which the clear is decided on.
+    // This image with results of its own pending is left to the old order (they are dropped or kept
+    // by the refresh after the flush):
+    if (anyLayerPending()) return refuse(RefusedPending);
+    // Each qualifies only when every unit of it that meets this surface lies inside this one's
+    // texels (so a write of this image covers every byte those units could occupy, padding
+    // included; the units of an image reaching past this surface stay pending as they are) and
+    // neither storing it nor storing this image's keys could move the other's keys, which the
+    // clear is decided on.
     for (const auto& image : overlapping) {
         const auto begin = image->descriptor.baseAddress;
         const auto end = begin + image->guestBytes;
-        if (!image->blockUnits || image->lent || begin < base || end > top || !disjoint(begin, end, keyBase, keyTop)) return false;
+        const auto low = std::max(begin, base);
+        const auto high = std::min(end, top);
+        if (!image->blockUnits || image->lent) return refuse(RefusedImage);
+        // Both bases are 64 KiB aligned, so the units line up; the overlap ends at an image's end or at this surface's.
+        if (high != end && high % 65536 != 0) return refuse(RefusedStraddle);
+        if (!disjoint(begin, end, keyBase, keyTop)) return refuse(RefusedKeyOverlap);
         if (image->descriptor.dccAddress != 0) {
             const auto imageKeyTop = image->descriptor.dccAddress + std::max<std::uint64_t>(DccKeyCount(image->descriptor, image->guestBytes), image->guestBytes / 256);
-            if (!disjoint(image->descriptor.dccAddress, imageKeyTop, base, top) || !disjoint(image->descriptor.dccAddress, imageKeyTop, keyBase, keyTop)) return false;
+            if (!disjoint(image->descriptor.dccAddress, imageKeyTop, base, top) || !disjoint(image->descriptor.dccAddress, imageKeyTop, keyBase, keyTop)) return refuse(RefusedKeyOverlap);
         }
-        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> run{{{begin - base, end - base}}};
-        if (!uncoveredBytes(run).empty()) return false;
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> run{{{low - base, high - base}}};
+        if (!uncoveredBytes(run).empty()) return refuse(RefusedUncovered);
     }
     // The upload that follows clears the surface and reads no guest bytes.
     VkClearColorValue clearValue{};
     const auto keys = ProvedKeys();
-    if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clearValue)) return false;
+    if (!IsDccClear(keys) || !ClearColorFor(storageFormat, keys, clearValue)) return refuse(RefusedKeys);
     std::uint64_t pendingBytes = 0;
     for (std::size_t index = 0; index < overlapping.size(); ++index) {
         const auto& image = overlapping[index];
         std::uint64_t bytes = 0;
         for (std::uint32_t unit = 0; unit < image->trackedLayers; ++unit) {
-            if (image->layerPending[unit]) bytes += image->layerBytes(unit);
+            const auto unitBegin = image->layerBegin(unit);
+            if (image->layerPending[unit] && unitBegin < top && base < unitBegin + image->layerBytes(unit)) bytes += image->layerBytes(unit);
         }
         // Stored meanwhile: nothing left to defer.
         if (bytes == 0) continue;
@@ -4247,10 +4277,10 @@ void StorageTexture::supersedeDeferred(std::uint32_t first, std::uint32_t count)
             // and keep them over this image's results. When nothing else was stamped outside the stored
             // image since this image's generation, they are that store's alone: the units it covers move
             // to the generation of the store.
-            const auto begin = image->descriptor.baseAddress;
-            const auto end = begin + image->guestBytes;
             const auto base = descriptor.baseAddress;
             const auto top = base + guestBytes;
+            const auto begin = std::max(image->descriptor.baseAddress, base);
+            const auto end = std::min(image->descriptor.baseAddress + image->guestBytes, top);
             const auto stored = image->lastStoreGeneration.load(std::memory_order_relaxed);
             GuestMemory::CollectWritesUncached(base, static_cast<std::size_t>(guestBytes));
             const bool outside = (begin == base || GuestMemory::UnchangedSince(base, static_cast<std::size_t>(begin - base), generation)) && (end == top || GuestMemory::UnchangedSince(end, static_cast<std::size_t>(top - end), generation));
@@ -4266,7 +4296,8 @@ void StorageTexture::supersedeDeferred(std::uint32_t first, std::uint32_t count)
         // cover: dead, as a copy or fill over the range would leave them (DiscardPendingInside).
         std::uint64_t dead = 0;
         for (std::uint32_t unit = 0; unit < image->trackedLayers; ++unit) {
-            if (!image->layerPending[unit]) continue;
+            const auto unitBegin = image->layerBegin(unit);
+            if (!image->layerPending[unit] || unitBegin >= descriptor.baseAddress + guestBytes || unitBegin + image->layerBytes(unit) <= descriptor.baseAddress) continue;
             image->layerPending[unit] = false;
             dead += image->layerBytes(unit);
         }
