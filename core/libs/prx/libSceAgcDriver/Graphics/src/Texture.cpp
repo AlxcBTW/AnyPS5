@@ -1359,6 +1359,25 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
 
+struct StoringScope;
+thread_local const StoringScope* storingTop = nullptr;
+
+struct StoringScope {
+    const StorageTexture* texture;
+    const StoringScope* previous;
+    explicit StoringScope(const StorageTexture* texture) : texture(texture), previous(storingTop) { storingTop = this; }
+    ~StoringScope() { storingTop = previous; }
+    StoringScope(const StoringScope&) = delete;
+    StoringScope& operator=(const StoringScope&) = delete;
+};
+
+bool IsStoring(const StorageTexture* texture) {
+    for (const auto* scope = storingTop; scope != nullptr; scope = scope->previous) {
+        if (scope->texture == texture) return true;
+    }
+    return false;
+}
+
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
 }
@@ -3288,7 +3307,7 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const auto take = [&](StorageTexture* texture) {
-            if (!texture->overlaps(address, bytes)) return;
+            if (IsStoring(texture) || !texture->overlaps(address, bytes)) return;
             if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
         };
         for (auto* texture : pending.textures) take(texture);
@@ -4019,6 +4038,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal, bool allowRegisterClear) {
+    const StoringScope storingScope(this);
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -4203,6 +4223,7 @@ bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
+    const StoringScope storingScope(this);
     if (&source == this || !SameSurfaceShape(source)) {
         refusal = "shape";
         return false;
@@ -4526,6 +4547,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const StoringScope storingScope(this);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;

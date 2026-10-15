@@ -2,4 +2,4 @@ name=prunwatch-lab
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-prunwatch-lab-f73a85d7d7-92704
+artifact=lab-libs-prunwatch-lab-d18cd90af8-101653
