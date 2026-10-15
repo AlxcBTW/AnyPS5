@@ -142,6 +142,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PinWorkerThread("draw committer");
+    GuestMemory::MarkCriticalGpuLockThread();
     try {
         RaiseWorkerThreadPriority("draw committer");
     } catch (...) {

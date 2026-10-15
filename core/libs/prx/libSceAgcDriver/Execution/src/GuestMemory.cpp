@@ -1871,13 +1871,38 @@ std::chrono::nanoseconds LockSpin() {
     return window;
 }
 
-void LockSpinning(std::recursive_mutex& mutex) {
-    const auto window = LockSpin();
+std::atomic<std::uint32_t> criticalWaiters{0};
+thread_local bool criticalThread = false;
+
+bool LockPriority() {
+    static const bool enabled = std::getenv("APS5_LAB_LOCK_PRIORITY") != nullptr;
+    return enabled;
+}
+
+struct CriticalWaiter {
+    bool active;
+    explicit CriticalWaiter(bool active) : active(active) {
+        if (active) criticalWaiters.fetch_add(1, std::memory_order_acq_rel);
+    }
+    ~CriticalWaiter() {
+        if (active) criticalWaiters.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    CriticalWaiter(const CriticalWaiter&) = delete;
+    CriticalWaiter& operator=(const CriticalWaiter&) = delete;
+};
+
+void LockSpinning(std::recursive_mutex& mutex, bool reentrant) {
+    const bool priority = LockPriority() && !reentrant;
+    const bool critical = priority && criticalThread;
+    const bool yielding = priority && !critical;
+    if (!(yielding && criticalWaiters.load(std::memory_order_relaxed) != 0) && mutex.try_lock()) return;
+    const CriticalWaiter waiter{critical};
+    const auto window = LockSpin() * (critical ? 3 : 1);
     if (window.count() != 0) {
         const auto until = std::chrono::steady_clock::now() + window;
         do {
             _mm_pause();
-            if (mutex.try_lock()) return;
+            if (!(yielding && criticalWaiters.load(std::memory_order_relaxed) != 0) && mutex.try_lock()) return;
         } while (std::chrono::steady_clock::now() < until);
     }
     mutex.lock();
@@ -1957,12 +1982,12 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            LockSpinning(mutex);
+            LockSpinning(mutex, HeldByThisThread());
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex);
+                LockSpinning(mutex, HeldByThisThread());
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -1980,7 +2005,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex);
+        LockSpinning(mutex, HeldByThisThread());
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
@@ -2088,6 +2113,10 @@ GpuMutexType& GpuMutex() {
 
 void TagGpuLockThread(std::uint32_t queue) {
     LockStats().tag = queue;
+}
+
+void MarkCriticalGpuLockThread() {
+    criticalThread = true;
 }
 
 unsigned long long CodeOffset(const void* address) {

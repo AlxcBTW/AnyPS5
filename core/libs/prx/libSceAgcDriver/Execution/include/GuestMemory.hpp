@@ -163,6 +163,7 @@ std::uint64_t GpuHoldSerial();
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
 void TagGpuLockThread(std::uint32_t queue);
+void MarkCriticalGpuLockThread();
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
 void MarkPresenterThread();

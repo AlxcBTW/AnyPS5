@@ -130,6 +130,7 @@ void Driver::run(std::uint32_t id) noexcept {
     PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
+    if (id == 0) GuestMemory::MarkCriticalGpuLockThread();
     if (id == 0) StartWorkerSampler();
     else if (id == 0x20) StartWorkerSampler("APS5_SAMPLE_WORKER_Q20");
     Submission submission;

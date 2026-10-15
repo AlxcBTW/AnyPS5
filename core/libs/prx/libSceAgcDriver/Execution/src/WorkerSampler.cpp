@@ -4,6 +4,7 @@
 #include <cstring>
 #ifdef _WIN32
 #include "prx/libSceAgcDriver/Execution/include/StackWalk.hpp"
+#include "prx/libc/include/general/ThreadName.hpp"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -252,7 +253,18 @@ struct ProcessSampler {
             std::uint64_t leaves = 0;
             for (const auto& [address, count] : hot) leaves += count.first;
             if (leaves == 0) continue;
-            std::fprintf(file, "thread %lu samples %llu\n", static_cast<unsigned long>(id), static_cast<unsigned long long>(thread.samples));
+            char threadName[96] = "-";
+            using GetThreadDescriptionFunction = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+            if (const auto describe = ThreadName::Resolve<GetThreadDescriptionFunction>("GetThreadDescription"); describe != nullptr && thread.target != nullptr) {
+                PWSTR wide = nullptr;
+                if (SUCCEEDED(describe(thread.target, &wide)) && wide != nullptr) {
+                    std::size_t length = 0;
+                    for (; wide[length] != L'\0' && length + 1 < sizeof(threadName); ++length) threadName[length] = wide[length] < 128 && wide[length] > 32 ? static_cast<char>(wide[length]) : '_';
+                    if (length != 0) threadName[length] = '\0';
+                    LocalFree(wide);
+                }
+            }
+            std::fprintf(file, "thread %lu samples %llu name %s\n", static_cast<unsigned long>(id), static_cast<unsigned long long>(thread.samples), threadName);
             for (std::size_t i = 0; i < hot.size() && i < 40; ++i) {
                 const auto address = hot[i].first;
                 HMODULE module = nullptr;
