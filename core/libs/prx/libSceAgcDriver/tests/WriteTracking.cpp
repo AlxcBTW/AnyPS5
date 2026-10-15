@@ -807,6 +807,116 @@ void CheckUnwatchedImport() {
 #endif
 }
 
+struct HookCall {
+    std::uint64_t address;
+    std::size_t bytes;
+    bool watched;
+};
+
+std::vector<HookCall> hookCalls;
+std::uint64_t hookProbe = 0;
+std::size_t hookProbeBytes = 0;
+
+void RecordHook(std::uint64_t address, std::size_t bytes) {
+    hookCalls.push_back({address, bytes, Watched(hookProbe, hookProbeBytes)});
+}
+
+struct RecordedHook {
+    RecordedHook() {
+        hookCalls.clear();
+        SetUnwatchHook(&RecordHook);
+    }
+    ~RecordedHook() { SetUnwatchHook(nullptr); }
+    RecordedHook(const RecordedHook&) = delete;
+    RecordedHook& operator=(const RecordedHook&) = delete;
+};
+
+void RequireHookOver(std::uint64_t address, std::size_t bytes, const std::string& path) {
+    Require(hookCalls.size() == 1, path + " did not run the unwatch hook once");
+    const auto& call = hookCalls.front();
+    Require(call.address <= address && address + bytes <= call.address + call.bytes, path + " gave the unwatch hook a range that misses its own");
+    Require(call.watched, path + " ran the unwatch hook after its range left the write watch");
+}
+
+void CheckUnwatchHooks() {
+    void* memory = AllocateWatched(8 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 8 * Block);
+    Require(CollectWritesUncached(base, 8 * Block) != 0, "the hooked block is not collected");
+    const RecordedHook recorded;
+    hookProbe = base;
+    hookProbeBytes = Block;
+    Unwatch(base, Block);
+    RequireHookOver(base, Block, "Unwatch");
+    Require(!Watched(base, Block), "Unwatch left its range watched");
+
+    hookCalls.clear();
+    hookProbe = base + Block;
+    bool hookedBeforeImport = false;
+    Require(ImportWatched(base + Block, Block, [&] {
+        hookedBeforeImport = hookCalls.size() == 1;
+        return true;
+    }, false), "an import that does not stay watched failed");
+    RequireHookOver(base + Block, Block, "an import that does not stay watched");
+    Require(hookedBeforeImport, "an import that does not stay watched ran the unwatch hook after the import");
+    Require(!Watched(base + Block, Block), "an import that does not stay watched left its range watched");
+
+    hookCalls.clear();
+    Require(ImportWatched(base + 2 * Block, Block, [] { return true; }), "an import that stays watched failed");
+    Require(hookCalls.empty() && Watched(base + 2 * Block, Block), "an import whose page walk vouched for its pages ran the unwatch hook or gave up its range");
+
+#ifndef _WIN32
+    hookCalls.clear();
+    const auto late = base + 4 * Block;
+    hookProbe = late;
+    bool hookedBeforeLoss = false;
+    Require(ImportWatched(late, 3 * Block, [&] {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(late + 2 * Block), Block);
+        hookedBeforeLoss = !hookCalls.empty();
+        return true;
+    }), "an import whose range lost a block during the import failed");
+    RequireHookOver(late, 3 * Block, "an import whose page walk failed after the import");
+    Require(!hookedBeforeLoss, "an import whose page walk failed after the import ran the unwatch hook before it");
+    Require(!Watched(late, Block), "an import whose page walk failed after the import left its range watched");
+#endif
+}
+
+void CheckMarkWrittenUnwatch() {
+#ifdef _WIN32
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, 2 * Block, nullptr);
+    Require(section != nullptr, "cannot create the backing of the incomplete collect");
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(GuestArena::GuestArenaHighestFree_nid_no_patch(2 * Block, Block), 2 * Block, Block));
+    Require(memory != nullptr, "cannot allocate the incomplete collect block");
+    GuestArena::GuestArenaMap_nid_postfix(memory, 2 * Block, section, 0, PAGE_READWRITE);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(Watched(base, 2 * Block), "the incomplete collect block is not watched");
+    GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base), 4096, PAGE_NOACCESS);
+    GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base + Block), 4096, PAGE_NOACCESS);
+#else
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(3 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    for (const auto page : {memory + Block - 4096, memory + 2 * Block - 4096}) {
+        Require(mmap(page, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page, "cannot make the pages whose collect fails");
+    }
+#endif
+    const RecordedHook recorded;
+    hookProbe = base;
+    hookProbeBytes = 4096;
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(MarkWritten(base + 16, 4) == 0, "a driver store whose collect was incomplete produced a generation");
+    }
+    RequireHookOver(base, Block, "a driver store whose collect was incomplete");
+    Require(!Watched(base, Block), "a driver store whose collect was incomplete left its block watched");
+    hookCalls.clear();
+    Require(MarkWritten(base + Block + 16, 4) == 0, "a driver store outside the GPU lock whose collect was incomplete produced a generation");
+    Require(hookCalls.empty() && !Watched(base + Block, Block), "a driver store outside the GPU lock ran the unwatch hook or kept its block watched");
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(memory, 2 * Block);
+    CloseHandle(section);
+#endif
+}
+
 class PartlyCommitted {
 public:
     static constexpr std::size_t Bytes = 4 * Block;
@@ -973,6 +1083,8 @@ int main() {
         CheckImportWindowOtherThread();
         CheckImportWindowOverUnwatchedPart();
         CheckUnwatchedImport();
+        CheckUnwatchHooks();
+        CheckMarkWrittenUnwatch();
         CheckCommittedRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
