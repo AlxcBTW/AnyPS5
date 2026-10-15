@@ -8799,17 +8799,41 @@ int main(int argc, char** argv) {
             Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, reported, 14000u * MiB, 0u) == floor, "a storage budget does not shrink past its floor");
             Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, 0u, 0u, 1000u) == floor, "a storage budget without a reported budget does not change");
             Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, reported, 13000u * MiB, 16u) == floor, "a storage budget without growth headroom does not grow");
+            Require(AgcDriver::Graphics::NextStorageBudget(5000u * MiB, floor, 4000u * MiB, reported, roomy, 0u) == 4375u * MiB, "a storage budget above a cap that fell steps down one step");
+            Require(AgcDriver::Graphics::NextStorageBudget(4100u * MiB, floor, 4000u * MiB, reported, roomy, 1000u) == 4000u * MiB, "a storage budget above its cap does not step below the cap");
+        }
+        {
+            constexpr std::uint64_t MiB = 1ull << 20u;
+            const std::uint64_t floor = 1780u * MiB;
+            const std::uint64_t cap = 3515u * MiB;
+            const std::uint64_t reported = 7123u * MiB;
+            Require(AgcDriver::Graphics::NextStorageBudget(floor, floor, cap, reported, 5400u * MiB, 16u) == floor + floor / 8u, "a storage budget on an 8 GiB card grows under a reserve of 1 GiB");
+            Require(AgcDriver::Graphics::NextStorageBudget(3208u * MiB, floor, cap, reported, 6000u * MiB, 0u) == 3208u * MiB, "a storage budget on an 8 GiB card holds while usage and the reserve fit the reported budget");
+            Require(AgcDriver::Graphics::NextStorageBudget(3208u * MiB, floor, cap, reported, 6200u * MiB, 0u) == 2807u * MiB, "a storage budget on an 8 GiB card shrinks once usage and the reserve pass the reported budget");
         }
         {
             constexpr std::uint64_t MiB = 1ull << 20u;
             const std::uint64_t floor = 3807u * MiB;
             const std::uint64_t heap = 16384u * MiB;
             const std::uint64_t reported = 15229u * MiB;
-            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == 8181u * MiB, "a storage cap leaves the sampled cache's remaining headroom and the reserve out of the device budget");
-            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 5000u * MiB, floor) == 4181u * MiB, "a storage cap shrinks as the other usage grows");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == heap / 2u, "a storage cap is at most half the heap");
+            Require(AgcDriver::Graphics::StorageBudgetCap(2u * heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, floor) == reported - 5000u * MiB - reported / 8u, "a storage cap leaves the sampled cache's headroom and the reserve out of the device budget");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 5000u * MiB, floor) == reported - 9000u * MiB - reported / 8u, "a storage cap shrinks as the other usage grows");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 14000u * MiB, 10000u * MiB, 9181u * MiB, floor) == floor, "a storage cap never falls below the floor");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4000u * MiB, 3000u * MiB, 4000u * MiB, 12288u * MiB) == 12288u * MiB, "a storage cap keeps a floor above the computed cap");
             Require(AgcDriver::Graphics::StorageBudgetCap(heap, 0u, 0u, 0u, 0u, floor) == heap / 2u, "a storage cap without a reported budget is half the heap");
+        }
+        {
+            constexpr std::uint64_t MiB = 1ull << 20u;
+            const std::uint64_t floor = 1780u * MiB;
+            const std::uint64_t heap = 8192u * MiB;
+            const std::uint64_t reported = 7123u * MiB;
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4500u * MiB, 1980u * MiB, 1848u * MiB, floor) == floor, "a storage cap on an 8 GiB card that holds back the sampled cache's whole remaining budget stays at the floor");
+            Require(AgcDriver::Graphics::StorageBudgetCap(heap, reported, 4500u * MiB, 1980u * MiB, 64u * MiB, floor) == 3515u * MiB, "a storage cap on an 8 GiB card leaves a reserve of 1 GiB and the sampled headroom out of the reported budget");
+            Require(AgcDriver::Graphics::SampledCacheHeadroom(2048u * MiB, 33u * MiB, 33u * MiB) == 64u * MiB, "a small sampled cache keeps one growth step of headroom");
+            Require(AgcDriver::Graphics::SampledCacheHeadroom(2048u * MiB, 200u * MiB, 1500u * MiB) == 1500u * MiB + 1500u * MiB / 8u - 200u * MiB, "a sampled cache below its recent peak keeps the headroom to return to it");
+            Require(AgcDriver::Graphics::SampledCacheHeadroom(1000u * MiB, 100u * MiB, 950u * MiB) == 900u * MiB, "the sampled headroom stays within the sampled budget");
+            Require(AgcDriver::Graphics::SampledCacheHeadroom(2048u * MiB, 2100u * MiB, 2100u * MiB) == 0u, "a sampled cache over its budget holds no headroom back");
         }
         std::cout << "Graphics validation tests passed\n";
         return 0;
