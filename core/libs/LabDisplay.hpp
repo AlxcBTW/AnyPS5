@@ -73,6 +73,16 @@ inline std::uint64_t GpuClockDivisor() {
     return value;
 }
 
+inline std::atomic<std::uint64_t>& GpuClockReads(int kind) {
+    static std::atomic<std::uint64_t> counts[3];
+    return counts[kind];
+}
+
+inline std::uint64_t GpuClock(int kind, std::uint64_t ticks) {
+    GpuClockReads(kind).fetch_add(1, std::memory_order_relaxed);
+    return ticks / GpuClockDivisor();
+}
+
 inline long long NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -110,6 +120,7 @@ inline void NoteDraw(std::uint32_t renderWidth, std::uint32_t renderHeight, floa
     for (const auto& entry : counts) sorted.emplace_back(entry.second, entry.first);
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     std::fprintf(stderr, "[lab-census] t=%lld window=%lld ms draws=%llu (render targets >= 256 px; render extent / viewport / scissor)\n", now, now - windowStart, static_cast<unsigned long long>(windowDraws));
+    std::fprintf(stderr, "[lab-census]   GPU clock reads by the title in the window: copy-data %llu, release-mem (queued) %llu, release-mem (executed) %llu\n", static_cast<unsigned long long>(GpuClockReads(0).exchange(0)), static_cast<unsigned long long>(GpuClockReads(1).exchange(0)), static_cast<unsigned long long>(GpuClockReads(2).exchange(0)));
     for (std::size_t i = 0; i < sorted.size() && i < 14; ++i) {
         const auto& key = sorted[i].second;
         std::fprintf(stderr, "[lab-census]   render %ux%u viewport %ux%u scissor %ux%u draws %llu\n", key[0], key[1], key[2], key[3], key[4], key[5], static_cast<unsigned long long>(sorted[i].first));
