@@ -1,0 +1,5 @@
+name=cpu-trace
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-trace-06b2b93c5b-30523
