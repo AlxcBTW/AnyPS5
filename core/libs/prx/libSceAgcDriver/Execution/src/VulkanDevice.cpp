@@ -3845,6 +3845,7 @@ constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderRe
 struct DispatchMoveCounters {
     std::atomic<std::uint64_t> checked{0}, exact{0}, moved{0}, buffers{0}, bytes{0};
     std::atomic<std::uint64_t> revalidateNs{0}, proofNs{0}, overlayNs{0};
+    std::array<std::atomic<std::uint64_t>, 3> pathCount{}, pathNs{};
     std::array<std::atomic<std::uint64_t>, 5> sizes{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refused{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> filtered{};
@@ -3889,6 +3890,12 @@ void reportDispatchMove() {
     const auto revalidateNs = take(moves.revalidateNs);
     const auto proofNs = take(moves.proofNs);
     const auto overlayNs = take(moves.overlayNs);
+    unsigned long long pathCounts[3], pathNanoseconds[3];
+    for (std::size_t i = 0; i < 3; ++i) {
+        pathCounts[i] = take(moves.pathCount[i]);
+        pathNanoseconds[i] = take(moves.pathNs[i]);
+    }
+    if (checked != 0) AgcDriver::ProfilePrint_nid_no_patch("[dispmove] Revalidate of the checked hits (10 s): fast %llu x %.1f us, own objects refreshed %llu x %.1f us, full walk %llu x %.1f us\n", pathCounts[0], pathCounts[0] != 0 ? pathNanoseconds[0] / 1000.0 / static_cast<double>(pathCounts[0]) : 0.0, pathCounts[1], pathCounts[1] != 0 ? pathNanoseconds[1] / 1000.0 / static_cast<double>(pathCounts[1]) : 0.0, pathCounts[2], pathCounts[2] != 0 ? pathNanoseconds[2] / 1000.0 / static_cast<double>(pathCounts[2]) : 0.0);
     if (checked != 0) AgcDriver::ProfilePrint_nid_no_patch("[dispmove] per checked hit (10 s): Revalidate %.1f us, proof %.1f us, overlay %.1f us (per overlay of %llu: snapshots %.1f us, descriptors %.1f us)\n", revalidateNs / 1000.0 / static_cast<double>(checked), proofNs / 1000.0 / static_cast<double>(checked), overlayNs / 1000.0 / static_cast<double>(checked), static_cast<unsigned long long>(times.calls), times.calls != 0 ? times.snapshotNs / 1000.0 / static_cast<double>(times.calls) : 0.0, times.calls != 0 ? times.descriptorNs / 1000.0 / static_cast<double>(times.calls) : 0.0);
     AgcDriver::ProfilePrint_nid_no_patch("[dispmove] (10 s) %llu template hits checked: %llu with every read-only buffer where it was built, %llu with %llu moved ones (%.2f MiB snapshotted; per dispatch up to 1 KiB %llu, 16 KiB %llu, 256 KiB %llu, 4 MiB %llu, more %llu); refused %s; stage A dropped cached objects: %s\n", checked, exact, moved, buffers, static_cast<double>(bytes) / 1048576.0, sizes[0], sizes[1], sizes[2], sizes[3], sizes[4], refused.c_str(), filtered.c_str());
 }
@@ -4746,7 +4753,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
             const auto revalidateStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool valid = cached->Revalidate(shaders[0]);
+            Graphics::ShaderResources::ProofReport proofReport;
+            const bool valid = cached->Revalidate(shaders[0], profile ? &proofReport : nullptr);
             const auto revalidated = profile ? std::chrono::steady_clock::now() : revalidateStart;
             if (valid) {
                 bool usable = true;
@@ -4767,6 +4775,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                         const auto overlaid = std::chrono::steady_clock::now();
                         const auto nanoseconds = [](auto from, auto to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); };
                         moves.revalidateNs.fetch_add(nanoseconds(revalidateStart, revalidated), std::memory_order_relaxed);
+                        const auto path = static_cast<std::size_t>(proofReport.path);
+                        moves.pathCount[path].fetch_add(1, std::memory_order_relaxed);
+                        moves.pathNs[path].fetch_add(nanoseconds(revalidateStart, revalidated), std::memory_order_relaxed);
                         moves.proofNs.fetch_add(nanoseconds(revalidated, proved), std::memory_order_relaxed);
                         moves.overlayNs.fetch_add(nanoseconds(proved, overlaid), std::memory_order_relaxed);
                     }

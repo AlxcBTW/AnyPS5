@@ -2346,6 +2346,8 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    std::array<std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::CollectFailure::Count)>, 2> collectFailures{};
+    std::array<std::atomic<std::uint64_t>, 2> collectFailureBytes{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -2356,6 +2358,13 @@ RevalidateProfile& Revalidations() {
 
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countCollectFailure(bool storage, std::uint64_t bytes) {
+    if (!BuildProfiled()) return;
+    auto& profile = Revalidations();
+    profile.collectFailures[storage ? 1 : 0][static_cast<std::size_t>(GuestMemory::LastCollectFailure())].fetch_add(1, std::memory_order_relaxed);
+    profile.collectFailureBytes[storage ? 1 : 0].fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void countPendingFail(std::span<const StorageTexture::PendingQuery> pending) {
@@ -2435,6 +2444,20 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    std::string collects;
+    for (std::size_t kind = 0; kind < 2; ++kind) {
+        collects += kind == 0 ? " textures:" : "; storage images:";
+        bool any = false;
+        for (std::size_t why = 1; why < static_cast<std::size_t>(GuestMemory::CollectFailure::Count); ++why) {
+            const auto count = profile.collectFailures[kind][why].load(std::memory_order_relaxed);
+            if (count == 0) continue;
+            any = true;
+            collects += std::string(" ") + GuestMemory::CollectFailureName(static_cast<GuestMemory::CollectFailure>(why)) + " " + std::to_string(count);
+        }
+        if (!any) collects += " none";
+        collects += " (" + std::to_string(profile.collectFailureBytes[kind].load(std::memory_order_relaxed) >> 20u) + " MiB of ranges)";
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] collect failures (cumulative, the fast proof's CollectWrites returned 0):%s\n", collects.c_str());
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2521,7 +2544,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return fail(FastFail::Collect);
+        if (surface.collected == 0) {
+            countCollectFailure(false, bytes);
+            return fail(FastFail::Collect);
+        }
         const auto* source = surface.source;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
@@ -2573,7 +2599,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            countCollectFailure(true, bytes);
+            return fail(FastFail::Collect);
+        }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its

@@ -1063,6 +1063,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 thread_local std::uint64_t threadCollectEpoch = 0;
+thread_local CollectFailure threadCollectFailure = CollectFailure::None;
 
 std::uint64_t currentCollectEpoch() {
     if (threadCollectEpoch != 0) return threadCollectEpoch;
@@ -1175,7 +1176,11 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    threadCollectFailure = CollectFailure::None;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) {
+        threadCollectFailure = CollectFailure::Empty;
+        return 0;
+    }
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
@@ -1208,7 +1213,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
+    if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) {
+        threadCollectFailure = !tracker.watched ? CollectFailure::Unwatched : CollectFailure::NotCovered;
+        return 0;
+    }
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
@@ -1229,7 +1237,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        threadCollectFailure = CollectFailure::Uncommitted;
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
@@ -1249,6 +1260,22 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, true);
+}
+
+CollectFailure LastCollectFailure() {
+    return threadCollectFailure;
+}
+
+const char* CollectFailureName(CollectFailure failure) {
+    switch (failure) {
+        case CollectFailure::None: return "none";
+        case CollectFailure::Empty: return "empty range";
+        case CollectFailure::Unwatched: return "tracker not watching";
+        case CollectFailure::NotCovered: return "outside the watched arena";
+        case CollectFailure::Uncommitted: return "walk failed (uncommitted pages)";
+        case CollectFailure::Count: break;
+    }
+    return "?";
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
