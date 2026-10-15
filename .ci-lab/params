@@ -1,0 +1,5 @@
+name=lead-tide
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-tide-fa2801a47a-102916
