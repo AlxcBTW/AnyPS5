@@ -4342,6 +4342,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         const bool gpuDirect = sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
         if (!gpuDirect) surfaces.emplace_back(address, guestBytes);
     };
+    static const bool presyncKeys = std::getenv("APS5_LAB_DCC_PRESYNC") != nullptr;
+    const auto considerKeys = [&](std::uint64_t dccAddress, std::uint64_t guestBytes) {
+        if (!presyncKeys || dccAddress == 0 || guestBytes / 256 == 0) return;
+        surfaces.emplace_back(dccAddress, (guestBytes / 256) | PresyncKeyRange);
+    };
     if (completed) {
         // A cached object (the resource cache): Revalidate repeats the lookups of the objects the
         // build made, which never change afterwards (a lookup returning another object fails the
@@ -4356,18 +4361,23 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
                 const auto& texture = textures[textureIndex++];
                 if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
                 else consider(range.format, range.address, range.bytes, true);
+                considerKeys(range.dccAddress, range.bytes);
             }
         }
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (index != 0 && storageTextures[index] == storageTextures[index - 1]) continue;
             const auto& image = *storageTextures[index];
             consider(image.Descriptor().format, image.Descriptor().baseAddress, image.GuestBytes(), false);
+            considerKeys(image.Descriptor().dccAddress, image.GuestBytes());
         }
         return surfaces;
     }
     if (!imageRecords.empty()) {
         for (const auto& record : imageRecords) {
-            if (record.decoded) consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled);
+            if (record.decoded) {
+                consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled);
+                considerKeys(record.resource.dccAddress, record.guestBytes);
+            }
         }
         return surfaces;
     }
@@ -4376,14 +4386,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (IsNullTextureResource(words)) return;
         const auto resource = DecodeTextureResource(words);
-        consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+        const auto guestBytes = DescribeSurface(resource).guestBytes;
+        consider(resource.format, resource.baseAddress, guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+        considerKeys(resource.dccAddress, guestBytes);
     });
     for (const auto& binding : deferredCompute.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::ImageTable) continue;
         for (std::size_t element = 0; element < binding.guestDescriptor.size() / 8u; ++element) {
             try {
                 const auto resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u));
-                consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, true);
+                const auto guestBytes = DescribeSurface(resource).guestBytes;
+                consider(resource.format, resource.baseAddress, guestBytes, true);
+                considerKeys(resource.dccAddress, guestBytes);
             } catch (const std::runtime_error&) {
             }
         }
