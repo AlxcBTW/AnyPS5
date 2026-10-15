@@ -885,19 +885,18 @@ void CheckMarkWrittenUnwatch() {
 #ifdef _WIN32
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, 2 * Block, nullptr);
     Require(section != nullptr, "cannot create the backing of the incomplete collect");
-    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(2 * Block, Block));
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocateAtOrAbove_nid_postfix(GuestArena::GuestArenaHighestFree_nid_no_patch(2 * Block, Block), 2 * Block, Block));
     Require(memory != nullptr, "cannot allocate the incomplete collect block");
     GuestArena::GuestArenaMap_nid_postfix(memory, 2 * Block, section, 0, PAGE_READWRITE);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     Require(Watched(base, 2 * Block), "the incomplete collect block is not watched");
     GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base), 4096, PAGE_NOACCESS);
     GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base + Block), 4096, PAGE_NOACCESS);
-    std::cerr << "step windows setup done\n";
 #else
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(3 * Block));
     const auto base = reinterpret_cast<std::uint64_t>(memory);
-    for (const auto hole : {memory + Block - 4096, memory + 2 * Block - 4096}) {
-        Require(mmap(hole, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == hole, "cannot make the pages whose collect fails");
+    for (const auto page : {memory + Block - 4096, memory + 2 * Block - 4096}) {
+        Require(mmap(page, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == page, "cannot make the pages whose collect fails");
     }
 #endif
     const RecordedHook recorded;
@@ -907,16 +906,14 @@ void CheckMarkWrittenUnwatch() {
         std::lock_guard gpu(GpuMutex());
         Require(MarkWritten(base + 16, 4) == 0, "a driver store whose collect was incomplete produced a generation");
     }
-    std::cerr << "step first MarkWritten done\n";
     RequireHookOver(base, Block, "a driver store whose collect was incomplete");
     Require(!Watched(base, Block), "a driver store whose collect was incomplete left its block watched");
     hookCalls.clear();
     Require(MarkWritten(base + Block + 16, 4) == 0, "a driver store outside the GPU lock whose collect was incomplete produced a generation");
     Require(hookCalls.empty() && !Watched(base + Block, Block), "a driver store outside the GPU lock ran the unwatch hook or kept its block watched");
 #ifdef _WIN32
-    std::cerr << "step cleanup\n";
     GuestArena::GuestArenaReset_nid_postfix(memory, 2 * Block);
-    std::cerr << "step reset done\n";
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base), 2 * Block);
     GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * Block);
     CloseHandle(section);
 #endif
@@ -1088,11 +1085,8 @@ int main() {
         CheckImportWindowOtherThread();
         CheckImportWindowOverUnwatchedPart();
         CheckUnwatchedImport();
-        std::cerr << "step CheckUnwatchHooks\n";
         CheckUnwatchHooks();
-        std::cerr << "step CheckMarkWrittenUnwatch\n";
         CheckMarkWrittenUnwatch();
-        std::cerr << "step CheckCommittedRanges\n";
         CheckCommittedRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
