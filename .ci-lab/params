@@ -1,0 +1,5 @@
+name=cpu-res
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-res-5d5845c5de-83899
