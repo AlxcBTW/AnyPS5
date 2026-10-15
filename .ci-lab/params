@@ -1,0 +1,5 @@
+name=md2-evict-cap3
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-md2-evict-cap3-77ade4ef59-30253
