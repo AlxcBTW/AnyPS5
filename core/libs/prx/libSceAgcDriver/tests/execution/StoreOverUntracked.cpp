@@ -60,6 +60,10 @@ alignas(256) constexpr std::array<std::uint32_t, 9> FillCode{
     0xd7460004, 0x04010c08, 0x7e000204, 0x7e020205, 0x7e040206, 0x7e060207, 0xe01c2000, 0x80000004, 0xbf810000,
 };
 
+alignas(256) constexpr std::array<std::uint32_t, 9> ReadCode{
+    0x7e020280, 0x7e04020c, 0xf0001108, 0x00010300, 0xbf8c3f70, 0x34080082, 0xe0701000, 0x80000304, 0xbf810000,
+};
+
 std::uint64_t AddressOf(const void* data) {
     return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(data));
 }
@@ -118,6 +122,20 @@ void Fill(const std::uint32_t* texels) {
         Filled,
     };
     Dispatch(FillCode, 64, (static_cast<std::uint32_t>(userData.size()) << 1u) | 0x80u, userData, static_cast<std::uint32_t>(SurfaceBytes / 1024u));
+}
+
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::size_t bytes) {
+    const auto address = AddressOf(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), static_cast<std::uint32_t>(bytes), 0x31016facu};
+}
+
+void ReadImage(const std::uint32_t* texels, std::uint32_t* output) {
+    std::array<std::uint32_t, 13> userData{};
+    const auto buffer = BufferDescriptor(output, SurfaceBytes);
+    const auto texture = TextureDescriptor(texels);
+    std::copy(buffer.begin(), buffer.end(), userData.begin());
+    std::copy(texture.begin(), texture.end(), userData.begin() + 4);
+    Dispatch(ReadCode, 32, static_cast<std::uint32_t>(userData.size()) << 1u, userData, 1);
 }
 
 class Surface {
@@ -217,7 +235,7 @@ void Settle(THold& hold, const Surface& surface, std::uint32_t result) {
     hold.unlock();
 }
 
-enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch, NeighbourCopied, NeighbourLeftWatch };
+enum class Kind { ReadAfter, ReadBefore, Filled, Copied, LeftWatch, WrittenThenLeftWatch, ImportLeftWatch, NeighbourCopied, NeighbourLeftWatch, UntrackedRepeat };
 
 // One 64 KiB block of the surface: the image of its last block, and the source copied into it.
 constexpr std::uint32_t BlockSide = 128;
@@ -294,6 +312,7 @@ Outcome RunSecondStore(const char* name) {
 }
 
 Outcome Run(const Case& test) {
+    std::optional<Surface> output;
     std::optional<Surface> source;
     if (test.kind == Kind::Copied || test.kind == Kind::NeighbourCopied) source.emplace();
     const bool neighbour = test.kind == Kind::NeighbourLeftWatch;
@@ -313,6 +332,16 @@ Outcome Run(const Case& test) {
         Settle(hold, *source, Filled);
     }
     Store(surface.Texels());
+    if (test.kind == Kind::UntrackedRepeat) {
+        Settle(hold, surface, Stored);
+        output.emplace();
+        ReadImage(surface.Texels(), output->Texels());
+        hold.lock();
+        const auto image = StorageTexture::FindLive(surface.Address(), SurfaceBytes);
+        Require(image != nullptr, "store over untracked: the sampled surface has no live storage image");
+        image->MarkDirty();
+        hold.unlock();
+    }
     if (test.kind == Kind::Filled || leaves) {
         Settle(hold, surface, Stored);
         if (leaves) {
@@ -428,7 +457,7 @@ int main() {
             Surface probe;
             Require(AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(probe.Texels()))).guestBytes == SurfaceBytes, "store over untracked: unexpected surface size");
         }
-        constexpr std::array<Case, 9> cases{{
+        constexpr std::array<Case, 10> cases{{
             {"another block read after the CPU write", Kind::ReadAfter, Block + Page},
             {"another block read before the CPU write", Kind::ReadBefore, 0xe000},
             {"a fill of the surface", Kind::Filled, 0xe000},
@@ -438,6 +467,7 @@ int main() {
             {"a surface whose import left the write watch", Kind::ImportLeftWatch, 0xe000},
             {"an image copy into another block of the surface", Kind::NeighbourCopied, 0xe000},
             {"a surface whose first block left the write watch with the page before it", Kind::NeighbourLeftWatch, 0xe000},
+            {"untracked storage results written again after an image read", Kind::UntrackedRepeat, 0xe000},
         }};
         bool kept = true;
         for (const auto& test : cases) {
