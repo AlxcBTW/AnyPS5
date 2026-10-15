@@ -1,0 +1,5 @@
+name=pr5315-main
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr5315-main-03c4cb5e78-65689
