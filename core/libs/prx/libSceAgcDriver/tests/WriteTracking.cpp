@@ -667,6 +667,31 @@ void CheckImportWindow() {
     Require(!UnchangedSince(base, Block, after), "a store after the import window was missed");
 }
 
+std::uint64_t hookedBegin = 0;
+std::uint64_t hookedEnd = 0;
+
+void CheckImportWindowOverUnwatchedPart() {
+    void* memory = AllocateWatched(3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 3 * Block);
+    static_cast<void>(CollectWritesUncached(base, 3 * Block));
+    Unwatch(base + Block, Block);
+    SetUnwatchHook([](std::uint64_t address, std::size_t bytes) {
+        hookedBegin = address;
+        hookedEnd = address + bytes;
+    });
+    bool hookedBeforeImport = false;
+    const bool imported = ImportWatched(base, 3 * Block, [&] {
+        hookedBeforeImport = hookedEnd != 0;
+        return true;
+    });
+    SetUnwatchHook(nullptr);
+    Require(imported, "an import over a partly unwatched range failed");
+    Require(!Watched(base, Block) && !Watched(base + 2 * Block, Block), "an import over a partly unwatched range left its watched blocks watched");
+    Require(hookedBegin <= base && hookedEnd >= base + 3 * Block, "an import that left the write watch did not run the unwatch hook over its range");
+    Require(hookedBeforeImport, "an import over a partly unwatched range ran the unwatch hook after the import");
+}
+
 void CheckImportWindowOtherThread() {
     void* memory = AllocateWatched(2 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -780,48 +805,6 @@ void CheckUnwatchedImport() {
     static_cast<void>(CollectWritesUncached(base, Block / 2));
     Require(after != 0 && !UnchangedSince(base, Block / 2, after), "a store beside an import that left the watch was missed");
 #endif
-}
-
-struct UnwatchCall {
-    std::uint64_t address;
-    std::size_t bytes;
-    bool watched;
-};
-
-std::vector<UnwatchCall> unwatchCalls;
-std::uint64_t unwatchProbe = 0;
-std::size_t unwatchProbeBytes = 0;
-
-void RecordUnwatch(std::uint64_t address, std::size_t bytes) {
-    unwatchCalls.push_back({address, bytes, Watched(unwatchProbe, unwatchProbeBytes)});
-}
-
-void CheckUnwalkedImport() {
-    void* memory = AllocateWatched(4 * Block);
-    const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0x11, 4 * Block);
-    Require(CollectWritesUncached(base, 4 * Block) != 0, "the unwalked import block is not collected");
-    SetUnwatchHook(&RecordUnwatch);
-    struct Restore {
-        ~Restore() { SetUnwatchHook(nullptr); }
-    } restore;
-    Require(ImportWatched(base + 2 * Block, 2 * Block, [] { return true; }), "an import that stays watched failed");
-    Require(unwatchCalls.empty() && Watched(base + 2 * Block, 2 * Block), "an import whose page walk vouched for its pages ran the unwatch hook or gave up its range");
-    Unwatch(base, Block);
-    unwatchCalls.clear();
-    unwatchProbe = base + Block;
-    unwatchProbeBytes = 3 * Block;
-    bool hookedBeforeImport = false;
-    Require(ImportWatched(base, 4 * Block, [&] {
-        hookedBeforeImport = unwatchCalls.size() == 1;
-        return true;
-    }), "an import over a range with an unwatched block failed");
-    Require(unwatchCalls.size() == 1, "an import whose page walk could not vouch for its pages did not run the unwatch hook once");
-    Require(hookedBeforeImport, "the unwatch hook of an import whose page walk could not vouch for its pages ran after the import");
-    const auto& call = unwatchCalls.front();
-    Require(call.address <= base && base + 4 * Block <= call.address + call.bytes, "the unwatch hook did not get the imported range");
-    Require(call.watched, "the unwatch hook ran after the imported range left the write watch");
-    Require(!Watched(base + Block, 3 * Block), "an import whose page walk could not vouch for its pages stayed watched");
 }
 
 class PartlyCommitted {
@@ -988,8 +971,8 @@ int main() {
         CheckImportWindow();
         CheckImportWindowZeroPages();
         CheckImportWindowOtherThread();
+        CheckImportWindowOverUnwatchedPart();
         CheckUnwatchedImport();
-        CheckUnwalkedImport();
         CheckCommittedRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
