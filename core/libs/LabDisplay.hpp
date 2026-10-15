@@ -31,8 +31,23 @@ inline bool LogCalls() {
     return value;
 }
 
+inline bool Tv1080() {
+    static const bool value = EnvOn("APS5_LAB_DISPLAY_TV");
+    return value;
+}
+
 inline bool Force1080() {
-    static const bool value = EnvOn("APS5_LAB_DISPLAY_1080");
+    static const bool value = EnvOn("APS5_LAB_DISPLAY_1080") || Tv1080();
+    return value;
+}
+
+inline bool ForceSdr() {
+    static const bool value = EnvOn("APS5_LAB_DISPLAY_SDR") || Tv1080();
+    return value;
+}
+
+inline bool Force60Hz() {
+    static const bool value = EnvOn("APS5_LAB_DISPLAY_60HZ") || Tv1080();
     return value;
 }
 

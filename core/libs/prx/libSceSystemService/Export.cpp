@@ -232,7 +232,7 @@ int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLumi
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- const auto hdr = AgcDriver::CurrentHostHdr();
+ const auto hdr = LabDisplay::ForceSdr() ? AgcDriver::HostHdrStatus{} : AgcDriver::CurrentHostHdr();
  luminance->max_tone_map_luminance = AgcDriver::ToneMapPeakNits(hdr);
  luminance->max_full_frame_tone_map_luminance = hdr.available ? hdr.display.maxFullFrameLuminance : AgcDriver::SdrToneMapLuminanceNits;
  luminance->min_tone_map_luminance = hdr.available ? hdr.display.minLuminance : 0.0f;

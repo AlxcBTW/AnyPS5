@@ -23,7 +23,7 @@ static VideoOutOutputStatus outputStatus(const auto& cfg) {
     status.resolution = (cfg.width >= 3840 || cfg.height >= 2160) ? 2u : 1u;
     if (LabDisplay::Force1080()) status.resolution = 1u;
     if (LabDisplay::ResolutionCode() >= 0) status.resolution = static_cast<std::uint32_t>(LabDisplay::ResolutionCode());
-    const bool hdr = AgcDriver::CurrentHostHdr().available;
+    const bool hdr = AgcDriver::CurrentHostHdr().available && !LabDisplay::ForceSdr();
     status.dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
     status.refreshRate = (cfg.outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status.flags = hdr ? VIDEO_OUT_OUTPUT_STATUS_FLAG_HDR : 0;
@@ -56,7 +56,7 @@ int ValidateVideoOutOutputMode_nid_no_patch(uint64_t mode, const VideoOutOutputO
 static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) {
     if (!VideoOutDriver::Get().HasConfig(handle) || !VideoOutDriver::Get().IsOpen(handle)) return VIDEO_OUT_ERROR_INVALID_HANDLE;
     if (reservedPtr != nullptr || reserved != 0) return VIDEO_OUT_ERROR_INVALID_VALUE;
-    return ValidateVideoOutOutputMode_nid_no_patch(mode, options, VideoOutDriver::Get().GetDisplayRefreshRate());
+    return ValidateVideoOutOutputMode_nid_no_patch(mode, options, LabDisplay::Force60Hz() ? 60 : VideoOutDriver::Get().GetDisplayRefreshRate());
 }
 
 static void validateOpenParam(const void* param) {
@@ -94,7 +94,7 @@ int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* pa
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");
     }
     const int handle = VideoOutDriver::Get().Open(busType);
-    APS5_LAB_DISPLAY_LOG(__func__, "userId=%d busType=%d index=%d -> handle=%d (lab: display1080=%d resolutionCode=%d viewportCensus=%d gpuClockDiv=%llu)", userId, busType, index, handle, LabDisplay::Force1080() ? 1 : 0, LabDisplay::ResolutionCode(), LabDisplay::ViewportCensus() ? 1 : 0, static_cast<unsigned long long>(LabDisplay::GpuClockDivisor()));
+    APS5_LAB_DISPLAY_LOG(__func__, "userId=%d busType=%d index=%d -> handle=%d (lab: display1080=%d sdr=%d hz60=%d resolutionCode=%d viewportCensus=%d gpuClockDiv=%llu)", userId, busType, index, handle, LabDisplay::Force1080() ? 1 : 0, LabDisplay::ForceSdr() ? 1 : 0, LabDisplay::Force60Hz() ? 1 : 0, LabDisplay::ResolutionCode(), LabDisplay::ViewportCensus() ? 1 : 0, static_cast<unsigned long long>(LabDisplay::GpuClockDivisor()));
     if (handle < 0) return VIDEO_OUT_ERROR_RESOURCE_BUSY;
     return handle;
 } catch (const ProcessShutdown&) {
@@ -258,7 +258,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
-    APS5_LAB_DISPLAY_LOG(__func__, "handle=%d mode=0x%llx options=%p -> %d (display %d Hz)", handle, static_cast<unsigned long long>(mode), static_cast<const void*>(options), result == 0 ? 1 : result, VideoOutDriver::Get().GetDisplayRefreshRate());
+    APS5_LAB_DISPLAY_LOG(__func__, "handle=%d mode=0x%llx options=%p -> %d (display %d Hz)", handle, static_cast<unsigned long long>(mode), static_cast<const void*>(options), result == 0 ? 1 : result, LabDisplay::Force60Hz() ? 60 : VideoOutDriver::Get().GetDisplayRefreshRate());
     if (result != 0) {
         return result;
     }
