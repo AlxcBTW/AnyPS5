@@ -1,0 +1,5 @@
+name=md2-main2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-md2-main2-636b1b93cf-18690
