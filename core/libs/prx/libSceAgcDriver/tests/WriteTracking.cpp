@@ -892,10 +892,13 @@ void CheckMarkWrittenUnwatch() {
     Require(Watched(base, 2 * Block), "the incomplete collect block is not watched");
     GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base), 4096, PAGE_NOACCESS);
     GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(base + Block), 4096, PAGE_NOACCESS);
+    std::cerr << "step windows setup done\n";
 #else
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(3 * Block));
     const auto base = reinterpret_cast<std::uint64_t>(memory);
-    Require(munmap(memory + Block - 4096, 4096) == 0 && munmap(memory + 2 * Block - 4096, 4096) == 0, "cannot make the pages whose collect fails");
+    for (const auto hole : {memory + Block - 4096, memory + 2 * Block - 4096}) {
+        Require(mmap(hole, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == hole, "cannot make the pages whose collect fails");
+    }
 #endif
     const RecordedHook recorded;
     hookProbe = base;
@@ -904,13 +907,16 @@ void CheckMarkWrittenUnwatch() {
         std::lock_guard gpu(GpuMutex());
         Require(MarkWritten(base + 16, 4) == 0, "a driver store whose collect was incomplete produced a generation");
     }
+    std::cerr << "step first MarkWritten done\n";
     RequireHookOver(base, Block, "a driver store whose collect was incomplete");
     Require(!Watched(base, Block), "a driver store whose collect was incomplete left its block watched");
     hookCalls.clear();
     Require(MarkWritten(base + Block + 16, 4) == 0, "a driver store outside the GPU lock whose collect was incomplete produced a generation");
     Require(hookCalls.empty() && !Watched(base + Block, Block), "a driver store outside the GPU lock ran the unwatch hook or kept its block watched");
 #ifdef _WIN32
+    std::cerr << "step cleanup\n";
     GuestArena::GuestArenaReset_nid_postfix(memory, 2 * Block);
+    std::cerr << "step reset done\n";
     GuestArena::GuestArenaRelease_nid_postfix(memory, 2 * Block);
     CloseHandle(section);
 #endif
@@ -1082,8 +1088,11 @@ int main() {
         CheckImportWindowOtherThread();
         CheckImportWindowOverUnwatchedPart();
         CheckUnwatchedImport();
+        std::cerr << "step CheckUnwatchHooks\n";
         CheckUnwatchHooks();
+        std::cerr << "step CheckMarkWrittenUnwatch\n";
         CheckMarkWrittenUnwatch();
+        std::cerr << "step CheckCommittedRanges\n";
         CheckCommittedRanges();
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
