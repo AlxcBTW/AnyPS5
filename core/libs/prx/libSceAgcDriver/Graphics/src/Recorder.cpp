@@ -2485,7 +2485,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             // Lab only (APS5_LAB_RANGELOG without APS5_PROFILE_GPU): the batch's own stamps, absolute, for per-frame busy and gaps.
-            if (batch.labWindow) std::fprintf(stderr, "[labbatch] p=%llu b=%llu start=%.1f dur=%.1f\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), batch.gpuStartNs / 1e3, (batch.gpuEndNs - batch.gpuStartNs) / 1e3);
+            if (batch.labWindow) std::fprintf(stderr, "[labbatch] p=%llu q=0x%x b=%llu start=%.1f dur=%.1f\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), batch.gpuStartNs / 1e3, (batch.gpuEndNs - batch.gpuStartNs) / 1e3);
         }
         return;
     }
@@ -2529,7 +2529,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             const double absoluteUs = static_cast<double>(stamps[i * 2]) * period / 1e3;
             const double durationUs = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period / 1e3;
             const char* note = i < batch.labNotes.size() ? batch.labNotes[i].c_str() : "";
-            std::fprintf(stderr, "[labrange] p=%llu b=%llu n=%zu t=%.1f a=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned long long>(batch.serial), i, startUs, absoluteUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
+            std::fprintf(stderr, "[labrange] p=%llu q=0x%x b=%llu n=%zu t=%.1f a=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), i, startUs, absoluteUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
         }
     }
     std::sort(intervals.begin(), intervals.end());

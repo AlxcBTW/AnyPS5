@@ -4263,7 +4263,12 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
     // Lab only (APS5_LAB_COPYLAYOUT=1): the transfer layouts around the copy instead of GENERAL (content kept, so the
     // result is the same; whether the driver copies faster in them is the question).
     const bool optimalLayouts = Recorder::LabLever(Recorder::LabLeverId::CopyLayout);
-    if (Recorder::LabLogging()) recorder->LabNote(timing, std::string("COPYIMG layouts=") + (optimalLayouts ? "transfer" : "general") + " src=[" + source.LabText() + "] dst=[" + LabText() + "]");
+    if (Recorder::LabLogging()) {
+        char packetText[48];
+        const auto packet = GuestMemory::CurrentPacket();
+        std::snprintf(packetText, sizeof(packetText), " pkt=0x%x q=0x%x", static_cast<unsigned>(packet.opcode), static_cast<unsigned>(packet.queue));
+        recorder->LabNote(timing, std::string("COPYIMG layouts=") + (optimalLayouts ? "transfer" : "general") + packetText + " src=[" + source.LabText() + "] dst=[" + LabText() + "]");
+    }
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));

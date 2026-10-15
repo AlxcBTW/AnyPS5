@@ -2249,7 +2249,8 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
     if (Graphics::Recorder::LabLogging()) {
         char text[200];
-        std::snprintf(text, sizeof(text), "FILL addr=0x%llx bytes=%zu uniform=%d pattern=%08x import=0x%llx+0x%llx", static_cast<unsigned long long>(address), bytes, uniform ? 1 : 0, pattern[0], static_cast<unsigned long long>(import->base), static_cast<unsigned long long>(import->bytes));
+        const auto packet = GuestMemory::CurrentPacket();
+        std::snprintf(text, sizeof(text), "FILL addr=0x%llx bytes=%zu uniform=%d pattern=%08x pkt=0x%x q=0x%x import=0x%llx+0x%llx", static_cast<unsigned long long>(address), bytes, uniform ? 1 : 0, pattern[0], static_cast<unsigned>(packet.opcode), static_cast<unsigned>(packet.queue), static_cast<unsigned long long>(import->base), static_cast<unsigned long long>(import->bytes));
         recorder.LabNote(timing, text);
     }
     if (Graphics::Recorder::BarrierValidate()) {
@@ -2519,7 +2520,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
     if (Graphics::Recorder::LabLogging()) {
         char text[224];
-        std::snprintf(text, sizeof(text), "COPYBUF src=0x%llx dst=0x%llx bytes=%zu q=0x%x prog=0x%llx", static_cast<unsigned long long>(source), static_cast<unsigned long long>(destination), bytes, queue, static_cast<unsigned long long>(programAddress));
+        std::snprintf(text, sizeof(text), "COPYBUF src=0x%llx dst=0x%llx bytes=%zu q=0x%x pkt=0x%x prog=0x%llx", static_cast<unsigned long long>(source), static_cast<unsigned long long>(destination), bytes, queue, static_cast<unsigned>(GuestMemory::CurrentPacket().opcode), static_cast<unsigned long long>(programAddress));
         recorder.LabNote(classTiming, text);
     }
     if (Graphics::Recorder::BarrierValidate()) {
