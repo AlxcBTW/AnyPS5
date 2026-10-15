@@ -327,6 +327,7 @@ bool Driver::enqueueClockStorePacket(std::span<const std::uint32_t> packet, std:
         GuestMemory::SetCurrentPacket(0x40, queue);
         commitClockStore(queue, address, bytes);
     }, {{address, address + bytes}});
+    ++clockStoresQueued;
     return true;
 }
 

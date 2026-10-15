@@ -2,4 +2,4 @@ name=cpu-pipe
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-cpu-pipe-d33021fe0c-86132
+artifact=lab-libs-cpu-pipe-48606f3d06-87731
