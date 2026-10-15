@@ -3113,8 +3113,14 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     std::vector<bool> unsaved(trackedLayers, false);
     bool anyUnsaved = false;
+    // Lab A/B, off by default (APS5_LAB_SAVE_AT_PENDING=1): a unit that has a write generation but no saved guest bytes
+    // and no save on its way also gets its bytes captured here when the image lies outside the write watch. Such a unit
+    // (tracked while its memory was watched, not pending when the memory left the watch, so saveBeforeUnwatch skipped it)
+    // otherwise reaches its write-back with nothing to compare against, which the write-back refuses.
+    static const bool saveAtPending = std::getenv("APS5_LAB_SAVE_AT_PENDING") != nullptr;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
-        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0;
+        const bool noBaseline = !layerPending[layer] && !layerOriginal[layer];
+        unsaved[layer] = noBaseline && (layerGeneration[layer] == 0 || (saveAtPending && (layer >= savedTicket.size() || savedTicket[layer] == 0)));
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
@@ -4525,6 +4531,14 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
     return GuestMemory::EqualsCommittedUnsynced(from, std::span<const std::byte>(baseline).subspan(offset, static_cast<std::size_t>(to - from)));
 }
 
+// Lab A/B, off by default: APS5_LAB_STORE_UNSAVED=1 stores a unit whose results are pending over memory outside the write
+// watch without saved guest bytes whole (the GPU results win) instead of refusing it. Guest bytes the CPU wrote since the
+// results became pending are overwritten, so this is a diagnostic switch, not a fix.
+static bool LabStoreUnsaved() {
+    static const bool enabled = std::getenv("APS5_LAB_STORE_UNSAVED") != nullptr;
+    return enabled;
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4636,9 +4650,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 std::snprintf(entry, sizeof(entry), " [unit %u at +0x%llx pending %d original %d generation %llu]", layer, static_cast<unsigned long long>(layerBegin(layer) - descriptor.baseAddress), layerPending[layer] ? 1 : 0, layerOriginal[layer] ? 1 : 0, static_cast<unsigned long long>(layerGeneration[layer]));
                 detail += entry;
             }
-            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d;%s\n",
+            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d;%s%s\n",
                 static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.samples, static_cast<unsigned long long>(descriptor.dccAddress),
-                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, detail.c_str());
+                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, detail.c_str(), LabStoreUnsaved() ? " [stored whole: APS5_LAB_STORE_UNSAVED]" : "");
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -4702,7 +4716,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
     if (!segments.empty()) {
-        Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+        Require(!unsavedOutsideWatch || LabStoreUnsaved(), "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         // Outside the write watch the stored bytes are what the next store compares with.
         const auto saveUnits = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? std::vector<std::uint32_t>{} : prepareStoredSave(layers, skippedLayer);
         if (blockUnits) {
@@ -4879,7 +4893,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    Require(!unsavedOutsideWatch || LabStoreUnsaved(), "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
