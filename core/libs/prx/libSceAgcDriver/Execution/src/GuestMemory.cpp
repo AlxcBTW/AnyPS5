@@ -1372,7 +1372,25 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return true;
     }
     const WindowCopy window{first, saved, slots};
-    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
+        // The import stays watched only when the walk can vouch for the pages; otherwise the range leaves the write watch here. The
+        // other two paths that unwatch (Unwatch, and the import that does not stay watched) first let pending storage results over
+        // the range save the guest bytes they will be compared with (beforeUnwatch); this one did not, so a pending unit lost its
+        // way to tell CPU writes from its own results and the write-back refused it. APS5_LAB_SAVE_AT_UNWATCH=1 saves them here too
+        // (the hook takes the GPU mutex, so it runs outside the tracker lock); off by default. Either way the event is reported
+        // (16 at most), to tell whether this path is the one a refused write-back came through.
+        static const bool saveAtUnwatch = std::getenv("APS5_LAB_SAVE_AT_UNWATCH") != nullptr;
+        static std::atomic<int> fallbackReports{0};
+        if (fallbackReports.fetch_add(1, std::memory_order_relaxed) < 16) {
+            std::fprintf(stderr, "[write-watch] range 0x%llx+0x%llx leaves the write watch after its import (covered before %d, first walk %d)%s\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first), covered ? 1 : 0, before ? 1 : 0, saveAtUnwatch ? "; pending storage results over it save their guest bytes first (APS5_LAB_SAVE_AT_UNWATCH)" : "");
+        }
+        if (saveAtUnwatch) {
+            lock.unlock();
+            beforeUnwatch(first, static_cast<std::size_t>(stop - first));
+            lock.lock();
+        }
+        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    }
     return true;
 }
 
