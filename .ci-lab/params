@@ -1,0 +1,5 @@
+name=cpu-gaps-pr-sq
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-gaps-pr-sq-a447c9693d-113769
