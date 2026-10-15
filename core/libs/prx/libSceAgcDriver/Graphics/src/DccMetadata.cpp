@@ -791,6 +791,12 @@ bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count) {
     return std::none_of(memo.entries.begin(), memo.entries.end(), [&](const GpuKeyStore& store) { return store.note != 0 && store.begin <= metaAddress && metaAddress + count <= store.end; });
 }
 
+bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count) {
+    if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    auto* recorder = Recorder::Active();
+    return recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count) && !PendingStoreKeys(*recorder, metaAddress, count).has_value();
+}
+
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
