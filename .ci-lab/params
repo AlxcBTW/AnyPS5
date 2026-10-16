@@ -2,4 +2,4 @@ name=alias-wb
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-alias-wb-e24dd40f01-213999
+artifact=lab-libs-alias-wb-8bad27f728-217511
