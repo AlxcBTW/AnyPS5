@@ -592,6 +592,12 @@ public:
         return plane.storage;
     }
 
+    // Whether the texels the clear stores are the plane's: as wide as its 16 or 32 bits and as many as its extent.
+    bool OverwritesWholePlane(const DepthPlaneOverwrite& overwrite) const {
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        return overwrite.bits == (d16 ? 16u : 32u) && overwrite.width >= target.extent.width && overwrite.height >= target.extent.height;
+    }
+
     // The clear (DepthPlaneClear) the calling thread's dispatch is recorded under, when it stores through `words` to every texel of this plane.
     DepthPlaneOverwrite* PlaneOverwritten(std::span<const std::uint32_t> words) const {
         auto* overwrite = currentOverwrite;
@@ -609,11 +615,12 @@ public:
         return overwrite;
     }
 
-    // The dispatch recorded under a DepthPlaneClear stored its value to every texel of `mirror` (its copy-in was left
-    // out): the depth image takes the value by a clear, which is what the copy-out would have written.
+    // The dispatch recorded under a DepthPlaneClear stored its value to every texel of `mirror`: the depth image takes the
+    // value by a clear, which is what the copy-out would have written. The dispatch's own stores are all that matters, so
+    // this holds whether Storage() left the copy-in out here or the dispatch was served from a template that never called it.
     bool StoreOverwrite(const StorageTexture& mirror) {
         auto* overwrite = currentOverwrite;
-        if (overwrite == nullptr || overwrite->mirror != &mirror) return false;
+        if (overwrite == nullptr || !OverwritesWholePlane(*overwrite)) return false;
         const auto& described = mirror.Descriptor();
         const auto& view = overwrite->view;
         if (described.baseAddress != view.baseAddress || described.format != view.format || described.tileMode != view.tileMode || described.dimension != view.dimension) return false;
@@ -625,9 +632,12 @@ public:
         const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
         RecordClearValue(VK_IMAGE_ASPECT_DEPTH_BIT, overwrite->depth, clearStencil);
         recorder->EndGpuTiming(timing, bytes);
+        // A fast clear still pending for the depth is superseded: every texel was stored after it (Storage() applies it before the
+        // copy-in, a dispatch served without Storage() would leave it for the next draw to apply over the stored values).
+        pendingClear &= ~static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT);
         auto& counters = depthClearCounters();
         ++counters.clears;
-        counters.bytesSkipped += 2u * bytes;
+        counters.bytesSkipped += (overwrite->mirror == &mirror ? 2u : 1u) * bytes;
         overwrite->mirror = nullptr;
         if (depthClearMode() >= 2) VerifyOverwrite(mirror, *overwrite);
         printDepthClearCounters();
