@@ -1,0 +1,6 @@
+name=f16-base-bench
+build_type=Release
+g1=off
+cmake=
+artifact=lab-bench-f16-base-bench-6999037605-138933
+targets=agc_shader_replay
