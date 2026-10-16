@@ -1897,7 +1897,7 @@ bool StorageTexture::Refresh() {
     std::vector<HandOver> handOvers;
     std::vector<std::shared_ptr<StorageTexture>> handOverSources;
     DccKeys handOverKeys = DccKeys::Uncompressed;
-    if (blockUnits && use != RefreshUse::Read && (applying || verify) && (!handedFrom.empty() || otherPendingOverlaps())) {
+    if (blockUnits && use != RefreshUse::Read && (applying || verify) && (!handedFrom.empty() || PendingStorageOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this))) {
         handOvers = handOversUnder(alias.get(), applying ? mode : AliasHandOverMode::All, handOverKeys);
         // The images stay alive across the refresh (their last owner may be a batch's kept list).
         std::erase_if(handOvers, [&](const HandOver& handOver) {
