@@ -277,6 +277,8 @@ struct PlaneModel {
     }
 };
 
+void Totals(const std::string& what);
+
 void Step(const Env& env, const ShaderRecompiler::RecompileResult& program, PlaneModel& model, const std::uint32_t* input, const std::string& what) {
     const auto expected = model.Dispatch(input);
     auto* output = env.buffers.Output();
@@ -285,6 +287,7 @@ void Step(const Env& env, const ShaderRecompiler::RecompileResult& program, Plan
     for (std::uint32_t lane = 0; lane < Threads; ++lane) {
         Require(output[lane] == expected[lane], "dispatch move depth: " + what + ": lane " + std::to_string(lane) + " is " + Hex(output[lane]) + ", expected " + Hex(expected[lane]));
     }
+    Totals(what);
 }
 
 void Verify(const Env& env, const void* plane, const PlaneModel& model, const std::string& what) {
