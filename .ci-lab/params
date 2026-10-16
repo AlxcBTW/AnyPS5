@@ -1,0 +1,5 @@
+name=guestcrash-peek
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-guestcrash-peek-221af06323-252878
