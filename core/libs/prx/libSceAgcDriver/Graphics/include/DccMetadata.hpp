@@ -135,6 +135,9 @@ struct DccKeyWaitCounts {
     std::array<std::uint64_t, 3> syncedBy;
     std::array<double, 3> syncedMs;
     std::array<std::uint64_t, 4> byCoverage;
+    // The locked syncs by what the quick predicate (DccKeyWritersPending: the lock-free snapshot, and a memoized driver
+    // key store covering the range counts as known) said just before: [0] pending, [1] not pending.
+    std::array<std::uint64_t, 2> byQuick;
 };
 DccKeyWaitCounts KeyWaitCounts();
 
