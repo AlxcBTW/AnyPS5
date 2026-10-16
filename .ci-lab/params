@@ -1,0 +1,5 @@
+name=pr-dispmove
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr-dispmove-ed4e4d3463-42552
