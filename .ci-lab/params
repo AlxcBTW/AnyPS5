@@ -1,0 +1,5 @@
+name=lead-best7-cpu
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best7-cpu-7d5067024e-263848
