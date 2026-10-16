@@ -73,7 +73,8 @@ struct DepthPlaneOverwrite {
     std::uint32_t height = 0;
     std::uint32_t raw = 0;
     float depth = 0.0f;
-    bool armed = false;
+    // The mirror whose copy-in was left out for this dispatch (set by DepthSurface::Storage, consumed by its StoreBack).
+    const void* mirror = nullptr;
 };
 // While alive, the depth storage bindings of the calling thread's dispatch that use the clear's image take the
 // clear above. The caller holds the GPU mutex with the packet's labels recorded (the colour is read from guest
