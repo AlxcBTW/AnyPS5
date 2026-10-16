@@ -75,6 +75,10 @@ jobs:
           cat "$icd"
           echo "VK_DRIVER_FILES=$(cygpath -w "$icd")" >> "$GITHUB_ENV"
           echo "VK_ICD_FILENAMES=$(cygpath -w "$icd")" >> "$GITHUB_ENV"
+          echo "VK_LOADER_DEBUG=error,warn,driver" >> "$GITHUB_ENV"
+          echo 'C:\mesa\x64' >> "$GITHUB_PATH"
+          where vulkan-1.dll || true
+          powershell -NoProfile -Command "Get-ChildItem C:/Windows/System32/vulkan-1.dll, C:/Windows/SysWOW64/vulkan-1.dll -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + ' ' + $_.VersionInfo.FileVersion }" || true
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DANYPS5_AGC_EXECUTION_TESTS=StorageWriteBackOverhang -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
