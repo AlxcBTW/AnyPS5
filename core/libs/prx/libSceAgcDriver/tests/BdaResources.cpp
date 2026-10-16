@@ -1116,6 +1116,62 @@ void importWatchTests() {
 #endif
 }
 
+void unwatchedHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
+        std::cout << "guest arena unavailable or not write-watched: heap mirrors without a write watch not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 3 * 65536;
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+#ifdef _WIN32
+    GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+#endif
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uintptr_t>(block);
+    const auto registry = [&](bool add) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        if (add) GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, block, bytes, true, false, true);
+        else GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, block);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    };
+    const auto build = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        const auto ranges = leased.AddressRanges();
+        const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
+        Require(found != ranges.end() && found->deviceAddress != 0u, "the heap range is missing from the BDA table");
+        leased.WriteBack();
+        return found->deviceAddress;
+    };
+    const auto sweep = [&] {
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+    };
+    sweep();
+    registry(true);
+    const auto before = MirrorCounters();
+    build();
+    const auto made = MirrorCounters();
+    Require(made.heapMirrors == before.heapMirrors + 1 && made.heapBytes == before.heapBytes + bytes, "a read-only heap range was not mirrored");
+    AgcDriver::GuestMemory::Unwatch(address + 65536, 65536);
+    Require(!AgcDriver::GuestMemory::Watched(address, bytes), "the heap range is still write-watched after one of its blocks left the watch");
+    guest[7] = 0x22;
+    guest[65536 + 9] = 0x33;
+    guest[2 * 65536 + 11] = 0x44;
+    const auto device = build();
+    Require(access.addressBytes(device)[7] == std::byte{0x22} && access.addressBytes(device)[65536 + 9] == std::byte{0x33} && access.addressBytes(device)[2 * 65536 + 11] == std::byte{0x44}, "a heap mirror whose range left the write watch missed a CPU write");
+    guest[65536 + 13] = 0x55;
+    const auto again = build();
+    Require(access.addressBytes(again)[65536 + 13] == std::byte{0x55} && access.addressBytes(again)[7] == std::byte{0x22}, "a heap mirror whose range left the write watch missed a CPU write of a later build");
+    registry(false);
+    sweep();
+    Require(MirrorCounters().heapMirrors == before.heapMirrors && MirrorCounters().heapBytes == before.heapBytes, "the heap mirror outlived its range");
+}
+
 void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
         std::cout << "guest arena unavailable or not write-watched: heap mirrors not tested\n";
@@ -1952,6 +2008,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     importNeighbouringEdgesTests(context);
     importAtMapOverBudgetTests(context);
     heapMirrorTests(context, access);
+    unwatchedHeapMirrorTests(context, access);
     importedHeapMirrorTests(context, access);
     importWatchTests();
     importedFreshTests(context);
