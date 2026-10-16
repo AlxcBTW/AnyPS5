@@ -29,14 +29,15 @@
 #include <string>
 #include <vector>
 
-// A compute template that binds a plane through a storage image must not outlive the depth surface that
-// owns the plane's memory. Templates are served from stamps (Revalidate's fast proof, the moved-buffer
+// A compute template that stores to a plane through a storage image must not outlive the depth surface
+// that owns the plane's memory. Templates are served from stamps (Revalidate's fast proof, the moved-buffer
 // path on top of it), and no stamp tells that a depth surface appeared over the image after the build:
 // the lookup would then hand out the plane's colour mirror, copied in from the depth image, and the
-// stale image would be copied over the depth image after the dispatch. The program reads the first row
-// of the plane, adds a read-only buffer to it, writes the sum to a buffer and stores the buffer over
-// the first row, so a stale image shows in the sums, in the first row and in every other texel the
-// copy-out writes back. The planes are read back by programs that are compiled anew (no template).
+// stale image would be copied over the whole depth image after the dispatch (DepthSurfaceStoreBack).
+// A program that overwrites the plane in full cannot tell, a program that stores to part of it can: the
+// first row of the plane takes a read-only buffer, every other texel must stay what the depth image holds.
+// The plane is only stored to (a program that also loads from it gets a sampled binding, which the
+// depth surface changes anyway). The planes are read back by programs compiled anew (no template).
 
 namespace {
 
@@ -55,16 +56,15 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 constexpr std::size_t Piece = 65536;
 
-// out[tid] = bits(plane(tid, 0)) + in[tid]; plane(tid, 0) = in[tid]. User data: s[0:3] the output V#,
-// s[4:11] the plane's T#, s[16:19] the input V#.
-alignas(256) constexpr std::array<std::uint32_t, 15> RowCode{
+// out[tid] = in[tid] + 1; plane(tid, 0) = in[tid]. User data: s[0:3] the output V#, s[4:11] the plane's T#,
+// s[16:19] the input V#.
+alignas(256) constexpr std::array<std::uint32_t, 13> RowCode{
     0x7e3c0300u,                // v_mov_b32 v30, v0
     0x7e3e0280u,                // v_mov_b32 v31, 0
-    0xf0001108u, 0x00010a1eu,   // image_load v10, v[30:31], s[4:11]
     0x34060082u,                // v_lshlrev_b32 v3, 2, v0
     0xe0301000u, 0x80040b03u,   // buffer_load_dword v11, v3, s[16:19], 0 offen
     0xbf8c3f70u,                // s_waitcnt vmcnt(0)
-    0x4a18170au,                // v_add_nc_u32 v12, v10, v11
+    0x4a181681u,                // v_add_nc_u32 v12, 1, v11
     0xe0701000u, 0x80000c03u,   // buffer_store_dword v12, v3, s[0:3], 0 offen
     0xf0201108u, 0x00010b1eu,   // image_store v11, v[30:31], s[4:11]
     0xbf810000u, 0xbf810000u,
@@ -272,7 +272,7 @@ struct PlaneModel {
     std::array<std::uint32_t, Threads> Dispatch(const std::uint32_t* input) {
         std::array<std::uint32_t, Threads> sums{};
         for (std::uint32_t lane = 0; lane < Threads; ++lane) {
-            sums[lane] = row0[lane] + input[lane];
+            sums[lane] = input[lane] + 1u;
             row0[lane] = input[lane];
         }
         return sums;
@@ -328,6 +328,18 @@ void Print(const char* what, const MoveSteps& step) {
     std::printf("dispatch move depth: %s: checked %llu, exact %llu, moved %llu, refused %llu\n", what, static_cast<unsigned long long>(step.checked), static_cast<unsigned long long>(step.exact), static_cast<unsigned long long>(step.moved), static_cast<unsigned long long>(step.refused));
 }
 
+// The first dispatch over a range of guest memory is not served by a template whose input moved onto it (the
+// object built then did not see the range imported), so every range the scenarios use is dispatched over once.
+void Warm(const Env& env, std::uint8_t* plane) {
+    FillPlane(plane, 0.5f);
+    PlaneModel model;
+    model.Set(0.5f);
+    const auto program = RowProgram(env.device, plane, env.buffers.InputA(), env.buffers.Output());
+    Step(env, program, model, env.buffers.InputA(), "warm-up: the first input");
+    Step(env, program, model, env.buffers.InputB(), "warm-up: the second input");
+    Step(env, program, model, env.buffers.InputC(), "warm-up: the third input");
+}
+
 // No depth surface anywhere near the plane: the template serves the repeats (the positive control).
 bool Control(const Env& env, std::uint8_t* plane) {
     FillPlane(plane, 0.5f);
@@ -348,7 +360,9 @@ bool Control(const Env& env, std::uint8_t* plane) {
     Print("control, a plane without a depth surface", steps);
     Verify(env, plane, model, "control");
     Require(steps.refused == 0, "dispatch move depth: the control's repeats were refused");
-    return steps.checked != 0;
+    if (steps.checked == 0) return false;
+    Require(steps.checked == 3 && steps.moved == 3, "dispatch move depth: the control's repeats were not all served by the template of the first dispatch");
+    return true;
 }
 
 // The depth surface exists before the first dispatch: the template holds the plane's colour mirror, which the
@@ -401,6 +415,7 @@ bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwat
     FillInput(env.buffers.InputA(), 0.0625f);
     FillInput(env.buffers.InputB(), 0.109375f);
     FillInput(env.buffers.InputC(), 0.15625f);
+    Warm(env, watched.PieceAt(9));
     const bool templates = Control(env, watched.PieceAt(0));
     if (!templates) std::puts("dispatch move depth: the device kept no template (no host imports); the moved-buffer path is not exercised");
     Mirror(env, watched.PieceAt(1), "inside the write watch");
