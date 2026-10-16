@@ -1,0 +1,5 @@
+name=bindcost
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-bindcost-55b0055f0a-43982
