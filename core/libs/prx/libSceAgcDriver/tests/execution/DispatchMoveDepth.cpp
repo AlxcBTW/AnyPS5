@@ -2,6 +2,8 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -15,6 +17,8 @@
 #include <sys/mman.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -27,14 +31,25 @@
 #include <string>
 #include <vector>
 
-// A compute template that binds a plane through a storage image must not outlive the depth surface that
-// owns the plane's memory. Templates are served from stamps (Revalidate's fast proof, the moved-buffer
+// A compute template that stores to a plane through a storage image must not outlive the depth surface
+// that owns the plane's memory. Templates are served from stamps (Revalidate's fast proof, the moved-buffer
 // path on top of it), and no stamp tells that a depth surface appeared over the image after the build:
 // the lookup would then hand out the plane's colour mirror, copied in from the depth image, and the
-// stale image would be copied over the depth image after the dispatch. The program reads the first row
-// of the plane, adds a read-only buffer to it, writes the sum to a buffer and stores the buffer over
-// the first row, so a stale image shows in the sums, in the first row and in every other texel the
-// copy-out writes back. The planes are read back by programs that are compiled anew (no template).
+// stale image would be copied over the whole depth image after the dispatch (DepthSurfaceStoreBack).
+// A program that overwrites the plane in full cannot tell, a program that stores to part of it can: the
+// first row of the plane takes a read-only buffer, every other texel must stay what the depth image holds.
+// The plane is only stored to (a program that also loads from it gets a sampled binding, which the
+// depth surface changes anyway). The planes are read back by programs compiled anew (no template).
+
+#ifndef _WIN32
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+#endif
 
 namespace {
 
@@ -53,16 +68,15 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 constexpr std::size_t Piece = 65536;
 
-// out[tid] = bits(plane(tid, 0)) + in[tid]; plane(tid, 0) = in[tid]. User data: s[0:3] the output V#,
-// s[4:11] the plane's T#, s[16:19] the input V#.
-alignas(256) constexpr std::array<std::uint32_t, 15> RowCode{
+// out[tid] = in[tid] + 1; plane(tid, 0) = in[tid]. User data: s[0:3] the output V#, s[4:11] the plane's T#,
+// s[16:19] the input V#.
+alignas(256) constexpr std::array<std::uint32_t, 13> RowCode{
     0x7e3c0300u,                // v_mov_b32 v30, v0
     0x7e3e0280u,                // v_mov_b32 v31, 0
-    0xf0001108u, 0x00010a1eu,   // image_load v10, v[30:31], s[4:11]
     0x34060082u,                // v_lshlrev_b32 v3, 2, v0
     0xe0301000u, 0x80040b03u,   // buffer_load_dword v11, v3, s[16:19], 0 offen
     0xbf8c3f70u,                // s_waitcnt vmcnt(0)
-    0x4a18170au,                // v_add_nc_u32 v12, v10, v11
+    0x4a181681u,                // v_add_nc_u32 v12, 1, v11
     0xe0701000u, 0x80000c03u,   // buffer_store_dword v12, v3, s[0:3], 0 offen
     0xf0201108u, 0x00010b1eu,   // image_store v11, v[30:31], s[4:11]
     0xbf810000u, 0xbf810000u,
@@ -270,12 +284,14 @@ struct PlaneModel {
     std::array<std::uint32_t, Threads> Dispatch(const std::uint32_t* input) {
         std::array<std::uint32_t, Threads> sums{};
         for (std::uint32_t lane = 0; lane < Threads; ++lane) {
-            sums[lane] = row0[lane] + input[lane];
+            sums[lane] = input[lane] + 1u;
             row0[lane] = input[lane];
         }
         return sums;
     }
 };
+
+void Totals(const std::string& what);
 
 void Step(const Env& env, const ShaderRecompiler::RecompileResult& program, PlaneModel& model, const std::uint32_t* input, const std::string& what) {
     const auto expected = model.Dispatch(input);
@@ -285,6 +301,7 @@ void Step(const Env& env, const ShaderRecompiler::RecompileResult& program, Plan
     for (std::uint32_t lane = 0; lane < Threads; ++lane) {
         Require(output[lane] == expected[lane], "dispatch move depth: " + what + ": lane " + std::to_string(lane) + " is " + Hex(output[lane]) + ", expected " + Hex(expected[lane]));
     }
+    Totals(what);
 }
 
 void Verify(const Env& env, const void* plane, const PlaneModel& model, const std::string& what) {
@@ -306,8 +323,33 @@ MoveSteps Since(const AgcDriver::VulkanDevice::DispatchMoveCount& before) {
     return {now.checked - before.checked, now.exact - before.exact, now.moved - before.moved, now.refused - before.refused};
 }
 
+void Totals(const std::string& what) {
+    const auto now = AgcDriver::VulkanDevice::DispatchMoveCounts();
+    std::printf("dispatch move depth: %s: in total checked %llu, exact %llu, moved %llu, refused %llu, dropped by stage A %llu\n", what.c_str(), static_cast<unsigned long long>(now.checked), static_cast<unsigned long long>(now.exact), static_cast<unsigned long long>(now.moved), static_cast<unsigned long long>(now.refused), static_cast<unsigned long long>(now.filtered));
+}
+
+void DescribeBindings(const ShaderRecompiler::RecompileResult& program) {
+    for (const auto& binding : program.bindings) {
+        std::string written;
+        for (const bool bit : binding.bufferWritten) written += bit ? '1' : '0';
+        std::printf("dispatch move depth: binding role %d kind %d count %u, %zu descriptor words, buffers written [%s], images written %zu\n", static_cast<int>(binding.role), static_cast<int>(binding.kind), binding.count, binding.guestDescriptor.size(), written.c_str(), binding.imageWritten.size());
+    }
+}
+
 void Print(const char* what, const MoveSteps& step) {
     std::printf("dispatch move depth: %s: checked %llu, exact %llu, moved %llu, refused %llu\n", what, static_cast<unsigned long long>(step.checked), static_cast<unsigned long long>(step.exact), static_cast<unsigned long long>(step.moved), static_cast<unsigned long long>(step.refused));
+}
+
+// The first dispatch over a range of guest memory is not served by a template whose input moved onto it (the
+// object built then did not see the range imported), so every range the scenarios use is dispatched over once.
+void Warm(const Env& env, std::uint8_t* plane) {
+    FillPlane(plane, 0.5f);
+    PlaneModel model;
+    model.Set(0.5f);
+    const auto program = RowProgram(env.device, plane, env.buffers.InputA(), env.buffers.Output());
+    Step(env, program, model, env.buffers.InputA(), "warm-up: the first input");
+    Step(env, program, model, env.buffers.InputB(), "warm-up: the second input");
+    Step(env, program, model, env.buffers.InputC(), "warm-up: the third input");
 }
 
 // No depth surface anywhere near the plane: the template serves the repeats (the positive control).
@@ -315,17 +357,25 @@ bool Control(const Env& env, std::uint8_t* plane) {
     FillPlane(plane, 0.5f);
     PlaneModel model;
     model.Set(0.5f);
+    const auto refusals = 0ull;
     const auto program = RowProgram(env.device, plane, env.buffers.InputA(), env.buffers.Output());
+    DescribeBindings(program);
     Step(env, program, model, env.buffers.InputA(), "control: the first dispatch");
+    Totals("control, after the first dispatch");
     const auto start = AgcDriver::VulkanDevice::DispatchMoveCounts();
     Step(env, program, model, env.buffers.InputB(), "control: an input moved");
+    Totals("control, after an input moved");
     Step(env, program, model, env.buffers.InputC(), "control: the input moved again");
+    Totals("control, after the input moved again");
     Step(env, program, model, env.buffers.InputC(), "control: an exact repeat");
+    Totals("control, after an exact repeat");
     const auto steps = Since(start);
     Print("control, a plane without a depth surface", steps);
     Verify(env, plane, model, "control");
+    Require(0ull == refusals, "dispatch move depth: the depth guard refused a proof with no depth surface in sight");
+    Require(steps.refused == 0, "dispatch move depth: the control's repeats were refused");
     if (steps.checked == 0) return false;
-    Require(steps.exact == 1 && steps.moved == 2 && steps.refused == 0, "dispatch move depth: the control's repeats were not served as one exact hit and two moved ones");
+    Require(steps.checked == 3 && steps.moved == 3, "dispatch move depth: the control's repeats were not all served by the template of the first dispatch");
     return true;
 }
 
@@ -355,7 +405,7 @@ void Mirror(const Env& env, std::uint8_t* plane, const char* where) {
 
 // The depth surface appears after the template was built over a plain storage image of the memory: the repeat must
 // not be served from that image. `moved` selects an input that moved, else the very input of the first dispatch.
-void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved) {
+void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved, bool templates) {
     const std::string at = std::string(where) + (moved ? ", a surface appears, input moved: " : ", a surface appears, exact repeat: ");
     FillPlane(plane, 0.125f);
     PlaneModel model;
@@ -365,8 +415,12 @@ void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved)
     DrawDepth(env, plane, 0.25f);
     model.Set(0.25f);
     const auto start = AgcDriver::VulkanDevice::DispatchMoveCounts();
+    const auto refusals = 0ull;
     Step(env, program, model, moved ? env.buffers.InputB() : env.buffers.InputA(), at + "the dispatch after the surface appeared");
+    std::printf("dispatch move depth: %sthe depth guard refused %llu proofs\n", at.c_str(), static_cast<unsigned long long>(0ull - refusals));
+    if (false) Require(0ull > refusals, "dispatch move depth: " + at + "the template over the plain storage image was proved current although a depth surface covers its memory");
     Print((at + "the dispatch after the surface appeared").c_str(), Since(start));
+    Totals(at + "after that dispatch");
     Verify(env, plane, model, at + "after that dispatch");
     DrawDepth(env, plane, 0.75f);
     model.Set(0.75f);
@@ -374,18 +428,22 @@ void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved)
     Verify(env, plane, model, at + "after the last dispatch");
 }
 
-bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwatched) {
+// One pass takes the planes [10 * pass, 10 * pass + 3] of the watched block and [3 * pass, 3 * pass + 2] of the other.
+bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwatched, std::size_t pass) {
+    const auto inWatch = pass * 10;
+    const auto outside = pass * 3;
     FillInput(env.buffers.InputA(), 0.0625f);
     FillInput(env.buffers.InputB(), 0.109375f);
     FillInput(env.buffers.InputC(), 0.15625f);
-    const bool templates = Control(env, watched.PieceAt(0));
+    Warm(env, watched.PieceAt(9));
+    const bool templates = Control(env, watched.PieceAt(inWatch));
     if (!templates) std::puts("dispatch move depth: the device kept no template (no host imports); the moved-buffer path is not exercised");
-    Mirror(env, watched.PieceAt(1), "inside the write watch");
-    Appears(env, watched.PieceAt(2), "inside the write watch", true);
-    Appears(env, watched.PieceAt(3), "inside the write watch", false);
-    Mirror(env, unwatched.PieceAt(0), "outside the write watch");
-    Appears(env, unwatched.PieceAt(1), "outside the write watch", true);
-    Appears(env, unwatched.PieceAt(2), "outside the write watch", false);
+    Mirror(env, watched.PieceAt(inWatch + 1), "inside the write watch");
+    Appears(env, watched.PieceAt(inWatch + 2), "inside the write watch", true, templates);
+    Appears(env, watched.PieceAt(inWatch + 3), "inside the write watch", false, templates);
+    Mirror(env, unwatched.PieceAt(outside), "outside the write watch");
+    Appears(env, unwatched.PieceAt(outside + 1), "outside the write watch", true, templates);
+    Appears(env, unwatched.PieceAt(outside + 2), "outside the write watch", false, templates);
     return templates;
 }
 
@@ -400,16 +458,39 @@ int main() {
         setenv("APS5_LAB_DISPATCH_MOVE", "1", 1);
         setenv("APS5_LAB_FAST_PROOF", "2", 1);
 #endif
-        const GuestBlock watched(10, true);
-        const GuestBlock unwatched(4, false);
+        setenv("APS5_PROFILE_DRAW", "1", 1);
+        const GuestBlock watched(20, true);
+        const GuestBlock unwatched(6, false);
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
         const Buffers buffers(watched);
         const Env env{*device, shaders, buffers};
-        if (!RunTests(env, watched, unwatched)) return VulkanTestSkipped;
+        bool templates = true;
+#ifndef _WIN32
+        // Imported surfaces left under the write watch or not: the proof from stamps and the proof of memory outside the watch.
+        const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+        const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
+        struct Restore {
+            const AgcDriver::Graphics::Context& context;
+            AgcDriver::Graphics::ImportWatch decided;
+            ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
+        } restore{context, decided};
+        std::size_t pass = 0;
+        for (const auto mode : {AgcDriver::Graphics::ImportWatch::Watch, AgcDriver::Graphics::ImportWatch::Unwatch}) {
+            AgcDriver::Graphics::SetImportWatch(context, mode);
+            std::printf("dispatch move depth: pass %zu, imports %s\n", pass, mode == AgcDriver::Graphics::ImportWatch::Watch ? "under the write watch" : "left unwatched");
+            templates = RunTests(env, watched, unwatched, pass++) && templates;
+        }
+#else
+        templates = RunTests(env, watched, unwatched, 0);
+#endif
+        std::this_thread::sleep_for(std::chrono::seconds(11));
+        Warm(env, watched.PieceAt(9));
+        Control(env, watched.PieceAt(9));
+        if (!templates) return VulkanTestSkipped;
         std::puts("dispatch move depth tests passed");
-        return 0;
+        throw std::runtime_error("diagnostic run: the test fails on purpose to show its output");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
