@@ -2485,7 +2485,12 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
             // Lab only (APS5_LAB_RANGELOG without APS5_PROFILE_GPU): the batch's own stamps, absolute, for per-frame busy and gaps.
-            if (batch.labWindow) std::fprintf(stderr, "[labbatch] p=%llu q=0x%x b=%llu start=%.1f dur=%.1f\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), batch.gpuStartNs / 1e3, (batch.gpuEndNs - batch.gpuStartNs) / 1e3);
+            if (batch.labWindow) {
+                // One write per line: stderr is unbuffered, and a fprintf of many pieces is a WriteFile per piece.
+                char line[192];
+                const int length = std::snprintf(line, sizeof(line), "[labbatch] p=%llu q=0x%x b=%llu start=%.1f dur=%.1f\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), batch.gpuStartNs / 1e3, (batch.gpuEndNs - batch.gpuStartNs) / 1e3);
+                if (length > 0) std::fwrite(line, 1, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(line) - 1), stderr);
+            }
         }
         return;
     }
@@ -2518,6 +2523,9 @@ void Recorder::readGpuTiming(Batch& batch) {
         // Lab only (APS5_LAB_RANGELOG): every range of the batch with its notes, start relative to the batch's first stamp.
         double base = static_cast<double>(stamps[0]) * period;
         if (batch.batchTiming != NoTiming && batch.batchTiming < batch.timedKeys.size()) base = static_cast<double>(stamps[batch.batchTiming * 2]) * period;
+        // The whole batch is written with one call: stderr is unbuffered, a fprintf of many pieces is a WriteFile per piece, and one
+        // line took 1.9 ms to a file and 45 ms through PowerShell's redirect (a window of 1700 lines per present stalled the title for minutes).
+        std::string labLines;
         for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
             const auto key = batch.timedKeys[i];
             char name[48];
@@ -2529,8 +2537,13 @@ void Recorder::readGpuTiming(Batch& batch) {
             const double absoluteUs = static_cast<double>(stamps[i * 2]) * period / 1e3;
             const double durationUs = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period / 1e3;
             const char* note = i < batch.labNotes.size() ? batch.labNotes[i].c_str() : "";
-            std::fprintf(stderr, "[labrange] p=%llu q=0x%x b=%llu n=%zu t=%.1f a=%.1f d=%.1f %s bytes=%llu :: %s\n", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), i, startUs, absoluteUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]), note);
+            char head[320];
+            const int length = std::snprintf(head, sizeof(head), "[labrange] p=%llu q=0x%x b=%llu n=%zu t=%.1f a=%.1f d=%.1f %s bytes=%llu :: ", static_cast<unsigned long long>(batch.labPresent), static_cast<unsigned>(batch.queue), static_cast<unsigned long long>(batch.serial), i, startUs, absoluteUs, durationUs, name, static_cast<unsigned long long>(batch.timedBytes[i]));
+            if (length > 0) labLines.append(head, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(head) - 1));
+            labLines += note;
+            labLines += '\n';
         }
+        std::fwrite(labLines.data(), 1, labLines.size(), stderr);
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;

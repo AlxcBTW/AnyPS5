@@ -515,6 +515,12 @@ private:
         const auto commands = recorder->Commands();
         recorder->Keep(storage);
         const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+        if (Recorder::LabLogging()) {
+            // Lab only (APS5_LAB_RANGELOG): which plane, which way, the staging buffer's and the storage image's memory.
+            char text[256];
+            std::snprintf(text, sizeof(text), "COPYDEPTH plane=%s dir=%s surface=0x%llx %ux%u fmt=%d bytes=%zu staging=%s storage=[", stencil ? "stencil" : "depth", toStorage ? "to-storage" : "from-storage", static_cast<unsigned long long>(stencil ? target.stencilAddress : target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), bytes, plane.staging->HostPlaced() ? "host" : "dev");
+            recorder->LabNote(timing, std::string(text) + storage->LabText() + "]");
+        }
         VkBufferImageCopy planeRegion{0, 0, 0, {stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
         VkBufferImageCopy colorRegion = planeRegion;
         colorRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -765,6 +771,11 @@ public:
         const auto commands = recorder->Commands();
         recorder->Keep(storage);
         const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+        if (Recorder::LabLogging()) {
+            char text[256];
+            std::snprintf(text, sizeof(text), "COPYDEPTH(layers) dir=%s layers=%zu %ux%u slice=%zu staging=%s storage=[", toStorage ? "to-storage" : "from-storage", slices.size(), extent.width, extent.height, static_cast<std::size_t>(sliceBytes()), staging->HostPlaced() ? "host" : "dev");
+            recorder->LabNote(timing, std::string(text) + storage->LabText() + "]");
+        }
         std::vector<VkBufferImageCopy> storageRegions;
         const auto region = [&](std::uint32_t layer, VkImageAspectFlags aspect, std::uint32_t imageLayer) {
             VkBufferImageCopy copy{};

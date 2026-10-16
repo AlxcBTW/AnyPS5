@@ -52,6 +52,8 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
     VkBuffer Handle() const;
     std::size_t Size() const;
+    // Placed in host memory because the device-local budget was spent when it was made (Context::DeviceMemoryType).
+    bool HostPlaced() const { return hostPlaced; }
 
 private:
     void release() noexcept;

@@ -255,7 +255,9 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
     // for n > 0); frame 0 of the capture is this function's caller.
     void* raw[16];
     const auto wanted = static_cast<DWORD>(std::min<std::size_t>(frames.size(), std::size(raw)));
-    const auto captured = RtlCaptureStackBackTrace(1 + skip, wanted, raw, nullptr);
+    // Frames that lie outside the driver module are kept as 0 but still counted, so a walk that ends early shows how far it got.
+    auto captured = RtlCaptureStackBackTrace(1 + skip, wanted, raw, nullptr);
+    if (captured == 0) captured = RtlCaptureStackBackTrace(1, wanted, raw, nullptr);
     // The driver's module is resolved once (this function lives in it): a per-frame
     // GetModuleHandleEx would take the loader lock several times per sync under the GpuMutex.
     static const auto module = [] {
