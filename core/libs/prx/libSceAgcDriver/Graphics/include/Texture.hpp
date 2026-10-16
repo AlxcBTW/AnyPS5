@@ -716,6 +716,8 @@ private:
         std::weak_ptr<StorageTexture> image;
         std::uint64_t version = 0;
         std::uint32_t unit = 0;
+        // The image's content version then: an upload or hand-over into it since replaces what it holds.
+        std::uint64_t imageVersion = 0;
     };
     std::map<std::uint32_t, Superseded> supersededFrom;
     void resurrectSuperseded(const std::vector<std::uint32_t>& units);

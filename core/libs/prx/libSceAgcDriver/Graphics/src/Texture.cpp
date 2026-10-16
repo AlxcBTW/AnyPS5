@@ -4974,11 +4974,11 @@ std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const Stora
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const auto surfaceEnd = descriptor.baseAddress + guestBytes;
-        for (auto* texture : pending.textures) {
-            if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
-            const bool storesWhole = texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed;
+        const auto storesWhole = [](const StorageTexture* texture) { return texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed; };
+        const auto countOwner = [&](const StorageTexture* texture) {
+            if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return;
             for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
-                if (!texture->layerPending[unit] && !storesWhole) continue;
+                if (!texture->layerPending[unit] && !storesWhole(texture)) continue;
                 const auto begin = std::max(texture->layerBegin(unit), descriptor.baseAddress);
                 const auto end = std::min(texture->layerBegin(unit) + texture->layerBytes(unit), surfaceEnd);
                 if (begin >= end) continue;
@@ -4986,9 +4986,14 @@ std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const Stora
                 const auto last = std::min(static_cast<std::size_t>((end - 1 - descriptor.baseAddress) / trackedLayerBytes), owners.size() - 1);
                 for (auto mine = first; mine <= last; ++mine) owners[mine] = static_cast<std::uint8_t>(std::min(owners[mine] + 1, 2));
             }
-            if (texture == alias || !texture->blockUnits) continue;
+        };
+        // An image another thread's FlushPending is storing right now still holds results there.
+        for (auto* texture : pending.flushing) countOwner(texture);
+        for (auto* texture : pending.textures) {
+            countOwner(texture);
+            if (texture == this || texture == alias || !texture->blockUnits || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
             // An image under a clear code stores whole (and its keys): never handed over.
-            if (storesWhole) continue;
+            if (storesWhole(texture)) continue;
             if (auto alive = texture->weak_from_this().lock()) sources.push_back(std::move(alive));
         }
     }
@@ -5263,7 +5268,7 @@ void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t coun
             source->cancelStoredSave(theirs);
             // What the source's results there superseded is dead with them.
             source->supersededFrom.erase(theirs);
-            supersededFrom[mine] = {source, handOver.version, theirs};
+            supersededFrom[mine] = {source, handOver.version, theirs, source->version};
             ++dropped;
             return true;
         });
@@ -5307,13 +5312,20 @@ void StorageTexture::resurrectSuperseded(const std::vector<std::uint32_t>& units
         const auto record = found->second;
         supersededFrom.erase(found);
         auto source = record.image.lock();
-        if (source == nullptr || source->resultsVersion != record.version || record.unit >= source->trackedLayers || source->layerPending[record.unit]) {
+        // Gone, written since, or its content replaced since (an upload or a hand-over into it).
+        if (source == nullptr || source->resultsVersion != record.version || source->version != record.imageVersion || record.unit >= source->trackedLayers || source->layerPending[record.unit]) {
             Census().supersededLost.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
+        const auto begin = source->layerBegin(record.unit);
+        const auto bytes = source->layerBytes(record.unit);
+        // A CPU store into the unit since the source's generation keeps its block at the store (the
+        // block rule): counted as such.
+        GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(bytes));
+        if (source->layerGeneration[record.unit] != 0 && !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), source->layerGeneration[record.unit])) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
         source->layerPending[record.unit] = true;
         source->reconcilePending();
-        ranges.emplace_back(source->layerBegin(record.unit), source->layerBytes(record.unit));
+        ranges.emplace_back(begin, bytes);
         Census().resurrected.fetch_add(1, std::memory_order_relaxed);
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, static_cast<std::size_t>(bytes), nullptr, "storage refresh", PublishScope::None));
