@@ -1,0 +1,5 @@
+name=draw-presync
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-draw-presync-2613cdfb92-169386
