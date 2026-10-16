@@ -1254,7 +1254,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
     if (state->float16DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     const char* nativeHalf = std::getenv("APS5_NATIVE_FLOAT16");
-    state->nativeFloat16Arithmetic = float16Rte && nativeHalf != nullptr && std::string_view(nativeHalf) != "0";
+    state->nativeFloat16Arithmetic = float16Rte && state->float16DenormPreserve && floatControls.roundingModeIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL && nativeHalf != nullptr && std::string_view(nativeHalf) != "0";
     VkPhysicalDeviceShaderFmaFeaturesKHR fmaFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FMA_FEATURES_KHR};
     if (state->nativeFloat16Arithmetic && hasExtension(VK_KHR_SHADER_FMA_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fmaFeatures};

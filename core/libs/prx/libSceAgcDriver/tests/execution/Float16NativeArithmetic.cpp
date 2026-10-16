@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <vector>
 
@@ -122,6 +123,11 @@ std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const Mode& mode
     const ShaderRecompiler::ShaderComputeStageInfo compute{{256, 1, 1}, 0u, {true, false, false}, false, 1};
     auto target = device.ComputeTarget(32);
     target.nativeFloat16Arithmetic = native;
+    if (!native) {
+        std::erase_if(target.supportedCapabilities, [](std::uint32_t capability) {
+            return capability == spv::CapabilityFloat16 || capability == spv::CapabilityRoundingModeRTE || capability == spv::CapabilityDenormPreserve;
+        });
+    }
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},

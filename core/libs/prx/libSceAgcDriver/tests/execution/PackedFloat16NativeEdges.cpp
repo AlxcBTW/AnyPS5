@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <vector>
 
@@ -123,7 +124,9 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const std::vector<std::uint32_t>& code, const std::optional<ShaderRecompiler::ShaderFloatMode>& mode, bool native) {
+enum class Variant { Lowering, Default, Native };
+
+std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const std::vector<std::uint32_t>& code, const std::optional<ShaderRecompiler::ShaderFloatMode>& mode, Variant variant) {
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
     const auto input = BufferDescriptor(Input.data(), static_cast<std::uint32_t>(Input.size() * 4u));
@@ -134,7 +137,12 @@ std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const std::vecto
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(words.data()), std::as_bytes(words)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{GroupThreads, 1, 1}, 0u, {true, false, false}, false, 1};
     auto target = device.ComputeTarget(32);
-    target.nativeFloat16Arithmetic = native;
+    target.nativeFloat16Arithmetic = variant == Variant::Native;
+    if (variant == Variant::Lowering) {
+        std::erase_if(target.supportedCapabilities, [](std::uint32_t capability) {
+            return capability == spv::CapabilityFloat16 || capability == spv::CapabilityRoundingModeRTE || capability == spv::CapabilityDenormPreserve;
+        });
+    }
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(words.data()), words, 0, {}},
         {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
@@ -180,22 +188,31 @@ int main() {
         }
         modes.push_back({"0xc3 DX10 IEEE", FM{0xc3u, true, true, false}});
         bool sawNative = false;
+        std::vector<std::string> defaultDiffers;
         for (const auto& [name, mode] : modes) {
-            const auto expected = Run(*device, code, mode, false);
-            const auto actual = Run(*device, code, mode, true);
+            const auto expected = Run(*device, code, mode, Variant::Lowering);
+            const auto actual = Run(*device, code, mode, Variant::Native);
+            const auto standard = Run(*device, code, mode, Variant::Default);
             for (std::size_t slot = 0; slot < expected.size(); ++slot) {
-                if (expected[slot] == actual[slot]) continue;
                 const auto row = static_cast<std::uint32_t>(slot / Stride);
                 if (slot % Stride >= Results) continue;
                 const auto& op = Ops[slot % Stride];
-                throw std::runtime_error("native packed f16, " + name + ": " + op.name + " with a=" + Hex(Input[row * 4u]) + " b=" + Hex(Input[row * 4u + 1u]) + " c=" + Hex(Input[row * 4u + 2u]) +
-                    " gives " + Hex(actual[slot]) + ", the f32 lowering " + Hex(expected[slot]));
+                if (expected[slot] != actual[slot]) {
+                    throw std::runtime_error("native packed f16, " + name + ": " + op.name + " with a=" + Hex(Input[row * 4u]) + " b=" + Hex(Input[row * 4u + 1u]) + " c=" + Hex(Input[row * 4u + 2u]) +
+                        " gives " + Hex(actual[slot]) + ", the f32 lowering " + Hex(expected[slot]));
+                }
+                if (standard[slot] != expected[slot] && defaultDiffers.size() < 8u) {
+                    defaultDiffers.push_back(name + ": " + op.name + " with a=" + Hex(Input[row * 4u]) + " b=" + Hex(Input[row * 4u + 1u]) + " c=" + Hex(Input[row * 4u + 2u]) +
+                        " gives " + Hex(standard[slot]) + " without the switch, the f32 lowering " + Hex(expected[slot]));
+                }
             }
             sawNative = sawNative || std::any_of(actual.begin(), actual.end(), [](std::uint32_t value) { return value != 0xdeadbeefu; });
         }
         Require(sawNative, "f16 edge test: the program wrote no results");
         const std::uint32_t tieRow = 10u * Edges.size() * Edges.size() + 11u * Edges.size() + 22u;
-        const auto lowering = Run(*device, code, std::nullopt, true);
+        for (const auto& line : defaultDiffers) std::cerr << "note, the default path differs from the f32 lowering: " << line << '
+';
+        const auto lowering = Run(*device, code, std::nullopt, Variant::Native);
         Require((lowering[tieRow * Stride + 2u] & 0xffffu) == 0x3c01u, "v_pk_fma_f16 (1 + 2^-10) * (1 - 2^-11) + 9 * 2^-24 is not rounded once: " + Hex(lowering[tieRow * Stride + 2u]));
         std::puts("native packed f16 edge tests passed");
         return 0;
