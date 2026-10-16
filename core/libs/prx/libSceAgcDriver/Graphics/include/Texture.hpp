@@ -352,6 +352,9 @@ public:
     static std::uint64_t SlabRetiles();
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
+    // APS5_LAB_FAST_PROOF=2: whether the memory of an image outside the write watch is, by the stamp
+    // compareUntracked takes, what its last byte compare found equal to the saved bytes. Reads only.
+    bool UntrackedUnchanged() const;
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }

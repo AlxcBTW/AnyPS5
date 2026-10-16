@@ -369,6 +369,13 @@ struct TextureCounters {
     // by a byte compare.
     std::atomic<std::uint64_t> untrackedKept{0};
     std::atomic<std::uint64_t> untrackedCompared{0};
+    // APS5_LAB_FAST_PROOF: stage-B records of snapshots outside the write watch proved by their
+    // untracked key, the keys that had moved, and (APS5_VERIFY_PROOFS) the proofs checked against
+    // the full lookup and those it disagreed with.
+    std::atomic<std::uint64_t> outsideKept{0};
+    std::atomic<std::uint64_t> outsideMoved{0};
+    std::atomic<std::uint64_t> outsideVerified{0};
+    std::atomic<std::uint64_t> outsideMismatch{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -386,6 +393,7 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] stage-B records outside the write watch (APS5_LAB_FAST_PROOF): %llu proved by their untracked key, %llu with a moved key; verified %llu, disagreeing %llu\n", count(counters.outsideKept), count(counters.outsideMoved), count(counters.outsideVerified), count(counters.outsideMismatch));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -401,6 +409,7 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    std::array<std::uint64_t, 4> untracked{};
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -815,7 +824,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, it);
-                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr, false, it->untracked});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
@@ -859,7 +868,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
-        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get(), false, entry.untracked});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
@@ -868,7 +877,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
-    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get(), false, entry.untracked});
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -2580,6 +2589,16 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> ownSourceViews{0};
     std::atomic<std::uint64_t> refreshedOverlaps{0};
     std::atomic<std::uint64_t> proofsVerified{0};
+    // Surfaces outside the write watch by kind (snapshot texture, storage-sourced view, storage image)
+    // and outcome (proved, stamp or key moved, left to the full walk), the fast proofs that rested on
+    // one, the verifications of them and the disagreements, and the time per path of the calls that
+    // succeeded (fast, own-object refresh, full walk).
+    std::array<std::array<std::atomic<std::uint64_t>, 3>, 3> outside{};
+    std::atomic<std::uint64_t> fastViaOutside{0};
+    std::atomic<std::uint64_t> outsideVerified{0};
+    std::atomic<std::uint64_t> outsideMismatch{0};
+    std::array<std::atomic<std::uint64_t>, 3> pathCalls{};
+    std::array<std::atomic<std::uint64_t>, 3> pathNanoseconds{};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -2590,6 +2609,10 @@ RevalidateProfile& Revalidations() {
 
 void countFastFail(FastFail reason) {
     if (BuildProfiled()) Revalidations().fastFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countOutside(std::size_t kind, std::size_t outcome) {
+    if (BuildProfiled()) Revalidations().outside[kind][outcome].fetch_add(1, std::memory_order_relaxed);
 }
 
 void countPendingFail(std::span<const StorageTexture::PendingQuery> pending) {
@@ -2639,6 +2662,21 @@ bool VerifyProofs() {
     return enabled;
 }
 
+// APS5_LAB_FAST_PROOF=1: a snapshot texture over memory outside the write watch (CollectWrites 0) is
+// proved unchanged by the key its lookup kept it by, as the lookup itself does (cachedTexture,
+// untrackedKey); =2 adds the images over such memory (a view follows its image, a storage image),
+// by the stamp compareUntracked kept (StorageTexture::UntrackedUnchanged). Off without the variable.
+int FastProofLevel() {
+    static const int level = [] {
+        const char* text = std::getenv("APS5_LAB_FAST_PROOF");
+        return text != nullptr ? static_cast<int>(std::strtol(text, nullptr, 10)) : 0;
+    }();
+    return level;
+}
+
+thread_local bool lastFastTextureOutside = false;
+thread_local std::uint32_t fastProofsOutside = 0;
+
 // Whether a sampled surface's keys are the very keys of the image the view follows (the same
 // metadata, extent, format and alpha placement: the same scan), so the image's proof serves it.
 bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& resource, std::uint64_t guestBytes) {
@@ -2647,12 +2685,18 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
-void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
+void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start, bool ownRefreshed) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
     profile.calls.fetch_add(1, std::memory_order_relaxed);
-    profile.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
+    profile.nanoseconds.fetch_add(elapsed, std::memory_order_relaxed);
     (!ok ? profile.failed : fast ? profile.fast : profile.full).fetch_add(1, std::memory_order_relaxed);
+    if (ok) {
+        const std::size_t path = fast ? (ownRefreshed ? 1u : 0u) : 2u;
+        profile.pathCalls[path].fetch_add(1, std::memory_order_relaxed);
+        profile.pathNanoseconds[path].fetch_add(elapsed, std::memory_order_relaxed);
+    }
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = profile.lastReport.load();
     if (nowMs - last < 10000 || !profile.lastReport.compare_exchange_strong(last, nowMs)) return;
@@ -2669,6 +2713,8 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] proof outside the write watch (APS5_LAB_FAST_PROOF=%d): snapshot textures proved %llu, key moved %llu, left to the walk %llu; storage-sourced views proved %llu, stamp moved %llu, left to the walk %llu; storage images proved %llu, stamp moved %llu, left to the walk %llu; fast proofs resting on one %llu; verified %llu, disagreeing %llu; time by path of the calls that succeeded: fast %llu x %.1f us, own-object refresh %llu x %.1f us, full walk %llu x %.1f us\n", FastProofLevel(), load(profile.outside[0][0]), load(profile.outside[0][1]), load(profile.outside[0][2]), load(profile.outside[1][0]), load(profile.outside[1][1]), load(profile.outside[1][2]), load(profile.outside[2][0]), load(profile.outside[2][1]), load(profile.outside[2][2]), load(profile.fastViaOutside), load(profile.outsideVerified), load(profile.outsideMismatch), load(profile.pathCalls[0]), load(profile.pathCalls[0]) != 0 ? load(profile.pathNanoseconds[0]) / 1000.0 / static_cast<double>(load(profile.pathCalls[0])) : 0.0, load(profile.pathCalls[1]), load(profile.pathCalls[1]) != 0 ? load(profile.pathNanoseconds[1]) / 1000.0 / static_cast<double>(load(profile.pathCalls[1])) : 0.0, load(profile.pathCalls[2]), load(profile.pathCalls[2]) != 0 ? load(profile.pathNanoseconds[2]) / 1000.0 / static_cast<double>(load(profile.pathCalls[2])) : 0.0);
 }
 
 // APS5_NO_EPOCH_REVALIDATE=1: the per-element registry, cache and stamp checks and the per-region
@@ -2692,7 +2738,7 @@ void ShaderResources::captureValidation() {
     };
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
+        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true, found->untracked};
     }
     lookupLog().clear();
 }
@@ -2716,6 +2762,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
+    fastProofsOutside = 0;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto fail = [&reason](FastFail why) {
         reason = why;
@@ -2755,8 +2802,26 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        bool outside = false;
+        if (surface.collected == 0) {
+            const auto level = FastProofLevel();
+            if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
+                const bool held = untrackedKey(address, bytes) == surface.untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
+                countOutside(0, held ? 0u : 1u);
+                if (!held) return fail(FastFail::Collect);
+                outside = true;
+            } else if (level >= 2 && source != nullptr) {
+                const bool held = source->UntrackedUnchanged();
+                countOutside(1, held ? 0u : 1u);
+                if (!held) return fail(FastFail::Collect);
+                outside = true;
+            } else {
+                countOutside(source != nullptr ? 1u : 0u, 2u);
+                return fail(FastFail::Collect);
+            }
+            ++fastProofsOutside;
+        }
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -2793,9 +2858,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
-            queries.push_back({address, bytes, source->Generation()});
+            if (!outside) queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
-        } else {
+        } else if (!outside) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -2811,7 +2876,18 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        bool outside = false;
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            if (FastProofLevel() < 2) {
+                countOutside(2, 2);
+                return fail(FastFail::Collect);
+            }
+            const bool held = image->UntrackedUnchanged();
+            countOutside(2, held ? 0u : 1u);
+            if (!held) return fail(FastFail::Collect);
+            outside = true;
+            ++fastProofsOutside;
+        }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -2821,7 +2897,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
-        queries.push_back({address, bytes, image->Generation()});
+        if (!outside) queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -2863,7 +2939,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (surface.source == nullptr) surface.generation = surface.collected;
+        if (surface.source == nullptr && surface.collected != 0) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
     }
     return true;
@@ -3064,8 +3140,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
+    bool ownedPath = false;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
-        if (profile) countRevalidate(fast, ok, start);
+        if (profile) countRevalidate(fast, ok, start, ownedPath);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
     };
@@ -3175,6 +3252,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
+    ownedPath = ownRefreshed;
+    const bool viaOutside = fast && fastProofsOutside != 0;
+    if (viaOutside && profile) Revalidations().fastViaOutside.fetch_add(1, std::memory_order_relaxed);
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
@@ -3190,7 +3270,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }();
             return finish(false, false, failure);
         }
-    } else if (ownRefreshed || accepted) {
+    } else if (ownRefreshed || accepted || viaOutside) {
         if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);
         if (VerifyProofs()) {
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must
@@ -3205,7 +3285,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
             const bool same = fullWalk();
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
-            if (!same || moved != versions.end()) {
+            if (viaOutside) {
+                if (profile) Revalidations().outsideVerified.fetch_add(1, std::memory_order_relaxed);
+                if (!same || moved != versions.end()) {
+                    const auto count = profile ? Revalidations().outsideMismatch.fetch_add(1, std::memory_order_relaxed) : 0;
+                    if (count < 20) {
+                        std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the proof outside the write watch disagrees with the full walk (%s)\n", !same ? "another object" : "an upload");
+                        std::fflush(stderr);
+                    }
+                }
+            } else if (!same || moved != versions.end()) {
                 std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the T1 proof (%s) disagrees with the full walk (%s)\n", ownRefreshed ? "own-object refresh" : "accepted overlap", !same ? "another object" : "an upload");
                 std::fflush(stderr);
                 std::abort();
@@ -4215,6 +4304,7 @@ bool ShaderResources::precollectImages() {
                         record.source = it->source;
                         record.entryKeys = it->keys;
                         record.entryGeneration = it->generation;
+                        record.entryUntracked = it->untracked;
                         counters.records.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -4246,7 +4336,11 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
     if (DepthSurfaceAt(address)) return nullptr;
-    if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
+    bool outside = false;
+    if (GuestMemory::CollectWrites(address, bytes) == 0) {
+        outside = FastProofLevel() >= 1 && record.source == nullptr && record.entryUntracked[0] != 0 && record.entryKeys == DccKeys::Uncompressed;
+        if (!outside) return nullptr;
+    }
     if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
     auto keys = record.keys;
     if (record.resource.dccAddress != 0) {
@@ -4259,7 +4353,11 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // The keys the entry was made under (a view of a pending render target was made under its clear
     // keys and stays valid while they are unchanged); a change is the full lookup's to judge.
     if (keys != record.entryKeys) return nullptr;
-    if (record.source != nullptr) {
+    if (outside) {
+        const bool held = keys == DccKeys::Uncompressed && untrackedKey(address, bytes) == record.entryUntracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
+        (held ? TextureCounts().outsideKept : TextureCounts().outsideMoved).fetch_add(1, std::memory_order_relaxed);
+        if (!held) return nullptr;
+    } else if (record.source != nullptr) {
         if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
         if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
         // Under fast-clear keys the view holds only while its image's results are still pending over
@@ -4274,9 +4372,11 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
     if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) return nullptr;
-    if (it->source == nullptr) it->generation = record.generation;
+    if (outside && it->untracked != record.entryUntracked) return nullptr;
+    if (it->source == nullptr && !outside) it->generation = record.generation;
     touchTexture(cache, it);
-    logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
+    logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get(), false, it->untracked});
+    lastFastTextureOutside = outside;
     outcome.hit = true;
     return record.texture;
 }
@@ -4325,8 +4425,20 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
             if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
             if (texture == nullptr && record != nullptr && record->texture != nullptr) {
+                lastFastTextureOutside = false;
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
+                if (texture != nullptr && lastFastTextureOutside && VerifyProofs()) {
+                    const auto full = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+                    counters.outsideVerified.fetch_add(1, std::memory_order_relaxed);
+                    if (full != texture) {
+                        if (counters.outsideMismatch.fetch_add(1, std::memory_order_relaxed) < 20) {
+                            std::fprintf(stderr, "[textures] APS5_VERIFY_PROOFS: the stage-B proof outside the write watch disagrees with the full lookup (texture 0x%llx)\n", static_cast<unsigned long long>(resource.baseAddress));
+                            std::fflush(stderr);
+                        }
+                        texture = full;
+                    }
+                }
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
