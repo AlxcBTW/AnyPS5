@@ -358,6 +358,51 @@ void Driver::commitClockStore(std::uint32_t queue, std::uint64_t address, std::s
     submitDueAfterCommit(localDevice.get());
 }
 
+// APS5_LAB_PIPE_DUMPS: an occlusion sample dump (EVENT_WRITE, event 0x39) is recorded on the draw committer in stream order instead of draining
+// it first. The dump closes the occlusion segment and stores the running sample count, so it must come after every earlier draw is recorded: the
+// committer runs its items in order, and it registers the dump's range, so a packet that reads or overwrites the range (a wait, a COPY_DATA or
+// DMA source, a predicated packet, a dispatch that reads it) drains through Overlaps first. A dump the GPU cannot write now (no host import over
+// the range, a copied writer or completion label over it) is made here as the worker would have made it: after a device wait, on the CPU.
+bool Driver::enqueueSampleDumpPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue) {
+    static const bool enabled = std::getenv("APS5_LAB_PIPE_DUMPS") != nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr && std::getenv("APS5_SYNC_SAMPLE_DUMPS") == nullptr && std::getenv("APS5_NO_GPU_SAMPLE_DUMPS") == nullptr;
+    if (!enabled || opcode != 0x46 || queue != 0 || packet.size() < 4 || !Pm4::SampleDump(packet)) return false;
+    if (!DrawPipeline::Active() || !deferredLabels().labels.empty()) {
+        ++sampleDumpsRefused;
+        return false;
+    }
+    const auto address = Pm4::SampleDumpAddress(packet);
+    if (address % 8 != 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), Pm4::SampleDumpBytes, true)) {
+        ++sampleDumpsRefused;
+        return false;
+    }
+    const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    DrawPipeline::Queue0().Enqueue([this, queue, address, epoch] {
+        DrawPipeline::FollowEpoch(epoch);
+        GuestMemory::SetCurrentPacket(0x46, queue);
+        commitSampleDump(queue, address);
+    }, {{address, address + Pm4::SampleDumpBytes}});
+    Graphics::Recorder::CountRecordedWork();
+    ++sampleDumpsQueued;
+    return true;
+}
+
+void Driver::commitSampleDump(std::uint32_t queue, std::uint64_t address) {
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = device.Load();
+        recordDeferredLabels(localDevice.get(), queue);
+        if (localDevice != nullptr && localDevice->DumpSamplesOnGpu(address)) {
+            submitDueAfterCommit(localDevice.get());
+            return;
+        }
+        if (localDevice != nullptr) localDevice->WaitIdle();
+    }
+    GuestMemory::BumpCollectEpoch();
+    dumpSampleCounters(address);
+    ++sampleDumpsOnCpu;
+}
+
 void Driver::commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes) {
     constexpr std::size_t gpuStoreLimit = 65536;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);

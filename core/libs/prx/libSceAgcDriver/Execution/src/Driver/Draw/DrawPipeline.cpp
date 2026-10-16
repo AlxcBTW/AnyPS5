@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -106,6 +107,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
+    std::fprintf(stderr, "[draw] queued in stream order (cumulative): %llu clock stores, %llu sample dumps (%llu of them written by the CPU after a device wait, %llu left to the worker), %llu SET_PREDICATION kept\n",
+                 static_cast<unsigned long long>(clockStoresQueued.load()), static_cast<unsigned long long>(sampleDumpsQueued.load()), static_cast<unsigned long long>(sampleDumpsOnCpu.load()), static_cast<unsigned long long>(sampleDumpsRefused.load()), static_cast<unsigned long long>(predicationsKept.load()));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};

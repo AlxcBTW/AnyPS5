@@ -23,12 +23,23 @@ bool orderedFills() {
     return ordered;
 }
 
+// APS5_LAB_PIPE_DUMPS: SET_PREDICATION only sets the queue's predication state on this thread; the packets that read the
+// predicate (a predicated packet, COND_EXEC) drain the pipeline themselves when a queued item writes the predicate's range.
+bool keepsPredication() {
+    static const bool kept = std::getenv("APS5_LAB_PIPE_DUMPS") != nullptr && std::getenv("APS5_LAB_NO_PIPE_PRED") == nullptr && std::getenv("APS5_DRAIN_ALL") == nullptr;
+    return kept;
+}
+
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
     switch (opcode) {
         case 0x11: case 0x12: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x42: case 0x58: case 0x59: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x46: return packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u;
+        case 0x20:
+            if (!keepsPredication()) return false;
+            ++predicationsKept;
+            return true;
         case 0x15: return orderedFills();
         case 0x63: case 0x64: case 0x9f:
             return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
@@ -173,7 +184,7 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
-        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueClockStorePacket(packet, opcode, submission.queue))) {
+        if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueClockStorePacket(packet, opcode, submission.queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
