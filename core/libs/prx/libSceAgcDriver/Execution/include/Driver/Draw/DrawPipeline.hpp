@@ -67,6 +67,8 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
+    std::array<std::uint64_t, 257> drainOpcodeNs{};
+    std::uint64_t committerIdleNs = 0;
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

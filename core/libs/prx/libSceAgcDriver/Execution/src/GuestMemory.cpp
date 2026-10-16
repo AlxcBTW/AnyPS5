@@ -1853,7 +1853,9 @@ void BeginHold(std::size_t site) {
 
 void EndHold() {
     auto& stats = LockStats();
-    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
+    const auto endedAt = std::chrono::steady_clock::now();
+    const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(endedAt - stats.holdStart).count();
+    if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.hold", GpuLockSiteNames[stats.holdSite], stats.holdStart, endedAt);
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
