@@ -4827,15 +4827,22 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // the write watch lately, so a repro says which write-back it is and why no bytes were compared.
         static std::atomic<int> unsavedReports{0};
         if (unsavedReports.fetch_add(1, std::memory_order_relaxed) < 24) {
-            std::uint32_t selectedUnits = 0, pendingUnits = 0, notOriginal = 0, notCompared = 0, shown = 0, watchedUnits = 0, savedLost = 0;
-            std::string detail;
+            std::uint32_t selectedUnits = 0, pendingUnits = 0, notOriginal = 0, notCompared = 0, shown = 0, watchedUnits = 0, savedLost = 0, outsideShown = 0;
+            std::string detail, outside;
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
                 if (!layers[layer]) continue;
                 ++selectedUnits;
                 if (layerPending[layer]) ++pendingUnits;
                 if (!layerOriginal[layer]) ++notOriginal;
                 if (savedBeforeCompare[layer] && !layerOriginal[layer]) ++savedLost;
-                if (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)))) ++watchedUnits;
+                if (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)))) {
+                    ++watchedUnits;
+                } else if (outsideShown < 6) {
+                    ++outsideShown;
+                    char entry[256];
+                    std::snprintf(entry, sizeof(entry), " [unit %u at +0x%llx original %d: %s]", layer, static_cast<unsigned long long>(layerBegin(layer) - descriptor.baseAddress), layerOriginal[layer] ? 1 : 0, GuestMemory::UnwatchedBy(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer))).c_str());
+                    outside += entry;
+                }
                 if (compared[layer]) continue;
                 ++notCompared;
                 if (shown >= 6) continue;
@@ -4845,9 +4852,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 detail += entry;
             }
             const auto recentUnwatches = GuestMemory::RecentUnwatches(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d, units still watched %u, saved bytes lost during the comparison %u, flush reason %s, recent unwatches over the image:%s;%s\n",
+            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d, units still watched %u, saved bytes lost during the comparison %u, flush reason %s, recent unwatches over the image:%s; units outside the watch (%llu unwatch and restore events so far):%s;%s\n",
                 static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.samples, static_cast<unsigned long long>(descriptor.dccAddress),
-                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, watchedUnits, savedLost, flushReason != nullptr ? flushReason : "-", recentUnwatches.empty() ? " none" : recentUnwatches.c_str(), detail.c_str());
+                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, watchedUnits, savedLost, flushReason != nullptr ? flushReason : "-", recentUnwatches.empty() ? " none" : recentUnwatches.c_str(), static_cast<unsigned long long>(GuestMemory::UnwatchSerial()), outside.empty() ? " none" : outside.c_str(), detail.c_str());
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
