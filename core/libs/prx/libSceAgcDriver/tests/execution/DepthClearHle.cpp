@@ -368,8 +368,8 @@ void AwaitCompletions(AgcDriver::VulkanDevice& device, TDone done) {
 }
 
 // A 16-bit plane, which the title's shadow atlases are: an R16 unorm view cleared to a colour of 0 and 1 (0.5 is 32767.5 in
-// 16 bits, no value to take), and an R16 uint view with the depth swizzle cleared to raw values. Verify mode compares every
-// texel of the mirror and of the depth image with the raw value, so the round trip through raw / 65535 is exact there.
+// 16 bits, no value to take), and an R16 uint view with the depth swizzle cleared to raw 0xffff and 0 (0x4000 is declined). Verify
+// mode compares every texel of the mirror and of the depth image with the raw value.
 void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
     Graphics::SetDepthClearModeForTest(mode);
     const auto before = Graphics::DepthClearCounts();
@@ -409,6 +409,7 @@ void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int
     const auto rawLess = [&] { return Draw(device, shaders, rawSurface, {.depthCompare = VK_COMPARE_OP_LESS}); };
     const auto rawGreater = [&] { return Draw(device, shaders, rawSurface, {.depthCompare = VK_COMPARE_OP_GREATER}); };
     Require(Draw(device, shaders, rawSurface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}) == Covered, label + "the producer of the uint plane did not cover it");
+    // 0x4000 depends on how the device rounds raw / 65535 back to 16 bits: declined, the clear runs as before.
     SetRaw(color, 0x4000u);
     RunClear(device, code, rawPlane, color, Format16Uint, 8, 4, TileZ64KBX);
     Require(rawGreater() == Covered, label + "after a clear to the raw value 0x4000 the depth test 0.5 > 0.25 did not pass everywhere");
@@ -419,19 +420,47 @@ void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int
     Require(rawLess() == Covered, label + "after a clear to the raw value 0xffff the depth test 0.5 < 1.0 did not pass everywhere");
     Require(rawGreater() == 0u, label + "after a clear to the raw value 0xffff a texel passed 0.5 > depth");
 
+    SetRaw(color, 0u);
+    RunClear(device, code, rawPlane, color, Format16Uint, 8, 4, TileZ64KBX);
+    Require(rawGreater() == Covered, label + "after a clear to the raw value 0 the depth test 0.5 > 0.0 did not pass everywhere");
+    Require(rawLess() == 0u, label + "after a clear to the raw value 0 a texel passed 0.5 < depth");
+
     if (mode >= 2) AwaitCompletions(device, [&] { return Graphics::DepthClearCounts().verified + Graphics::DepthClearCounts().violations >= before.verified + before.violations + 4u; });
     const auto difference = Difference(Graphics::DepthClearCounts(), before);
     if (mode == 0) {
         Require(difference.matched == 0u && difference.clears == 0u, label + "the lever counted with the switch off");
         return;
     }
-    Require(difference.clears == 4u, label + "the lever took " + std::to_string(difference.clears) + " clears, expected 4 (unorm 1.0 and 0.0, raw 0x4000 and 0xffff)");
-    Require(difference.declined[2] >= 1u, label + "the unorm clear to 0.5 was not declined for its value (" + std::to_string(difference.declined[2]) + ")");
+    Require(difference.clears == 4u, label + "the lever took " + std::to_string(difference.clears) + " clears, expected 4 (unorm 1.0 and 0.0, raw 0xffff and 0)");
+    Require(difference.declined[2] >= 2u, label + "the unorm clear to 0.5 and the raw clear to 0x4000 were not declined for their value (" + std::to_string(difference.declined[2]) + ")");
     Require(difference.bytesSkipped == difference.clears * 2u * Width * Height * sizeof(std::uint16_t), label + "the copies left out add up to " + std::to_string(difference.bytesSkipped) + " bytes");
     if (mode >= 2) {
         Require(difference.violations == 0u, label + "verify mode found " + std::to_string(difference.violations) + " violations");
         Require(difference.verified == 4u, label + "verify mode checked " + std::to_string(difference.verified) + " clears, expected 4");
     }
+}
+
+// A surface with a stencil plane: the lever clears the depth plane only, the stencil values survive.
+void StencilCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    Graphics::SetDepthClearModeForTest(mode);
+    const auto before = Graphics::DepthClearCounts();
+    const std::string label = "depth and stencil, mode " + std::to_string(mode) + ": ";
+    auto& code = NewBlock();
+    std::memcpy(code.Data(), ClearKernel.data(), sizeof(ClearKernel));
+    auto& plane = NewBlock();
+    auto& stencilPlane = NewBlock();
+    auto& color = NewBlock();
+    const Surface surface{plane.Address(), stencilPlane.Address(), 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    const VkStencilOpState writeFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 5u};
+    const VkStencilOpState equalFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 5u};
+    Require(Draw(device, shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS, .stencilTest = true, .stencil = writeFive}) == Covered, label + "the depth and stencil producer did not cover the surface");
+    SetColor(color, 1.0f);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
+    Require(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}) == Covered, label + "after a clear to 1.0 the depth test 0.5 < 1.0 did not pass everywhere");
+    Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equalFive}) == Covered, label + "the depth clear changed the stencil values");
+    const auto difference = Difference(Graphics::DepthClearCounts(), before);
+    if (mode == 0) Require(difference.matched == 0u && difference.clears == 0u, label + "the lever counted with the switch off");
+    else Require(difference.clears == 1u, label + "the clear was not taken (" + std::to_string(difference.clears) + " clears, " + std::to_string(Declined(difference)) + " declined)");
 }
 
 }
@@ -490,6 +519,7 @@ int main() {
 
         for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
         for (const int mode : {0, 1, 2}) run(mode == 0 ? "16-bit plane, switch off" : mode == 1 ? "16-bit plane, lever" : "16-bit plane, verify", [&] { SixteenBitCase(*device, shaders, mode); });
+        for (const int mode : {0, 1}) run(mode == 0 ? "depth and stencil, switch off" : "depth and stencil, lever", [&] { StencilCase(*device, shaders, mode); });
         for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
         Graphics::SetDepthClearModeForTest(-1);
         LibcRunShutdown_nid_postfix();
