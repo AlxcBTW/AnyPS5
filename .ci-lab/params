@@ -1,0 +1,5 @@
+name=gpu-hz3
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-hz3-843528d01c-174053
