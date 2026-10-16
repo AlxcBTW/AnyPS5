@@ -2575,21 +2575,6 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     return importAccess(context, state, address, address + bytes, lease);
 }
 
-const HostImport* HostImportSpanning(const Context& context, std::uint64_t address, std::size_t bytes) {
-    if (const auto* import = HostImportFor(context, address, bytes)) return import;
-    std::fprintf(stderr, "[diag] HostImportSpanning 0x%llx+0x%llx: HostImportFor is null (alignment %llu)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(context.hostImportAlignment));
-    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-    if (const auto* found = findImport(state, address, address + bytes)) return found;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    refreshImports(context, state, lease);
-    const auto run = crossedRun(lease, address, address + bytes);
-    if (run.ranges.empty()) return nullptr;
-    const auto* joined = importJoined(context, state, run.base, run.base + run.bytes, lease);
-    return joined != nullptr && findImport(state, address, address + bytes) == joined ? joined : nullptr;
-}
-
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
     if (context.hostImportAlignment == 0) return true;
     ensurePinWaiter();
