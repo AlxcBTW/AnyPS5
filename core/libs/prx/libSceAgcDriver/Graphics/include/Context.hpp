@@ -79,7 +79,8 @@ struct DescriptorRejected : std::runtime_error {
 };
 
 struct BdaUnalignedAccess : std::runtime_error {
-    using std::runtime_error::runtime_error;
+    BdaUnalignedAccess(const std::string& message, std::uint32_t instruction) : std::runtime_error(message), instruction(instruction) {}
+    std::uint32_t instruction;
 };
 
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the

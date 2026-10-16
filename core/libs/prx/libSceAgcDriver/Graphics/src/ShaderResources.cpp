@@ -4647,13 +4647,20 @@ bool SkipWriteBack() {
 }
 
 void ShaderResources::WriteBack() {
-    WriteBackBuffers();
-    if (SkipWriteBack()) return;
-    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (!storageWritten[index]) continue;
-        storageTextures[index]->MarkDirty();
-        static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
+    std::exception_ptr unaligned;
+    try {
+        WriteBackBuffers();
+    } catch (const BdaUnalignedAccess&) {
+        unaligned = std::current_exception();
     }
+    if (!SkipWriteBack()) {
+        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+            if (!storageWritten[index]) continue;
+            storageTextures[index]->MarkDirty();
+            static_cast<void>(DepthSurfaceStoreBack(context, *storageTextures[index]));
+        }
+    }
+    if (unaligned) std::rethrow_exception(unaligned);
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
