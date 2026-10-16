@@ -1,0 +1,5 @@
+name=lead-best7-depth
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best7-depth-46ed0859fc-260463
