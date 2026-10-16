@@ -1,0 +1,5 @@
+name=cpu-mutex
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-mutex-c83d6b885e-163440
