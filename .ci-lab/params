@@ -1,0 +1,5 @@
+name=guestcrash-ring
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-guestcrash-ring-ca886e7455-231755
