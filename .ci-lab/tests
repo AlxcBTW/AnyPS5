@@ -1,0 +1,1 @@
+^agc_driver_(pipelined_|indirect_arguments_|gpu_indirect_|gated_dispatch|same_queue_label|write_data_written|skip_shader|pattern_buffer_fill|unimported_label|queue_zero_idle)
