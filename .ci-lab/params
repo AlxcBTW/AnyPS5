@@ -1,0 +1,5 @@
+name=waitdefer
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-waitdefer-b1786834b4-4412
