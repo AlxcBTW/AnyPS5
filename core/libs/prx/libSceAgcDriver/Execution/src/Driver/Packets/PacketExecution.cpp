@@ -23,6 +23,18 @@ bool orderedFills() {
     return ordered;
 }
 
+// APS5_LAB_WAIT_DEFER: whether a packet can have an effect (GPU work, a store, a flip, a read of guest memory)
+// before which a deferred wait has to be verified in memory. Only packets that set registers or order
+// the command processor against itself, and further waits, may run ahead of the verification.
+bool landsDeferredWaits(std::uint32_t header, std::uint32_t opcode) {
+    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return true;
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x26: case 0x28: case 0x2a: case 0x2f: case 0x3c: case 0x42: case 0x58: case 0x59: case 0x68: case 0x69: case 0x76: case 0x78: case 0x79: case 0x7a: case 0x81: case 0x93: return false;
+        case 0x10: return ((header >> 2u) & 0x3fu) != 0;
+        default: return true;
+    }
+}
+
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
@@ -173,6 +185,7 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (waitDeferEnabled() && landsDeferredWaits(header, opcode)) landPendingWaits(submission.queue, true);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueClockStorePacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
@@ -402,6 +415,8 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
+    // A submission is consumed only once its waits hold: a deferred one is verified before the end is visible.
+    if (waitDeferEnabled()) landPendingWaits(submission.queue, true);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

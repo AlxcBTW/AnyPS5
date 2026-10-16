@@ -7,7 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #ifdef _WIN32
@@ -35,6 +37,50 @@ void PollSleep() {
     std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
+bool Driver::waitDeferEnabled() {
+    static const bool on = [] {
+        const char* text = std::getenv("APS5_LAB_WAIT_DEFER");
+        return text != nullptr && *text != 0 && std::strcmp(text, "0") != 0;
+    }();
+    return on;
+}
+
+namespace {
+
+// APS5_LAB_WAIT_DEFER counters (all threads), printed as one [waitdefer] line every 10 s.
+struct DeferStats {
+    // Waits that reached the deferral check, and why the ones that stayed in the poll did.
+    std::atomic<std::uint64_t> past{0}, noEntry{0}, overwritten{0}, mismatch{0};
+    // Deferred waits: where, on which queue, and the state of the label entry that satisfied them.
+    std::atomic<std::uint64_t> deferredEntry{0}, deferredPoll{0}, deferredQueue0{0}, unclosed{0}, closedChanged{0}, closedKept{0}, behindCompletion{0}, submits{0};
+    // Polls that ended in memory, in the table (a later trusted hit), in a deferral; the time they took.
+    std::atomic<std::uint64_t> endMemory{0}, endTable{0}, endOther{0}, memoryUs{0}, tableUs{0}, deferUs{0};
+    // Landings of deferred waits: already satisfied, had to wait, the wait, the gap since deferral.
+    std::atomic<std::uint64_t> lands{0}, landedFree{0}, landedWaited{0}, waitedUs{0}, maxUs{0}, gapUs{0}, gaveUp{0};
+    std::atomic<std::int64_t> reported{0};
+} deferStats;
+
+void ReportDeferStats() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = deferStats.reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        deferStats.reported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !deferStats.reported.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto past = take(deferStats.past), none = take(deferStats.noEntry), over = take(deferStats.overwritten), mismatch = take(deferStats.mismatch);
+    const auto entry = take(deferStats.deferredEntry), poll = take(deferStats.deferredPoll), q0 = take(deferStats.deferredQueue0), unclosed = take(deferStats.unclosed), changed = take(deferStats.closedChanged), kept = take(deferStats.closedKept), behind = take(deferStats.behindCompletion), submits = take(deferStats.submits);
+    const auto endMemory = take(deferStats.endMemory), endTable = take(deferStats.endTable), endOther = take(deferStats.endOther), memoryUs = take(deferStats.memoryUs), tableUs = take(deferStats.tableUs), deferUs = take(deferStats.deferUs);
+    const auto lands = take(deferStats.lands), satisfied = take(deferStats.landedFree), waited = take(deferStats.landedWaited), waitedUs = take(deferStats.waitedUs), maxUs = take(deferStats.maxUs), gapUs = take(deferStats.gapUs), gaveUp = take(deferStats.gaveUp);
+    AgcDriver::ProfilePrint_nid_no_patch("[waitdefer] (10 s): %llu waits reached the check; deferred %llu (entry %llu, polling %llu, queue 0 %llu; entry unclosed %llu, closed+CPU store %llu, closed+kept %llu, behind completion %llu, open batch submitted %llu) in %.1f ms parked; stayed in the poll: no recorded entry %llu, overwritten %llu, value does not satisfy %llu; polls ended in memory %llu (%.1f ms), table %llu (%.1f ms), other %llu; landings %llu: already satisfied %llu, had to wait %llu (%.1f ms, max %.2f ms), %.1f ms between deferral and landing in total, gave up %llu\n",
+                                         past, entry + poll, entry, poll, q0, unclosed, changed, kept, behind, submits, deferUs / 1000.0, none, over, mismatch, endMemory, memoryUs / 1000.0, endTable, tableUs / 1000.0, endOther, lands, satisfied, waited, waitedUs / 1000.0, maxUs / 1000.0, gapUs / 1000.0, gaveUp);
+}
+
+void DeferCount(std::atomic<std::uint64_t>& value, std::uint64_t amount = 1) { value.fetch_add(amount, std::memory_order_relaxed); }
+
+}
+
 int Driver::waitTimeoutMs() {
     static const int value = [] { const char* text = std::getenv("APS5_GPU_WAIT_TIMEOUT_MS"); return text ? std::atoi(text) : 1000; }();
     return value;
@@ -60,25 +106,36 @@ std::vector<Driver::PendingWait>& Driver::pendingWaits() {
     return HostThreadLocal<std::vector<PendingWait>, WaitsTag>();
 }
 
-void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received) {
+void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, bool deferred) {
     if (packet.size() > std::tuple_size_v<decltype(PendingWait::words)>) return;
     static const bool allQueues = std::getenv("APS5_LAND_WAITS_ALL_QUEUES") != nullptr;
-    if (!allQueues && queue == 0) return;
+    if (!allQueues && queue == 0 && !deferred) return;
     if (Pm4::WaitSatisfiedUnchecked(packet)) return;
     auto& waits = pendingWaits();
-    for (const auto& wait : waits) {
-        if (wait.count == packet.size() && std::equal(packet.begin(), packet.end(), wait.words.begin())) return;
+    for (auto& wait : waits) {
+        if (wait.count == packet.size() && std::equal(packet.begin(), packet.end(), wait.words.begin())) {
+            if (deferred && !wait.deferred) {
+                wait.deferred = true;
+                wait.noted = std::chrono::steady_clock::now();
+            }
+            return;
+        }
     }
     PendingWait wait{};
     std::copy(packet.begin(), packet.end(), wait.words.begin());
     wait.count = packet.size();
     wait.received = received;
+    if (deferred) {
+        wait.deferred = true;
+        wait.noted = std::chrono::steady_clock::now();
+    }
     waits.push_back(wait);
 }
 
-void Driver::landPendingWaits(std::uint32_t queue) {
+void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
     auto& waits = pendingWaits();
     if (waits.empty()) return;
+    if (onlyDeferred && std::none_of(waits.begin(), waits.end(), [](const PendingWait& wait) { return wait.deferred; })) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct LandStats {
         std::uint64_t lands = 0, waited = 0;
@@ -87,25 +144,47 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     };
     static thread_local LandStats stats;
     const PacketHistory none{};
+    std::vector<PendingWait> kept;
     for (const auto& wait : waits) {
+        if (onlyDeferred && !wait.deferred) {
+            kept.push_back(wait);
+            continue;
+        }
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         ++stats.lands;
-        if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
         const auto started = std::chrono::steady_clock::now();
-        waitMemory(packet, queue, none, wait.received, false, true);
+        if (wait.deferred) {
+            DeferCount(deferStats.lands);
+            DeferCount(deferStats.gapUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(started - wait.noted).count()));
+        }
+        if (Pm4::WaitSatisfiedUnchecked(packet)) {
+            if (wait.deferred) DeferCount(deferStats.landedFree);
+            continue;
+        }
+        waitMemory(packet, queue, none, wait.received, false, true, wait.deferred);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         ++stats.waited;
         stats.waitedMs += ms;
         stats.maxMs = std::max(stats.maxMs, ms);
+        if (wait.deferred) {
+            const auto us = static_cast<std::uint64_t>(ms * 1000.0);
+            DeferCount(deferStats.landedWaited);
+            DeferCount(deferStats.waitedUs, us);
+            auto seen = deferStats.maxUs.load(std::memory_order_relaxed);
+            while (seen < us && !deferStats.maxUs.compare_exchange_weak(seen, us, std::memory_order_relaxed)) {
+            }
+        }
     }
-    waits.clear();
+    if (onlyDeferred) waits = std::move(kept);
+    else waits.clear();
+    if (waitDeferEnabled()) ReportDeferStats();
     if (profile && std::chrono::steady_clock::now() - stats.reported > std::chrono::seconds(10)) {
         AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu had to wait for the GPU: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats.lands), static_cast<unsigned long long>(stats.waited), stats.waitedMs, stats.maxMs);
         stats = LandStats{};
     }
 }
 
-void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
+void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory, bool strictLanding) {
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
@@ -189,6 +268,44 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return true;
     };
 
+    // APS5_LAB_WAIT_DEFER: a recorded, satisfying, not overwritten label entry that the late rules (or the
+    // pending group close) keep from serving the wait lets translation go on. The compare is then
+    // verified in guest memory by landPendingWaits before the next packet with an effect.
+    const bool deferOn = waitDeferEnabled() && labelTable && packet.size() <= std::tuple_size_v<decltype(PendingWait::words)>;
+    bool classified = false, deferredNow = false;
+    const auto tryDefer = [&](VulkanDevice* lockedDevice, bool polling) {
+        Graphics::Recorder::RawLabel raw;
+        const bool found = Graphics::Recorder::LookupLabelRaw(awaited, awaitedBytes, received, raw);
+        const bool satisfies = found && !raw.overwritten && Pm4::WaitComparesValue(packet, raw.value);
+        if (!classified) {
+            classified = true;
+            DeferCount(deferStats.past);
+            if (!satisfies) DeferCount(!found ? deferStats.noEntry : raw.overwritten ? deferStats.overwritten : deferStats.mismatch);
+        }
+        if (!satisfies) return false;
+        DeferCount(polling ? deferStats.deferredPoll : deferStats.deferredEntry);
+        if (queue == 0) DeferCount(deferStats.deferredQueue0);
+        DeferCount(!raw.closed ? deferStats.unclosed : GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, raw.generation) ? deferStats.closedKept : deferStats.closedChanged);
+        if (raw.behindCompletion) DeferCount(deferStats.behindCompletion);
+        notePendingWait(packet, queue, received, true);
+        const auto flush = [&](VulkanDevice& target) {
+            if (!target.OpenWriteOverlaps(awaited, awaitedBytes)) return;
+            target.SubmitRecorded(false);
+            DeferCount(deferStats.submits);
+        };
+        if (lockedDevice != nullptr) {
+            flush(*lockedDevice);
+        } else {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+            std::unique_lock flushLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            if (flushLock.owns_lock()) {
+                if (const auto flushDevice = device.Load()) flush(*flushDevice);
+            }
+        }
+        deferredNow = true;
+        return true;
+    };
+
     std::uint64_t seenGeneration = Graphics::Recorder::WriteGeneration();
 
     const bool unlocked = !waitLock && overlapSubmit;
@@ -225,13 +342,37 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
 
+    struct PollAccount {
+        bool on;
+        const bool& deferred;
+        int outcome = 2;
+        std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+        ~PollAccount() {
+            if (!on) return;
+            const auto us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count());
+            if (deferred) {
+                DeferCount(deferStats.deferUs, us);
+            } else if (outcome == 0) {
+                DeferCount(deferStats.endMemory);
+                DeferCount(deferStats.memoryUs, us);
+            } else if (outcome == 1) {
+                DeferCount(deferStats.endTable);
+                DeferCount(deferStats.tableUs, us);
+            } else {
+                DeferCount(deferStats.endOther);
+            }
+            ReportDeferStats();
+        }
+    } account{deferOn, deferredNow};
+    if (deferOn && tryDefer(nullptr, false)) return;
+
     static const bool pollProfile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& poll = pollStats();
     const auto pollRefused = [&](Graphics::Recorder::LabelRefusal refusal) {
         if (pollProfile && refusal != Graphics::Recorder::LabelRefusal::None && static_cast<std::size_t>(refusal) < poll.refusals.size()) ++poll.refusals[static_cast<std::size_t>(refusal)];
     };
 
-    const bool reapAll = pollReapAll() || !labelShortcut || queue == 0;
+    const bool reapAll = pollReapAll() || !labelShortcut || queue == 0 || strictLanding;
     std::chrono::steady_clock::time_point lastTry{};
     const auto pollService = [&](bool sleeping) {
         if (pollProfile) ++poll.ticks;
@@ -254,6 +395,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 return true;
             }
             pollRefused(refusal);
+            if (deferOn && tryDefer(nullptr, true)) return true;
         }
         if (pollProfile) ++poll.tries;
         std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
@@ -291,6 +433,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                     return true;
                 }
                 pollRefused(refusal);
+                if (deferOn && tryDefer(localDevice.get(), true)) return true;
             }
             if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
                 localDevice->SubmitRecorded(false);
@@ -318,7 +461,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         return false;
     };
 
-    if (entryTryFailed && pollService(false)) return;
+    if (entryTryFailed && pollService(false)) {
+        if (!deferredNow) account.outcome = 1;
+        return;
+    }
 
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
@@ -332,10 +478,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     StallWatch stall(queue);
+    std::chrono::steady_clock::time_point settledAt{};
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            account.outcome = 3;
             return;
         }
         ++polls;
@@ -349,12 +497,26 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::this_thread::yield();
         }
         CheckFailure();
-        if (pollService(!spinning)) return;
+        if (pollService(!spinning)) {
+            if (!deferredNow) account.outcome = 1;
+            return;
+        }
         noteAwaitingTitle(queue, awaited);
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
+                    if (!strictLanding) return;
+                    // A deferred wait was never proven by the table: settled writes without the value in memory
+                    // keep it waiting (as the hardware would) until the usual timeout, then it gives up like a plain landing.
+                    const auto now = std::chrono::steady_clock::now();
+                    if (settledAt == std::chrono::steady_clock::time_point{}) settledAt = now;
+                    if (now - settledAt > std::chrono::milliseconds(waitTimeoutMs())) {
+                        DeferCount(deferStats.gaveUp);
+                        std::fprintf(stderr, "[waitdefer] queue 0x%x landing of the wait on 0x%llx gave up: recorded writes settled without the compare holding\n", queue, static_cast<unsigned long long>(awaited));
+                        return;
+                    }
+                }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -401,6 +563,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    account.outcome = 0;
 }
 
 }
