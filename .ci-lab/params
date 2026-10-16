@@ -2,4 +2,4 @@ name=cpu-all
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-cpu-all-ea0f87b6b8-181520
+artifact=lab-libs-cpu-all-5485b0dc26-183732
