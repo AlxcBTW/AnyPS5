@@ -6,10 +6,12 @@
 #endif
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -101,12 +103,38 @@ void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
 bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count);
 bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count);
+// APS5_LAB_MUTEX_GATE: a key range a dispatch's gate settled (see VulkanDevice::SettleKeyWriters).
+struct DccGateRange {
+    std::uint64_t address;
+    std::uint64_t bytes;
+};
+// While an object of this class lives on a thread (a dispatch's device call), the locked syncs of
+// WaitForKeyWriters are classified against the ranges the gate settled: covered (the range was
+// settled and a writer arrived after the gate), overlapping (a settled range overlaps it) or not
+// listed (the pre-sync's list did not name it). Counting only; no sync is skipped or changed.
+class KeyGateScope {
+public:
+    explicit KeyGateScope(std::vector<DccGateRange> settled);
+    ~KeyGateScope();
+    KeyGateScope(const KeyGateScope&) = delete;
+    KeyGateScope& operator=(const KeyGateScope&) = delete;
+private:
+    std::vector<DccGateRange> ranges;
+    const std::vector<DccGateRange>* previous;
+};
+// The ranges of the locked key syncs the gate's list did not name since the scope began, taken (and cleared) by the dispatch driver.
+std::vector<DccGateRange> TakeUnlistedKeyRanges();
 struct DccKeyWaitCounts {
     std::uint64_t calls;
     std::uint64_t noPending;
     std::uint64_t known;
     std::uint64_t fillsUncompressed;
     std::uint64_t synced;
+    // The locked syncs by the calling thread (queue 0, queue 0x20, any other), their count and
+    // GPU wait, and by the gate's view of the range: covered, overlapping, not listed, no gate.
+    std::array<std::uint64_t, 3> syncedBy;
+    std::array<double, 3> syncedMs;
+    std::array<std::uint64_t, 4> byCoverage;
 };
 DccKeyWaitCounts KeyWaitCounts();
 
