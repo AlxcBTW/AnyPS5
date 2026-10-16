@@ -1,0 +1,5 @@
+name=uppr-fastproof
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-uppr-fastproof-01cba29ef0-46774
