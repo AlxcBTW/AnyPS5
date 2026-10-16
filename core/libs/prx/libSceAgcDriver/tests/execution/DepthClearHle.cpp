@@ -2,6 +2,10 @@
 // plane (the UAV clear games run over shadow atlases) leaves out the copies of the plane around the dispatch and clears
 // the depth image to the stored value instead. The kernel is the one a title runs: 15 words, 8 x 8 threads, the T# in
 // user data 0-7, the V# of the colour in user data 8-11, groups 8 x 4 for the 64 x 32 plane.
+// Three layers: the matcher alone; the lever's scope around a dispatch on the test's own device, where the depth plane
+// of the harness lives (a driver submit would use another VkDevice, which has no such surface); and a PM4 submit through
+// the driver, which only the matching, the scope and the colour read can reach (counters), since the driver's device
+// holds no depth surface.
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -28,6 +32,7 @@
 #include <deque>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -70,7 +75,7 @@ public:
     GuestBlock(const GuestBlock&) = delete;
     GuestBlock& operator=(const GuestBlock&) = delete;
 
-    std::uint8_t* Data() { return block; }
+    std::uint8_t* Data() const { return block; }
 
     std::uint64_t Address() const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block)); }
 
@@ -132,6 +137,34 @@ void DispatchClear(const GuestBlock& code, const GuestBlock& plane, const GuestB
     for (std::uint32_t word = 0; word < 4u; ++word) packets.push_back(Pm4Packet(0x76, {0x248u + word, buffer[word]}));
     packets.push_back(Pm4Packet(0x15, {groupsX, groupsY, 1, 0x41}));
     Submit(std::move(packets));
+}
+
+// One dispatch of the kernel over `plane` through `device`, recorded under the lever's scope as Driver::dispatch does.
+void RunClear(AgcDriver::VulkanDevice& device, const GuestBlock& code, const GuestBlock& plane, const GuestBlock& color, std::uint32_t format, std::uint32_t groupsX, std::uint32_t groupsY, std::uint32_t tile = TileLinear) {
+    std::vector<std::uint32_t> userData(12);
+    const auto texture = TextureDescriptor(plane.Address(), format, tile);
+    const auto buffer = BufferDescriptor(color.Address(), 16u);
+    std::copy(texture.begin(), texture.end(), userData.begin());
+    std::copy(buffer.begin(), buffer.end(), userData.begin() + 8);
+    const std::span<const std::uint32_t> kernel(reinterpret_cast<const std::uint32_t*>(code.Data()), ClearKernel.size());
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{8, 8, 1}, 0u, {true, true, true}, false, 2u, {0, 0, 0}};
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{
+        {static_cast<std::uintptr_t>(code.Address()), std::as_bytes(kernel)},
+        {static_cast<std::uintptr_t>(color.Address()), std::span<const std::byte>(reinterpret_cast<const std::byte*>(color.Data()), 16)},
+    }};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderRecompiler::ShaderStage::Compute, static_cast<std::uintptr_t>(code.Address()), kernel, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    const auto program = ShaderRecompiler::Recompile(request);
+    std::optional<Graphics::DepthPlaneClear> scope;
+    if (const auto clear = Graphics::MatchStorageImageClear(kernel, userData, compute, {groupsX, groupsY, 1u})) scope.emplace(*clear);
+    device.Dispatch(program, groupsX, groupsY, 1, {}, static_cast<std::uintptr_t>(code.Address()));
+    scope.reset();
+    device.WaitIdle();
 }
 
 void SetColor(GuestBlock& color, float value) {
@@ -233,33 +266,33 @@ Graphics::DepthClearStatistics ClearSequence(AgcDriver::VulkanDevice& device, co
     Require(drawEqual() == Covered, label + "the plane does not hold exactly 0.5");
 
     SetColor(color, 1.0f);
-    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
     Require(drawLess() == Covered, label + "after a clear to 1.0 the depth test 0.5 < 1.0 did not pass everywhere");
     Require(drawGreater() == 0u, label + "after a clear to 1.0 a texel passed 0.5 > depth");
 
     SetColor(color, 0.25f);
-    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
     Require(drawLess() == 0u, label + "after a clear to 0.25 a texel passed 0.5 < depth");
     Require(drawGreater() == Covered, label + "after a clear to 0.25 the depth test 0.5 > 0.25 did not pass everywhere");
 
     SetColor(color, 0.5f);
-    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
     Require(drawEqual() == Covered, label + "after a clear to 0.5 the plane does not hold exactly 0.5");
 
     // Half the plane: the clear cannot be taken (the other half keeps its depth), whatever the mode.
     SetColor(color, 0.75f);
-    DispatchClear(code, plane, color, Format32Float, 4, 4);
+    RunClear(device, code, plane, color, Format32Float, 4, 4);
     Require(drawGreater() == 0u, label + "after a clear of the left half to 0.75 a texel passed 0.5 > depth");
     Require(drawEqual() == Covered / 2u, label + "after a clear of the left half the right half does not keep 0.5");
     Require(drawLess() == Covered / 2u, label + "after a clear of the left half the left half does not hold 0.75");
 
     // Values the lever does not take: an integer format, a negative value, a value above 1.
     SetColor(color, 2.0f);
-    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
     Require(drawEqual() == 0u, label + "after a clear to 2.0 a texel still holds exactly 0.5");
 
     SetColor(color, 0.125f);
-    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    RunClear(device, code, plane, color, Format32Float, 8, 4);
     Require(drawGreater() == Covered, label + "after the last full clear the depth test 0.5 > 0.125 did not pass everywhere");
     Require(drawLess() == 0u, label + "after the last full clear a texel passed 0.5 < depth");
 
@@ -288,12 +321,32 @@ void IntegerViewCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, in
     const std::array<std::uint32_t, 4> bits{std::bit_cast<std::uint32_t>(0.25f), 0u, 0u, 0u};
     std::memcpy(color.Data(), bits.data(), sizeof(bits));
     AgcDriver::GuestMemory::MarkWritten(color.Address(), sizeof(bits));
-    DispatchClear(code, plane, color, Format32Uint, 8, 4, TileZ64KBX);
+    RunClear(device, code, plane, color, Format32Uint, 8, 4, TileZ64KBX);
     Require(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_GREATER}) == Covered, label + "after a clear to the bits of 0.25 the depth test 0.5 > 0.25 did not pass everywhere");
     Require(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}) == 0u, label + "after a clear to the bits of 0.25 a texel passed 0.5 < depth");
     const auto difference = Difference(Graphics::DepthClearCounts(), before);
     if (mode == 0) Require(difference.matched == 0u && difference.clears == 0u, label + "the lever counted with the switch off");
     else Require(difference.clears == 1u, label + "the clear was not taken (" + std::to_string(difference.clears) + " clears, " + std::to_string(Declined(difference)) + " declined)");
+}
+
+// A PM4 submit through the driver: its device holds no depth surface (the harness' draws are another VkDevice's), so only
+// what happens before the plane is looked up can be seen: the matching of the kernel with the registers the packets set,
+// the scope, the colour read. The counters say whether Driver::dispatch got that far.
+void DriverMatchCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    Graphics::SetDepthClearModeForTest(mode);
+    const auto before = Graphics::DepthClearCounts();
+    const std::string label = "driver submit, mode " + std::to_string(mode) + ": ";
+    auto& code = NewBlock();
+    std::memcpy(code.Data(), ClearKernel.data(), sizeof(ClearKernel));
+    auto& plane = NewBlock();
+    auto& color = NewBlock();
+    const Surface surface{plane.Address(), 0, 0, false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}) == Covered, label + "the producer did not cover the plane");
+    SetColor(color, 1.0f);
+    DispatchClear(code, plane, color, Format32Float, 8, 4);
+    const auto difference = Difference(Graphics::DepthClearCounts(), before);
+    if (mode == 0) Require(difference.matched == 0u && difference.taken == 0u, label + "the driver's dispatch reached the lever with the switch off");
+    else Require(difference.matched == 1u && difference.taken == 1u, label + "the driver's dispatch matched " + std::to_string(difference.matched) + " and took " + std::to_string(difference.taken) + " clears (declined " + std::to_string(Declined(difference)) + "), expected 1 and 1");
 }
 
 // Reaps the completions of recorded work until `done` holds (the checks of verify mode run when their batch completes).
@@ -361,6 +414,7 @@ int main() {
         Graphics::SetDepthClearModeForTest(-1);
 
         for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
+        for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
         Graphics::SetDepthClearModeForTest(-1);
         LibcRunShutdown_nid_postfix();
     } catch (const std::exception& error) {
