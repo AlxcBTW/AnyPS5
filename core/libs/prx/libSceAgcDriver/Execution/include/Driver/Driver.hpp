@@ -252,15 +252,19 @@ private:
     static bool pollReapAll();
     static bool pollTryEach();
     static bool traceLateLabels();
-    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false);
+    void waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory = false, bool strictLanding = false);
     struct PendingWait {
         std::array<std::uint32_t, 8> words;
         std::size_t count;
         std::uint64_t received;
+        // Noted by APS5_LAB_WAIT_DEFER: the compare was not seen in memory, only expected from a recorded label.
+        bool deferred = false;
+        std::chrono::steady_clock::time_point noted{};
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
-    void landPendingWaits(std::uint32_t queue);
+    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, bool deferred = false);
+    void landPendingWaits(std::uint32_t queue, bool onlyDeferred = false);
+    static bool waitDeferEnabled();
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
         std::array<std::uint32_t, 5> packet{};
