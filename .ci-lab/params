@@ -1,0 +1,5 @@
+name=gpu-dc2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-dc2-afaf87c969-223546
