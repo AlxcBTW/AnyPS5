@@ -470,7 +470,6 @@ std::size_t ImagePagesSize() {
 }
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
-    GuestWriteRing::Record(GuestWriteRing::Kind::MappingChanged, address, bytes, 0);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -501,6 +500,8 @@ void PageStates::initialize() {
         }
 #endif
         if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+        // Lab diagnostics: every guest mapping change, with what made it, reaches APS5_GUEST_WRITE_RING (a no-op without it).
+        GuestAllocations::GuestAllocationsSetChangeObserver_nid_postfix(&GuestWriteRing::RecordMappingChange);
     });
 }
 

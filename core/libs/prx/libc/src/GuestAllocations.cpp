@@ -50,6 +50,7 @@ std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> pinWaiter{nullptr};
 std::atomic<void (*)(const Mapped&, std::uint64_t)> gpuMapObserver{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t)> unmapObserver{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t, int)> changeObserver{nullptr};
 std::atomic<std::uint32_t> gpuMapObserverCalls{0};
 
 std::chrono::milliseconds pinWait() {
@@ -71,10 +72,15 @@ struct MutationState {
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
     std::vector<std::pair<std::uintptr_t, std::size_t>> gpuMapped;
+    // What changed each range of `changed`, for the change observer.
+    std::vector<ChangeKind> changeKinds;
 };
 
-void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
-    if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+void recordChange(void* mutation, const void* pointer, std::size_t bytes, ChangeKind kind) {
+    if (mutation == nullptr || bytes == 0) return;
+    auto* state = static_cast<MutationState*>(mutation);
+    state->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    state->changeKinds.push_back(kind);
 }
 
 #ifndef _WIN32
@@ -124,6 +130,9 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
     }
+    if (const auto observer = changeObserver.load(std::memory_order_acquire)) {
+        for (std::size_t k = 0; k < state->changed.size(); ++k) observer(state->changed[k].first, state->changed[k].second, static_cast<int>(state->changeKinds[k]));
+    }
     if (!state->gpuMapped.empty()) gpuMapObserverCalls.fetch_add(1);
     const auto observer = state->gpuMapped.empty() ? nullptr : gpuMapObserver.load();
     Lease::Ranges mapped;
@@ -161,6 +170,7 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
+    if (const auto observer = changeObserver.load(std::memory_order_acquire)) observer(address, bytes, static_cast<int>(ChangeKind::Release));
 }
 
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation)) {
@@ -233,7 +243,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     if (found == state.registeredImages.end()) return;
     const auto [begin, end] = *found;
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, image, end - begin);
-    recordChange(mutation, image, end - begin);
+    recordChange(mutation, image, end - begin, ChangeKind::UnregisterImage);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
     state.registeredImages.erase(found);
 }
@@ -285,7 +295,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
 #endif
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) {
-    recordChange(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes, ChangeKind::Map);
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
     require(!writable || readable, "writable guest allocation must be readable");
@@ -444,7 +454,7 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
-    recordChange(mutation, pointer, range.bytes);
+    recordChange(mutation, pointer, range.bytes, ChangeKind::Free);
     auto& ranges = registry().ranges;
     const auto exact = ranges.find(range.address);
     if (exact != ranges.end() && exact->second->allocationBytes == exact->second->bytes) {
@@ -515,7 +525,7 @@ bool allocationRemains(const Range& range, const RangePatch& patch) {
 
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu, const std::function<void()>& apply) {
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
-    recordChange(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes, ChangeKind::Protect);
     const auto patch = replaceRange(pointer, bytes, false, readable, writable, gpu);
     apply();
     applyPatch(patch);
@@ -523,7 +533,7 @@ void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, st
 
 void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, const std::function<void(const void*, std::size_t, const void*, bool)>& apply) {
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
-    recordChange(mutation, pointer, bytes);
+    recordChange(mutation, pointer, bytes, ChangeKind::Unmap);
     const auto end = reinterpret_cast<std::uintptr_t>(pointer) + bytes;
     auto cursor = reinterpret_cast<std::uintptr_t>(pointer);
     bool any = false;
@@ -556,6 +566,10 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
 
 void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_t, std::size_t)) {
     unmapObserver.store(callback, std::memory_order_release);
+}
+
+void GuestAllocationsSetChangeObserver_nid_postfix(void (*callback)(std::uintptr_t, std::size_t, int)) {
+    changeObserver.store(callback, std::memory_order_release);
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {
