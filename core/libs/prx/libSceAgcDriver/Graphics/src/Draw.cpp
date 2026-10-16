@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -844,6 +845,112 @@ void CountDrawSkip(DrawSkip kind, double us) {
 }
 
 
+// APS5_LAB_DRAW_STAGEA counters (atomic: stage A runs on the committer and the queue workers
+// outside the mutex, the check inside it), printed as [drawstageA] every 10 s through the
+// asynchronous profile writer.
+namespace {
+
+struct StageACounters {
+    std::atomic<std::uint64_t> runs{0}, keyed{0}, found{0}, passed{0}, failed{0}, verified{0}, disagreed{0}, precollected{0}, targetWalks{0};
+    std::atomic<std::uint64_t> movedNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+StageACounters& StageA() {
+    static StageACounters counters;
+    return counters;
+}
+
+void reportStageA() {
+    auto& c = StageA();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto runs = take(c.runs);
+    const auto keyed = take(c.keyed);
+    const auto found = take(c.found);
+    const auto passed = take(c.passed);
+    const auto failed = take(c.failed);
+    const auto verified = take(c.verified);
+    const auto disagreed = take(c.disagreed);
+    const auto precollected = take(c.precollected);
+    const auto walks = take(c.targetWalks);
+    const auto movedMs = static_cast<double>(c.movedNs.exchange(0, std::memory_order_relaxed)) / 1e6;
+    AgcDriver::ProfilePrint_nid_no_patch("[drawstageA] %llu stage-A runs (%llu keyed, %llu found a template, %llu templates pre-walked, %llu target walks); re-checks under the mutex: %llu passed, %llu failed (recomputed locked); %.1f ms moved out of the hold (10 s); verify: %llu compared, %llu DISAGREEING\n", runs, keyed, found, precollected, walks, passed, failed, movedMs, verified, disagreed);
+}
+
+bool StageAVerify() {
+    static const bool verify = std::getenv("APS5_LAB_DRAW_STAGEA_VERIFY") != nullptr;
+    return verify;
+}
+
+void countStageA(bool passed, const DrawStageA* stageA) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& c = StageA();
+    (passed ? c.passed : c.failed).fetch_add(1, std::memory_order_relaxed);
+    if (passed) c.movedNs.fetch_add(static_cast<std::uint64_t>(stageA->us * 1000.0), std::memory_order_relaxed);
+    if (profile) reportStageA();
+}
+
+void countStageAVerified(bool same) {
+    auto& c = StageA();
+    c.verified.fetch_add(1, std::memory_order_relaxed);
+    if (!same) {
+        c.disagreed.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<std::uint32_t> printed{0};
+        if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[drawstageA] APS5_LAB_DRAW_STAGEA_VERIFY: stage A's key or template differs from the locked Find although the cache generation was unchanged\n");
+    }
+}
+
+}
+
+bool DrawStageAEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LAB_DRAW_STAGEA");
+        return text != nullptr && *text != '\0' && *text != '0';
+    }();
+    return enabled;
+}
+
+std::shared_ptr<DrawStageA> PrepareDrawStageA(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (!DrawStageAEnabled() || draw.indirect) return nullptr;
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    if (noDrawResourceCache || noTextureCache || !trimKey || shaders.empty()) return nullptr;
+    // The static part of resolveDrawResources' `cacheable` (the rest, `recordable`, is decided
+    // under the mutex: a draw that is not recordable never reads the stage).
+    if (!std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) || ShaderResources::NeverReusable(shaders)) return nullptr;
+    const auto start = std::chrono::steady_clock::now();
+    auto& c = StageA();
+    c.runs.fetch_add(1, std::memory_order_relaxed);
+    auto prepared = std::make_shared<DrawStageA>();
+    prepared->device = context.device;
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    prepared->key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, false);
+    prepared->keyed = true;
+    c.keyed.fetch_add(1, std::memory_order_relaxed);
+    // The generation first, the Find second: an insert between them moves the generation past the
+    // value stored here, so the locked comparison fails and the work is redone there.
+    prepared->cacheGeneration = SharedResourceCache().Generation();
+    prepared->cached = SharedResourceCache().Find(prepared->key);
+    if (prepared->cached != nullptr) {
+        c.found.fetch_add(1, std::memory_order_relaxed);
+        // The walks Revalidate's collects would make under the mutex, made here in the same
+        // collect epoch of this thread, so the locked ones are memo hits (as PrepareDispatch does).
+        prepared->cached->PrecollectSurfaces();
+        c.precollected.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (const auto& color : state.colors) {
+        if (color.samples > 1 || color.bytes == 0 || color.tileMode == ColorTileMode::Linear) continue;
+        GuestMemory::CollectWrites(color.address, static_cast<std::size_t>(color.bytes));
+        c.targetWalks.fetch_add(1, std::memory_order_relaxed);
+    }
+    prepared->us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    return prepared;
+}
+
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
     return !noDrawRecipe;
@@ -1275,7 +1382,7 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
-ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
+ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer, const DrawStageA* stageA) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
@@ -1291,8 +1398,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
-        resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        std::shared_ptr<ShaderResources> found;
+        // Stage A's key and Find stand in for the locked ones while the device is the one the key
+        // names and the cache's generation has not moved since before stage A's Find: no insert,
+        // removal or eviction happened in between, so Find would return the same object (a miss
+        // stays a miss). Anything else computes both here, as without stage A.
+        const bool trusted = stageA != nullptr && stageA->keyed && trimKey && stageA->device == context.device && stageA->cacheGeneration == SharedResourceCache().Generation();
+        if (stageA != nullptr) countStageA(trusted, stageA);
+        if (trusted) {
+            resolved.contentKey = stageA->key;
+            found = stageA->cached;
+            if (StageAVerify()) {
+                const auto again = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, false);
+                const auto refound = SharedResourceCache().Find(again);
+                countStageAVerified(again == resolved.contentKey && refound == found);
+            }
+        } else {
+            resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+            found = SharedResourceCache().Find(resolved.contentKey);
+        }
+        if (auto cached = std::move(found)) {
             const bool valid = cached->Revalidate(shaders);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -1914,7 +2039,7 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawStageA* stageA) {
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
@@ -2073,7 +2198,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
-    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer);
+    auto resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, outcome, timer, stageA);
     auto& resources = resolved.resources;
     if (!stencilReferences.empty() && resources->ChecksFaults()) recordable = false;
     if (!stencilReferences.empty()) {
