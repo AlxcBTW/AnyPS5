@@ -210,8 +210,7 @@ int main() {
         }
         Require(sawNative, "f16 edge test: the program wrote no results");
         const std::uint32_t tieRow = 10u * Edges.size() * Edges.size() + 11u * Edges.size() + 22u;
-        for (const auto& line : defaultDiffers) std::cerr << "note, the default path differs from the f32 lowering: " << line << '
-';
+        for (const auto& line : defaultDiffers) std::cerr << "note, the default path differs from the f32 lowering: " << line << '\n';
         const auto lowering = Run(*device, code, std::nullopt, Variant::Native);
         Require((lowering[tieRow * Stride + 2u] & 0xffffu) == 0x3c01u, "v_pk_fma_f16 (1 + 2^-10) * (1 - 2^-11) + 9 * 2^-24 is not rounded once: " + Hex(lowering[tieRow * Stride + 2u]));
         std::puts("native packed f16 edge tests passed");
