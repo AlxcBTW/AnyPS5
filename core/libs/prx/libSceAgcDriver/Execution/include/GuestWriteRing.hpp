@@ -28,6 +28,7 @@ enum class Kind : std::uint8_t {
     PublishRetired = 14,
     MappingChanged = 15,
     StorageWriteBackDecided = 16,
+    StoragePending = 17,
 };
 
 struct Entry {
@@ -67,6 +68,8 @@ constexpr char Magic[8] = {'A', 'P', 'S', '5', 'W', 'R', 'G', '1'};
 // (APS5_GUEST_WRITE_RACE). MappingChanged is a guest range whose mapping or protection changed, tagged with what changed
 // it (libc's GuestAllocations::ChangeKind: 1 a map, 2 a free, 3 a protection change, 4 an unmap, 5 an image unregistered,
 // 6 a release outside a mutation, the guest heap's); RecordMappingChange is the change observer that records it.
+// StoragePending marks when a storage image's results became pending (a write marked units that were not pending): the
+// marked units' range, tagged with the image's address; a GPU write marks every unit of the image (MarkDirty).
 void Record(Kind kind, std::uint64_t address, std::uint64_t bytes, std::uint64_t tag);
 void RecordMappingChange(std::uintptr_t address, std::size_t bytes, int kind);
 

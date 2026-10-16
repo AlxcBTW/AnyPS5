@@ -3314,7 +3314,14 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
-    for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
+    std::uint32_t newlyPending = 0;
+    for (std::uint32_t layer = first; layer < first + count; ++layer) {
+        if (!layerPending[layer]) ++newlyPending;
+        layerPending[layer] = true;
+    }
+    // Lab diagnostics: when the image's results became pending again (some of the marked units were not), not every
+    // write; the range is the marked units', the tag the image's address.
+    if (newlyPending != 0) GuestWriteRing::Record(GuestWriteRing::Kind::StoragePending, descriptor.baseAddress + static_cast<std::uint64_t>(first) * trackedLayerBytes, static_cast<std::uint64_t>(count) * trackedLayerBytes, descriptor.baseAddress);
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
