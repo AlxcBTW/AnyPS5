@@ -1,0 +1,5 @@
+name=lead-best3
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best3-f74e387cdb-145226
