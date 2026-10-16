@@ -4727,10 +4727,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
     const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
     std::vector<bool> compared(trackedLayers, false);
+    std::vector<bool> savedBeforeCompare(trackedLayers, false);
     if (!tracked) {
         awaitStoredSave(&layers);
         std::vector<bool> saved(trackedLayers, false);
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) saved[layer] = layers[layer] && layerOriginal[layer];
+        savedBeforeCompare = saved;
         for (const auto& [begin, end] : unitRuns(saved)) {
             const auto from = descriptor.baseAddress + begin;
             const auto last = descriptor.baseAddress + end - 1;
@@ -4768,6 +4770,34 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             }
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
             else keep.emplace_back(from, to);
+        }
+    }
+    if (unsavedOutsideWatch) {
+        // Lab diagnostics: the store below refuses this case; name the image, its units and the paths that took its memory out of
+        // the write watch lately, so a repro says which write-back it is and why no bytes were compared.
+        static std::atomic<int> unsavedReports{0};
+        if (unsavedReports.fetch_add(1, std::memory_order_relaxed) < 24) {
+            std::uint32_t selectedUnits = 0, pendingUnits = 0, notOriginal = 0, notCompared = 0, shown = 0, watchedUnits = 0, savedLost = 0;
+            std::string detail;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!layers[layer]) continue;
+                ++selectedUnits;
+                if (layerPending[layer]) ++pendingUnits;
+                if (!layerOriginal[layer]) ++notOriginal;
+                if (savedBeforeCompare[layer] && !layerOriginal[layer]) ++savedLost;
+                if (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)))) ++watchedUnits;
+                if (compared[layer]) continue;
+                ++notCompared;
+                if (shown >= 6) continue;
+                ++shown;
+                char entry[160];
+                std::snprintf(entry, sizeof(entry), " [unit %u at +0x%llx pending %d original %d generation %llu]", layer, static_cast<unsigned long long>(layerBegin(layer) - descriptor.baseAddress), layerPending[layer] ? 1 : 0, layerOriginal[layer] ? 1 : 0, static_cast<unsigned long long>(layerGeneration[layer]));
+                detail += entry;
+            }
+            const auto recentUnwatches = GuestMemory::RecentUnwatches(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            std::fprintf(stderr, "[gpu] storage write-back over unwatched memory without compared bytes: image 0x%llx+0x%llx %ux%u mips %u format %u tile %d dimension %d samples %u dcc 0x%llx; %u of %u units selected, %u pending, %u without saved bytes, %u not compared; span watched %d, tracked %d, block units %d, units still watched %u, saved bytes lost during the comparison %u, flush reason %s, recent unwatches over the image:%s;%s\n",
+                static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.mipCount, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), descriptor.samples, static_cast<unsigned long long>(descriptor.dccAddress),
+                selectedUnits, trackedLayers, pendingUnits, notOriginal, notCompared, GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? 1 : 0, tracked ? 1 : 0, blockUnits ? 1 : 0, watchedUnits, savedLost, flushReason != nullptr ? flushReason : "-", recentUnwatches.empty() ? " none" : recentUnwatches.c_str(), detail.c_str());
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
