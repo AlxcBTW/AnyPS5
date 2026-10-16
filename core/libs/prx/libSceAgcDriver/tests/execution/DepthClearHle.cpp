@@ -209,6 +209,7 @@ void MatcherCases() {
     std::vector<std::uint32_t> code(ClearKernel.begin(), ClearKernel.end());
     code.insert(code.end(), {0u, 0u, 0u, 0u});
 
+    const auto counted = Graphics::DepthClearCounts();
     const auto clear = Graphics::MatchStorageImageClear(code, userData, compute, groups);
     Require(clear.has_value(), "the clear kernel was not recognized");
     Require(clear->width == 64u && clear->height == 32u, "the clear covers " + std::to_string(clear->width) + " x " + std::to_string(clear->height) + " texels, expected 64 x 32");
@@ -252,6 +253,16 @@ void MatcherCases() {
     partial.partialThreads = {60, 30, 1};
     const auto cut = Graphics::MatchStorageImageClear(code, userData, partial, groups);
     Require(cut.has_value() && cut->width == 60u && cut->height == 30u, "a dispatch of 60 x 30 threads does not cover 60 x 30 texels");
+
+    // What the matcher refused is counted by reason, and only for the kernel's own code (the changed words and the truncated kernel are not counted).
+    const auto seen = Graphics::DepthClearCounts();
+    const auto refused = [&](std::size_t reason) { return seen.refused[reason] - counted.refused[reason]; };
+    Require(seen.kernelSeen - counted.kernelSeen == 14u, "the matcher saw the kernel's code " + std::to_string(seen.kernelSeen - counted.kernelSeen) + " times, expected 14");
+    Require(refused(0) == 2u, "user data count refusals: " + std::to_string(refused(0)) + ", expected 2");
+    Require(refused(1) == 2u, "thread group size refusals: " + std::to_string(refused(1)) + ", expected 2");
+    Require(refused(2) == 3u, "group id refusals: " + std::to_string(refused(2)) + ", expected 3");
+    Require(refused(3) == 1u, "thread id refusals: " + std::to_string(refused(3)) + ", expected 1");
+    Require(refused(4) == 3u, "coverage refusals: " + std::to_string(refused(4)) + ", expected 3");
 }
 
 // Runs the same sequence of clears under `mode` and returns what the lever counted. The depth the plane holds is
