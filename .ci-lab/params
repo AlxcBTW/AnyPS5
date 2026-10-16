@@ -1,0 +1,5 @@
+name=gpu-hz4
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-hz4-b71c41a582-174813

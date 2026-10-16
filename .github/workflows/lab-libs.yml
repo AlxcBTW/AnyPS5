@@ -1,0 +1,108 @@
+# Lab-only: builds the AnyPS5 `libs` target on a Windows runner and uploads the .prx files as a short-lived
+# artifact. Fork only (AlxcBTW/AnyPS5), never proposed upstream. Started by tools/ci-build.sh, which pushes the
+# tree plus this file and .ci-lab/params to ci/lab/<name>. It is a push workflow on purpose: workflow_dispatch
+# would need the file on the fork's main.
+name: Lab libs
+
+on:
+  push:
+    branches: ['ci/lab/**']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lab-libs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  libs:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      SSL_CERT_FILE: C:\Program Files\Git\mingw64\etc\ssl\certs\ca-bundle.crt
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Read .ci-lab/params
+        id: p
+        run: |
+          [ -f .ci-lab/params ] || { echo "::error::.ci-lab/params missing"; exit 1; }
+          while IFS='=' read -r k v; do
+            case $k in name|build_type|g1|cmake|artifact) echo "$k=$v" >> "$GITHUB_OUTPUT" ;; esac
+          done < .ci-lab/params
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+      - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      # Key = toolchain + build type + g1 + branch (a branch cache is only readable from that branch and from main).
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-${{ env.WINLIBS_ZIP }}-${{ steps.p.outputs.build_type }}-g1${{ steps.p.outputs.g1 }}
+          restore-keys: ccache-windows-
+          max-size: 2G
+          evict-old-files: job
+      - name: Fetch FFmpeg prebuilts
+        run: |
+          # 3rdparty/ffmpeg-core downloads its prebuilt package during Configure, and that download fails now and then
+          # with an SSL error on the runners. Fetch it here with retries into the path Configure checks first.
+          sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)
+          mkdir -p build/externals
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 5 -o "build/externals/$sha-ffmpeg-mingw-x64.zip" \
+            "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/$sha/ffmpeg-mingw-x64.zip"
+      - name: Configure
+        run: |
+          # The lab's -g1 include (lab/g1-agcdriver.cmake): function names and line tables for two targets, no code change.
+          cat > "$RUNNER_TEMP/g1.cmake" <<'CMK'
+          cmake_language(DEFER CALL lab_add_g1)
+          function(lab_add_g1)
+              foreach(target IN ITEMS libSceAgcDriver shader_recompiler_agc_driver)
+                  target_compile_options(${target} PRIVATE -g1)
+              endforeach()
+          endfunction()
+          CMK
+          args=(-G Ninja -DCMAKE_BUILD_TYPE=${{ steps.p.outputs.build_type }}
+                -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache)
+          if [ "${{ steps.p.outputs.g1 }}" = on ]; then
+            args+=("-DCMAKE_PROJECT_Relinker_INCLUDE=$(cygpath -m "$RUNNER_TEMP/g1.cmake")")
+          fi
+          if [ -n "${{ steps.p.outputs.cmake }}" ]; then
+            while IFS= read -r line; do [ -n "$line" ] && args+=("$line"); done < <(printf '%s' "${{ steps.p.outputs.cmake }}" | base64 -d)
+          fi
+          echo "configure: ${args[*]}"
+          cmake -S . -B build "${args[@]}"
+      - name: Build libs
+        run: cmake --build build --target libs relinker --parallel 4
+      - name: Stage
+        id: stage
+        run: |
+          out="$RUNNER_TEMP/out"; mkdir -p "$out"
+          cp -p build/core/libs/libs/*.prx "$out"/
+          cp -p build/core/relinker/relinker.exe "$out"/ 2>/dev/null || cp -p build/relinker.exe "$out"/ 2>/dev/null || find build -name relinker.exe -exec cp -p {} "$out"/ \; -quit
+          cp -p /c/winlibs/mingw64/bin/{libgcc_s_seh-1.dll,libstdc++-6.dll,libwinpthread-1.dll} "$out"/
+          (cd "$out" && sha256sum -b -- * > "$RUNNER_TEMP/SHA256SUMS" && mv "$RUNNER_TEMP/SHA256SUMS" .)
+          echo "dir=$out" >> "$GITHUB_OUTPUT"
+          echo "$(ls "$out" | wc -l) files, $(du -sm "$out" | cut -f1) MiB"
+          ccache -s | grep -E 'Hits|Misses|Cache size' || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.p.outputs.artifact }}
+          path: ${{ steps.stage.outputs.dir }}
+          retention-days: 2
+          compression-level: 1
+          if-no-files-found: error
