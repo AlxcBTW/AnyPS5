@@ -2,4 +2,4 @@ name=cpu-all-hm
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-cpu-all-hm-33bba40131-189953
+artifact=lab-libs-cpu-all-hm-5fd14eb8b5-190213
