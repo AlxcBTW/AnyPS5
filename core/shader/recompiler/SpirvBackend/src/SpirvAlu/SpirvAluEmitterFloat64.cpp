@@ -872,7 +872,7 @@ std::uint32_t EmitFPMixF16(SpirvEmitterState& state, std::uint32_t arg0, std::ui
     const auto below = Binary(state, spv::OpBitwiseAnd, u32, mantissa, Binary(state, spv::OpISub, u32, Binary(state, spv::OpShiftLeftLogical, u32, half, ConstantU32(state, 1u)), ConstantU32(state, 1u)));
     auto slow = Binary(state, spv::OpIEqual, boolean, below, half);
     for (const auto input : {arg0, arg1, arg2}) slow = Binary(state, spv::OpLogicalOr, boolean, slow, NonFinite32(state, Unary(state, spv::OpBitcast, u32, input)));
-    return EmitValueOrDefaultIfCondition(state, slow, TypeF32(state), fused, [&] { return Interpolate(state, arg0, arg1, arg2, true, 0u); });
+    return EmitValueOrDefaultIfCondition(state, slow, TypeF32(state), fused, [&] { return CallInterpolate(state, arg0, arg1, arg2, true, 0u); });
 }
 
 std::uint32_t EmitConvertF32F64(SpirvEmitterState& state, std::uint32_t arg0) {
