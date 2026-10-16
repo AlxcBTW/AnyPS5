@@ -1897,7 +1897,7 @@ bool StorageTexture::Refresh() {
     std::vector<HandOver> handOvers;
     std::vector<std::shared_ptr<StorageTexture>> handOverSources;
     DccKeys handOverKeys = DccKeys::Uncompressed;
-    if (blockUnits && use != RefreshUse::Read && (applying || verify) && (!handedFrom.empty() || otherPendingOverlaps())) {
+    if (blockUnits && use != RefreshUse::Read && (applying || verify) && (!handedFrom.empty() || PendingStorageOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this))) {
         handOvers = handOversUnder(alias.get(), applying ? mode : AliasHandOverMode::All, handOverKeys);
         // The images stay alive across the refresh (their last owner may be a batch's kept list).
         std::erase_if(handOvers, [&](const HandOver& handOver) {
@@ -5290,11 +5290,13 @@ void StorageTexture::verifyDeviceHandOvers(const std::vector<HandOver>& handOver
         auto source = handOver.image.lock();
         if (!handOver.device || source == nullptr || handOver.units.empty()) continue;
         // The source's results, retiled as the device hand-over would take them, and the bytes
-        // this image's upload reads after the eager store just made: they must be equal.
+        // this image's upload reads after the eager store just made: they must be equal. At most
+        // 16 units per decision (a 1 MiB readback), the first ones of the surface.
         std::uint32_t firstMine = trackedLayers, lastMine = 0;
         std::vector<std::uint32_t> theirs;
         std::vector<bool> mineUnits(trackedLayers, false);
-        for (const auto& [unitTheirs, unitMine] : handOver.units) {
+        const auto compared = std::span(handOver.units).first(std::min<std::size_t>(handOver.units.size(), 16));
+        for (const auto& [unitTheirs, unitMine] : compared) {
             theirs.push_back(unitTheirs);
             mineUnits[unitMine] = true;
             firstMine = std::min(firstMine, unitMine);

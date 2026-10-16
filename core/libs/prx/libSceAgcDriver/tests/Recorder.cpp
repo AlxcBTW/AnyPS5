@@ -7898,7 +7898,10 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 continue;
             }
             if (order == Order::Superseded) {
-                Require(on.counts.superseded == 2 && on.counts.storedLater == 0, label + ": did not drop A's two units under B unstored (superseded " + std::to_string(on.counts.superseded) + ", stored later " + std::to_string(on.counts.storedLater) + ")");
+                // Outside the write watch B's first write captures the guest bytes of its units
+                // without a generation (markLayersPending), a read that stores A's units first.
+                if (watched) Require(on.counts.superseded == 2 && on.counts.storedLater == 0, label + ": did not drop A's two units under B unstored (superseded " + std::to_string(on.counts.superseded) + ", stored later " + std::to_string(on.counts.storedLater) + ")");
+                else Require(on.counts.superseded + on.counts.storedLater == 2, label + ": lost track of A's two units under B (superseded " + std::to_string(on.counts.superseded) + ", stored later " + std::to_string(on.counts.storedLater) + ")");
             } else if (order == Order::ReadFirst) {
                 Require(on.counts.storedLater >= 1 && on.counts.storedLater + on.counts.superseded == 2, label + ": lost track of A's two units under B (superseded " + std::to_string(on.counts.superseded) + ", stored later " + std::to_string(on.counts.storedLater) + ")");
             } else {
