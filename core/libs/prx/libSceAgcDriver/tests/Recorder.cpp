@@ -1273,6 +1273,41 @@ void lateLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabel(a, 4, 5).has_value() && !Recorder::LookupLabel(b, 8, 5).has_value() && !recorder.PendingLabelIn(0x70000, 0x400), "(7) entries outlived their batch");
 }
 
+// Recorder::LookupLabelRaw (APS5_LAB_WAIT_DEFER): recorded entries whatever the late rules say.
+void rawLabelTests(Recorder& recorder) {
+    using Raw = Recorder::RawLabel;
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 4> two{std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const std::array<std::byte, 8> pair{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    const auto tag = AgcDriver::GuestMemory::GpuLockThreadTag();
+    constexpr std::uint64_t a = 0x74000, b = 0x74100, c = 0x74200;
+    Raw raw;
+    recorder.Sync();
+    Require(!Recorder::LookupLabelRaw(a, 4, 0, raw), "(1) an empty table returned an entry");
+    recorder.NoteLabel(a, one, 10, 0);
+    Require(Recorder::LookupLabelRaw(a, 4, 5, raw) && raw.value == 1 && !raw.late && !raw.closed && raw.generation == 0 && !raw.overwritten && !raw.behindCompletion, "(2) a fresh unclosed entry is wrong");
+    Require(Recorder::LookupLabelRaw(a, 4, 10, raw) && raw.late && !raw.closed && raw.value == 1, "(2) a late unclosed entry is refused or not marked late");
+    const auto generation = AgcDriver::GuestMemory::TrackerGeneration();
+    Recorder::CloseLabelGroup(generation);
+    Require(Recorder::LookupLabelRaw(a, 4, 10, raw) && raw.late && raw.closed && raw.generation == generation, "(3) a closed entry does not report its generation");
+    // (4) An overlapping non-label write marks the entry; the raw lookup still reports the value.
+    recorder.NotePendingWrite(a - 8, 12);
+    Require(Recorder::LookupLabelRaw(a, 4, 10, raw) && raw.overwritten && raw.value == 1, "(4) an overwritten entry is not reported");
+    // (5) Wide lookups compose the dwords; a dword without an entry fails the lookup.
+    recorder.NoteLabel(b, pair, 20, 0);
+    Require(Recorder::LookupLabelRaw(b, 8, 30, raw) && raw.value == 0x200000001ull && raw.late && !raw.closed, "(5) an 8-byte entry is not composed");
+    Require(!Recorder::LookupLabelRaw(b + 4, 8, 30, raw) && !Recorder::LookupLabelRaw(b, 12, 30, raw) && !Recorder::LookupLabelRaw(b + 2, 4, 30, raw) && !Recorder::LookupLabelRaw(b + 8, 4, 30, raw), "(5) a partial, odd-sized or misaligned lookup returned an entry");
+    // (6) A queued label of the dword (not recorded) hides the recorded one.
+    recorder.NoteLabel(c, one, 40, 0);
+    Require(Recorder::LookupLabelRaw(c, 4, 50, raw), "(6) the recorded entry is missing");
+    Recorder::NoteQueuedLabel(c, two, 41, tag);
+    Require(!Recorder::LookupLabelRaw(c, 4, 50, raw), "(6) a queued label of the dword did not hide the recorded entry");
+    Recorder::ForgetQueuedLabels();
+    // (7) Entries leave the table with their batch.
+    recorder.Sync();
+    Require(!Recorder::LookupLabelRaw(a, 4, 5, raw) && !Recorder::LookupLabelRaw(b, 8, 5, raw), "(7) entries outlived their batch");
+}
+
 void largeLabelTests(Recorder& recorder) {
     constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -8994,6 +9029,7 @@ int main(int argc, char** argv) {
             directCompletionLabelTests(recorder);
             labelTests(recorder);
             lateLabelTests(recorder);
+        rawLabelTests(recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
@@ -9149,6 +9185,7 @@ int main(int argc, char** argv) {
         batchStampTests(recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
+        rawLabelTests(recorder);
         largeLabelTests(recorder);
         unchangedSinceTests();
         closeRaceTests(device, recorder);

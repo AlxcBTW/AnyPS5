@@ -322,6 +322,17 @@ public:
     // of its own (every mutation holds both), so a WAIT_REG_MEM consults it without queueing behind
     // device work. Nothing is done under the table mutex but the lookup (it never takes the GPU mutex).
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
+    // What a deferred WAIT_REG_MEM (APS5_LAB_WAIT_DEFER) needs to know about the recorded entries of
+    // a range, whether or not the late rules would serve them: the value memory will hold once the
+    // recorded stores land, and why a lookup might refuse. Recorded entries only: a dword without an
+    // entry, with a queued (not yet recorded) label, or with a wide label returns false. `closed` is
+    // true when every entry's record group closed; `generation` is then the oldest close generation.
+    struct RawLabel {
+        std::uint64_t value = 0;
+        std::uint64_t generation = 0;
+        bool late = false, closed = false, overwritten = false, behindCompletion = false;
+    };
+    static bool LookupLabelRaw(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, RawLabel& out);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
@@ -780,6 +791,7 @@ private:
     std::uint64_t writtenBackSequence = 0;
     // PendingLabel without the table mutex (the caller holds it, or the GPU mutex).
     std::optional<LabelHit> lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const;
+    bool lookupLabelRaw(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, RawLabel& out) const;
     // Whether the in-flight batch with that serial has not signaled its fence (false when it is
     // not in flight any more): what makes a wait for it a real GPU wait (ThreadHookWaits).
     bool unsignaled(std::uint64_t serial) const;
