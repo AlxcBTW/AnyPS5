@@ -128,6 +128,12 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 constexpr std::uint8_t BlockUnchanged = 0;
 constexpr std::uint8_t BlockWritten = 1;
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu = {});
+// Lab diagnostics, APS5_GUEST_WRITE_RACE=1: a GPU store into guest memory decided at `generation` (a storage write-back's
+// or a unit shadow publish's TrackerGeneration after its decision) is checked again when its batch retires: every 64 KiB
+// block of the ranges that a CPU store reached since was either written after the GPU copy or overwritten by it. Such
+// blocks are counted, the first 64 printed, and kept in the guest write ring (GuestWriteRing::Kind::*WindowCpuStore).
+bool StoreWindowCheckEnabled();
+void CheckStoreWindow(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, bool publish, std::uint64_t tag);
 
 // Serializes device work: draws, dispatches, presentation and the deferred write-backs below. The
 // mutex is recursive; it is wrapped so every acquisition (std::lock_guard at any site) measures how
