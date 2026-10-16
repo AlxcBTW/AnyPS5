@@ -1,0 +1,5 @@
+name=alias-wb
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-alias-wb-d5c2364fa1-179114
