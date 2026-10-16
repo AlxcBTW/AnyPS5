@@ -40,3 +40,16 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Repeat sequentially
+        if: always()
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          failed=0
+          for i in $(seq 1 10); do
+            ctest --test-dir build --timeout 120 -R '^agc_driver_pipelined_indirect_dispatch_args$' > "seq-$i.log" 2>&1 && echo "run $i: passed" || { failed=$((failed+1)); echo "run $i: failed"; }
+          done
+          echo "failed in $failed of 10 runs"
+          grep -h "read its arguments" seq-*.log | sort | uniq -c
+          echo "RESULT failed=$failed"
