@@ -4274,7 +4274,6 @@ void descriptorSkipTests() {
             DescriptorCache cache(context);
             context.descriptorCache = &cache;
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-            Recorder recorder(context);
             ShaderRecompiler::RecompileResult vertex, fragment;
             auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
             binding.bufferWritten = {false, false};
@@ -4283,6 +4282,8 @@ void descriptorSkipTests() {
             const auto state = AgcDriver::Graphics::DecodeState(makeState());
             ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
             const auto draw = [&](std::uint32_t pattern) {
+                // A recorder per draw: its destruction releases the kept draw bindings, which recycles their sets into the cache.
+                Recorder recorder(context);
                 std::vector<ShaderResources::MovedBuffer> moved;
                 moved.push_back({0, 0, 24, std::vector<std::uint32_t>(6, pattern)});
                 mock.writes.clear();
