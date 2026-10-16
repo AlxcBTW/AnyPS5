@@ -1079,11 +1079,12 @@ std::size_t DeferredFailureLines(Recorder& recorder, std::size_t count, const st
 
 void deferredFailureReportTests(Recorder& recorder) {
     const auto plain = [] { throw std::runtime_error("image table: poisoned entry"); };
-    const auto unaligned = [] { throw BdaUnalignedAccess("BDA access failed: unaligned"); };
+    const auto unaligned = [](std::uint32_t instruction) { return [instruction] { throw BdaUnalignedAccess("BDA access failed: unaligned", instruction); }; };
     Require(DeferredFailureLines(recorder, 12, plain) == 12, "a deferred failure other than an unaligned BDA access was not printed every time");
-    Require(DeferredFailureLines(recorder, 12, unaligned) == 8, "the first 8 deferred reports of an unaligned BDA access were not the only ones printed");
+    Require(DeferredFailureLines(recorder, 12, unaligned(0x5c8)) == 8, "the first 8 deferred reports of an unaligned BDA access were not the only ones printed");
     std::string log;
-    Require(DeferredFailureLines(recorder, 1012, unaligned, &log) == 1 && log.find("1024 times so far") != std::string::npos, "the 1024th deferred report of an unaligned BDA access was not the only one printed");
+    Require(DeferredFailureLines(recorder, 1012, unaligned(0x5c8), &log) == 1 && log.find("pc 0x5c8 1024 times so far") != std::string::npos, "the 1024th deferred report of an unaligned BDA access was not the only one printed");
+    Require(DeferredFailureLines(recorder, 12, unaligned(0x7a0)) == 8, "unaligned BDA reports at one instruction limited the printing of the reports at another");
     Require(DeferredFailureLines(recorder, 12, plain) == 12, "unaligned BDA reports limited the printing of other deferred failures");
 }
 
