@@ -1041,11 +1041,14 @@ std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
 }
 
 #ifdef _WIN32
+void forgetUnwatchedBlocks(WriteTracker& tracker, std::uint64_t address, std::size_t bytes);
+
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
     tracker.coverage.Restore(address, bytes, generation);
+    forgetUnwatchedBlocks(tracker, address, bytes);
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
@@ -1306,11 +1309,26 @@ struct UnwatchRecord {
 };
 std::array<UnwatchRecord, 32> unwatchRing;
 std::size_t unwatchRingNext = 0;
+std::unordered_map<std::uint64_t, UnwatchRecord> unwatchedBlocks;
+
+#ifdef _WIN32
+void forgetUnwatchedBlocks(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    for (auto it = unwatchedBlocks.begin(); it != unwatchedBlocks.end();) {
+        const auto start = it->first * WriteBlockBytes;
+        if (start + WriteBlockBytes > address && start < address + bytes && tracker.coverage.Covers(start, 1)) it = unwatchedBlocks.erase(it);
+        else ++it;
+    }
+}
+#endif
 
 bool unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, const char* path) {
     if (!tracker.watched) return false;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
+    std::vector<std::uint64_t> fresh;
+    for (auto block = address / WriteBlockBytes; bytes != 0 && block <= (address + bytes - 1) / WriteBlockBytes; ++block) {
+        if (tracker.coverage.Covers(block * WriteBlockBytes, 1)) fresh.push_back(block);
+    }
     const bool changed = tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix());
 #else
     const bool changed = GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
@@ -1318,6 +1336,12 @@ bool unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
     if (!changed) return false;
     const auto serial = unwatchSerial.fetch_add(1, std::memory_order_release) + 1;
     unwatchRing[unwatchRingNext++ % unwatchRing.size()] = {address, bytes, serial, path};
+    const UnwatchRecord record{address, bytes, serial, path};
+#ifdef _WIN32
+    for (const auto block : fresh) unwatchedBlocks.insert_or_assign(block, record);
+#else
+    for (auto block = address / WriteBlockBytes; block <= (address + bytes - 1) / WriteBlockBytes; ++block) unwatchedBlocks.insert_or_assign(block, record);
+#endif
     return true;
 }
 
@@ -1348,6 +1372,19 @@ std::string RecentUnwatches(std::uint64_t address, std::size_t bytes) {
         ++shown;
     }
     return text;
+}
+
+std::string UnwatchedBy(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    for (auto block = address / WriteBlockBytes; bytes != 0 && block <= (address + bytes - 1) / WriteBlockBytes; ++block) {
+        const auto found = unwatchedBlocks.find(block);
+        if (found == unwatchedBlocks.end()) continue;
+        char text[192];
+        std::snprintf(text, sizeof(text), "%s #%llu 0x%llx+0x%llx", found->second.path, static_cast<unsigned long long>(found->second.serial), static_cast<unsigned long long>(found->second.address), static_cast<unsigned long long>(found->second.bytes));
+        return text;
+    }
+    return "no record";
 }
 
 void Unwatch(std::uint64_t address, std::size_t bytes) {
