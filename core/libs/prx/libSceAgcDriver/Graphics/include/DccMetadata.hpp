@@ -102,7 +102,8 @@ void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std:
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
 bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count);
-bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count);
+// publishShadows = false (the mutex gate): a range with a unit shadow over it answers false and is left to the locked path, so the call has no side effect.
+bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count, bool publishShadows = true);
 // APS5_LAB_MUTEX_GATE: a key range a dispatch's gate settled (see VulkanDevice::SettleKeyWriters).
 struct DccGateRange {
     std::uint64_t address;
