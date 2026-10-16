@@ -73,8 +73,12 @@ jobs:
             printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"1.3.0"}}' "$(cygpath -m "$dll")" > "$icd"
           fi
           cat "$icd"
-          echo "VK_DRIVER_FILES=$(cygpath -w "$icd")" >> "$GITHUB_ENV"
-          echo "VK_ICD_FILENAMES=$(cygpath -w "$icd")" >> "$GITHUB_ENV"
+          reg add "HKLM\SOFTWARE\Khronos\Vulkan\Drivers" //v "$(cygpath -w "$icd")" //t REG_DWORD //d 0 //f
+          reg query "HKLM\SOFTWARE\Khronos\Vulkan\Drivers"
+          echo "VK_LOADER_DEBUG=error,warn,driver" >> "$GITHUB_ENV"
+          echo 'C:\mesa\x64' >> "$GITHUB_PATH"
+          where vulkan-1.dll || true
+          powershell -NoProfile -Command "Get-ChildItem C:/Windows/System32/vulkan-1.dll, C:/Windows/SysWOW64/vulkan-1.dll -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + ' ' + $_.VersionInfo.FileVersion }" || true
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DANYPS5_AGC_EXECUTION_TESTS=StorageWriteBackOverhang -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
