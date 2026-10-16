@@ -7836,6 +7836,9 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         {
             auto imageA = StorageTexture::Create(context, detiler, resourceA, 0);
             auto imageB = StorageTexture::Create(context, detiler, content == Content::KeysClear ? resourceB : resourcePlainB, 0);
+            // A synced first, as the draw path does: its units get a write generation (a CPU store
+            // since then keeps its block at A's store).
+            if (order == Order::ReclearedUnwatched) imageA->Refresh();
             draw(imageA, {{1.0f, 0.0f, 0.0f, 1.0f}});
             {
                 const RefreshUseScope scope(use);
@@ -7883,10 +7886,12 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 recorder.Submit();
                 device.WaitQueue();
                 recorder.Sync();
-                // The memory leaves the write watch while B's results are pending (the unwatch hook
-                // saves the bytes under pending units): A's superseded units come back without saved
-                // bytes of their own.
+                // A CPU store over A's first unit, then the memory leaves the write watch while B's
+                // results are pending (the unwatch hook saves the bytes under pending units, and those
+                // of A's superseded units in B's records): A's units come back outside the watch, and
+                // the CPU's block stays the CPU's, as in the eager order.
                 if (order == Order::ReclearedUnwatched) {
+                    std::memset(memory, 0x77, 65536);
                     AgcDriver::GuestMemory::Unwatch(address, bytes);
                     Require(!AgcDriver::GuestMemory::Watched(address, bytes), where + ": the block stayed in the write watch");
                 }
@@ -7897,7 +7902,12 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 }
                 outcome.imageB2 = readImage(imageB, 128, 128, 8);
                 const auto read = readMemory(address, 2 * 65536);
-                Require(holds(read, red), where + ": memory under B's new clear keys did not hold A's results");
+                if (order == Order::ReclearedUnwatched) {
+                    Require(std::all_of(read.begin(), read.begin() + 65536, [](std::byte value) { return value == std::byte{0x77}; }), where + ": the CPU's store under B's new clear keys was overwritten");
+                    Require(holds(std::vector<std::byte>(read.begin() + 65536, read.end()), red), where + ": memory under B's new clear keys did not hold A's results");
+                } else {
+                    Require(holds(read, red), where + ": memory under B's new clear keys did not hold A's results");
+                }
             }
             Require(StorageTexture::FlushPending(address, bytes, nullptr, "alias hand-over test", PublishScope::Whole), where + ": nothing was pending at the end");
             recorder.Submit();
@@ -7974,13 +7984,15 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         const auto label = name(Order::ReclearedUnwatched, Content::KeysClear);
         const auto on = run(true, Order::ReclearedUnwatched, Content::KeysClear);
         const auto off = run(false, Order::ReclearedUnwatched, Content::KeysClear);
-        bool aHeld = true;
-        for (std::size_t i = 0; i < surfaceA; i += 4) aHeld = aHeld && std::memcmp(off.bytes.data() + i, red.data(), 4) == 0;
-        Require(aHeld, label + ": A's results did not reach guest memory without the hand-over");
+        // The CPU's block over A's first unit, A's results in the other three.
+        bool aHeld = std::all_of(off.bytes.begin(), off.bytes.begin() + 65536, [](std::byte value) { return value == std::byte{0x77}; });
+        for (std::size_t i = 65536; i < surfaceA; i += 4) aHeld = aHeld && std::memcmp(off.bytes.data() + i, red.data(), 4) == 0;
+        Require(aHeld, label + ": A's results and the CPU's block did not reach guest memory without the hand-over");
         Require(on.imageB == off.imageB && on.imageB2 == off.imageB2, label + ": B held other texels with the hand-over than without");
         Require(on.bytes == off.bytes, label + ": the hand-over left other guest bytes than without it");
         Require(on.counts.superseded == 2 && on.counts.resurrected == 2 && on.counts.resurrectedUnwatched == 2, label + ": did not bring A's two units back with their bytes saved (superseded " + std::to_string(on.counts.superseded) + ", resurrected " + std::to_string(on.counts.resurrected) + ", outside the watch " + std::to_string(on.counts.resurrectedUnwatched) + ")");
-        Require(on.counts.fallbacks == 0 && on.counts.keptForCpu == 0 && on.counts.supersededLost == 0, label + ": a hand-over fell back, met a CPU store or lost superseded results");
+        // The CPU's block is the one unit counted as kept for the CPU.
+        Require(on.counts.fallbacks == 0 && on.counts.keptForCpu == 1 && on.counts.supersededLost == 0, label + ": a hand-over fell back, lost superseded results or miscounted the CPU's block (kept for the CPU " + std::to_string(on.counts.keptForCpu) + ")");
         Require(off.counts.handedOver == 0 && off.counts.resurrected == 0, label + ": units were handed over without the hand-over");
     }
     std::cout << what << ": ok\n";
