@@ -8450,6 +8450,19 @@ void Run(Context context) {
 }
 #endif
 
+// APS5_LAB_DRAW_STAGEA: the resource cache's generation moves with changes of the map and not with lookups.
+static void resourceCacheGenerationTests() {
+    ResourceCache cache;
+    const auto start = cache.Generation();
+    Require(cache.Find({1, 2, 3}) == nullptr, "resource cache generation: a missing key was found");
+    Require(!cache.Touch({1, 2, 3}), "resource cache generation: a missing key was touched");
+    Require(cache.Generation() == start, "resource cache generation: a lookup moved the generation");
+    cache.Remove({1, 2, 3});
+    Require(cache.Generation() == start, "resource cache generation: removing a missing key moved the generation");
+    cache.Clear();
+    Require(cache.Generation() != start, "resource cache generation: Clear did not move the generation");
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--device-selection-only") {
@@ -8457,6 +8470,7 @@ int main(int argc, char** argv) {
             std::cout << "recorder device selection tests passed\n";
             return 0;
         }
+        resourceCacheGenerationTests();
         if (argc == 2 && std::string_view(argv[1]) == "--queued-write-groups-only") {
             queuedWriteGroupTests();
             std::cout << "queued write group tests passed\n";

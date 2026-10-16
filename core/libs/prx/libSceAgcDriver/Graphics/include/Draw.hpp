@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include <memory>
 #include <vector>
 
@@ -17,7 +18,26 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// Stage A of a draw's resource work, made WITHOUT GuestMemory::GpuMutex (lab switch
+// APS5_LAB_DRAW_STAGEA=1, DrawStageAEnabled): the resource cache's content key of the draw, the
+// object ResourceCache::Find returned for it with the cache's generation read BEFORE the Find, and the
+// write-watch walks (ShaderResources::PrecollectSurfaces of that object, the color targets' pages)
+// that the locked lookups then meet as collect-memo hits. Draw takes it as `stageA`: under the mutex
+// it only compares the device and the cache generation; a mismatch makes Draw compute the key and
+// call Find itself, exactly as without stage A. The proof (ShaderResources::Revalidate) always runs
+// under the mutex. See knowledge/md2/DRAWSTAGE-2026-10-16.md for the per-step argument.
+struct DrawStageA {
+    VkDevice device = VK_NULL_HANDLE;
+    bool keyed = false;
+    ResourceCache::Key key;
+    std::shared_ptr<ShaderResources> cached;
+    std::uint64_t cacheGeneration = 0;
+    double us = 0;
+};
+bool DrawStageAEnabled();
+// Null when the switch is off or the draw cannot use the resource cache for static reasons.
+std::shared_ptr<DrawStageA> PrepareDrawStageA(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawStageA* stageA = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
 
