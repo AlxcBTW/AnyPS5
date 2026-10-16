@@ -7537,6 +7537,11 @@ void pipelineJournalTests() {
         BuildPipelineStoreKey(grid, context, gridState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL);
         BuildPipelineStoreKey(gridReplayed, context, gridDecoded.state, gridDecoded.vertexInput, layouts.View(), shaders, gridDecoded.attachmentLayout);
         Require(grid != original && grid == gridReplayed, "the decoded sample grid state keys another pipeline");
+        auto lineState = state;
+        lineState.stages.mesh = ShaderRecompiler::MeshConfiguration{1, 2, 2, 4, 4, 32, 64, 1, 4, 2};
+        GraphicsPipelineRecipe lineDecoded;
+        Require(DecodeGraphicsPipelineRecipe(EncodeGraphicsPipelineRecipe(MakeGraphicsPipelineRecipe(lineState, input, layouts.View(), shaders, VK_IMAGE_LAYOUT_GENERAL)), lineDecoded), "the line strip mesh recipe does not decode");
+        Require(lineDecoded.state.stages.mesh && lineDecoded.state.stages.mesh->outputPrimitiveSize == 2u && lineDecoded.state.stages.mesh->esgsItemSize == 4u, "the recipe dropped the mesh output primitive size");
         auto fourSampleState = state;
         fourSampleState.samples = 4;
         auto maskState = fourSampleState;

@@ -36,8 +36,8 @@ static_assert(sizeof(VkVertexInputBindingDescription) == 12, "VkVertexInputBindi
 static_assert(sizeof(VkVertexInputAttributeDescription) == 16, "VkVertexInputAttributeDescription changed: update the recipe codec");
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(State) == 752, "State changed: update CanonicalPipelineState and the recipe codec");
-static_assert(sizeof(ShaderStages) == 108, "ShaderStages changed: update the recipe codec");
-static_assert(sizeof(ShaderRecompiler::MeshConfiguration) == 36, "MeshConfiguration changed: update the recipe codec");
+static_assert(sizeof(ShaderStages) == 112, "ShaderStages changed: update the recipe codec");
+static_assert(sizeof(ShaderRecompiler::MeshConfiguration) == 40, "MeshConfiguration changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "TessellationConfiguration changed: update the recipe codec");
 #endif
 
@@ -147,11 +147,11 @@ void encodeOptional(Writer& writer, const std::optional<TValue>& value, void (*e
 }
 
 void encodeMesh(Writer& writer, const ShaderRecompiler::MeshConfiguration& mesh) {
-    for (const auto value : {mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize}) writer.U32(value);
+    for (const auto value : {mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize, mesh.outputPrimitiveSize}) writer.U32(value);
 }
 
 void decodeMesh(Reader& reader, ShaderRecompiler::MeshConfiguration& mesh) {
-    for (auto* value : {&mesh.inputPrimitive, &mesh.primitivesPerGroup, &mesh.verticesPerGroup, &mesh.maxVertices, &mesh.maxPrimitives, &mesh.threadsPerGroup, &mesh.ldsSizeDwords, &mesh.provokingVertex, &mesh.esgsItemSize}) *value = reader.U32();
+    for (auto* value : {&mesh.inputPrimitive, &mesh.primitivesPerGroup, &mesh.verticesPerGroup, &mesh.maxVertices, &mesh.maxPrimitives, &mesh.threadsPerGroup, &mesh.ldsSizeDwords, &mesh.provokingVertex, &mesh.esgsItemSize, &mesh.outputPrimitiveSize}) *value = reader.U32();
 }
 
 void encodeTessellation(Writer& writer, const ShaderRecompiler::TessellationConfiguration& tessellation) {
