@@ -7857,7 +7857,12 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             draw(imageB, {{0.0f, 1.0f, 0.0f, 1.0f}});
             if (order == Order::Recleared) {
                 // The title fast-clears B again before anything stored B's results: they die under the
-                // new keys, and memory holds what lay under them in the eager order, A's results.
+                // new keys, and memory holds what lay under them in the eager order, A's results. B's
+                // write recorded a fill of its keys to uncompressed: it lands first (the title's
+                // clear follows the work before it).
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
                 std::memset(memory + surfaceA, 0x40, keyCount);
                 {
                     const RefreshUseScope scope(use);
