@@ -15,6 +15,8 @@
 #include <sys/mman.h>
 #endif
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -407,6 +409,8 @@ bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwat
     Mirror(env, unwatched.PieceAt(0), "outside the write watch");
     Appears(env, unwatched.PieceAt(1), "outside the write watch", true);
     Appears(env, unwatched.PieceAt(2), "outside the write watch", false);
+    std::this_thread::sleep_for(std::chrono::seconds(11));
+    Control(env, watched.PieceAt(9));
     return templates;
 }
 
@@ -421,6 +425,7 @@ int main() {
         setenv("APS5_LAB_DISPATCH_MOVE", "1", 1);
         setenv("APS5_LAB_FAST_PROOF", "2", 1);
 #endif
+        setenv("APS5_PROFILE_DRAW", "1", 1);
         const GuestBlock watched(10, true);
         const GuestBlock unwatched(4, false);
         const auto device = OpenVulkanTestDevice();
@@ -430,7 +435,7 @@ int main() {
         const Env env{*device, shaders, buffers};
         if (!RunTests(env, watched, unwatched)) return VulkanTestSkipped;
         std::puts("dispatch move depth tests passed");
-        return 0;
+        throw std::runtime_error("diagnostic run: the test failed on purpose to show its output");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;
