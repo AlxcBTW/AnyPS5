@@ -376,6 +376,9 @@ struct TextureCounters {
     std::atomic<std::uint64_t> outsideMoved{0};
     std::atomic<std::uint64_t> outsideVerified{0};
     std::atomic<std::uint64_t> outsideMismatch{0};
+    // Cache entries replaced because the memory changed (monotonic; the per-10 s `stale` count is reset
+    // by its report): a verification walk that replaced one saw a real change behind a proof.
+    std::atomic<std::uint64_t> staleReplaced{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -813,7 +816,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
             };
             const auto kept = [&] {
-                if (untracked[0] == 0) return false;
+                if (untracked[0] == 0 || UntrackedBypass::Active()) return false;
                 const bool same = it->untracked == untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
@@ -831,6 +834,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         eraseTexture(cache, it);
         ++cache.counts.stale;
+        counters.staleReplaced.fetch_add(1, std::memory_order_relaxed);
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
@@ -2750,8 +2754,10 @@ void ShaderResources::captureValidation() {
 // pending over the memory (a lookup would flush them into it), a storage image must still be the
 // cache's image of its surface, the memory must be unchanged since the object's content matched it,
 // and the DCC keys must be what the content was made under whenever the surface has any (a fast
-// clear touches only the keys). Anything else, including a failed collect (memory outside the arena,
-// uncommitted pages), is left to the full walk.
+// clear touches only the keys). Anything else is left to the full walk, including a failed collect
+// (memory outside the arena, uncommitted pages) except, with APS5_LAB_FAST_PROOF, a snapshot texture
+// (level 1), a storage-sourced view or a storage image (level 2) over memory outside the write watch:
+// those are proved by the key the lookup kept them by (untrackedKey, StorageTexture::UntrackedUnchanged).
 // The epoch gate: while the pending registry's serial is what this object's last proof saw
 // (pendingSerialSeen), the registry is what it was then (every change bumps the serial under the
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
@@ -2806,11 +2812,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.collected == 0) {
             const auto level = FastProofLevel();
             if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
+                // A depth surface registered over the memory is the lookup's to return (DepthSurfaceTexture).
+                if (DepthSurfaceAt(address)) return fail(FastFail::Depth);
                 const bool held = untrackedKey(address, bytes) == surface.untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
                 countOutside(0, held ? 0u : 1u);
                 if (!held) return fail(FastFail::Collect);
                 outside = true;
             } else if (level >= 2 && source != nullptr) {
+                if (!source->Cached()) return fail(FastFail::Evicted);
                 const bool held = source->UntrackedUnchanged();
                 countOutside(1, held ? 0u : 1u);
                 if (!held) return fail(FastFail::Collect);
@@ -2881,6 +2890,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 countOutside(2, 2);
                 return fail(FastFail::Collect);
             }
+            if (!image->Cached()) return fail(FastFail::Evicted);
             const bool held = image->UntrackedUnchanged();
             countOutside(2, held ? 0u : 1u);
             if (!held) return fail(FastFail::Collect);
@@ -3282,14 +3292,26 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
             }
             for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
-            const bool same = fullWalk();
+            // Beside a proof that rested on memory outside the write watch the walk compares bytes instead of
+            // trusting the hint, so it judges the memory and not the key the proof used.
+            const auto staleBefore = TextureCounts().staleReplaced.load(std::memory_order_relaxed);
+            const bool same = [&] {
+                std::optional<UntrackedBypass> bypass;
+                if (viaOutside) bypass.emplace();
+                return fullWalk();
+            }();
+            const bool staleSeen = TextureCounts().staleReplaced.load(std::memory_order_relaxed) != staleBefore;
             const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
             if (viaOutside) {
                 if (profile) Revalidations().outsideVerified.fetch_add(1, std::memory_order_relaxed);
                 if (!same || moved != versions.end()) {
-                    const auto count = profile ? Revalidations().outsideMismatch.fetch_add(1, std::memory_order_relaxed) : 0;
-                    if (count < 20) {
-                        std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the proof outside the write watch disagrees with the full walk (%s)\n", !same ? "another object" : "an upload");
+                    // Counted, not aborted: a call that also rested on a T1 proof cannot name which of the two was wrong.
+                    if (profile) Revalidations().outsideMismatch.fetch_add(1, std::memory_order_relaxed);
+                    static std::atomic<std::uint32_t> printed{0};
+                    if (printed.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        std::fprintf(stderr, "[rescache] APS5_VERIFY_PROOFS: the proof outside the write watch disagrees with the full walk (%s%s)\n",
+                                     !same ? (staleSeen ? "a cache entry was replaced because the bytes differ" : "another object, no entry replaced: eviction or a view flip") : "an upload",
+                                     ownRefreshed ? ", with an own-object refresh" : accepted ? ", with an accepted overlap" : "");
                         std::fflush(stderr);
                     }
                 }
@@ -4352,11 +4374,19 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
                 if (texture != nullptr && lastFastTextureOutside && VerifyProofs()) {
-                    const auto full = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+                    // The lookup beside the proof compares bytes instead of trusting the write-watch hint (UntrackedBypass).
+                    const auto staleBefore = counters.staleReplaced.load(std::memory_order_relaxed);
+                    std::shared_ptr<Texture> full;
+                    {
+                        const UntrackedBypass bypass;
+                        full = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+                    }
                     counters.outsideVerified.fetch_add(1, std::memory_order_relaxed);
                     if (full != texture) {
+                        const bool staleSeen = counters.staleReplaced.load(std::memory_order_relaxed) != staleBefore;
                         if (counters.outsideMismatch.fetch_add(1, std::memory_order_relaxed) < 20) {
-                            std::fprintf(stderr, "[textures] APS5_VERIFY_PROOFS: the stage-B proof outside the write watch disagrees with the full lookup (texture 0x%llx)\n", static_cast<unsigned long long>(resource.baseAddress));
+                            std::fprintf(stderr, "[textures] APS5_VERIFY_PROOFS: the stage-B proof outside the write watch disagrees with the full lookup (texture 0x%llx, %s)\n", static_cast<unsigned long long>(resource.baseAddress),
+                                         staleSeen ? "the cache entry was replaced because the bytes differ" : "another object, no entry replaced: eviction");
                             std::fflush(stderr);
                         }
                         texture = full;
