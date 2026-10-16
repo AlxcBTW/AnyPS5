@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWriteRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1338,6 +1339,7 @@ bool unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 #else
     for (auto block = address / WriteBlockBytes; block <= (address + bytes - 1) / WriteBlockBytes; ++block) unwatchedBlocks.insert_or_assign(block, record);
 #endif
+    GuestWriteRing::Record(GuestWriteRing::Kind::Unwatch, address, bytes, GuestWriteRing::PathTag(path));
     return true;
 }
 
@@ -1515,8 +1517,13 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
     return true;
 }
 
-std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& storeBytes, std::uint64_t site = 0) {
     if (bytes == 0) return 0;
+    const auto store = [&] {
+        const auto stored = storeBytes();
+        if (stored.second > stored.first) GuestWriteRing::Record(GuestWriteRing::Kind::CpuStore, stored.first, stored.second - stored.first, site);
+        return stored;
+    };
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -1543,23 +1550,31 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     return stampStored(tracker, stored);
 }
 
+std::uint64_t storeOwnSpan(std::uint64_t address, std::span<const std::byte> source, std::uint64_t site) {
+    return storeOwn(address, source.size(), [&] {
+        const std::pair<std::uint64_t, std::uint64_t> stored{address, address + source.size()};
+#ifndef _WIN32
+        if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return stored;
+#endif
+        std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
+        return stored;
+    }, site);
+}
+
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std::function<void()>& store) {
+    const auto site = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
     return storeOwn(address, bytes, [&] {
         store();
         return std::pair<std::uint64_t, std::uint64_t>{address, address + bytes};
-    });
+    }, site);
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
-    return StoreOwnBytes(address, source.size(), [&] {
-#ifndef _WIN32
-        if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
-#endif
-        std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
-    });
+    return storeOwnSpan(address, source, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    if (bytes != 0) GuestWriteRing::Record(GuestWriteRing::Kind::GpuNoted, address, bytes, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -2440,20 +2455,27 @@ Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     return queried ? outcome : Compare::Unmapped;
 }
 
+void writeChangedFrom(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t caller);
+
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    const auto caller = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
     if (Accessible(reinterpret_cast<const void*>(address), current.size(), true)) {
-        WriteChanged(address, current, original);
+        writeChangedFrom(address, current, original, caller);
         return;
     }
     for (const auto& [begin, end] : CommittedRanges(address, current.size(), true)) {
         const auto offset = static_cast<std::size_t>(begin - address);
         const auto length = static_cast<std::size_t>(end - begin);
-        WriteChanged(begin, current.subspan(offset, length), original.subspan(offset, length));
+        writeChangedFrom(begin, current.subspan(offset, length), original.subspan(offset, length), caller);
     }
 }
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    writeChangedFrom(address, current, original, reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)));
+}
+
+void writeChangedFrom(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t caller) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
@@ -2488,7 +2510,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
             lastChanged = std::max(lastChanged, at + 1);
         }
         return firstChanged < lastChanged ? std::pair<std::uint64_t, std::uint64_t>{address + firstChanged, address + lastChanged} : std::pair<std::uint64_t, std::uint64_t>{0, 0};
-    });
+    }, caller);
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
@@ -2498,11 +2520,18 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     FlushGpuWrites(address, source.size());
     const TimedAccess timed(CounterWrite, source.size());
     CountWriteCaller(__builtin_return_address(0));
+    const auto caller = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
     auto* destination = reinterpret_cast<void*>(address);
     CheckRange(destination, source.size(), alignment, true);
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
-    if (source.size() >= PageBytes) StoreOwnBytes(address, source);
-    else StoreOwnBytes(address, source.size(), [&] { std::memcpy(destination, source.data(), source.size()); });
+    if (source.size() >= PageBytes) {
+        storeOwnSpan(address, source, caller);
+    } else {
+        storeOwn(address, source.size(), [&] {
+            std::memcpy(destination, source.data(), source.size());
+            return std::pair<std::uint64_t, std::uint64_t>{address, address + source.size()};
+        }, caller);
+    }
 }
 
 }
