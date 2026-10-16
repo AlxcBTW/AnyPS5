@@ -1,0 +1,5 @@
+name=cpu-fastproof
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-fastproof-3b906b467d-129120
