@@ -1,0 +1,5 @@
+name=lead-best6-cpu
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best6-cpu-db4a225560-254787
