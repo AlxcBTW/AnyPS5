@@ -15,6 +15,8 @@
 #include <string>
 #include <thread>
 
+namespace GuestMemory = AgcDriver::GuestMemory;
+
 namespace {
 
 void Require(bool condition, const std::string& message) {
