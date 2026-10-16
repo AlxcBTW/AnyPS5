@@ -1743,7 +1743,7 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
         if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
@@ -1858,7 +1858,7 @@ bool StorageTexture::Refresh() {
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
-        direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        direct = keys == DccKeys::Uncompressed && HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
@@ -2189,7 +2189,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
-        static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+        static_cast<void>(HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
@@ -2242,7 +2242,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
-    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
+    if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
         if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
@@ -4346,7 +4346,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         refusal = "released";
         return false;
     }
-    if (HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
+    if (HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
         refusal = "not imported";
         return false;
     }
@@ -4805,7 +4805,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
-    if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
+    if (const auto* import = HostImportSpanning(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
     std::fprintf(stderr, "[diag] writeBackLayers image=0x%llx bytes=0x%llx keep=%zu segments=%zu blockUnits=%d unsaved=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), keep.size(), segments.size(), blockUnits ? 1 : 0, unsavedOutsideWatch ? 1 : 0);
     if (!segments.empty()) {
@@ -4815,6 +4815,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            std::fprintf(stderr, "[diag] writeBackWindows image=0x%llx storedBytes=%llu shadowed=%zu imported=%zu import=0x%llx+0x%llx\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(storedBytes), shadowed.size(), imported.size(), static_cast<unsigned long long>(segments.front().import->base), static_cast<unsigned long long>(segments.front().import->bytes));
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
