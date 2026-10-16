@@ -1765,6 +1765,44 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     return true;
 }
 
+bool StoreWindowCheckEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_GUEST_WRITE_RACE");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+void CheckStoreWindow(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation, bool publish, std::uint64_t tag) {
+    static std::atomic<std::uint64_t> checkedRanges{0};
+    static std::atomic<std::uint64_t> storedBlocks{0};
+    if (generation == 0) return;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto bytes = static_cast<std::size_t>(end - begin);
+        CollectWritesUncached(begin, bytes);
+        const auto firstBlock = begin & ~(std::uint64_t{WriteBlockBytes} - 1);
+        const auto blocks = static_cast<std::size_t>((end - 1 - firstBlock) / WriteBlockBytes + 1);
+        std::vector<std::uint64_t> generations(blocks, generation);
+        std::vector<std::uint8_t> changed(blocks), cpu(blocks);
+        const auto checked = checkedRanges.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (checked >= 1024 && (checked & (checked - 1)) == 0) std::fprintf(stderr, "[guestcrash] store windows: %llu ranges checked, %llu blocks reached by a CPU store\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(storedBlocks.load(std::memory_order_relaxed)));
+        if (!ChangedBlocks(begin, bytes, generations, changed, cpu)) continue;
+        for (std::size_t k = 0; k < blocks; ++k) {
+            if (cpu[k] == 0) continue;
+            const auto from = std::max<std::uint64_t>(begin, firstBlock + k * WriteBlockBytes);
+            const auto to = std::min<std::uint64_t>(end, firstBlock + (k + 1) * WriteBlockBytes);
+            GuestWriteRing::Record(publish ? GuestWriteRing::Kind::PublishWindowCpuStore : GuestWriteRing::Kind::WriteBackWindowCpuStore, from, to - from, tag);
+            const auto count = storedBlocks.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 64 || (count & (count - 1)) == 0) {
+                std::fprintf(stderr, "[guestcrash] a CPU store reached 0x%llx+0x%llx between the %s decision and the retire of its batch (%s 0x%llx); %llu such blocks in %llu checked ranges\n",
+                    static_cast<unsigned long long>(from), static_cast<unsigned long long>(to - from), publish ? "shadow publish" : "storage write-back", publish ? "import" : "image",
+                    static_cast<unsigned long long>(tag), static_cast<unsigned long long>(count), static_cast<unsigned long long>(checked));
+            }
+        }
+    }
+}
+
 namespace {
 
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other

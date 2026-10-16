@@ -4747,6 +4747,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // satisfy it); the unselected layers keep their own generations and are collected by their
     // own refreshes. One tracker lock then reads the span's stamps against the layers' generations.
     GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    const auto decided = GuestMemory::StoreWindowCheckEnabled() ? GuestMemory::TrackerGeneration() : 0;
     std::vector<std::uint64_t> generations(spanBlocks, 0);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
@@ -4897,6 +4898,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            if (decided != 0 && !imported.empty()) {
+                if (auto* windowRecorder = Recorder::Active()) windowRecorder->OnRetire([imported, decided, base = descriptor.baseAddress] { GuestMemory::CheckStoreWindow(imported, decided, false, base); });
+            }
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
@@ -5011,6 +5015,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            if (decided != 0) recorder->OnRetire([keep, decided, base = descriptor.baseAddress] { GuestMemory::CheckStoreWindow(keep, decided, false, base); });
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
