@@ -64,6 +64,8 @@ struct StorageImageClear {
 std::optional<StorageImageClear> MatchStorageImageClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::array<std::uint32_t, 3>& groups);
 std::uint64_t StorageImageClearAddress(const StorageImageClear& clear);
 bool DepthPlaneClearEnabled();
+// A dispatch of the kernel whose image is no depth plane (a colour image: nothing to do, counted).
+void NoteStorageImageClearOffDepth();
 struct DepthPlaneOverwrite {
     std::array<std::uint32_t, 8> image{};
     GuestTextureResource view{};
@@ -100,6 +102,11 @@ struct DepthClearStatistics {
     std::uint64_t verified = 0;
     std::uint64_t violations = 0;
     std::array<std::uint64_t, 8> declined{};
+    // The kernel's own code seen at a dispatch (any configuration), the dispatches that clear a colour image, and the configurations the matcher
+    // refused: user data count, thread group size, group ids, thread ids, coverage (zero, or more than one layer of groups).
+    std::uint64_t kernelSeen = 0;
+    std::uint64_t offDepth = 0;
+    std::array<std::uint64_t, 8> refused{};
 };
 DepthClearStatistics DepthClearCounts();
 // Tests: -1 lets the environment decide, 0 off, 1 the lever, 2 the lever with the read-back check; `perturb` is
