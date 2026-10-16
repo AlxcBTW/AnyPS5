@@ -1,0 +1,5 @@
+name=guestcrash-race
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-guestcrash-race-76183b706d-237376
