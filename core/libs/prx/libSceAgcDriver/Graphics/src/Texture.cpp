@@ -2135,9 +2135,10 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers, bool kee
         GuestMemory::ReadCommittedUnsynced(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
     }
     if (keepWritten) {
-        for (const auto& [begin, end] : runs) GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-            if (selected[layer] && layerGeneration[layer] != 0) keepWrittenSince(layer);
+            if (!selected[layer] || layerGeneration[layer] == 0) continue;
+            GuestMemory::CollectWritesUncached(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)));
+            keepWrittenSince(layer);
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
