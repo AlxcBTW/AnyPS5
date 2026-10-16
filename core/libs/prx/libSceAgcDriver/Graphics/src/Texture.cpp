@@ -1735,6 +1735,22 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+namespace {
+thread_local bool untrackedBypass = false;
+}
+
+UntrackedBypass::UntrackedBypass() : previous(untrackedBypass) {
+    untrackedBypass = true;
+}
+
+UntrackedBypass::~UntrackedBypass() {
+    untrackedBypass = previous;
+}
+
+bool UntrackedBypass::Active() {
+    return untrackedBypass;
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2150,7 +2166,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto hint = memoize && epoch != 0 && whole ? GuestMemory::UntrackedHint(address, bytes) : 0;
     const std::array<std::uint64_t, 5> stamp{hint != 0, hint != 0 ? hint : epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
     const bool cacheable = memoize && epoch != 0 && (stamp[3] & 1u) == 0 && whole;
-    if (cacheable && comparedGuestBytes == stamp) {
+    if (cacheable && !UntrackedBypass::Active() && comparedGuestBytes == stamp) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
     }
@@ -2176,7 +2192,7 @@ bool StorageTexture::UntrackedUnchanged() const {
     const auto address = descriptor.baseAddress;
     if (!keptAtUnwatch.empty() || original.size() != guestBytes || !originalHolds(address, bytes)) return false;
     const auto epoch = GuestMemory::CollectEpoch();
-    if (epoch == 0) return false;
+    if (epoch == 0 || Recorder::SnapshotWriteOverlaps(address, bytes)) return false;
     const auto* recorder = Recorder::Active();
     const auto hint = GuestMemory::UntrackedHint(address, bytes);
     const std::array<std::uint64_t, 5> stamp{hint != 0, hint != 0 ? hint : epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
