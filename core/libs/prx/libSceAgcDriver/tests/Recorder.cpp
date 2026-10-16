@@ -1078,7 +1078,8 @@ std::size_t DeferredFailureLines(Recorder& recorder, std::size_t count, const st
 }
 
 void deferredFailureReportTests(Recorder& recorder) {
-    const auto plain = [] { throw std::runtime_error("image table: poisoned entry"); };
+    std::uint32_t serial = 0;
+    const auto plain = [&serial] { throw std::runtime_error("image table: poisoned entry " + std::to_string(serial++)); };
     const auto unaligned = [](std::uint32_t instruction) { return [instruction] { throw BdaUnalignedAccess("BDA access failed: unaligned", instruction); }; };
     Require(DeferredFailureLines(recorder, 12, plain) == 12, "a deferred failure other than an unaligned BDA access was not printed every time");
     Require(DeferredFailureLines(recorder, 12, unaligned(0x5c8)) == 8, "the first 8 deferred reports of an unaligned BDA access were not the only ones printed");
