@@ -1,0 +1,5 @@
+name=drawstage
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-drawstage-d16b07b8fb-933
