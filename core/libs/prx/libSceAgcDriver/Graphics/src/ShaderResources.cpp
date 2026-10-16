@@ -988,6 +988,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     if (disabled) return StorageTexture::Create(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+    // A written storage image: its refresh may leave other images' results under it pending (the
+    // alias hand-over), as the dispatch's results then supersede them. Other lookups keep the use
+    // their caller set (a draw's target, or a read).
+    std::optional<RefreshUseScope> writtenUse;
+    if (written) writtenUse.emplace(RefreshUse::DispatchWrite);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& counters = TextureCounts();
@@ -2892,6 +2897,9 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         if (image == nullptr || !image->Cached()) return OwnRefreshFallback::Uncached;
         if (i >= storageKeys.size() || !StorageImageServesKeys(*image, storageKeys[i])) return OwnRefreshFallback::Keys;
         countOwnRefresh(true);
+        // As cachedStorageTexture's lookup of a written element (the alias hand-over).
+        std::optional<RefreshUseScope> writtenUse;
+        if (i < storageWritten.size() && storageWritten[i]) writtenUse.emplace(RefreshUse::DispatchWrite);
         image->Refresh();
         return OwnRefreshFallback::Count;
     };
