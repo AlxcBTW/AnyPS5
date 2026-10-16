@@ -8360,8 +8360,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--label-table-only") {
             rawLabelTests(recorder);
             pendingWriteSerialTests(recorder);
-            std::cout << "label table tests passed
-";
+            std::cout << "label table tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
