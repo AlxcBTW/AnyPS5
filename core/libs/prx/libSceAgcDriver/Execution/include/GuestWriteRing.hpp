@@ -18,6 +18,8 @@ enum class Kind : std::uint8_t {
     StorageWriteBack = 4,
     StorageCpuWriteBack = 5,
     ShadowPublish = 6,
+    WriteBackWindowCpuStore = 7,
+    PublishWindowCpuStore = 8,
 };
 
 struct Entry {
@@ -44,7 +46,9 @@ constexpr char Magic[8] = {'A', 'P', 'S', '5', 'W', 'R', 'G', '1'};
 
 // CpuStore and GpuNoted carry the code address that called into GuestMemory as the tag, Unwatch up to eight characters
 // of the path that took the range out of the write watch (PathTag), the storage kinds the image's guest address and
-// ShadowPublish the import's base. Bytes past 4 GiB are recorded as 0xffffffff.
+// ShadowPublish the import's base. The window kinds (GuestMemory::CheckStoreWindow) name a 64 KiB block that a CPU
+// store reached between a GPU store's decision and the retire of its batch, with the tag of the store. Bytes past 4 GiB
+// are recorded as 0xffffffff.
 void Record(Kind kind, std::uint64_t address, std::uint64_t bytes, std::uint64_t tag);
 bool Enabled();
 std::uint64_t PathTag(const char* path);
