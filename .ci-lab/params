@@ -1,0 +1,5 @@
+name=mutexsplit-s0
+build_type=Release
+g1=on
+cmake=
+artifact=lab-libs-mutexsplit-s0-eb84b2e82c-1883
