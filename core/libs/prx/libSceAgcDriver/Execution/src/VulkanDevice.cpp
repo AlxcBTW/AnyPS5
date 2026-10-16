@@ -4124,12 +4124,14 @@ bool VulkanDevice::DrawPresync() {
 std::uint64_t VulkanDevice::PresyncDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw) {
     if (!DrawPresync() || !CanWaitUnlocked() || GuestMemory::GpuMutex().HeldByThisThread()) return 0;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool keyRanges = std::getenv("APS5_NO_DCC_PRESYNC") == nullptr;
     auto& counters = DrawPresyncs();
     counters.checked.fetch_add(1, std::memory_order_relaxed);
     const auto context = graphicsContext();
-    auto surfaces = Graphics::PrepareDrawUnlocked(context, graphics);
-    const auto htileSurfaces = surfaces.size();
-    if (draw.indexed && draw.indexAddress != 0 && draw.indexCount != 0 && draw.indexSize != 0) surfaces.push_back({draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, false});
+    auto surfaces = Graphics::PrepareDrawUnlocked(context, graphics, CachedPrecollect());
+    if (!keyRanges) std::erase_if(surfaces, [](const Graphics::PresyncSurface& surface) { return surface.dccKeys; });
+    const auto attachmentSurfaces = surfaces.size();
+    if (!draw.indirect && draw.indexed && draw.indexAddress != 0 && draw.indexCount != 0 && draw.indexSize != 0) surfaces.push_back({draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, false});
     bool overlaps = false;
     for (std::size_t index = 0; index < surfaces.size(); ++index) {
         const auto& surface = surfaces[index];
@@ -4139,7 +4141,7 @@ std::uint64_t VulkanDevice::PresyncDraw(const Graphics::State& graphics, const P
         if (profile && surface.dccKeys && Graphics::AnyShadowedOverlaps(surface.address, bytes)) counters.shadowed.fetch_add(1, std::memory_order_relaxed);
         if (!pending) continue;
         overlaps = true;
-        (surface.dccKeys ? counters.keys : index >= htileSurfaces ? counters.index : counters.htile).fetch_add(1, std::memory_order_relaxed);
+        (surface.dccKeys ? counters.keys : index >= attachmentSurfaces ? counters.index : counters.htile).fetch_add(1, std::memory_order_relaxed);
     }
     std::uint64_t serial = 0;
     if (overlaps) {

@@ -108,15 +108,26 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
     constexpr const char* format = "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n";
-    if (AsyncDrawReports_nid_no_patch()) ProfilePrint_nid_no_patch(format, Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
-    else std::fprintf(stderr, format, Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
+    bool printed = false;
+    if (AsyncDrawReports_nid_no_patch()) {
+        try {
+            ProfilePrint_nid_no_patch(format, Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
+            printed = true;
+        } catch (const std::exception&) {
+        }
+    }
+    if (!printed) std::fprintf(stderr, format, Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};
 }
 
 void DrawPipeline::run() {
-    StartCommitterSampler();
+    try {
+        StartCommitterSampler();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[draw] committer sampler not started: %s\n", error.what());
+    }
     for (;;) {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });

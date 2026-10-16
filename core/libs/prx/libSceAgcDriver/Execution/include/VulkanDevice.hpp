@@ -237,12 +237,18 @@ public:
     };
     static PresyncStatistics PresyncCounts();
     // Lab switch APS5_LAB_DRAW_PRESYNC=1: the pre-sync of a draw, made by the committing thread
-    // WITHOUT GuestMemory::GpuMutex right before the draw's hold. It waits for the recorded writers
-    // of the guest memory the draw reads on the CPU under the hold when a recorded batch writes it:
-    // the depth target's HTILE (DepthSurfaceView), the color targets' DCC keys (by the rule
-    // PrepareDispatch's pre-sync applies to keys) and the index buffer. Returns the serial waited
-    // for (0: none); the caller reaps it under the mutex (ReapRecorded) before the draw, which
-    // then finds those writers finished, as when the GPU had been faster.
+    // WITHOUT GuestMemory::GpuMutex right before the draw's hold (the caller skips it while it has
+    // queued labels, which its hold records first). It walks the write watch over the draw's
+    // attachments (Graphics::PrepareDrawUnlocked; not with APS5_NO_CACHED_PRECOLLECT=1) and waits
+    // for the recorded writers of the guest memory the draw reads on the CPU under the hold: the
+    // depth target's HTILE (DepthSurfaceView; not while resident depth guards exist), the color
+    // targets' DCC keys (the rule PrepareDispatch's pre-sync applies to keys; not with
+    // APS5_NO_DCC_PRESYNC=1) and a direct draw's index buffer. A writer in the open batch makes it
+    // submit that batch, as the draw's own wait through the flush hook would. Returns the serial
+    // waited for (0: none); the caller reaps it under the mutex (ReapRecorded) before the draw,
+    // which then finds those writers finished, as when the GPU had finished them before the draw.
+    // It can wait where the locked path would not (pending fills that leave the keys
+    // uncompressed, as PrepareDispatch's pre-sync can): a cost of time outside the mutex only.
     static bool DrawPresync();
     std::uint64_t PresyncDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw);
     struct DrawPresyncStatistics {
