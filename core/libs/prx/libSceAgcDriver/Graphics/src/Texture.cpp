@@ -93,6 +93,76 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+// The alias hand-over's switches (Texture.hpp) and the [alias] census. The census rows are per 10 s
+// (taken by the report); the hand-over counts are cumulative (TakeAliasHandOverCounts).
+std::atomic<int> aliasModeOverride{-1};
+bool LabSwitch(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+}
+AliasHandOverMode AliasMode() {
+    const auto forced = aliasModeOverride.load(std::memory_order_relaxed);
+    if (forced >= 0) return static_cast<AliasHandOverMode>(forced);
+    static const auto mode = [] {
+        if (!LabSwitch("APS5_LAB_ALIAS_HANDOVER")) return AliasHandOverMode::Off;
+        return std::strcmp(std::getenv("APS5_LAB_ALIAS_HANDOVER"), "clear") == 0 ? AliasHandOverMode::Clear : AliasHandOverMode::All;
+    }();
+    return mode;
+}
+bool AliasSkip() {
+    static const bool skip = LabSwitch("APS5_LAB_ALIAS_SKIP");
+    return skip;
+}
+bool AliasVerify() {
+    static const bool verify = LabSwitch("APS5_LAB_ALIAS_VERIFY");
+    return verify;
+}
+thread_local RefreshUse refreshUse = RefreshUse::Read;
+// The write-backs this thread stored (count, bytes): the census of the refresh flush around them.
+thread_local std::uint64_t threadWriteBacks = 0, threadWriteBackBytes = 0;
+// The path of this thread's last StorageTexture::upload: 0 GPU clear, 1 direct, 2 CPU, -1 none.
+thread_local int lastUploadPath = -1;
+enum AliasRefusal : std::size_t { RefusedNotInside, RefusedTakerPartial, RefusedTakerPending, RefusedSourcePartial, RefusedSourceChanged, RefusedKeys, RefusedNotImported, RefusalCount };
+struct AliasCensus {
+    // By RefreshUse: refreshes whose flush stored something, the write-backs and bytes it stored,
+    // and the flush's time.
+    std::array<std::atomic<std::uint64_t>, 3> flushes{}, writeBacks{}, bytes{}, nanoseconds{};
+    // What the refresh did after such a flush: 0 a GPU clear (the stored bytes unread), 1 an
+    // upload of the changed units (read), 2 neither; with the bytes the flush had stored.
+    std::array<std::atomic<std::uint64_t>, 3> outcomes{}, outcomeBytes{};
+    std::array<std::atomic<std::uint64_t>, RefusalCount> refusals{};
+    std::atomic<std::uint64_t> handedOver{0}, deviceUnits{0}, deviceBytes{0}, superseded{0}, storedLater{0}, takerAdvanced{0}, voided{0}, fallbacks{0}, keptForCpu{0}, skippedUnits{0}, verifyDecisions{0}, verifiedUnits{0}, verifyMismatches{0};
+};
+AliasCensus& Census() {
+    static AliasCensus census;
+    return census;
+}
+
+void reportAlias() {
+    auto& census = Census();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    static AliasHandOverCounts reported;
+    const auto counts = TakeAliasHandOverCounts();
+    const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    std::string uses;
+    static constexpr const char* useNames[3] = {"read", "dispatch-write", "draw-target"};
+    char text[160];
+    for (std::size_t i = 0; i < 3; ++i) {
+        const auto flushes = take(census.flushes[i]), writeBacks = take(census.writeBacks[i]);
+        const auto mib = static_cast<double>(take(census.bytes[i])) / 1048576.0, ms = static_cast<double>(take(census.nanoseconds[i])) / 1e6;
+        std::snprintf(text, sizeof(text), " %s %llu/%llu/%.1f/%.1f", useNames[i], flushes, writeBacks, mib, ms);
+        uses += text;
+    }
+    const auto outcome = [&](std::size_t i) { return std::pair<unsigned long long, double>{take(census.outcomes[i]), static_cast<double>(take(census.outcomeBytes[i])) / 1048576.0}; };
+    const auto cleared = outcome(0), reread = outcome(1), other = outcome(2);
+    std::array<unsigned long long, RefusalCount> refused{};
+    for (std::size_t i = 0; i < RefusalCount; ++i) refused[i] = take(census.refusals[i]);
+    static constexpr const char* modeNames[3] = {"off", "clear", "all"};
+    AgcDriver::ProfilePrint_nid_no_patch("[alias] storage-refresh flushes (10 s) by use (refreshes/write-backs/MiB/ms):%s; after the flush: cleared %llu/%.1f MiB, re-read %llu/%.1f MiB, other %llu/%.1f MiB; hand-over %s%s%s: units left pending %llu (on the device %llu, %.1f MiB), superseded %llu, stored later %llu (taker advanced %llu), voided %llu, fallbacks %llu, kept for the CPU %llu; refused units: not inside %llu, taker partial %llu, taker pending %llu, source partial %llu, source changed %llu; refused refreshes: keys %llu, not imported %llu; verify: decisions %llu, device units %llu, mismatches %llu\n", uses.c_str(), cleared.first, cleared.second, reread.first, reread.second, other.first, other.second, modeNames[static_cast<int>(AliasMode())], AliasSkip() ? ", SKIP (not exact)" : "", AliasVerify() ? ", VERIFY (eager order)" : "", delta(counts.handedOver, reported.handedOver), delta(counts.deviceUnits, reported.deviceUnits), static_cast<double>(take(census.deviceBytes)) / 1048576.0, delta(counts.superseded, reported.superseded), delta(counts.storedLater, reported.storedLater), delta(counts.takerAdvanced, reported.takerAdvanced), delta(counts.voided, reported.voided), delta(counts.fallbacks, reported.fallbacks), delta(counts.keptForCpu, reported.keptForCpu), refused[RefusedNotInside], refused[RefusedTakerPartial], refused[RefusedTakerPending], refused[RefusedSourcePartial], refused[RefusedSourceChanged], refused[RefusedKeys], refused[RefusedNotImported], take(census.verifyDecisions), delta(counts.verifiedUnits, reported.verifiedUnits), delta(counts.verifyMismatches, reported.verifyMismatches));
+    if (counts.skippedUnits != reported.skippedUnits) AgcDriver::ProfilePrint_nid_no_patch("[alias] APS5_LAB_ALIAS_SKIP (not exact): %llu pending units dropped unstored (10 s)\n", delta(counts.skippedUnits, reported.skippedUnits));
+    reported = counts;
+}
+
 struct StorageTraffic {
     std::mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -136,6 +206,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    reportAlias();
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
@@ -151,6 +222,8 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
 }
 
 void countStorageWriteBack(std::uint64_t bytes, bool direct) {
+    ++threadWriteBacks;
+    threadWriteBackBytes += bytes;
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -1359,6 +1432,30 @@ bool FillClearColor(VkFormat format, std::uint32_t elementBytes, std::span<const
 // so the comparison with guest memory must not flush them.
 thread_local const StorageTexture* refreshing = nullptr;
 
+// The alias hand-over of the refresh running on this thread: the pending images whose units it
+// leaves pending (FlushPending does not list an image all of whose pending units over the range are
+// handed over; writeBack leaves them out of its selection), and the device buffer its upload takes
+// the handed units from.
+struct HandOverFilter {
+    const StorageTexture* image;
+    const std::vector<bool>* units;
+};
+thread_local const std::vector<HandOverFilter>* handOverFilters = nullptr;
+const std::vector<bool>* HandedUnitsOf(const StorageTexture* image) {
+    if (handOverFilters == nullptr) return nullptr;
+    for (const auto& filter : *handOverFilters) {
+        if (filter.image == image) return filter.units;
+    }
+    return nullptr;
+}
+struct HandOverUpload {
+    DccKeys keys = DccKeys::Uncompressed;
+    std::shared_ptr<DeviceBuffer> buffer;
+    std::uint64_t base = 0;
+    const std::vector<bool>* units = nullptr;
+};
+thread_local const HandOverUpload* handOverUpload = nullptr;
+
 void FlushHook(std::uint64_t address, std::size_t bytes) {
     StorageTexture::FlushPending(address, bytes);
 }
@@ -1715,6 +1812,36 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+RefreshUseScope::RefreshUseScope(RefreshUse use) : previous(refreshUse) {
+    refreshUse = use;
+}
+
+RefreshUseScope::~RefreshUseScope() {
+    refreshUse = previous;
+}
+
+void SetAliasHandOverForTests(AliasHandOverMode mode) {
+    aliasModeOverride.store(static_cast<int>(mode), std::memory_order_relaxed);
+}
+
+AliasHandOverCounts TakeAliasHandOverCounts() {
+    const auto& census = Census();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    AliasHandOverCounts counts;
+    counts.handedOver = load(census.handedOver);
+    counts.deviceUnits = load(census.deviceUnits);
+    counts.superseded = load(census.superseded);
+    counts.storedLater = load(census.storedLater);
+    counts.takerAdvanced = load(census.takerAdvanced);
+    counts.voided = load(census.voided);
+    counts.fallbacks = load(census.fallbacks);
+    counts.keptForCpu = load(census.keptForCpu);
+    counts.skippedUnits = load(census.skippedUnits);
+    counts.verifiedUnits = load(census.verifiedUnits);
+    counts.verifyMismatches = load(census.verifyMismatches);
+    return counts;
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1755,9 +1882,139 @@ bool StorageTexture::Refresh() {
             }
         }
     }
-    // No publish: the upload below reads the stored units from the unit shadow itself.
-    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    // The alias hand-over (APS5_LAB_ALIAS_HANDOVER, see Texture.hpp): the pending units of other
+    // images that this lookup's own write will supersede stay pending where this image's content
+    // does not come from guest memory, instead of being stored for nobody. APS5_LAB_ALIAS_SKIP drops
+    // them unstored (an upper bound, not exact); APS5_LAB_ALIAS_VERIFY keeps the eager order below
+    // and checks the device path's bytes against what this image's upload reads.
+    const auto use = refreshUse;
+    const auto mode = AliasMode();
+    const bool verify = AliasVerify();
+    const bool applying = mode != AliasHandOverMode::Off && !verify;
+    if (AliasSkip()) {
+        if (const auto dropped = dropPendingOverForSkip(alias.get()); dropped != 0) Census().skippedUnits.fetch_add(dropped, std::memory_order_relaxed);
+    }
+    std::vector<HandOver> handOvers;
+    std::vector<std::shared_ptr<StorageTexture>> handOverSources;
+    DccKeys handOverKeys = DccKeys::Uncompressed;
+    if (blockUnits && use != RefreshUse::Read && (applying || verify) && (!handedFrom.empty() || otherPendingOverlaps())) {
+        handOvers = handOversUnder(alias.get(), applying ? mode : AliasHandOverMode::All, handOverKeys);
+        // The images stay alive across the refresh (their last owner may be a batch's kept list).
+        std::erase_if(handOvers, [&](const HandOver& handOver) {
+            auto source = handOver.image.lock();
+            if (source == nullptr) return true;
+            handOverSources.push_back(std::move(source));
+            return false;
+        });
+    }
+    std::vector<std::vector<bool>> handedUnits;
+    std::vector<HandOverFilter> filters;
+    if (applying) {
+        handedUnits.reserve(handOvers.size());
+        for (std::size_t i = 0; i < handOvers.size(); ++i) {
+            std::vector<bool> units(handOverSources[i]->trackedLayers, false);
+            for (const auto& [theirs, mine] : handOvers[i].units) units[theirs] = true;
+            handedUnits.push_back(std::move(units));
+            filters.push_back({handOverSources[i].get(), &handedUnits.back()});
+        }
+    }
+    const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto writeBacksBefore = threadWriteBacks;
+    const auto bytesBefore = threadWriteBackBytes;
+    bool flushed = false;
+    {
+        const auto previousFilters = std::exchange(handOverFilters, filters.empty() ? nullptr : &filters);
+        struct Restore {
+            const std::vector<HandOverFilter>* filters;
+            ~Restore() { handOverFilters = filters; }
+        } restore{previousFilters};
+        // No publish: the upload below reads the stored units from the unit shadow itself.
+        flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+        // The keys decided the hand-over; a store above may have changed them (another image's
+        // results over this surface's keys): then the units are stored first after all.
+        if (applying && !handOvers.empty() && ProvedKeys() != handOverKeys) {
+            Census().fallbacks.fetch_add(1, std::memory_order_relaxed);
+            handOverFilters = nullptr;
+            flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None) || flushed;
+            handOvers.clear();
+            filters.clear();
+        }
+    }
+    if (verify && !handOvers.empty()) {
+        Census().verifyDecisions.fetch_add(1, std::memory_order_relaxed);
+        verifyDeviceHandOvers(handOvers);
+    }
+    if (!applying) handOvers.clear();
+    const auto flushedBytes = threadWriteBackBytes - bytesBefore;
+    if (profile && flushed) {
+        auto& census = Census();
+        const auto index = static_cast<std::size_t>(use);
+        census.flushes[index].fetch_add(1, std::memory_order_relaxed);
+        census.writeBacks[index].fetch_add(threadWriteBacks - writeBacksBefore, std::memory_order_relaxed);
+        census.bytes[index].fetch_add(flushedBytes, std::memory_order_relaxed);
+        census.nanoseconds[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - flushStart).count()), std::memory_order_relaxed);
+    }
+    lastUploadPath = -1;
+    // What the refresh did with what its flush stored: the [alias] census.
+    const auto noteOutcome = [&] {
+        if (!profile || !flushed) return;
+        const std::size_t outcome = lastUploadPath == 0 ? 0u : lastUploadPath > 0 ? 1u : 2u;
+        Census().outcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+        Census().outcomeBytes[outcome].fetch_add(flushedBytes, std::memory_order_relaxed);
+    };
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+    // The hand-overs of an earlier refresh end here and this one's take their place (a unit of
+    // theirs the flush above stored advanced this image past its stamps, see writeBackLayers).
+    auto previousHandOvers = std::move(handedFrom);
+    handedFrom.clear();
+    for (auto& handOver : handOvers) {
+        auto source = handOver.image.lock();
+        if (source == nullptr) continue;
+        std::size_t fresh = 0;
+        for (const auto& pair : handOver.units) {
+            const bool known = std::any_of(previousHandOvers.begin(), previousHandOvers.end(), [&](const HandOver& previous) { return previous.image.lock() == source && previous.version == handOver.version && std::find(previous.units.begin(), previous.units.end(), pair) != previous.units.end(); });
+            if (!known) ++fresh;
+        }
+        Census().handedOver.fetch_add(fresh, std::memory_order_relaxed);
+        const auto self = weak_from_this();
+        std::erase_if(source->handedTo, [](const std::weak_ptr<StorageTexture>& taker) { return taker.expired(); });
+        if (std::none_of(source->handedTo.begin(), source->handedTo.end(), [&](const std::weak_ptr<StorageTexture>& taker) { return !taker.owner_before(self) && !self.owner_before(taker); })) source->handedTo.push_back(self);
+        if (handOver.device) {
+            for (const auto& previous : previousHandOvers) {
+                if (!previous.device || previous.image.lock() != source || previous.version != handOver.version || previous.takerVersion != version || previous.units != handOver.units) continue;
+                handOver.held = true;
+                handOver.takerVersion = version;
+            }
+        }
+        handedFrom.push_back(std::move(handOver));
+    }
+    // `original` no longer vouches for the handed units: guest memory lacks the results they hold.
+    if (!handedFrom.empty()) {
+        comparedGuestBytes = {};
+        for (const auto& handOver : handedFrom) {
+            for (const auto& [theirs, mine] : handOver.units) {
+                layerOriginal[mine] = false;
+                cancelStoredSave(mine);
+            }
+        }
+    }
+    std::vector<bool> deviceUnits;
+    HandOverUpload uploadState{handOverKeys, nullptr, 0, nullptr};
+    std::uint32_t firstDevice = trackedLayers, lastDevice = 0;
+    for (const auto& handOver : handedFrom) {
+        if (!handOver.device || handOver.held) continue;
+        if (deviceUnits.empty()) deviceUnits.assign(trackedLayers, false);
+        for (const auto& [theirs, mine] : handOver.units) {
+            deviceUnits[mine] = true;
+            firstDevice = std::min(firstDevice, mine);
+            lastDevice = std::max(lastDevice, mine);
+        }
+    }
+    if (!deviceUnits.empty()) {
+        uploadState.base = layerBegin(firstDevice);
+        uploadState.buffer = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(layerBegin(lastDevice) + 65536 - uploadState.base), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        uploadState.units = &deviceUnits;
+    }
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
@@ -1882,12 +2139,20 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    // Units taken on the device from a hand-over (not held from an earlier refresh) are uploaded
+    // from it below.
+    for (std::uint32_t unit = 0; unit < deviceUnits.size(); ++unit) {
+        if (!deviceUnits[unit]) continue;
+        changed[unit] = true;
+        unchanged = false;
+    }
     if (unchanged) {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         takeRefreshProof(alias != nullptr);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
+        noteOutcome();
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
@@ -1982,10 +2247,44 @@ bool StorageTexture::Refresh() {
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        if (uploadState.buffer != nullptr) {
+            for (const auto& handOver : handedFrom) {
+                auto source = handOver.image.lock();
+                if (!handOver.device || handOver.held || source == nullptr) continue;
+                std::vector<std::uint32_t> theirs;
+                for (const auto& pair : handOver.units) theirs.push_back(pair.first);
+                source->retileUnitsTo({uploadState.buffer, uploadState.base}, theirs);
+                Census().deviceUnits.fetch_add(theirs.size(), std::memory_order_relaxed);
+                Census().deviceBytes.fetch_add(theirs.size() * 65536, std::memory_order_relaxed);
+            }
+        }
+        // The handed units stay out of every store the upload may cause, and it takes the device
+        // units from the buffer above.
+        const auto previousUpload = std::exchange(handOverUpload, handedFrom.empty() ? nullptr : &uploadState);
+        const auto previousFilters = std::exchange(handOverFilters, handedFrom.empty() || filters.empty() ? handOverFilters : &filters);
+        struct Restore {
+            const HandOverUpload* upload;
+            const std::vector<HandOverFilter>* filters;
+            ~Restore() {
+                handOverUpload = upload;
+                handOverFilters = filters;
+            }
+        } restore{previousUpload, previousFilters};
         upload(&changed);
+        if (uploadState.buffer != nullptr) {
+            for (std::uint32_t unit = 0; unit < deviceUnits.size(); ++unit) {
+                if (!deviceUnits[unit]) continue;
+                layerOriginal[unit] = false;
+                cancelStoredSave(unit);
+            }
+            for (auto& handOver : handedFrom) {
+                if (handOver.device) handOver.takerVersion = version;
+            }
+        }
     } else {
         uploadedKeys = keys;
     }
+    noteOutcome();
     return false;
 }
 
@@ -2006,11 +2305,25 @@ std::uint64_t StorageTexture::SlabRetiles() {
     return slabRetiles.load(std::memory_order_relaxed);
 }
 
-bool StorageTexture::otherPendingOverlaps() const {
+bool StorageTexture::otherPendingOverlaps(bool exceptHandOvers) const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
-    return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
+    // Every pending unit of the image over this surface handed over to this image, the image still
+    // at the version it handed them over at (a write of its own voids the hand-over first).
+    const auto handedOver = [&](const StorageTexture* texture) {
+        for (const auto& handOver : handedFrom) {
+            if (handOver.image.lock().get() != texture || texture->version != handOver.version) continue;
+            for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+                if (!texture->layerPending[unit] || !overlaps(texture->layerBegin(unit), static_cast<std::size_t>(texture->layerBytes(unit)))) continue;
+                if (std::none_of(handOver.units.begin(), handOver.units.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& pair) { return pair.first == unit; })) return false;
+            }
+            return true;
+        }
+        return false;
+    };
+    const auto blocking = [&](const StorageTexture* texture) { return other(texture) && !(exceptHandOvers && handedOver(texture)); };
+    return std::any_of(pending.textures.begin(), pending.textures.end(), blocking) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
 bool StorageTexture::refreshProved() {
@@ -2030,7 +2343,9 @@ bool StorageTexture::refreshProved() {
     if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        // Units handed over to this image do not break the proof (its content does not depend on
+        // their bytes, or holds them already); a write of theirs bumps the serial (voidHandedTo).
+        if (otherPendingOverlaps(true)) return false;
         refreshProof.pendingSerial = serial;
     }
     return true;
@@ -2041,7 +2356,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
     const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) return;
+    if (otherPendingOverlaps(true)) return;
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
 }
 
@@ -2164,7 +2479,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
-    const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    // A refresh handing other images' units over to this one (see Refresh): their results are not
+    // in guest memory, so no copy of it vouches for the image.
+    const bool handingOver = handOverUpload != nullptr;
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
         if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
@@ -2190,7 +2508,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        if (handingOver || GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
         } else {
@@ -2198,6 +2516,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
+        lastUploadPath = 0;
         static const bool recordClear = std::getenv("APS5_NO_RECORDED_CLEAR") == nullptr;
         auto* recorder = recordClear ? Recorder::Active() : nullptr;
         std::unique_ptr<CommandBatch> batch;
@@ -2242,20 +2561,44 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadClear, start);
         return;
     }
+    // The keys a hand-over was decided under changed before the upload read them: the handed units
+    // are stored first, as without the hand-over, and the upload reads them from guest memory.
+    if (handingOver && uploadedKeys != handOverUpload->keys) {
+        Census().fallbacks.fetch_add(1, std::memory_order_relaxed);
+        const auto previousFilters = std::exchange(handOverFilters, nullptr);
+        static_cast<void>(FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage refresh", PublishScope::None));
+        handOverFilters = previousFilters;
+        now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    }
+    const bool keysHeld = !handingOver || uploadedKeys == handOverUpload->keys;
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+        if (handingOver || GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
         } else {
             captureGuestBytes(layers);
         }
         stampLayers(true);
+        lastUploadPath = 1;
+        // Units a hand-over takes on the device are detiled from its buffer (Refresh retiled them
+        // into it), the others from the import or its unit shadow as before.
+        const auto* device = keysHeld && handingOver && handOverUpload->buffer != nullptr && blockUnits && handOverUpload->units != nullptr && handOverUpload->units->size() == trackedLayers ? handOverUpload : nullptr;
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
         // layout yet); a partial one always does.
-        if (blockUnits && (layers != nullptr || AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)))) {
+        if (blockUnits && (layers != nullptr || device != nullptr || AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)))) {
             std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
-            if (layers != nullptr) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> deviceRuns;
+            if (device != nullptr) {
+                std::vector<bool> fromImport(trackedLayers, false), fromDevice(trackedLayers, false);
+                for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                    if (layers != nullptr && !(*layers)[unit]) continue;
+                    forgetBorrowed(unit, 1);
+                    ((*device->units)[unit] ? fromDevice : fromImport)[unit] = true;
+                }
+                runs = unitRuns(fromImport);
+                deviceRuns = unitRuns(fromDevice);
+            } else if (layers != nullptr) {
                 for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
                     if ((*layers)[unit]) forgetBorrowed(unit, 1);
                 }
@@ -2264,8 +2607,18 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 forgetBorrowed(0, trackedLayers);
                 runs.emplace_back(0, guestBytes);
             }
-            const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
-            countStorageUpload(1, uploadedBytes);
+            std::uint64_t uploadedBytes = 0;
+            if (!runs.empty()) {
+                uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0 && deviceRuns.empty());
+                countStorageUpload(1, uploadedBytes);
+            }
+            if (!deviceRuns.empty()) {
+                const auto previousReason = std::exchange(uploadReason, "handover");
+                const auto deviceBytes = uploadUnitsFrom({device->buffer, device->base}, deviceRuns);
+                countStorageUpload(3, deviceBytes);
+                uploadReason = previousReason;
+                uploadedBytes += deviceBytes;
+            }
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
                 partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
@@ -2373,6 +2726,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     cancelStoredSaves();
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
+    lastUploadPath = 2;
     original.resize(static_cast<std::size_t>(guestBytes));
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
@@ -3249,7 +3603,13 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
+    // New results of this image: what it handed over to other images is no longer what they hold
+    // (their next refresh decides again, see voidHandedTo).
+    if (!handedTo.empty()) voidHandedTo();
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
+    // This image's results now cover the units other images handed over to it: its write-back
+    // stores every byte of them, so theirs are dead (supersedeHandedFrom).
+    if (!handedFrom.empty()) supersedeHandedFrom(first, count);
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -3353,6 +3713,20 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
                     continue;
+                }
+                // The refresh on this thread hands every pending unit of this image over the range
+                // over: nothing of it is stored (writeBack leaves the handed units out of the others).
+                if (const auto* handed = HandedUnitsOf(texture); handed != nullptr && !(texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed)) {
+                    bool storable = false;
+                    for (std::uint32_t layer = 0; layer < texture->trackedLayers && !storable; ++layer) {
+                        if (!texture->layerPending[layer] || (layer < handed->size() && (*handed)[layer])) continue;
+                        const auto begin = texture->layerBegin(layer);
+                        storable = address < begin + texture->layerBytes(layer) && begin < address + bytes;
+                    }
+                    if (!storable) {
+                        ++it;
+                        continue;
+                    }
                 }
                 texture->dirty = false;
                 if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
@@ -4526,6 +4900,450 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     return nullptr;
 }
 
+const std::vector<bool>& StorageTexture::wholeUnitsOf() {
+    if (wholeUnitsKnown) return wholeUnits;
+    wholeUnitsKnown = true;
+    wholeUnits.assign(blockUnits ? trackedLayers : 0u, false);
+    if (!blockUnits) return wholeUnits;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) wholeUnits[unit] = layerBytes(unit) == trackedLayerBytes;
+    const std::pair<std::uint64_t, std::uint64_t> whole{0, guestBytes};
+    for (const auto& [begin, end] : uncoveredBytes(std::span(&whole, 1))) {
+        for (auto unit = begin / trackedLayerBytes; unit < trackedLayers && unit * trackedLayerBytes < end; ++unit) wholeUnits[static_cast<std::size_t>(unit)] = false;
+    }
+    return wholeUnits;
+}
+
+std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const StorageTexture* alias, AliasHandOverMode mode, DccKeys& keys) {
+    keys = DccKeys::Uncompressed;
+    std::vector<HandOver> handOvers;
+    auto& census = Census();
+    if (!blockUnits || mode == AliasHandOverMode::Off) return handOvers;
+    // Where this image's content will come from: its keys' clear (the units' bytes unread), or, on
+    // the device, the bytes the store of the units would write (uncompressed keys over an import).
+    bool device = false;
+    if (descriptor.dccAddress != 0) {
+        const auto proved = ProvedKeys();
+        VkClearColorValue clear{};
+        if (IsDccClear(proved) && ClearColorFor(storageFormat, proved, clear)) keys = proved;
+        else if (proved == DccKeys::Uncompressed && mode == AliasHandOverMode::All) device = true;
+        else {
+            census.refusals[RefusedKeys].fetch_add(1, std::memory_order_relaxed);
+            return handOvers;
+        }
+    } else if (mode == AliasHandOverMode::All) {
+        device = true;
+    } else {
+        census.refusals[RefusedKeys].fetch_add(1, std::memory_order_relaxed);
+        return handOvers;
+    }
+    if (device && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
+        census.refusals[RefusedNotImported].fetch_add(1, std::memory_order_relaxed);
+        return handOvers;
+    }
+    const auto& whole = wholeUnitsOf();
+    std::vector<std::shared_ptr<StorageTexture>> sources;
+    {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        for (auto* texture : pending.textures) {
+            if (texture == this || texture == alias || !texture->blockUnits || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            // An image under a clear code stores whole (and its keys): never handed over.
+            if (texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed) continue;
+            if (auto alive = texture->weak_from_this().lock()) sources.push_back(std::move(alive));
+        }
+    }
+    if (sources.empty()) return handOvers;
+    // On the device a unit's store must write all of it: nothing stamped it since its generation
+    // (one uncached walk over the surface, as a store's keep decision makes it).
+    if (device) GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    const auto end = descriptor.baseAddress + guestBytes;
+    for (const auto& source : sources) {
+        HandOver handOver{source, source->version, {}, device};
+        const auto* theirWhole = device ? &source->wholeUnitsOf() : nullptr;
+        for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) {
+            if (!source->layerPending[unit]) continue;
+            const auto begin = source->layerBegin(unit);
+            const auto unitEnd = begin + source->layerBytes(unit);
+            if (unitEnd <= descriptor.baseAddress || begin >= end) continue;
+            if (source->layerBytes(unit) != 65536 || begin < descriptor.baseAddress || begin + 65536 > end) {
+                census.refusals[RefusedNotInside].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            const auto mine = static_cast<std::uint32_t>((begin - descriptor.baseAddress) / 65536);
+            if (mine >= whole.size() || !whole[mine]) {
+                census.refusals[RefusedTakerPartial].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (layerPending[mine]) {
+                census.refusals[RefusedTakerPending].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (device) {
+                if (unit >= theirWhole->size() || !(*theirWhole)[unit]) {
+                    census.refusals[RefusedSourcePartial].fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (source->layerGeneration[unit] == 0 || source->keptAtUnwatchHolds(begin, unit) || !GuestMemory::UnchangedSince(begin, 65536, source->layerGeneration[unit])) {
+                    census.refusals[RefusedSourceChanged].fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+            }
+            handOver.units.emplace_back(unit, mine);
+        }
+        if (!handOver.units.empty()) handOvers.push_back(std::move(handOver));
+    }
+    if (device && !handOvers.empty()) {
+        // A mip tail block holds several levels: taken on the device all or nothing.
+        std::vector<bool> handed(trackedLayers, false);
+        for (const auto& handOver : handOvers) {
+            for (const auto& [theirs, mine] : handOver.units) handed[mine] = true;
+        }
+        std::vector<bool> refused(trackedLayers, false);
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                if (!geometry.HasLayer(level, layer) || !mips[level].tail) continue;
+                const auto begin = geometry.GuestLayerOffset(layer) + mips[level].tiledOffset;
+                const auto first = static_cast<std::uint32_t>(begin / 65536);
+                const auto last = static_cast<std::uint32_t>(std::min<std::uint64_t>((begin + mips[level].tiledSize - 1) / 65536, trackedLayers - 1u));
+                bool all = true, any = false;
+                for (auto unit = first; unit <= last; ++unit) {
+                    all = all && handed[unit];
+                    any = any || handed[unit];
+                }
+                if (any && !all) {
+                    for (auto unit = first; unit <= last; ++unit) refused[unit] = true;
+                }
+            }
+        }
+        for (auto& handOver : handOvers) std::erase_if(handOver.units, [&](const std::pair<std::uint32_t, std::uint32_t>& pair) { return refused[pair.second]; });
+        std::erase_if(handOvers, [](const HandOver& handOver) { return handOver.units.empty(); });
+    }
+    return handOvers;
+}
+
+void StorageTexture::retileUnitsTo(const DeviceUnits& target, const std::vector<std::uint32_t>& units) {
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    std::vector<bool> selected(trackedLayers, false);
+    for (const auto unit : units) selected[unit] = true;
+    const auto runs = unitRuns(selected);
+    auto windows = sliceWindows(runs);
+    Require(!windows.empty(), "a device hand-over retiles no unit");
+    std::vector<std::uint64_t> linearPositions, scratchPositions;
+    std::uint64_t linearTotal = 0, scratchTotal = 0;
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        const auto& window = windows[i];
+        linearPositions.push_back(linearTotal);
+        linearTotal += (window.linearBytes + 255) & ~std::uint64_t{255};
+        std::size_t shared = 0;
+        while (shared < i && (windows[shared].tiledBegin != window.tiledBegin || windows[shared].tiledEnd != window.tiledEnd)) ++shared;
+        if (shared < i) {
+            scratchPositions.push_back(scratchPositions[shared]);
+            continue;
+        }
+        scratchPositions.push_back(scratchTotal);
+        scratchTotal += (window.tiledEnd - window.tiledBegin + 255) & ~std::uint64_t{255};
+    }
+    std::vector<VkBufferCopy> copies;
+    std::uint64_t bytes = 0;
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        const auto& window = windows[i];
+        if (i != 0 && scratchPositions[i] == scratchPositions[i - 1]) continue;
+        for (const auto& [from, to] : runs) {
+            const auto begin = std::max(from, window.tiledBegin);
+            const auto stop = std::min(to, window.tiledEnd);
+            if (begin >= stop) continue;
+            const auto guest = descriptor.baseAddress + begin;
+            Require(guest >= target.base && guest + (stop - begin) <= target.base + target.buffer->Size(), "a device hand-over retiles outside its buffer");
+            copies.push_back({scratchPositions[i] + (begin - window.tiledBegin), guest - target.base, stop - begin});
+            bytes += stop - begin;
+        }
+    }
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "a device hand-over needs the recorder");
+    const bool direct = singlePass();
+    auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    auto tiledScratch = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    detiler.BeginBatch();
+    const auto commands = recorder->Commands();
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+    if (linear) recorder->Keep(linear, linear->Size());
+    recorder->Keep(tiledScratch, tiledScratch->Size());
+    recorder->Keep(target.buffer, target.buffer->Size());
+    if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
+    Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, direct ? 3 : 4);
+    if (Recorder::BarrierValidate()) {
+        const std::pair<VkImage, bool> read{image, false};
+        recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{{}, {}, std::span(&read, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSource.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.image = image;
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    const VkMemoryBarrier scratchReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+    if (direct) {
+        VkImageMemoryBarrier toRead = toSource;
+        toRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        toRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &scratchReady, 0, nullptr, 1, &toRead);
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& window = windows[i];
+            auto retile = window.window;
+            retile.pipeBankXor = descriptor.pipeBankXor;
+            detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, tiledScratch->Handle(), scratchPositions[i], elementLayerView(window.level, window.layer), mips[window.level], true, window.layer, retile);
+        }
+        singlePassMoves.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        std::vector<VkBufferImageCopy> regions;
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            for (auto region : windows[i].regions) {
+                region.bufferOffset += linearPositions[i];
+                regions.push_back(region);
+            }
+        }
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &scratchReady, 1, &linearRead, 0, nullptr);
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& window = windows[i];
+            auto retile = window.window;
+            retile.pipeBankXor = descriptor.pipeBankXor;
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, retile);
+        }
+    }
+    const VkMemoryBarrier scratchDone{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
+    context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, tiledScratch->Handle(), target.buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+    VkImageMemoryBarrier backToGeneral = toSource;
+    backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    const VkMemoryBarrier copied{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &copied, 0, nullptr, direct ? 0u : 1u, &backToGeneral);
+    recorder->EndGpuTiming(timing, bytes);
+}
+
+std::uint64_t StorageTexture::uploadUnitsFrom(const DeviceUnits& source, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    auto windows = sliceWindows(runs);
+    Require(!windows.empty(), "a device hand-over uploads no unit");
+    std::vector<std::uint64_t> positions;
+    std::uint64_t linearTotal = 0, uploadedBytes = 0;
+    for (const auto& window : windows) {
+        positions.push_back(linearTotal);
+        linearTotal += (window.linearBytes + 255) & ~std::uint64_t{255};
+        Require(descriptor.baseAddress + window.tiledBegin >= source.base && descriptor.baseAddress + window.tiledEnd <= source.base + source.buffer->Size(), "a device hand-over reads outside its buffer");
+    }
+    for (const auto& [begin, end] : runs) uploadedBytes += end - begin;
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "a device hand-over needs the recorder");
+    const bool direct = singlePass();
+    auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    detiler.BeginBatch();
+    const auto commands = recorder->Commands();
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+    if (linear) recorder->Keep(linear, linear->Size());
+    recorder->Keep(source.buffer, source.buffer->Size());
+    if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
+    Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, direct ? 2 : 3);
+    if (Recorder::BarrierValidate()) {
+        const std::pair<VkImage, bool> written{image, true};
+        recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    // As a slab piece (uploadWindows): the window's first tiled byte at its offset in the buffer.
+    const auto offsetOf = [&](const SliceWindow& window) { return descriptor.baseAddress + window.tiledBegin - source.base; };
+    if (direct) {
+        recordDirectUploadBarrier(commands, false);
+        for (const auto& window : windows) {
+            auto detile = window.window;
+            detile.pipeBankXor = descriptor.pipeBankXor;
+            detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source.buffer->Handle(), offsetOf(window), elementLayerView(window.level, window.layer), mips[window.level], false, window.layer, detile);
+        }
+        recordDirectUploadDone(commands);
+        singlePassMoves.fetch_add(1, std::memory_order_relaxed);
+        recorder->EndGpuTiming(timing, uploadedBytes);
+        return uploadedBytes;
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    std::vector<VkBufferImageCopy> regions;
+    for (std::size_t i = 0; i < windows.size(); ++i) {
+        const auto& window = windows[i];
+        auto detile = window.window;
+        detile.pipeBankXor = descriptor.pipeBankXor;
+        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source.buffer->Handle(), offsetOf(window), linear->Handle(), positions[i], mips[window.level], false, window.layer, false, detile);
+        for (auto region : window.regions) {
+            region.bufferOffset += positions[i];
+            regions.push_back(region);
+        }
+    }
+    const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransfer.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = image;
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    VkImageMemoryBarrier toGeneral = toTransfer;
+    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    recorder->EndGpuTiming(timing, uploadedBytes);
+    return uploadedBytes;
+}
+
+void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t count) {
+    for (auto& handOver : handedFrom) {
+        auto source = handOver.image.lock();
+        std::size_t dropped = 0;
+        std::erase_if(handOver.units, [&](const std::pair<std::uint32_t, std::uint32_t>& pair) {
+            const auto [theirs, mine] = pair;
+            if (mine < first || mine >= first + count) return false;
+            // A source written since voided its hand-overs (voidHandedTo); gone or stored: nothing left.
+            if (source == nullptr || source->version != handOver.version || theirs >= source->trackedLayers || !source->layerPending[theirs]) return true;
+            source->layerPending[theirs] = false;
+            source->layerOriginal[theirs] = false;
+            source->cancelStoredSave(theirs);
+            if (supersededUnits.size() != trackedLayers) supersededUnits.assign(trackedLayers, false);
+            supersededUnits[mine] = true;
+            ++dropped;
+            return true;
+        });
+        if (dropped != 0) {
+            source->reconcilePending();
+            Census().superseded.fetch_add(dropped, std::memory_order_relaxed);
+        }
+    }
+    std::erase_if(handedFrom, [](const HandOver& handOver) { return handOver.units.empty(); });
+}
+
+void StorageTexture::voidHandedTo() {
+    std::size_t voided = 0;
+    for (const auto& weak : handedTo) {
+        const auto taker = weak.lock();
+        if (taker == nullptr) continue;
+        std::erase_if(taker->handedFrom, [&](const HandOver& handOver) {
+            if (handOver.image.lock().get() != this) return false;
+            voided += handOver.units.size();
+            return true;
+        });
+    }
+    handedTo.clear();
+    // The takers' refresh proofs counted the handed units as theirs; they decide again.
+    if (voided != 0) {
+        Census().voided.fetch_add(voided, std::memory_order_relaxed);
+        BumpPendingSerial();
+    }
+}
+
+std::size_t StorageTexture::dropPendingOverForSkip(const StorageTexture* alias) {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    std::size_t dropped = 0;
+    const auto begin = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    for (auto it = pending.textures.MayOverlap(begin, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
+        auto* texture = *it;
+        if (texture == this || texture == alias || !texture->overlaps(begin, bytes)) {
+            ++it;
+            continue;
+        }
+        // The units the refresh's flush would store (writeBack's selection), dropped instead.
+        const bool whole = texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed;
+        for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+            if (!texture->layerPending[unit]) continue;
+            if (!whole && !(begin < texture->layerBegin(unit) + texture->layerBytes(unit) && texture->layerBegin(unit) < begin + bytes)) continue;
+            texture->layerPending[unit] = false;
+            texture->layerOriginal[unit] = false;
+            texture->cancelStoredSave(unit);
+            ++dropped;
+        }
+        if (!texture->anyLayerPending()) {
+            texture->dirty = false;
+            it = pending.textures.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    if (dropped != 0) BumpPendingSerial();
+    return dropped;
+}
+
+void StorageTexture::verifyDeviceHandOvers(const std::vector<HandOver>& handOvers) {
+    auto* recorder = Recorder::Active();
+    const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (recorder == nullptr || import == nullptr) return;
+    for (const auto& handOver : handOvers) {
+        auto source = handOver.image.lock();
+        if (!handOver.device || source == nullptr || handOver.units.empty()) continue;
+        // The source's results, retiled as the device hand-over would take them, and the bytes
+        // this image's upload reads after the eager store just made: they must be equal.
+        std::uint32_t firstMine = trackedLayers, lastMine = 0;
+        std::vector<std::uint32_t> theirs;
+        std::vector<bool> mineUnits(trackedLayers, false);
+        for (const auto& [unitTheirs, unitMine] : handOver.units) {
+            theirs.push_back(unitTheirs);
+            mineUnits[unitMine] = true;
+            firstMine = std::min(firstMine, unitMine);
+            lastMine = std::max(lastMine, unitMine);
+        }
+        DeviceUnits target{std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(layerBegin(lastMine) + 65536 - layerBegin(firstMine)), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT), layerBegin(firstMine)};
+        source->retileUnitsTo(target, theirs);
+        const auto runs = unitRuns(mineUnits);
+        std::uint64_t total = 0;
+        for (const auto& [begin, end] : runs) total += end - begin;
+        auto readback = std::make_shared<Buffer>(context, static_cast<std::size_t>(2 * total), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto sources = ShadowSources(context, *import, descriptor.baseAddress, runs, {}, false);
+        const auto commands = recorder->Commands();
+        recorder->Keep(readback);
+        recorder->Keep(target.buffer, target.buffer->Size());
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+        // Packed: run after run, the device bytes in the first half, the upload's in the second.
+        std::uint64_t packed = 0;
+        std::vector<VkBufferCopy> fromDevice;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> packedRuns;
+        for (const auto& [begin, end] : runs) {
+            fromDevice.push_back({descriptor.baseAddress + begin - target.base, packed, end - begin});
+            packedRuns.emplace_back(begin, packed);
+            packed += end - begin;
+        }
+        copyBuffer(commands, target.buffer->Handle(), readback->Handle(), static_cast<std::uint32_t>(fromDevice.size()), fromDevice.data());
+        for (const auto& piece : sources) {
+            if (piece.slab != nullptr) recorder->Keep(piece.slab);
+            auto run = std::upper_bound(packedRuns.begin(), packedRuns.end(), piece.begin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& entry) { return value < entry.first; });
+            Require(run != packedRuns.begin(), "a verified device hand-over piece lies before its runs");
+            --run;
+            const VkBufferCopy copy{piece.offset, total + run->second + (piece.begin - run->first), piece.end - piece.begin};
+            copyBuffer(commands, piece.buffer, readback->Handle(), 1, &copy);
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        const auto units = static_cast<std::uint64_t>(theirs.size());
+        recorder->OnComplete([readback, total, units] {
+            const auto bytes = readback->Bytes();
+            auto& census = Census();
+            census.verifiedUnits.fetch_add(units, std::memory_order_relaxed);
+            for (std::uint64_t at = 0; at < total; at += 65536) {
+                const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(65536, total - at));
+                if (std::memcmp(bytes.data() + at, bytes.data() + total + at, length) != 0) census.verifyMismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+}
+
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
     if (borrowedUnits.empty()) return;
     for (auto unit = first; unit < first + count && unit < borrowedUnits.size(); ++unit) borrowedUnits[unit] = false;
@@ -4639,6 +5457,16 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
             coalescedWriteBacks.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    // Units the refresh on this thread hands over stay pending (see FlushPending).
+    if (const auto* handed = whole ? nullptr : HandedUnitsOf(this)) {
+        for (std::uint32_t layer = 0; layer < trackedLayers && layer < handed->size(); ++layer) {
+            if ((*handed)[layer]) layers[layer] = false;
+        }
+        if (std::none_of(layers.begin(), layers.end(), [](bool chosen) { return chosen; })) {
+            reconcilePending();
+            return;
+        }
+    }
     writeBackLayers(layers);
 }
 
@@ -4750,6 +5578,28 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
     }
+    // The alias hand-over's one deviation class (see ALIAS report): a unit whose results a
+    // hand-over kept out of guest memory, now left to a CPU store that landed meanwhile (the keep
+    // rule above), would have kept the CPU's bytes over those results instead. Counted, not changed.
+    if (!handedTo.empty() || !supersededUnits.empty()) {
+        std::vector<bool> handed(trackedLayers, false);
+        for (const auto& weak : handedTo) {
+            const auto taker = weak.lock();
+            if (taker == nullptr) continue;
+            for (const auto& handOver : taker->handedFrom) {
+                if (handOver.image.lock().get() != this) continue;
+                for (const auto& [theirs, mine] : handOver.units) {
+                    if (theirs < trackedLayers) handed[theirs] = true;
+                }
+            }
+        }
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!layers[layer]) continue;
+            const bool superseded = layer < supersededUnits.size() && supersededUnits[layer];
+            if (skippedLayer[layer] && (handed[layer] || superseded)) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
+            if (superseded) supersededUnits[layer] = false;
+        }
+    }
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
     static const bool traceKept = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (traceKept && skippedAny) {
@@ -4760,7 +5610,33 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // its stamps cover.
     const auto firstBlock = firstStored / block;
     const auto lastBlock = (lastStored - 1) / block;
-    const auto adjacent = adjacentPendingUnchanged(firstBlock, lastBlock);
+    auto adjacent = adjacentPendingUnchanged(firstBlock, lastBlock);
+    // Units of this image handed over to another one (see Refresh) stored now, a reader having come
+    // before the taker's own write: the taker's content does not depend on their bytes (cleared
+    // under its keys) or holds them already (taken on the device), so its units are advanced past
+    // this store's stamps like an adjacent pending image's, when nothing else changed them since
+    // its generation and this image still holds the results it handed over.
+    if (!handedTo.empty()) {
+        std::erase_if(handedTo, [](const std::weak_ptr<StorageTexture>& taker) { return taker.expired(); });
+        for (const auto& weak : handedTo) {
+            auto taker = weak.lock();
+            if (taker == nullptr) continue;
+            for (const auto& handOver : taker->handedFrom) {
+                if (handOver.image.lock().get() != this) continue;
+                for (const auto& [theirs, mine] : handOver.units) {
+                    if (theirs >= layers.size() || !layers[theirs] || !layerPending[theirs] || mine >= taker->trackedLayers) continue;
+                    Census().storedLater.fetch_add(1, std::memory_order_relaxed);
+                    if (handOver.version != version) continue;
+                    const auto begin = taker->layerBegin(mine);
+                    const auto bytes = static_cast<std::size_t>(taker->layerBytes(mine));
+                    GuestMemory::CollectWritesUncached(begin, bytes);
+                    if (!GuestMemory::UnchangedSince(begin, bytes, taker->layerGeneration[mine])) continue;
+                    adjacent.push_back({taker, mine, taker->layerGeneration[mine]});
+                    Census().takerAdvanced.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
     // After the store: the stored layers are in sync at a fresh generation unless blocks were kept
     // for the CPU (then the layer is stale there, keeps its old generation and re-uploads at its
     // next use); their results are no longer pending either way. The collect covers the stored

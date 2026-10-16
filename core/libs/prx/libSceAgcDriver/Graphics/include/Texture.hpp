@@ -23,10 +23,51 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class DeviceBuffer;
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
 struct HostImport;
+
+// What a storage-cache lookup refreshes its image for (StorageTexture::Refresh): the [alias] census
+// splits the storage-refresh flushes by it, and only a lookup whose own command writes the image (a
+// dispatch's written storage image, a draw's color target) may leave another image's results
+// pending under it (the alias hand-over below): that command's write then supersedes them.
+enum class RefreshUse : std::uint8_t { Read, DispatchWrite, DrawTarget };
+class RefreshUseScope {
+public:
+    explicit RefreshUseScope(RefreshUse use);
+    ~RefreshUseScope();
+    RefreshUseScope(const RefreshUseScope&) = delete;
+    RefreshUseScope& operator=(const RefreshUseScope&) = delete;
+
+private:
+    RefreshUse previous;
+};
+
+// Lab switches of the storage-refresh flush (read once; the tests set the mode directly):
+// APS5_LAB_ALIAS_HANDOVER=1 (All) or =clear (Clear) leaves the pending units of an image A that a
+// refreshed surface B covers whole pending instead of storing them, where B's content does not come
+// from guest memory (Clear: B's DCC keys are a clear code; All also: B takes them on the device);
+// APS5_LAB_ALIAS_SKIP=1 drops them unstored (an upper bound, NOT exact); APS5_LAB_ALIAS_VERIFY=1
+// keeps the eager order and checks the hand-over's device bytes against what B's upload reads.
+enum class AliasHandOverMode : std::uint8_t { Off, Clear, All };
+void SetAliasHandOverForTests(AliasHandOverMode mode);
+// Cumulative counts (relaxed), for the tests and the [alias] line.
+struct AliasHandOverCounts {
+    std::uint64_t handedOver = 0;
+    std::uint64_t deviceUnits = 0;
+    std::uint64_t superseded = 0;
+    std::uint64_t storedLater = 0;
+    std::uint64_t takerAdvanced = 0;
+    std::uint64_t voided = 0;
+    std::uint64_t fallbacks = 0;
+    std::uint64_t keptForCpu = 0;
+    std::uint64_t skippedUnits = 0;
+    std::uint64_t verifiedUnits = 0;
+    std::uint64_t verifyMismatches = 0;
+};
+AliasHandOverCounts TakeAliasHandOverCounts();
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
@@ -355,6 +396,42 @@ public:
 
 private:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    // The alias hand-over (APS5_LAB_ALIAS_HANDOVER, see the switches above). Held by the taker B:
+    // units (A's, B's) of the pending image A that B's refresh left pending, at A's version then;
+    // `device`: B took them on the device (A's retiled bytes, detiled into B), `held`: from an
+    // earlier refresh, B's content still the one taken then (`takerVersion`). A unit is handed over
+    // only when it lies inside B, B's elements cover all of it (B's write-back stores it whole) and B
+    // holds no results of its own there; on the device also when A's elements cover all of it and
+    // nothing stamped it since A's generation. A's write of its own voids its hand-overs
+    // (voidHandedTo); B's write supersedes them (supersedeHandedFrom: A's units are dropped); a
+    // store of them first (any reader) advances B's units past its stamps (writeBackLayers).
+    struct HandOver {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t version = 0;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> units;
+        bool device = false;
+        std::uint64_t takerVersion = 0;
+        bool held = false;
+    };
+    std::vector<HandOver> handOversUnder(const StorageTexture* alias, AliasHandOverMode mode, DccKeys& keys);
+    struct DeviceUnits {
+        std::shared_ptr<DeviceBuffer> buffer;
+        std::uint64_t base = 0;
+    };
+    // Records A's results of the units into `target` as its store would write them (tiled bytes at
+    // their guest offsets from target.base), and B's detile of the runs from such a buffer.
+    void retileUnitsTo(const DeviceUnits& target, const std::vector<std::uint32_t>& units);
+    std::uint64_t uploadUnitsFrom(const DeviceUnits& source, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
+    void supersedeHandedFrom(std::uint32_t first, std::uint32_t count);
+    void voidHandedTo();
+    // Per tracked unit: a whole 64 KiB block every byte of which an element of the surface holds.
+    const std::vector<bool>& wholeUnitsOf();
+    // APS5_LAB_ALIAS_SKIP: drops the pending units of the other images over this surface (except
+    // `alias`) unstored; returns how many.
+    std::size_t dropPendingOverForSkip(const StorageTexture* alias);
+    // APS5_LAB_ALIAS_VERIFY: after the eager flush, compares A's device bytes of the units a device
+    // hand-over would take with the bytes this image's upload reads (recorded, checked at completion).
+    void verifyDeviceHandOvers(const std::vector<HandOver>& handOvers);
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
@@ -457,7 +534,9 @@ private:
     void refreshGeneration();
     bool refreshProved();
     void takeRefreshProof(bool aliased);
-    bool otherPendingOverlaps() const;
+    // `exceptHandOvers`: an image whose every pending unit over this surface is handed over to it
+    // (at the version it had then) does not count.
+    bool otherPendingOverlaps(bool exceptHandOvers = false) const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -617,6 +696,14 @@ private:
     // The generation at which a one-layer FillClear was refused as 'surface changed': the check
     // fails again until `generation` moves, so ClassifyFill skips the layer match meanwhile.
     std::uint64_t layerRefusedGeneration = ~0ull;
+    // The alias hand-over (see HandOver; under GuestMemory::GpuMutex): what this image took over as
+    // B, the images it handed units to as A, and the units its own results superseded since its
+    // last write-back (the [alias] check that the write-back then stores them whole).
+    std::vector<bool> wholeUnits;
+    bool wholeUnitsKnown = false;
+    std::vector<HandOver> handedFrom;
+    std::vector<std::weak_ptr<StorageTexture>> handedTo;
+    std::vector<bool> supersededUnits;
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome
