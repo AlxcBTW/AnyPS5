@@ -1,0 +1,5 @@
+name=guestcrash-prio
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-guestcrash-prio-cb3ce18da2-260289
