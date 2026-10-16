@@ -143,8 +143,15 @@ int main() {
         }
         GuestSurface whole(false);
         GuestSurface split(true);
+        const auto countTexels = [](const std::uint8_t* base) {
+            std::size_t n = 0;
+            for (std::size_t at = 0; at < SurfaceBytes; at += 8) n += !std::all_of(base + at, base + at + 8, [](std::uint8_t byte) { return byte == 0 || byte == Sentinel; });
+            return n;
+        };
         Write(whole.Data());
+        std::fprintf(stderr, "diag: after the first Write: whole %zu texels, split %zu texels\n", countTexels(whole.Data()), countTexels(split.Data()));
         Write(split.Data());
+        std::fprintf(stderr, "diag: after the second Write: whole %zu texels, split %zu texels\n", countTexels(whole.Data()), countTexels(split.Data()));
         const auto* expected = whole.Data();
         const auto* stored = split.Data();
         const auto texel = [](const std::uint8_t* at) { return !std::all_of(at, at + 8, [](std::uint8_t byte) { return byte == 0 || byte == Sentinel; }); };
