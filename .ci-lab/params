@@ -1,0 +1,5 @@
+name=pr-main
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr-main-bc3c0fc13c-42739
