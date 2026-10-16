@@ -47,7 +47,7 @@ struct Module {
     bool position = false;
     std::uint32_t clipDistances = 0;
     std::uint32_t cullDistances = 0;
-    bool primitiveIndices = false;
+    std::uint32_t primitiveIndices = 0;
     bool fragmentBarycentric = false;
     bool layerOutput = false;
     std::map<std::uint32_t, std::vector<std::uint32_t>> modes;
@@ -134,8 +134,9 @@ struct Module {
                 Require(input && ((value == spv::BuiltInPosition && signature == "f32x4") || (value == spv::BuiltInTessCoord && stage == Stage::TessellationEvaluation && signature == "f32x3") || ((value == spv::BuiltInInvocationId || value == spv::BuiltInPrimitiveId || value == spv::BuiltInPatchVertices) && (signature == "i32" || signature == "u32"))), "unsupported tessellation built-in");
                 return;
             }
-            if (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT) primitiveIndices = true;
-            Require((input && ((value == spv::BuiltInWorkgroupId || value == spv::BuiltInLocalInvocationId || value == spv::BuiltInGlobalInvocationId || value == spv::BuiltInNumWorkgroups) && signature == "u32x3")) || (input && value == spv::BuiltInLocalInvocationIndex && signature == "u32") || (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT && signature == "u32x3") || (!input && value == spv::BuiltInCullPrimitiveEXT && signature == "bool") || (!input && value == spv::BuiltInLayer && signature == "u32"), "unsupported mesh built-in");
+            if (!input && value == spv::BuiltInPrimitiveLineIndicesEXT) primitiveIndices = 2u;
+            if (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT) primitiveIndices = 3u;
+            Require((input && ((value == spv::BuiltInWorkgroupId || value == spv::BuiltInLocalInvocationId || value == spv::BuiltInGlobalInvocationId || value == spv::BuiltInNumWorkgroups) && signature == "u32x3")) || (input && value == spv::BuiltInLocalInvocationIndex && signature == "u32") || (!input && value == spv::BuiltInPrimitiveLineIndicesEXT && signature == "u32x2") || (!input && value == spv::BuiltInPrimitiveTriangleIndicesEXT && signature == "u32x3") || (!input && value == spv::BuiltInCullPrimitiveEXT && signature == "bool") || (!input && value == spv::BuiltInLayer && signature == "u32"), "unsupported mesh built-in");
             return;
         }
         const auto signature = Signature(type);
@@ -437,7 +438,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         mode(spv::ExecutionModeLocalSize, {paired ? config.threadsPerGroup / 2u : config.threadsPerGroup, 1, 1});
         mode(spv::ExecutionModeOutputVertices, {config.maxVertices});
         mode(spv::ExecutionModeOutputPrimitivesEXT, {config.maxPrimitives});
-        mode(spv::ExecutionModeOutputTrianglesEXT, {});
+        mode(config.outputPrimitiveSize == 2u ? spv::ExecutionModeOutputLinesEXT : spv::ExecutionModeOutputTrianglesEXT, {});
         Require(module.modes.size() == 4, "unsupported mesh execution mode");
     } else if (control) {
         Require(state.rectList || state.stages.tessellation.has_value(), "tessellation configuration is missing");
@@ -486,7 +487,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             const auto length = module.constants.find(outer[3]);
             Require(length != module.constants.end() && length->second != 0, "invalid per-vertex interface array length");
             if (mesh) {
-                const bool primitive = decoration.perPrimitive || (decoration.builtin && (*decoration.builtin == spv::BuiltInPrimitiveTriangleIndicesEXT || *decoration.builtin == spv::BuiltInCullPrimitiveEXT));
+                const bool primitive = decoration.perPrimitive || (decoration.builtin && (*decoration.builtin == spv::BuiltInPrimitiveLineIndicesEXT || *decoration.builtin == spv::BuiltInPrimitiveTriangleIndicesEXT || *decoration.builtin == spv::BuiltInCullPrimitiveEXT));
                 Require(length->second == (primitive ? state.stages.mesh->maxPrimitives : state.stages.mesh->maxVertices), "mesh interface array disagrees with output limits");
             } else if (geometry) {
                 Require(length->second == 3u, "geometry interface array must hold the three vertices of a triangle");
@@ -594,7 +595,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
     Require(descriptors.size() == shader.bindings.size(), "recompiler binding metadata contains undeclared resources");
     Require(push == (!shader.pushConstants.empty() || mesh || (control && !rectListControl)), "recompiler push constant metadata disagrees with SPIR-V");
     for (const auto id : module.interface) Require(module.variables.contains(id), "entry point interface contains an unknown variable");
-    if (mesh) Require(module.primitiveIndices, "mesh shader does not export primitive indices");
+    if (mesh) Require(module.primitiveIndices == state.stages.mesh->outputPrimitiveSize, "mesh shader does not export primitive indices");
     if (stage == Stage::Vertex || mesh || evaluation || geometry) Require(module.position, "vertex shader does not export position");
     return module;
 }

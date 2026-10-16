@@ -658,6 +658,7 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(mesh.threadsPerGroup);
             add(mesh.ldsSizeDwords);
             add(mesh.provokingVertex);
+            add(mesh.outputPrimitiveSize);
         }
         add(state.stages.tessellation.has_value());
         if (state.stages.tessellation) {

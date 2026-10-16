@@ -303,6 +303,7 @@ struct MeshConfiguration {
     std::uint32_t ldsSizeDwords;
     std::uint32_t provokingVertex;
     std::uint32_t esgsItemSize = 0;
+    std::uint32_t outputPrimitiveSize = 3;
 };
 
 struct TessellationConfiguration {

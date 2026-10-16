@@ -820,6 +820,10 @@ void ShaderStageTests() {
         Require(state.stages.path == AgcDriver::Graphics::ShaderPath::Geometry && state.stages.vertexWaveSize == 32 && state.stages.mesh, "a fast-launch draw did not decode as wave32 geometry");
         const auto& mesh = *state.stages.mesh;
         Require(mesh.inputPrimitive == 1 && mesh.primitivesPerGroup == 1 && mesh.verticesPerGroup == 1 && mesh.maxVertices == 32 && mesh.maxPrimitives == 64 && mesh.threadsPerGroup == 64 && mesh.ldsSizeDwords == 128, "a fast-launch subgroup did not decode as one point amplified by PRIM_AMP_FACTOR");
+        fast.context[0x29b] = 1;
+        const auto fastLines = AgcDriver::Graphics::DecodeState(fast);
+        Require(fastLines.stages.mesh->outputPrimitiveSize == 2 && fastLines.stages.mesh->maxPrimitives == 64 && AgcDriver::Graphics::RasterPrimitiveOf(fastLines) == ShaderRecompiler::RasterPrimitive::Line, "a fast-launch line strip did not take its line count from PRIM_AMP_FACTOR");
+        fast.context[0x29b] = 2;
         fast.context[0x2d5] = 0x502030;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "unsupported geometry routing, fast launch or wave-ID state");
         fast.context[0x2d5] = 0x482030;
@@ -831,6 +835,40 @@ void ShaderStageTests() {
         fast.userConfig[0x242] = 1;
         fast.context[0x2d3] = 0;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(fast); }, "amplifies to no primitives");
+    }
+    {
+        auto lines = makeState();
+        lines.userConfig[0x242] = 1;
+        lines.context[0x2d5] = 0x2030;
+        lines.userConfig[0x25b] = 0x6633;
+        lines.context[0x1ff] = 255;
+        lines.context[0x2ce] = 5;
+        lines.context[0x29b] = 1;
+        lines.context[0x2ab] = 4;
+        lines.shader[0x8a] = 3u << 29u;
+        lines.shader[0x8b] = 3u << 16u;
+        auto state = AgcDriver::Graphics::DecodeState(lines);
+        Require(state.stages.path == AgcDriver::Graphics::ShaderPath::Geometry && state.stages.mesh && AgcDriver::Graphics::RasterPrimitiveOf(state) == ShaderRecompiler::RasterPrimitive::Line, "a geometry program that outputs line strips did not decode as geometry rasterized as lines");
+        auto mesh = *state.stages.mesh;
+        Require(mesh.inputPrimitive == 1 && mesh.primitivesPerGroup == 51 && mesh.verticesPerGroup == 51 && mesh.maxVertices == 255 && mesh.maxPrimitives == 255 && mesh.threadsPerGroup == 256 && mesh.outputPrimitiveSize == 2, "a line-strip subgroup did not decode as 51 points with a line slot per output vertex");
+        lines.context[0x29b] = 2;
+        state = AgcDriver::Graphics::DecodeState(lines);
+        mesh = *state.stages.mesh;
+        Require(mesh.maxPrimitives == 153 && mesh.threadsPerGroup == 256 && mesh.outputPrimitiveSize == 3 && AgcDriver::Graphics::RasterPrimitiveOf(state) == ShaderRecompiler::RasterPrimitive::Triangle, "the triangle-strip subgroup of the same draw changed");
+        lines.context[0x29b] = 1;
+        lines.context[0x2ce] = 1;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "unsupported geometry input or output assembly");
+        lines.context[0x2ce] = 5;
+        for (const auto output : {0u, 3u, 0x80000001u, 0x101u}) {
+            lines.context[0x29b] = output;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a line strip from a geometry program, is unsupported");
+        }
+        lines.userConfig[0x242] = 4;
+        lines.context[0x205] = 0x2a40;
+        lines.context[0x29b] = 2;
+        Require(AgcDriver::Graphics::DecodeState(lines).stages.mesh->primitivesPerGroup == 17, "triangle input with a triangle-strip output and a triangle polygon offset did not decode");
+        lines.context[0x29b] = 1;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(lines); }, "polygon mode, depth bias or nonstandard rasterization");
     }
     queue.context[0x2ab] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "invalid VGT_ESGS_RING_ITEMSIZE");
@@ -951,6 +989,9 @@ void NggVertexWorkgroupTests() {
         queue.context[0x2d5] = stages;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "requires PRIMGEN_EN without GS_EN, PRIMGEN_PASSTHRU_EN or tessellation");
     }
+    queue.context[0x2d5] = 0x12010;
+    queue.context[0x29b] = 1;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue, true); }, "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a line strip from a geometry program, is unsupported");
 }
 
 constexpr std::array<std::uint8_t, 8> IdentityExports{0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u, 0xe4u};
