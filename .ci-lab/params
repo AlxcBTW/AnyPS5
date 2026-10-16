@@ -1,0 +1,5 @@
+name=gpu-hz2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-hz2-07bb758f6d-164231
