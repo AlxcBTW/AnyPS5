@@ -2,4 +2,4 @@ name=cpu-fastproof-move
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-cpu-fastproof-move-91f661021b-134230
+artifact=lab-libs-cpu-fastproof-move-3fef5eca8a-138652
