@@ -1041,9 +1041,7 @@ std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
 }
 
 #ifdef _WIN32
-namespace {
 void forgetUnwatchedBlocks(WriteTracker& tracker, std::uint64_t address, std::size_t bytes);
-}
 
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
