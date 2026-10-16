@@ -64,8 +64,8 @@ struct AliasHandOverCounts {
     std::uint64_t fallbacks = 0;
     std::uint64_t keptForCpu = 0;
     std::uint64_t resurrected = 0;
-    // Of those, units whose memory had left the write watch: their guest bytes are saved at the
-    // resurrect, so a CPU store made after the range left the watch is not kept there.
+    // Of those, units whose memory had left the write watch since: stored with what was saved for
+    // them when it left (or, after an exit that runs no unwatch hook, with the bytes at the resurrect).
     std::uint64_t resurrectedUnwatched = 0;
     std::uint64_t supersededLost = 0;
     std::uint64_t skippedUnits = 0;
@@ -726,9 +726,17 @@ private:
         std::uint32_t unit = 0;
         // The image's content version then: an upload or hand-over into it since replaces what it holds.
         std::uint64_t imageVersion = 0;
+        // What saveBeforeUnwatch saves for a pending unit, saved for this one when its memory left the
+        // write watch (saveSupersededBeforeUnwatch): the guest bytes then, and the 64 KiB blocks the
+        // CPU wrote since the image's generation for the unit (kept at its store, the block rule).
+        bool savedAtUnwatch = false;
+        std::vector<std::byte> unwatchBytes;
+        std::vector<std::uint64_t> keptBlocks;
+        std::uint64_t savedGeneration = 0;
     };
     std::map<std::uint32_t, Superseded> supersededFrom;
     void resurrectSuperseded(const std::vector<std::uint32_t>& units);
+    void saveSupersededBeforeUnwatch();
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome

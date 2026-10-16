@@ -99,10 +99,11 @@ std::atomic<int> aliasModeOverride{-1};
 bool LabSwitch(const char* name) {
     const char* text = std::getenv(name);
     if (text == nullptr || *text == '\0') return false;
-    for (const char* off : {"0", "off", "false", "no"}) {
-        if (std::strcmp(text, off) == 0) return false;
+    std::string value(text);
+    for (auto& c : value) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
-    return true;
+    return value != "0" && value != "off" && value != "false" && value != "no";
 }
 AliasHandOverMode AliasMode() {
     const auto forced = aliasModeOverride.load(std::memory_order_relaxed);
@@ -3870,6 +3871,11 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
     if (overlapping.empty()) return;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     for (const auto& texture : overlapping) texture->saveBeforeUnwatch();
+    // Units of other images these images' results superseded (the alias hand-over) are not pending:
+    // what saveBeforeUnwatch saves for a pending unit is kept for them in the record.
+    for (const auto& texture : overlapping) {
+        if (!texture->supersededFrom.empty()) texture->saveSupersededBeforeUnwatch();
+    }
 }
 
 void StorageTexture::forgetKeptAtUnwatch(std::uint32_t unit) {
@@ -3929,6 +3935,41 @@ void StorageTexture::saveBeforeUnwatch() {
         }
         layerOriginal[unit] = true;
         cancelStoredSave(unit);
+    }
+}
+
+void StorageTexture::saveSupersededBeforeUnwatch() {
+    // A superseded unit is pending again when this image's results there die unstored under new
+    // clear keys (resurrectSuperseded); stored outside the watch then, it needs what saveBeforeUnwatch
+    // saves for a pending unit as its memory leaves the watch: the bytes now and the blocks the CPU
+    // wrote since its image's generation for it.
+    constexpr std::uint64_t block = 65536;
+    for (auto& entry : supersededFrom) {
+        auto& record = entry.second;
+        if (record.savedAtUnwatch) continue;
+        const auto source = record.image.lock();
+        if (source == nullptr || source->resultsVersion != record.version || source->version != record.imageVersion || record.unit >= source->trackedLayers || source->layerPending[record.unit]) continue;
+        const auto begin = source->layerBegin(record.unit);
+        const auto end = begin + source->layerBytes(record.unit);
+        record.unwatchBytes.resize(static_cast<std::size_t>(end - begin));
+        GuestMemory::ReadCommittedUnsynced(begin, std::span(record.unwatchBytes));
+        GuestMemory::CollectWritesUncached(begin, static_cast<std::size_t>(end - begin));
+        record.keptBlocks.clear();
+        record.savedGeneration = source->layerGeneration[record.unit];
+        if (record.savedGeneration != 0) {
+            const auto spanBegin = begin & ~(block - 1);
+            const auto spanBlocks = static_cast<std::size_t>((end - spanBegin + block - 1) / block);
+            const std::vector<std::uint64_t> generations(spanBlocks, record.savedGeneration);
+            std::vector<std::uint8_t> changedBlocks(spanBlocks);
+            if (!GuestMemory::ChangedBlocks(begin, static_cast<std::size_t>(end - begin), generations, changedBlocks)) continue;
+            for (auto at = spanBegin; at < end; at += block) {
+                const auto from = std::max(at, begin);
+                const auto to = std::min(at + block, end);
+                const bool edge = from != at || to != at + block;
+                if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), record.savedGeneration)) && !source->unchangedSinceBaseline(from, to)) record.keptBlocks.push_back(from);
+            }
+        }
+        record.savedAtUnwatch = true;
     }
 }
 
@@ -5314,6 +5355,13 @@ std::uint64_t StorageTexture::uploadUnitsFrom(const DeviceUnits& source, std::sp
 }
 
 void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t count) {
+    // The sources stay alive across the scan below and are released after it, outside the pending
+    // registry's lock (a last owner's destructor takes that lock) and after the GPU mutex (as in
+    // FlushPending).
+    std::vector<std::shared_ptr<StorageTexture>> sources;
+    for (const auto& handOver : handedFrom) {
+        if (auto source = handOver.image.lock()) sources.push_back(std::move(source));
+    }
     // Draws and dispatches hold the GPU mutex here already; a store on another thread must not run
     // while the units change hands.
     std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -5321,19 +5369,20 @@ void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t coun
     // mutex) would store nothing of the units superseded below, and its reader would see the bytes
     // from before the source's results: the source stores them now, as the eager order did before
     // this image's results (counted as stored later; the store advances this image's units).
-    std::vector<std::shared_ptr<StorageTexture>> claimed;
+    std::vector<StorageTexture*> claimed;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        for (const auto& handOver : handedFrom) {
-            auto source = handOver.image.lock();
-            if (source != nullptr && std::find(pending.flushing.begin(), pending.flushing.end(), source.get()) != pending.flushing.end()) claimed.push_back(std::move(source));
+        for (const auto& source : sources) {
+            if (std::find(pending.flushing.begin(), pending.flushing.end(), source.get()) != pending.flushing.end()) claimed.push_back(source.get());
         }
     }
     if (!claimed.empty()) {
-        const auto previous = std::exchange(flushReason, "storage refresh");
-        for (const auto& source : claimed) source->writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-        flushReason = previous;
+        struct Reason {
+            const char* previous;
+            ~Reason() { flushReason = previous; }
+        } reason{std::exchange(flushReason, "storage refresh")};
+        for (auto* source : claimed) source->writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     }
     for (auto& handOver : handedFrom) {
         auto source = handOver.image.lock();
@@ -5400,14 +5449,24 @@ void StorageTexture::resurrectSuperseded(const std::vector<std::uint32_t>& units
         const auto begin = source->layerBegin(record.unit);
         const auto bytes = source->layerBytes(record.unit);
         if (!GuestMemory::Watched(begin, static_cast<std::size_t>(bytes))) {
-            // The memory left the write watch since the supersede (SaveBeforeUnwatch saves the bytes
-            // under pending units only, and this one was not pending): outside the watch a store
-            // compares guest memory with the bytes saved before the results, so they are saved now,
-            // read as saveBeforeUnwatch reads them. A CPU store into the unit after the range left
-            // the watch is overwritten then; counted apart.
+            // The memory left the write watch since the supersede: outside the watch a store compares
+            // guest memory with the bytes saved before the results and keeps the blocks the CPU wrote
+            // before the range left the watch (keptAtUnwatch). SaveBeforeUnwatch saved both for this
+            // unit in the record (saveSupersededBeforeUnwatch), as it does for a pending unit; the
+            // store then keeps what the eager order keeps (the block rule, counted as kept for the CPU).
+            // After an exit that runs no unwatch hook nothing was saved: the bytes are read now, and a
+            // CPU store into the unit since the source's generation is overwritten there.
+            const auto offset = static_cast<std::size_t>(begin - source->descriptor.baseAddress);
             source->original.resize(static_cast<std::size_t>(source->guestBytes));
             source->comparedGuestBytes = {};
-            GuestMemory::ReadCommittedUnsynced(begin, std::span(source->original).subspan(static_cast<std::size_t>(begin - source->descriptor.baseAddress), static_cast<std::size_t>(bytes)));
+            source->forgetKeptAtUnwatch(record.unit);
+            if (record.savedAtUnwatch && record.unwatchBytes.size() == bytes) {
+                std::memcpy(source->original.data() + offset, record.unwatchBytes.data(), record.unwatchBytes.size());
+                for (const auto from : record.keptBlocks) source->keptAtUnwatch.emplace(from, record.savedGeneration);
+                if (!record.keptBlocks.empty()) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                GuestMemory::ReadCommittedUnsynced(begin, std::span(source->original).subspan(offset, static_cast<std::size_t>(bytes)));
+            }
             source->layerOriginal[record.unit] = true;
             source->cancelStoredSave(record.unit);
             Census().resurrectedUnwatched.fetch_add(1, std::memory_order_relaxed);
