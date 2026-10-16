@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWriteRing.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -359,6 +360,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         const auto packet = GuestMemory::CurrentPacket();
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
+    for (const auto& [begin, end] : ranges) GuestWriteRing::Record(GuestWriteRing::Kind::ShadowPublish, begin, end - begin, shadow->importBase);
     recordCopies(*shadow, copies, ranges, bytes);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;

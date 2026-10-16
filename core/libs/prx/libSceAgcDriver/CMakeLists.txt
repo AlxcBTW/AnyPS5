@@ -189,6 +189,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestWriteRing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -507,6 +508,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/GuestWriteRing.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_shader_memory_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -531,6 +533,7 @@ configure_windows_unwind(agc_shared_write_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/GuestWriteRing.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_write_tracking_tests PRIVATE shader_recompiler_agc_driver libc)
@@ -546,6 +549,19 @@ if(BUILD_TESTING)
         set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+add_test_executable(agc_guest_write_ring_tests EXCLUDE_FROM_ALL
+        tests/GuestWriteRing.cpp
+        Execution/src/GuestWriteRing.cpp
+)
+target_include_directories(agc_guest_write_ring_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_guest_write_ring_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_guest_write_ring_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_guest_write_ring_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_guest_write_ring COMMAND agc_guest_write_ring_tests)
+    set_tests_properties(agc_guest_write_ring PROPERTIES TIMEOUT 60)
 endif()
 
 add_test_executable(agc_thread_priority_tests EXCLUDE_FROM_ALL
