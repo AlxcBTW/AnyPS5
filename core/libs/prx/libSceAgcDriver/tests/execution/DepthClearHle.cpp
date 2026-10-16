@@ -50,6 +50,8 @@ using DepthFastClearHarness::Width;
 
 namespace Graphics = AgcDriver::Graphics;
 
+constexpr std::uint32_t Format16UNorm = 7;
+constexpr std::uint32_t Format16Uint = 11;
 constexpr std::uint32_t Format32Float = 22;
 constexpr std::uint32_t Format32Uint = 20;
 constexpr std::uint32_t Type2DArray = 13;
@@ -169,6 +171,12 @@ void RunClear(AgcDriver::VulkanDevice& device, const GuestBlock& code, const Gue
 
 void SetColor(GuestBlock& color, float value) {
     const std::array<float, 4> channels{value, value, value, value};
+    std::memcpy(color.Data(), channels.data(), sizeof(channels));
+    AgcDriver::GuestMemory::MarkWritten(color.Address(), sizeof(channels));
+}
+
+void SetRaw(GuestBlock& color, std::uint32_t raw) {
+    const std::array<std::uint32_t, 4> channels{raw, 0u, 0u, 0u};
     std::memcpy(color.Data(), channels.data(), sizeof(channels));
     AgcDriver::GuestMemory::MarkWritten(color.Address(), sizeof(channels));
 }
@@ -359,6 +367,73 @@ void AwaitCompletions(AgcDriver::VulkanDevice& device, TDone done) {
     }
 }
 
+// A 16-bit plane, which the title's shadow atlases are: an R16 unorm view cleared to a colour of 0 and 1 (0.5 is 32767.5 in
+// 16 bits, no value to take), and an R16 uint view with the depth swizzle cleared to raw values. Verify mode compares every
+// texel of the mirror and of the depth image with the raw value, so the round trip through raw / 65535 is exact there.
+void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    Graphics::SetDepthClearModeForTest(mode);
+    const auto before = Graphics::DepthClearCounts();
+    const std::string label = "16-bit plane, mode " + std::to_string(mode) + ": ";
+    auto& code = NewBlock();
+    std::memcpy(code.Data(), ClearKernel.data(), sizeof(ClearKernel));
+    auto& plane = NewBlock();
+    auto& color = NewBlock();
+    const Surface surface{plane.Address(), 0, 0, false, VK_FORMAT_D16_UNORM};
+    const auto drawLess = [&] { return Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}); };
+    const auto drawGreater = [&] { return Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_GREATER}); };
+    Require(Draw(device, shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}) == Covered, label + "the producer did not cover the plane");
+
+    SetColor(color, 1.0f);
+    try {
+        RunClear(device, code, plane, color, Format16UNorm, 8, 4);
+    } catch (const std::exception& error) {
+        // A device without 16-bit unorm storage images cannot run the baseline either: nothing to compare.
+        if (std::string(error.what()).find("unsupported format") == std::string::npos) throw;
+        std::printf("16-bit plane skipped: %s\n", error.what());
+        return;
+    }
+    Require(drawLess() == Covered, label + "after a clear to 1.0 the depth test 0.5 < 1.0 did not pass everywhere");
+    Require(drawGreater() == 0u, label + "after a clear to 1.0 a texel passed 0.5 > depth");
+
+    SetColor(color, 0.0f);
+    RunClear(device, code, plane, color, Format16UNorm, 8, 4);
+    Require(drawGreater() == Covered, label + "after a clear to 0.0 the depth test 0.5 > 0.0 did not pass everywhere");
+    Require(drawLess() == 0u, label + "after a clear to 0.0 a texel passed 0.5 < depth");
+
+    SetColor(color, 0.5f);
+    RunClear(device, code, plane, color, Format16UNorm, 8, 4);
+
+    // Another plane for the uint view: one mirror format per plane, as a title has it.
+    auto& rawPlane = NewBlock();
+    const Surface rawSurface{rawPlane.Address(), 0, 0, false, VK_FORMAT_D16_UNORM};
+    const auto rawLess = [&] { return Draw(device, shaders, rawSurface, {.depthCompare = VK_COMPARE_OP_LESS}); };
+    const auto rawGreater = [&] { return Draw(device, shaders, rawSurface, {.depthCompare = VK_COMPARE_OP_GREATER}); };
+    Require(Draw(device, shaders, rawSurface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}) == Covered, label + "the producer of the uint plane did not cover it");
+    SetRaw(color, 0x4000u);
+    RunClear(device, code, rawPlane, color, Format16Uint, 8, 4, TileZ64KBX);
+    Require(rawGreater() == Covered, label + "after a clear to the raw value 0x4000 the depth test 0.5 > 0.25 did not pass everywhere");
+    Require(rawLess() == 0u, label + "after a clear to the raw value 0x4000 a texel passed 0.5 < depth");
+
+    SetRaw(color, 0xffffu);
+    RunClear(device, code, rawPlane, color, Format16Uint, 8, 4, TileZ64KBX);
+    Require(rawLess() == Covered, label + "after a clear to the raw value 0xffff the depth test 0.5 < 1.0 did not pass everywhere");
+    Require(rawGreater() == 0u, label + "after a clear to the raw value 0xffff a texel passed 0.5 > depth");
+
+    if (mode >= 2) AwaitCompletions(device, [&] { return Graphics::DepthClearCounts().verified + Graphics::DepthClearCounts().violations >= before.verified + before.violations + 4u; });
+    const auto difference = Difference(Graphics::DepthClearCounts(), before);
+    if (mode == 0) {
+        Require(difference.matched == 0u && difference.clears == 0u, label + "the lever counted with the switch off");
+        return;
+    }
+    Require(difference.clears == 4u, label + "the lever took " + std::to_string(difference.clears) + " clears, expected 4 (unorm 1.0 and 0.0, raw 0x4000 and 0xffff)");
+    Require(difference.declined[2] >= 1u, label + "the unorm clear to 0.5 was not declined for its value (" + std::to_string(difference.declined[2]) + ")");
+    Require(difference.bytesSkipped == difference.clears * 2u * Width * Height * sizeof(std::uint16_t), label + "the copies left out add up to " + std::to_string(difference.bytesSkipped) + " bytes");
+    if (mode >= 2) {
+        Require(difference.violations == 0u, label + "verify mode found " + std::to_string(difference.violations) + " violations");
+        Require(difference.verified == 4u, label + "verify mode checked " + std::to_string(difference.verified) + " clears, expected 4");
+    }
+}
+
 }
 
 int main() {
@@ -414,6 +489,7 @@ int main() {
         Graphics::SetDepthClearModeForTest(-1);
 
         for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
+        for (const int mode : {0, 1, 2}) run(mode == 0 ? "16-bit plane, switch off" : mode == 1 ? "16-bit plane, lever" : "16-bit plane, verify", [&] { SixteenBitCase(*device, shaders, mode); });
         for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
         Graphics::SetDepthClearModeForTest(-1);
         LibcRunShutdown_nid_postfix();
