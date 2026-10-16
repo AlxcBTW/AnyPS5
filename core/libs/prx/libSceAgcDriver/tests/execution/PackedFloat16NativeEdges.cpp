@@ -138,10 +138,13 @@ std::vector<std::uint32_t> Run(AgcDriver::VulkanDevice& device, const std::vecto
     const ShaderRecompiler::ShaderComputeStageInfo compute{{GroupThreads, 1, 1}, 0u, {true, false, false}, false, 1};
     auto target = device.ComputeTarget(32);
     target.nativeFloat16Arithmetic = variant == Variant::Native;
+    std::vector<std::uint32_t> capabilities;
     if (variant == Variant::Lowering) {
-        std::erase_if(target.supportedCapabilities, [](std::uint32_t capability) {
+        capabilities.assign(target.supportedCapabilities.begin(), target.supportedCapabilities.end());
+        std::erase_if(capabilities, [](std::uint32_t capability) {
             return capability == spv::CapabilityFloat16 || capability == spv::CapabilityRoundingModeRTE || capability == spv::CapabilityDenormPreserve;
         });
+        target.supportedCapabilities = capabilities;
     }
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(words.data()), words, 0, {}},
