@@ -1845,6 +1845,8 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
+    // Lab hold profile (APS5_LAB_HOLD_PROFILE): what the record phase is made of, by kind of work.
+    GuestMemory::HoldSpan holdSpan(GuestMemory::HoldSpanKind::Rest);
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
@@ -1866,10 +1868,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Descriptor);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Rest);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool addressBased = resources.HoldsLease();
@@ -1887,15 +1892,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     const PassAccess passAccess{passReads, resources.GpuWrites(), passImages, passAttachments, unknownMemory, unknownMemory};
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Command);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect, fenced, passAccess);
     const bool continued = start.continued;
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     const auto commands = start.commands;
     if (!continued) recorder->PrepareSampleSlot();
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Rest);
     if (capture) captureInputs(context, *recorder, commands, resources, drawBindings, record.targets.empty() || record.targets.front() == nullptr ? 0 : record.targets.front()->Descriptor().baseAddress);
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
@@ -1910,12 +1918,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Rest);
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Command);
     if (continued) {
         record.pipeline->Continue(commands, state);
     } else {
@@ -1982,10 +1992,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome);
     timer.phase(PhaseKeep);
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Rest);
     if (record.waited) {
         // The wait the dispatch path makes for such work (source 3, "address-based"): the
         // write-back runs before the next packet, so the CPU never reads copied results or
