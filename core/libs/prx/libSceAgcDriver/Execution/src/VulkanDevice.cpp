@@ -37,6 +37,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -3700,9 +3701,10 @@ bool MutexLearn() {
     return learn;
 }
 
+// Not a thread_local object with a destructor (the MinGW build frees the TLS block before such a destructor runs): the fiber-local slot of HostThreadLocal.
+struct LearnedKeysTag {};
 std::unordered_map<const void*, std::vector<Graphics::DccGateRange>>& LearnedKeys() {
-    thread_local std::unordered_map<const void*, std::vector<Graphics::DccGateRange>> table;
-    return table;
+    return HostThreadLocal<std::unordered_map<const void*, std::vector<Graphics::DccGateRange>>, LearnedKeysTag>();
 }
 
 void AppendLearned(std::vector<Graphics::PresyncSurface>& surfaces, const void* identity) {
@@ -4160,7 +4162,7 @@ std::vector<Graphics::DccGateRange> VulkanDevice::SettleKeyWriters(const Prepare
         for (const auto& range : *keys) {
             const auto bytes = static_cast<std::size_t>(range.bytes);
             if (!Graphics::Recorder::SnapshotWriteOverlaps(range.address, bytes)) continue;
-            if (!Graphics::DccKeyWriterNeedsSync(range.address, bytes)) continue;
+            if (!Graphics::DccKeyWriterNeedsSync(range.address, bytes, false)) continue;
             const auto info = state->recorder->DescribePendingWrite(range.address, bytes);
             if (!info.has_value()) continue;
             open = open || info->open;
