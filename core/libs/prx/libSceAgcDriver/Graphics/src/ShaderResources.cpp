@@ -2719,6 +2719,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        // A depth surface registered over the image's memory is the lookup's to answer, not this image's: cachedStorageTexture
+        // hands out the plane's colour mirror (DepthSurfaceStorage), copied in from the depth image anew for every use, and a
+        // written image retires the surfaces it lands on. No stamp says whether one appeared after the build, so the walk decides.
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) return fail(FastFail::Depth);
         bool outside = false;
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
             if (FastProofLevel() < 2) {
@@ -2834,6 +2838,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (own.dccAddress != 0) return false;
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) return false;
         if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
         if (PendingStorageOverlaps(address, bytes, image)) return false;
         if (!StorageImageCached(context, image)) return false;
