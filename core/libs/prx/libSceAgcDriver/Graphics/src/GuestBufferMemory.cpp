@@ -2577,6 +2577,7 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
 
 const HostImport* HostImportSpanning(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (const auto* import = HostImportFor(context, address, bytes)) return import;
+    std::fprintf(stderr, "[diag] HostImportSpanning 0x%llx+0x%llx: HostImportFor is null (alignment %llu)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(context.hostImportAlignment));
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
