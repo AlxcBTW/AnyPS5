@@ -131,7 +131,7 @@ void ReportTimelineStats() {
     causes[length] = 0;
     const auto attempts = take(timelineStats.attempts), waits = take(timelineStats.waits), waitUs = take(timelineStats.waitUs), held = take(timelineStats.held), notHeld = take(timelineStats.notHeld), noTarget = take(timelineStats.noTarget), openSubmits = take(timelineStats.openSubmits), dormant = take(timelineStats.skippedQueue0Dormant);
     const auto exactUs = take(timelineStats.savedExactUs), upperUs = take(timelineStats.savedUpperUs), deferredLands = take(timelineStats.deferredLands);
-    AgcDriver::ProfilePrint_nid_no_patch("[waitdefer2] (10 s): landings by cause (landings/found unsatisfied/ms waited):%s; timeline: %llu landings tried, %llu waited on the GPU for %.1f ms (compare held after %llu, not after %llu), no submitted batch noting the label %llu, open batch submitted %llu, skipped with queue 0 dormant %llu; deferred waits landed %llu: translation overlapped %.1f ms exactly (landing had to wait), up to %.1f ms more (landing found it satisfied)\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[waitdefer2] (10 s): landings by cause (landings/found unsatisfied/ms waited):%s; timeline: %llu landings tried, %llu waited on the GPU for %.1f ms (compare held after %llu, not after %llu), no recorded label entry in an unfinished batch %llu, open batch submitted %llu, skipped with queue 0 dormant %llu; deferred waits landed %llu: translation overlapped %.1f ms exactly (landing had to wait), up to %.1f ms more (landing found it satisfied)\n",
                                          causes, attempts, waits, waitUs / 1000.0, held, notHeld, noTarget, openSubmits, dormant, deferredLands, exactUs / 1000.0, upperUs / 1000.0);
 }
 
@@ -559,8 +559,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     // APS5_LAB_WAIT_DEFER=2: a landing (the compare must hold in guest memory) of a compute worker waits for the producer's batch on
     // the GPU timeline, without the mutex, instead of polling memory. Only the way the thread sleeps changes: the loop below
     // re-reads memory after every wait and keeps polling when the compare still does not hold (a recycled slot, a label stored by a
-    // completion, a producer that is not recorded yet). The wait covers the newest submitted batch that notes a write over the
-    // label, so it ends at the latest when that batch's store ran. Queue 0 and a dormant queue 0 keep polling: their polls reap
+    // completion, a producer that is not recorded yet). The wait covers the batch that holds the label's pending-table entry, so it
+    // ends when that batch's store ran; a dword without an entry (no label store recorded for it) is not waited for at all. Queue 0 and a dormant queue 0 keep polling: their polls reap
     // completions (flips, interrupts) that a blocked worker would leave to others.
     const bool timelineLanding = requireMemory && queue != 0 && waitTimelineLanding();
     std::uint64_t timelineWaited = 0;
@@ -584,7 +584,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             target = device.Load();
             if (target == nullptr || !target->CanWaitUnlocked()) return false;
             openSubmitted = target->OpenWriteOverlaps(awaited, awaitedBytes);
-            serial = target->SubmitForWrites(awaited, awaitedBytes);
+            serial = target->SubmitForLabel(awaited, awaitedBytes);
         }
         if (!timelineTried) {
             timelineTried = true;
