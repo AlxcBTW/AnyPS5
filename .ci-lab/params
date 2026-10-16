@@ -1,0 +1,5 @@
+name=alias-stack
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-alias-stack-70447663d2-197825
