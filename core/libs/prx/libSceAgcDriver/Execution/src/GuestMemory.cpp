@@ -471,6 +471,7 @@ std::size_t ImagePagesSize() {
 }
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
+    GuestWriteRing::Record(GuestWriteRing::Kind::MappingChanged, address, bytes, 0);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     forgetSerial.fetch_add(1, std::memory_order_release);
@@ -1812,6 +1813,7 @@ void CheckStoreWindow(std::span<const std::pair<std::uint64_t, std::uint64_t>> r
     if (generation == 0) return;
     for (const auto& [begin, end] : ranges) {
         if (end <= begin) continue;
+        GuestWriteRing::Record(publish ? GuestWriteRing::Kind::PublishRetired : GuestWriteRing::Kind::WriteBackRetired, begin, end - begin, tag);
         const auto bytes = static_cast<std::size_t>(end - begin);
         CollectWritesUncached(begin, bytes);
         const auto firstBlock = begin & ~(std::uint64_t{WriteBlockBytes} - 1);

@@ -348,7 +348,13 @@ void CheckGuestWriteRing() {
     static_cast<volatile std::uint8_t*>(memory)[Block + 100] = 0x77;
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{base, base + 2 * Block}}};
     CheckStoreWindow(stored, decided, true, 0x1234);
+    CheckStoreWindow(stored, decided, false, 0x5678);
     Unwatch(base + Block, Block);
+    // libc's invalidator reaches the ring once the page caches registered it (Accessible sets them up).
+    static_cast<void>(Accessible(memory, 1, false));
+    const auto forgetBefore = ForgetSerial();
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(base + Block, Block);
+    const bool invalidatorRegistered = ForgetSerial() != forgetBefore;
     Ring::Close();
     const auto entries = Ring::ReadFile(path);
     const auto has = [&](Ring::Kind kind, std::uint64_t address, std::uint32_t bytes) {
@@ -363,6 +369,14 @@ void CheckGuestWriteRing() {
     Require(std::any_of(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(Ring::Kind::Unwatch) && entry.tag == Ring::PathTag("Unwatch"); }), "an unwatch left no entry with its path in the guest write ring");
     const auto windows = std::count_if(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(Ring::Kind::PublishWindowCpuStore); });
     Require(windows == 1 && has(Ring::Kind::PublishWindowCpuStore, base + Block, static_cast<std::uint32_t>(Block)), "the store window check does not name exactly the block a CPU store reached after the decision");
+    const auto tagged = [&](Ring::Kind kind, std::uint64_t address, std::uint32_t bytes, std::uint64_t tag) {
+        return std::any_of(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(kind) && entry.address == address && entry.bytes == bytes && entry.tag == tag; });
+    };
+    Require(tagged(Ring::Kind::PublishRetired, base, static_cast<std::uint32_t>(2 * Block), 0x1234), "a retired shadow publish left no entry with its import in the guest write ring");
+    Require(tagged(Ring::Kind::WriteBackRetired, base, static_cast<std::uint32_t>(2 * Block), 0x5678), "a retired storage write-back left no entry with its image in the guest write ring");
+    Require(tagged(Ring::Kind::WriteBackWindowCpuStore, base + Block, static_cast<std::uint32_t>(Block), 0x5678), "the write-back's store window does not name the block a CPU store reached after the decision");
+    Require(!invalidatorRegistered || tagged(Ring::Kind::MappingChanged, base + Block, static_cast<std::uint32_t>(Block), 0), "a guest mapping change left no entry in the guest write ring");
+    if (!invalidatorRegistered) std::cout << "guest write ring: no page caches, the mapping change entry is not checked\n";
     std::filesystem::remove(path);
 }
 
