@@ -1,0 +1,5 @@
+name=uppr-depth
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-uppr-depth-e2559177f9-54320
