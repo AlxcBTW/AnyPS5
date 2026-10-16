@@ -4804,6 +4804,20 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     return images;
 }
 
+HazardFootprint ShaderResources::DispatchFootprint(std::uint64_t indirectArguments) const {
+    HazardFootprint footprint;
+    if (guestMemory.HoldsLease()) footprint.unknown = "address-based";
+    else if (usesBda) footprint.unknown = "address table";
+    else if (bda != nullptr) footprint.unknown = "fault buffer";
+    else if (guestMemory.CopiedBytes() != 0) footprint.unknown = "private buffers";
+    if (!footprint.Known()) return footprint;
+    footprint.reads = guestMemory.DeviceReads();
+    footprint.writes = guestMemory.Writes();
+    footprint.images = StorageImages();
+    if (indirectArguments != 0) footprint.reads.emplace_back(indirectArguments, indirectArguments + 12);
+    return footprint;
+}
+
 bool ShaderResources::HasCachedStorageImages() const {
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) { return image != nullptr && !image->Cached(); })) return false;
     return std::none_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->StorageSource() != nullptr && !texture->StorageSource()->Cached(); });

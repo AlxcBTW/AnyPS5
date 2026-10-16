@@ -4311,7 +4311,23 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    // Lab (APS5_LAB_HAZARD_BARRIERS, APS5_LAB_HAZARD_VERIFY): a dispatch whose accesses can be listed is recorded behind the
+    // trailing barrier of the independent dispatches before it without that barrier (Recorder::CommandsForDispatch), and leaves
+    // its own barrier owed (Recorder::OweDispatchBarrier below). One that reads its arguments on the GPU or refreshes its data
+    // buffers records a barrier or a transfer before its own, so it never follows a run.
+    Graphics::HazardFootprint footprint;
+    const bool hazard = Graphics::Recorder::HazardEnabled();
+    bool follower = false;
+    if (hazard) {
+        footprint = resources.DispatchFootprint(argumentImport != nullptr ? arguments : 0);
+        if (footprint.Known() && record.shader->program->workgroupMemoryDwords != 0) footprint.unknown = "workgroup memory";
+        // RefreshData records a transfer exactly when the per-word compare finds a difference (the condition used below).
+        const bool refreshes = record.dataRefresh != RecordedDispatch::DataRefresh::None
+            && (record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash)
+            && resources.DataWordsDiffer(*record.shader);
+        follower = argumentImport == nullptr && !refreshes;
+    }
+    const auto commands = hazard ? recorder.CommandsForDispatch(footprint, follower, &covered) : recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -4409,10 +4425,15 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(gpuTiming);
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+    // Lab: with a listed footprint the recorder may owe the barrier (it records it before the next command that is not an
+    // independent dispatch, or at Submit); then nothing is covered yet.
+    const bool owed = hazard && recorder.OweDispatchBarrier(footprint, Graphics::OwedBarrier{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess}, shaderAccess);
+    if (!owed) {
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+    }
     recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (!owed) recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);

@@ -1360,6 +1360,13 @@ std::uint64_t Recorder::ReapsWithWork() {
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    // Whatever is recorded next goes behind the barrier a dispatch left owed (APS5_LAB_HAZARD_BARRIERS); only a dispatch that
+    // CommandsForDispatch found independent of the run is recorded without it.
+    settleDebt(DebtEnd::OtherCommand);
+    return commandsOpen(coveredAccess);
+}
+
+VkCommandBuffer Recorder::commandsOpen(VkAccessFlags* coveredAccess) {
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1368,6 +1375,191 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
+}
+
+namespace {
+
+// Lab: hazard-driven barriers between dispatches (see Recorder::HazardBarriers). The mode: 0 off, 1 narrowed, 2 verify.
+std::atomic<int> hazardModeForced{-1};
+int HazardMode() {
+    static const int environment = [] {
+        if (std::getenv("APS5_LAB_HAZARD_VERIFY") != nullptr) return 2;
+        return std::getenv("APS5_LAB_HAZARD_BARRIERS") != nullptr ? 1 : 0;
+    }();
+    const int forced = hazardModeForced.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced : environment;
+}
+std::atomic<std::uint64_t> hazardDispatches{0}, hazardKnown{0}, hazardRuns{0}, hazardJoined{0}, hazardSettled{0}, hazardRecorded{0}, hazardViolations{0};
+std::atomic<std::uint64_t> hazardUnknown[6]{};
+std::atomic<std::uint64_t> hazardSettledBy[static_cast<std::size_t>(Recorder::DebtEnd::Count)]{};
+std::atomic<std::uint64_t> hazardRunLengths[8]{};
+std::atomic<std::int64_t> traceHazardsLeft{[] {
+    const char* text = std::getenv("APS5_TRACE_HAZARDS");
+    return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
+}()};
+constexpr const char* DebtEndNames[static_cast<std::size_t>(Recorder::DebtEnd::Count)] = {"raw", "waw", "war", "image", "ineligible", "unknown", "uncovered", "other", "submit"};
+constexpr const char* HazardUnknownNames[6] = {"address-based", "address table", "fault buffer", "private buffers", "workgroup memory", "other"};
+
+std::size_t HazardUnknownIndex(const char* reason) {
+    for (std::size_t i = 0; i < 5; ++i) {
+        if (std::strcmp(reason, HazardUnknownNames[i]) == 0) return i;
+    }
+    return 5;
+}
+
+// The first range of a list, for the trace lines.
+std::pair<std::uint64_t, std::uint64_t> FirstRange(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    return ranges.empty() ? std::pair<std::uint64_t, std::uint64_t>{0, 0} : std::pair<std::uint64_t, std::uint64_t>{ranges.front().first, ranges.front().second - ranges.front().first};
+}
+
+bool HazardTraceTurn() {
+    return traceHazardsLeft.load(std::memory_order_relaxed) > 0 && traceHazardsLeft.fetch_sub(1, std::memory_order_relaxed) > 0;
+}
+
+}
+
+bool Recorder::HazardBarriers() {
+    return HazardMode() == 1;
+}
+
+bool Recorder::HazardVerify() {
+    return HazardMode() == 2;
+}
+
+void Recorder::SetHazardMode(int mode) {
+    hazardModeForced.store(mode, std::memory_order_relaxed);
+}
+
+Recorder::HazardStatistics Recorder::HazardCounts() {
+    HazardStatistics counts;
+    counts.dispatches = hazardDispatches.load(std::memory_order_relaxed);
+    counts.known = hazardKnown.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < 6; ++i) counts.unknownBy[i] = hazardUnknown[i].load(std::memory_order_relaxed);
+    counts.runs = hazardRuns.load(std::memory_order_relaxed);
+    counts.joined = hazardJoined.load(std::memory_order_relaxed);
+    counts.settled = hazardSettled.load(std::memory_order_relaxed);
+    counts.recorded = hazardRecorded.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(DebtEnd::Count); ++i) counts.settledBy[i] = hazardSettledBy[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < 8; ++i) counts.runLengths[i] = hazardRunLengths[i].load(std::memory_order_relaxed);
+    counts.violations = hazardViolations.load(std::memory_order_relaxed);
+    return counts;
+}
+
+void Recorder::settleDebt(DebtEnd why) {
+    if (open == nullptr || !open->debt.Active()) return;
+    auto& debt = open->debt;
+    const auto members = debt.Members();
+    hazardSettled.fetch_add(1, std::memory_order_relaxed);
+    hazardSettledBy[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+    hazardRunLengths[std::min<std::uint32_t>(members, 8u) - 1u].fetch_add(1, std::memory_order_relaxed);
+    const auto barrier = debt.Take();
+    open->debtMembers.clear();
+    open->debtKept = false;
+    // Verify mode recorded every barrier when its dispatch asked: only the shadow run ends here.
+    if (!HazardBarriers()) return;
+    // The trailing barrier the last dispatch of the run would have recorded (the union of the members' own), before the command
+    // that comes next.
+    hazardRecorded.fetch_add(1, std::memory_order_relaxed);
+    const auto timing = beginTiming(ClassKey(CommandClass::DispatchTrailing));
+    recordBarrier(open->commands, barrier.sourceStage, barrier.destinationStage, barrier.sourceAccess, barrier.destinationAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    open->coveredAccess = barrier.destinationAccess;
+}
+
+VkCommandBuffer Recorder::CommandsForDispatch(const HazardFootprint& footprint, bool follower, VkAccessFlags* coveredAccess) {
+    ensureOpen();
+    hazardDispatches.fetch_add(1, std::memory_order_relaxed);
+    if (footprint.Known()) hazardKnown.fetch_add(1, std::memory_order_relaxed);
+    else hazardUnknown[HazardUnknownIndex(footprint.unknown)].fetch_add(1, std::memory_order_relaxed);
+    auto& debt = open->debt;
+    open->debtKept = false;
+    if (!debt.Active()) return commandsOpen(coveredAccess);
+    constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    DebtEnd end = DebtEnd::OtherCommand;
+    bool keep = false;
+    PassHazard hazard = PassHazard::None;
+    if (!footprint.Known()) end = DebtEnd::Unknown;
+    else if (!follower) end = DebtEnd::Ineligible;
+    else if (open->renderPass.open || (open->run.open && !LabelRunsPerBatch())) end = DebtEnd::OtherCommand;   // a pass or a run settles the debt where it starts: never both
+    else {
+        switch (debt.Decide(footprint.Access(), shaderAccess, &hazard)) {
+            case DebtVerdict::Keep: keep = true; break;
+            case DebtVerdict::Uncovered: end = DebtEnd::Uncovered; break;
+            case DebtVerdict::Hazard:
+                end = hazard == PassHazard::ReadAfterWrite ? DebtEnd::ReadAfterWrite : hazard == PassHazard::WriteAfterWrite ? DebtEnd::WriteAfterWrite : hazard == PassHazard::WriteAfterRead ? DebtEnd::WriteAfterRead : hazard == PassHazard::Image ? DebtEnd::Image : DebtEnd::Unknown;
+                break;
+            case DebtVerdict::NotOwed: break;
+        }
+    }
+    if (!keep) {
+        if (HazardTraceTurn()) {
+            const auto reads = FirstRange(footprint.reads);
+            const auto writes = FirstRange(footprint.writes);
+            std::fprintf(stderr, "[hazard] settle (%s) before a dispatch: reads %zu (first 0x%llx+0x%llx), writes %zu (first 0x%llx+0x%llx), images %zu; run of %u dispatches\n", DebtEndNames[static_cast<std::size_t>(end)], footprint.reads.size(), static_cast<unsigned long long>(reads.first), static_cast<unsigned long long>(reads.second), footprint.writes.size(), static_cast<unsigned long long>(writes.first), static_cast<unsigned long long>(writes.second), footprint.images.size(), debt.Members());
+        }
+        settleDebt(end);
+        return commandsOpen(coveredAccess);
+    }
+    hazardJoined.fetch_add(1, std::memory_order_relaxed);
+    open->debtKept = true;
+    if (HazardVerify()) {
+        // The decision stands on PassHazards' interval sets; compare the follower with every member of the run pair by pair as well.
+        for (const auto& member : open->debtMembers) {
+            if (!AccessesConflict(member.Access(), footprint.Access())) continue;
+            hazardViolations.fetch_add(1, std::memory_order_relaxed);
+            const auto reads = FirstRange(footprint.reads);
+            const auto writes = FirstRange(footprint.writes);
+            std::fprintf(stderr, "[hazard] VIOLATION: a dispatch kept behind a run that it overlaps: follower reads %zu (first 0x%llx+0x%llx), writes %zu (first 0x%llx+0x%llx), images %zu\n", footprint.reads.size(), static_cast<unsigned long long>(reads.first), static_cast<unsigned long long>(reads.second), footprint.writes.size(), static_cast<unsigned long long>(writes.first), static_cast<unsigned long long>(writes.second), footprint.images.size());
+            break;
+        }
+    }
+    if (HazardTraceTurn()) {
+        const auto reads = FirstRange(footprint.reads);
+        const auto writes = FirstRange(footprint.writes);
+        std::fprintf(stderr, "[hazard] keep a dispatch behind a run of %u: reads %zu (first 0x%llx+0x%llx), writes %zu (first 0x%llx+0x%llx), images %zu", debt.Members(), footprint.reads.size(), static_cast<unsigned long long>(reads.first), static_cast<unsigned long long>(reads.second), footprint.writes.size(), static_cast<unsigned long long>(writes.first), static_cast<unsigned long long>(writes.second), footprint.images.size());
+        if (!open->debtMembers.empty()) {
+            // What the skipped barrier was protecting: the writes and reads of the run's members.
+            std::size_t runWrites = 0, runReads = 0;
+            for (const auto& member : open->debtMembers) {
+                runWrites += member.writes.size();
+                runReads += member.reads.size();
+            }
+            const auto first = FirstRange(open->debtMembers.front().writes);
+            std::fprintf(stderr, "; the run wrote %zu ranges (first member's first 0x%llx+0x%llx) and read %zu", runWrites, static_cast<unsigned long long>(first.first), static_cast<unsigned long long>(first.second), runReads);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    if (HazardBarriers()) {
+        // Recorded behind the owed barrier: the run's head covered the earlier commands for every shader access, this dispatch's
+        // included. No pass is open and no store run either (checked above), so there is nothing else to close.
+        if (coveredAccess != nullptr) *coveredAccess = debt.HeadCovered();
+        open->coveredAccess = 0;
+        return open->commands;
+    }
+    // Verify mode recorded the owed barrier already: report what is really covered.
+    return commandsOpen(coveredAccess);
+}
+
+bool Recorder::OweDispatchBarrier(const HazardFootprint& footprint, const OwedBarrier& barrier, VkAccessFlags headCovered) {
+    if (!HazardEnabled() || open == nullptr || !footprint.Known()) {
+        if (open != nullptr) open->debtKept = false;
+        return false;
+    }
+    auto& debt = open->debt;
+    const bool verify = HazardVerify();
+    if (open->debtKept && debt.Active()) {
+        debt.Join(footprint.Access(), barrier);
+        if (verify) open->debtMembers.push_back(footprint);
+    } else {
+        Require(!debt.Active(), "a dispatch recorded behind an owed barrier it did not join");
+        debt.Start(footprint.Access(), barrier, headCovered);
+        hazardRuns.fetch_add(1, std::memory_order_relaxed);
+        open->debtMembers.clear();
+        if (verify) open->debtMembers.push_back(footprint);
+    }
+    open->debtKept = false;
+    return HazardBarriers();
 }
 
 void Recorder::MarkCovered(VkAccessFlags access) {
@@ -1535,6 +1727,8 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
+    // A store run opened here records its stores behind the barrier an earlier dispatch left owed.
+    if (!LabelRunsPerBatch()) settleDebt(DebtEnd::OtherCommand);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -1625,6 +1819,7 @@ void Recorder::flushPendingStore() {
 }
 
 bool Recorder::closeStoreRun(bool atSubmit) {
+    settleDebt(DebtEnd::OtherCommand);
     auto& run = open->run;
     if (LabelRunsPerBatch()) {
         auto stores = std::move(run.queued);
@@ -1806,6 +2001,28 @@ void reportBarriers() {
         AgcDriver::ProfilePrint_nid_no_patch("; validate: would emit %llu (%s) + %llu batch ends, would skip %llu; emitted/skipped by class:%s", static_cast<unsigned long long>(emitted), kinds.c_str() + 1, static_cast<unsigned long long>(validateBatchEnds.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(skipped), classes.c_str());
     }
     AgcDriver::ProfilePrint_nid_no_patch("\n");
+    if (Recorder::HazardEnabled()) {
+        // Lab: the hazard-driven barriers' decisions of the last 10 s (violations cumulative).
+        static Recorder::HazardStatistics reported;
+        const auto now = Recorder::HazardCounts();
+        const auto delta = [](std::uint64_t a, std::uint64_t b) { return static_cast<unsigned long long>(a - b); };
+        std::string ends, lengths;
+        for (std::size_t i = 0; i < static_cast<std::size_t>(Recorder::DebtEnd::Count); ++i) {
+            char text[48];
+            std::snprintf(text, sizeof(text), " %s %llu", DebtEndNames[i], delta(now.settledBy[i], reported.settledBy[i]));
+            ends += text;
+        }
+        for (std::size_t i = 0; i < 8; ++i) {
+            char text[32];
+            std::snprintf(text, sizeof(text), " %zu%s:%llu", i + 1, i == 7 ? "+" : "", delta(now.runLengths[i], reported.runLengths[i]));
+            lengths += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
+            Recorder::HazardVerify() ? "verify (every barrier recorded, decisions on the side)" : "narrowed", delta(now.dispatches, reported.dispatches), delta(now.known, reported.known),
+            delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]),
+            delta(now.runs, reported.runs), delta(now.joined, reported.joined), delta(now.settled, reported.settled), Recorder::HazardVerify() ? "would be recorded" : "recorded", ends.c_str(), lengths.c_str(), static_cast<unsigned long long>(now.violations));
+        reported = now;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));
 }
 
@@ -3291,6 +3508,8 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    // The barrier a dispatch left owed orders it behind everything the next batch records: it goes in before the batch ends.
+    settleDebt(DebtEnd::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();

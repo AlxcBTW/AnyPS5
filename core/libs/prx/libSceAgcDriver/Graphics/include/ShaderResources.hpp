@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BarrierDebt.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -202,6 +203,13 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    // What a dispatch of this use touches, for the hazard-driven barriers (Recorder::CommandsForDispatch): the guest ranges bound
+    // in place (host imports) or through an image mirror, the ranges it may write, its storage images, and `indirectArguments`
+    // (0: none) as a read. The same lists the draw path hands PassHazards. `unknown` says why they cannot be listed: an
+    // address-based build (it may reach any leased range), a BDA table or a fault buffer, a buffer copied for this use (staged,
+    // copied by the GPU or the CPU: its bytes live in a buffer of the use, and its results go back by commands recorded behind
+    // the dispatch).
+    HazardFootprint DispatchFootprint(std::uint64_t indirectArguments = 0) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;

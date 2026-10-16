@@ -4784,6 +4784,110 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
 }
 
 
+// The barrier a dispatch leaves owed (APS5_LAB_HAZARD_BARRIERS): an independent dispatch is recorded behind it without it, every
+// other command, an overlapping dispatch and the end of the batch record it first; verify mode records every barrier and only
+// decides on the side.
+void barrierDebtTests(Recorder& recorder) {
+    constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    const OwedBarrier trailing{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess};
+    HazardFootprint first;
+    first.reads = {{0x1000, 0x1100}};
+    first.writes = {{0x2000, 0x2100}};
+    HazardFootprint independent;
+    independent.reads = {{0x3000, 0x3100}};
+    independent.writes = {{0x4000, 0x4100}};
+    HazardFootprint overlapping;
+    overlapping.reads = {{0x2080, 0x2090}};
+    HazardFootprint unlisted;
+    unlisted.unknown = "address-based";
+    const auto counts = [] { return Recorder::HazardCounts(); };
+    const auto ends = [](const Recorder::HazardStatistics& a, const Recorder::HazardStatistics& b, Recorder::DebtEnd why) { return a.settledBy[static_cast<std::size_t>(why)] - b.settledBy[static_cast<std::size_t>(why)]; };
+    VkAccessFlags covered = 0xffffffffu;
+    recorder.Sync();
+
+    // Narrowed mode.
+    Recorder::SetHazardMode(1);
+    Require(Recorder::HazardBarriers() && !Recorder::HazardVerify() && Recorder::HazardEnabled(), "mode 1 is the narrowed mode");
+    auto before = counts();
+    recorder.CommandsForDispatch(first, true, &covered);
+    Require(covered == 0, "a new batch starts uncovered");
+    Require(recorder.OweDispatchBarrier(first, trailing, shaderAccess), "a dispatch with a listed footprint owes its barrier");
+    auto now = counts();
+    Require(now.dispatches == before.dispatches + 1 && now.known == before.known + 1 && now.runs == before.runs + 1 && now.joined == before.joined && now.settled == before.settled, "the first dispatch started a run");
+    // an independent dispatch is recorded behind the owed barrier and reports what the run's head covered
+    recorder.CommandsForDispatch(independent, true, &covered);
+    Require(covered == shaderAccess, "a kept dispatch reports the head's coverage so it skips its leading barrier");
+    Require(recorder.OweDispatchBarrier(independent, trailing, shaderAccess), "the kept dispatch owes the barrier too");
+    now = counts();
+    Require(now.joined == before.joined + 1 && now.runs == before.runs + 1 && now.settled == before.settled && now.recorded == before.recorded, "an independent dispatch joined the run; nothing was recorded");
+    // a dispatch that reads what the run wrote settles it, and the settled barrier covers what the dispatch's own would have
+    recorder.CommandsForDispatch(overlapping, true, &covered);
+    now = counts();
+    Require(now.settled == before.settled + 1 && now.recorded == before.recorded + 1 && ends(now, before, Recorder::DebtEnd::ReadAfterWrite) == 1, "an overlapping dispatch settled the run (read after write)");
+    Require(covered == dispatchedAccess, "the settled barrier covers the access a dispatch's own trailing barrier covers");
+    Require(now.runLengths[1] == before.runLengths[1] + 1, "the run had two members");
+    // another command settles it before it is recorded
+    Require(recorder.OweDispatchBarrier(overlapping, trailing, shaderAccess), "the overlapping dispatch starts the next run");
+    before = counts();
+    recorder.Commands(&covered);
+    now = counts();
+    Require(now.settled == before.settled + 1 && now.recorded == before.recorded + 1 && ends(now, before, Recorder::DebtEnd::OtherCommand) == 1 && covered == dispatchedAccess, "Commands() records the owed barrier first");
+    recorder.Commands(&covered);
+    Require(counts().settled == now.settled && covered == 0, "nothing is owed after the settle");
+    // a dispatch that cannot follow a run (an indirect read, a data refresh) settles it
+    recorder.CommandsForDispatch(first, true, &covered);
+    Require(recorder.OweDispatchBarrier(first, trailing, shaderAccess), "a run for the next checks");
+    before = counts();
+    recorder.CommandsForDispatch(independent, false, &covered);
+    now = counts();
+    Require(ends(now, before, Recorder::DebtEnd::Ineligible) == 1 && now.joined == before.joined && now.recorded == before.recorded + 1, "a dispatch that cannot follow a run settled it");
+    Require(!recorder.OweDispatchBarrier(unlisted, trailing, shaderAccess), "a dispatch whose accesses are not listed records its own barrier");
+    // a dispatch whose accesses are not listed settles it too
+    Require(recorder.OweDispatchBarrier(independent, trailing, shaderAccess), "a run for the unlisted dispatch");
+    before = counts();
+    recorder.CommandsForDispatch(unlisted, true, &covered);
+    now = counts();
+    Require(ends(now, before, Recorder::DebtEnd::Unknown) == 1 && now.unknownBy[0] == before.unknownBy[0] + 1 && now.known == before.known, "an unlisted dispatch settled the run and was counted by reason");
+    // a head that did not cover shader accesses takes no follower
+    Require(recorder.OweDispatchBarrier(first, trailing, VK_ACCESS_SHADER_READ_BIT), "a run whose head covered only reads");
+    before = counts();
+    recorder.CommandsForDispatch(independent, true, &covered);
+    now = counts();
+    Require(ends(now, before, Recorder::DebtEnd::Uncovered) == 1 && now.joined == before.joined, "an uncovered head settled the run");
+    // the end of the batch records the owed barrier
+    Require(recorder.OweDispatchBarrier(first, trailing, shaderAccess), "a run left owed at the end of the batch");
+    before = counts();
+    recorder.Submit();
+    now = counts();
+    Require(ends(now, before, Recorder::DebtEnd::Submit) == 1 && now.recorded == before.recorded + 1, "Submit records the owed barrier");
+    recorder.Sync();
+
+    // Verify mode: every barrier is recorded by the dispatch, the decisions are made on the side.
+    Recorder::SetHazardMode(2);
+    Require(!Recorder::HazardBarriers() && Recorder::HazardVerify() && Recorder::HazardEnabled(), "mode 2 is the verify mode");
+    before = counts();
+    recorder.CommandsForDispatch(first, true, &covered);
+    Require(!recorder.OweDispatchBarrier(first, trailing, shaderAccess), "verify mode never withholds a barrier");
+    recorder.CommandsForDispatch(independent, true, &covered);
+    Require(!recorder.OweDispatchBarrier(independent, trailing, shaderAccess), "verify mode never withholds a barrier (kept)");
+    recorder.CommandsForDispatch(overlapping, true, &covered);
+    recorder.Commands(&covered);
+    recorder.Submit();
+    now = counts();
+    Require(now.runs == before.runs + 1 && now.joined == before.joined + 1 && now.settled == before.settled + 1 && now.recorded == before.recorded && now.violations == before.violations, "verify mode counted the same decisions and recorded none of them");
+    recorder.Sync();
+
+    // Off: nothing is owed and nothing is counted.
+    Recorder::SetHazardMode(0);
+    Require(!Recorder::HazardEnabled(), "mode 0 is off");
+    before = counts();
+    recorder.Commands(&covered);
+    Require(!recorder.OweDispatchBarrier(first, trailing, shaderAccess) && counts().runs == before.runs, "a dispatch owes nothing when the lever is off");
+    recorder.Sync();
+    Recorder::SetHazardMode(-1);
+}
+
 void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     constexpr std::uint32_t side = 256;
@@ -8096,6 +8200,11 @@ int main(int argc, char** argv) {
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--barrier-debt-only") {
+            barrierDebtTests(recorder);
+            std::cout << "barrier debt tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {

@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BarrierDebt.hpp"
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
@@ -61,6 +62,47 @@ public:
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
+    // Lab: hazard-driven barriers between dispatches. APS5_LAB_HAZARD_BARRIERS=1: a dispatch whose accesses the layer can list
+    // (HazardFootprint) leaves its trailing barrier unrecorded (OweDispatchBarrier) and the next dispatch that overlaps none of the
+    // accesses of the run since the last barrier is recorded behind it without one (CommandsForDispatch); every other command
+    // (Commands(), the store runs, a draw's pass, the end of the batch) first records the owed barrier exactly as the dispatch
+    // would have, so no command is ever recorded before it unless it is a dispatch independent of the run. APS5_LAB_HAZARD_VERIFY=1
+    // records every barrier as before and makes the same decisions on the side, counting them and checking every would-keep
+    // decision against a brute-force comparison of the run's lists; with both set, verify wins. Both off: nothing changes.
+    // APS5_TRACE_HAZARDS=<n> prints the first n decisions with their ranges.
+    static bool HazardBarriers();
+    static bool HazardVerify();
+    static bool HazardEnabled() { return HazardBarriers() || HazardVerify(); }
+    // Tests: 0 off, 1 narrowed, 2 verify; -1 leaves the decision to the environment (the default).
+    static void SetHazardMode(int mode);
+    // The command buffer for a dispatch with the accesses `footprint`. `follower`: whether the dispatch may be recorded behind a
+    // run at all (a direct dispatch that needs no data refresh and no argument read before its own barrier). `coveredAccess` as
+    // in Commands(); when the dispatch kept the run (it is recorded behind the owed barrier) it reports what the barrier before
+    // the run covered, so the dispatch skips its leading barrier as the run's first member did.
+    VkCommandBuffer CommandsForDispatch(const HazardFootprint& footprint, bool follower, VkAccessFlags* coveredAccess);
+    // After a dispatch with a listed footprint was recorded: its trailing barrier is `barrier`. True: the recorder owes it (the
+    // caller records nothing and does not MarkCovered); false: the caller records it as before. `headCovered`: what a run that
+    // starts here can say its head made visible to later shader accesses.
+    bool OweDispatchBarrier(const HazardFootprint& footprint, const OwedBarrier& barrier, VkAccessFlags headCovered);
+    // Why an owed barrier was recorded (or, in verify mode, would have been).
+    enum class DebtEnd : std::uint8_t { ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, Ineligible, Unknown, Uncovered, OtherCommand, Submit, Count };
+    struct HazardStatistics {
+        std::uint64_t dispatches = 0;
+        std::uint64_t known = 0;
+        // Unlisted accesses by reason: address-based, address table, fault buffer, private buffers, workgroup memory, other.
+        std::uint64_t unknownBy[6] = {};
+        std::uint64_t runs = 0;
+        std::uint64_t joined = 0;
+        std::uint64_t settled = 0;
+        // Owed barriers really recorded (narrowed mode; verify mode records them when the dispatches ask).
+        std::uint64_t recorded = 0;
+        std::uint64_t settledBy[static_cast<std::size_t>(DebtEnd::Count)] = {};
+        // Runs by length (1..7, 8 or more), counted when a run ends.
+        std::uint64_t runLengths[8] = {};
+        // Would-keep decisions the brute-force check disagreed with (verify mode).
+        std::uint64_t violations = 0;
+    };
+    static HazardStatistics HazardCounts();
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -641,6 +683,12 @@ private:
             std::function<void(VkCommandBuffer)> afterPass;
         } renderPass;
         PassHazards passHazards;
+        // The trailing barrier of the dispatches recorded since the last settle, withheld (APS5_LAB_HAZARD_BARRIERS) or only
+        // tracked (APS5_LAB_HAZARD_VERIFY); see BarrierDebt. `debtKept`: the dispatch being recorded joined the run. `debtMembers`:
+        // verify mode only, the run members' lists for the brute-force check.
+        BarrierDebt debt;
+        bool debtKept = false;
+        std::vector<HazardFootprint> debtMembers;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -731,6 +779,11 @@ private:
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
+    // Records the owed dispatch barrier, if any (verify mode: ends the shadow run), before anything else is recorded into the
+    // open batch; `why` is counted.
+    void settleDebt(DebtEnd why);
+    // Commands() without the settle: the open batch's command buffer with the pass and the store run closed.
+    VkCommandBuffer commandsOpen(VkAccessFlags* coveredAccess);
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
     void dropStaleHoldKept();
