@@ -113,6 +113,8 @@ static_assert(SurfaceTag(0, 0, 0x7ff, 0, 0, 0, 0, 0) == 0x7ffull << 30u && Surfa
 static_assert(SurfaceTag(0, 0, 0, 0, 0xf, 0, 0, 0) == 0xfull << 50u && SurfaceTag(0, 0, 0, 0, 0, 0x1f, 0, 0) == 0x1full << 54u);
 static_assert(SurfaceTag(0, 0, 0, 0, 0, 0, 7, 0) == 7ull << 59u && SurfaceTag(0, 0, 0, 0, 0, 0, 0, 3) == 3ull << 62u);
 static_assert(SurfaceTag(0x8000 | 5, 0x8000 | 6, 0x800 | 7, 0x200 | 8, 0x10 | 9, 0x20 | 10, 8 | 3, 4 | 2) == SurfaceTag(5, 6, 7, 8, 9, 10, 3, 2));
+// The numbers the lab's reader decodes.
+static_assert(static_cast<int>(Kind::StorageWriteBackDecided) == 16 && static_cast<int>(Kind::StoragePending) == 17);
 
 void CheckSurfaceTag() {
     const auto tag = SurfaceTag(1024, 1024, 7, 1, 1, 7, 4, 0);

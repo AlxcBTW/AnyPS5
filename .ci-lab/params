@@ -2,4 +2,4 @@ name=guestcrash-prio
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-guestcrash-prio-60202b3d86-6547
+artifact=lab-libs-guestcrash-prio-ab3422e35f-61913
