@@ -1,0 +1,95 @@
+# Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the storage write-back tests on a Windows runner and runs them
+# on Mesa lavapipe for Windows (mesa-dist-win), so host imports are host-pointer imports of private MEM_WRITE_WATCH memory as on
+# the lab machine, not the Linux lavapipe path.
+name: Lab tests windows lavapipe
+
+on:
+  push:
+    branches: ['ci/test/**']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      MESA_VERSION: 26.2.4
+      ANYPS5_REQUIRE_VULKAN: 1
+      GALLIUM_OVERRIDE_CPU_CAPS: avx
+      TESTS: '^(agc_storage_alias_handover|agc_storage_write_back|agc_storage_split_writeback|agc_unit_shadow|agc_storage_kept_unit_settle|agc_storage_baseline_settled|agc_storage_written_buffer_order|agc_driver_storage_write_back_overhang)$'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Point the WinLibs CMake at the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+      - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-tests-windows-lvp
+          max-size: 2G
+          evict-old-files: job
+      - name: Fetch FFmpeg prebuilts
+        run: |
+          sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)
+          mkdir -p build/externals
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 5 -o "build/externals/$sha-ffmpeg-mingw-x64.zip" \
+            "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/$sha/ffmpeg-mingw-x64.zip"
+      - name: Mesa lavapipe for Windows
+        run: |
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 -o "$RUNNER_TEMP/mesa.7z" \
+            "https://github.com/pal1000/mesa-dist-win/releases/download/$MESA_VERSION/mesa3d-$MESA_VERSION-release-msvc.7z"
+          7z x "$RUNNER_TEMP/mesa.7z" -oC:/mesa > /dev/null
+          ls C:/mesa C:/mesa/x64 | head -80
+          icd=$(find C:/mesa -iname 'lvp_icd*.json' | head -1)
+          echo "icd json: $icd"
+          if [ -z "$icd" ]; then
+            dll=$(find C:/mesa -iname 'vulkan_lvp.dll' | head -1)
+            echo "no icd json, library: $dll"
+            icd="C:/mesa/lvp_icd.json"
+            printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s","api_version":"1.3.0"}}' "$(cygpath -m "$dll")" > "$icd"
+          fi
+          cat "$icd"
+          reg add "HKLM\SOFTWARE\Khronos\Vulkan\Drivers" //v "$(cygpath -w "$icd")" //t REG_DWORD //d 0 //f
+          reg query "HKLM\SOFTWARE\Khronos\Vulkan\Drivers"
+          echo "VK_LOADER_DEBUG=error,warn,driver" >> "$GITHUB_ENV"
+          echo 'C:\mesa\x64' >> "$GITHUB_PATH"
+          where vulkan-1.dll || true
+          powershell -NoProfile -Command "Get-ChildItem C:/Windows/System32/vulkan-1.dll, C:/Windows/SysWOW64/vulkan-1.dll -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName + ' ' + $_.VersionInfo.FileVersion }" || true
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DANYPS5_AGC_EXECUTION_TESTS=StorageWriteBackOverhang -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build --target agc_driver_recorder_tests agc_driver_storage_write_back_overhang_tests --parallel 4
+      - name: Test
+        run: |
+          set +e
+          ctest --test-dir build -V --timeout 120 -R "$TESTS" > "$RUNNER_TEMP/ctest.log" 2>&1
+          rc=$?
+          tail -n 300 "$RUNNER_TEMP/ctest.log"
+          echo "::group::summary"
+          grep -E "Test +#|tests passed|tests failed|Vulkan device|skipped" "$RUNNER_TEMP/ctest.log"
+          echo "::endgroup::"
+          exit $rc
