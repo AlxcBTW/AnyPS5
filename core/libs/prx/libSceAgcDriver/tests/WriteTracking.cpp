@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestWriteRing.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -11,9 +12,11 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -319,6 +322,40 @@ void CheckUnwatch() {
     static_cast<volatile std::uint8_t*>(memory)[0] = 0x33;
     CollectWritesUncached(base, Block);
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
+}
+
+void CheckGuestWriteRing() {
+    namespace Ring = AgcDriver::GuestWriteRing;
+    const auto path = (std::filesystem::temp_directory_path() / "agc-write-tracking-ring.bin").string();
+    Require(Ring::Open(path, 64), "the guest write ring could not be mapped");
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    CollectWritesUncached(base, 2 * Block);
+    MarkWritten(base, 4096);
+    std::array<std::byte, 64> label{};
+    label.fill(std::byte{0x55});
+    StoreOwnBytes(base + 8192, label);
+    std::array<std::byte, 32> original{};
+    original.fill(std::byte{0x11});
+    auto current = original;
+    for (std::size_t k = 5; k < 9; ++k) current[k] = std::byte{0x66};
+    WriteChanged(base + 16384, current, original);
+    Write(base + 20480, label);
+    Unwatch(base + Block, Block);
+    Ring::Close();
+    const auto entries = Ring::ReadFile(path);
+    const auto has = [&](Ring::Kind kind, std::uint64_t address, std::uint32_t bytes) {
+        return std::any_of(entries.begin(), entries.end(), [&](const Ring::Entry& entry) {
+            return entry.kind == static_cast<std::uint8_t>(kind) && entry.address == address && entry.bytes == bytes && (kind == Ring::Kind::Unwatch || entry.tag != 0);
+        });
+    };
+    Require(has(Ring::Kind::GpuNoted, base, 4096), "MarkWritten left no GPU entry with its call site in the guest write ring");
+    Require(has(Ring::Kind::CpuStore, base + 8192, 64), "StoreOwnBytes left no CPU entry with its call site in the guest write ring");
+    Require(has(Ring::Kind::CpuStore, base + 16384 + 5, 4), "WriteChanged did not record the bytes it changed");
+    Require(has(Ring::Kind::CpuStore, base + 20480, 64), "Write left no CPU entry with its call site in the guest write ring");
+    Require(std::any_of(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(Ring::Kind::Unwatch) && entry.tag == Ring::PathTag("Unwatch"); }), "an unwatch left no entry with its path in the guest write ring");
+    std::filesystem::remove(path);
 }
 
 void CheckNewestStamp() {
@@ -1141,6 +1178,7 @@ int main() {
         CheckStoredAllSince();
         CheckOwnStore();
         CheckUnwatch();
+        CheckGuestWriteRing();
         CheckNewestStamp();
 #ifdef _WIN32
         CheckSparseLeafBoundaries();
