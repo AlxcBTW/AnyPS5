@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -776,7 +777,9 @@ struct KeyWaitTotals {
 };
 
 thread_local const std::vector<DccGateRange>* keyGate = nullptr;
-thread_local std::vector<DccGateRange> unlistedKeyRanges;
+// Not a thread_local object with a destructor (the MinGW build frees the TLS block before such a destructor runs): the fiber-local slot of HostThreadLocal.
+struct UnlistedKeyRangesTag {};
+std::vector<DccGateRange>& UnlistedKeyRanges() { return HostThreadLocal<std::vector<DccGateRange>, UnlistedKeyRangesTag>(); }
 
 KeyWaitTotals& KeyWaits() {
     static KeyWaitTotals totals;
@@ -787,11 +790,11 @@ KeyWaitTotals& KeyWaits() {
 
 KeyGateScope::KeyGateScope(std::vector<DccGateRange> settled) : ranges(std::move(settled)), previous(keyGate) {
     keyGate = &ranges;
-    unlistedKeyRanges.clear();
+    UnlistedKeyRanges().clear();
 }
 
 std::vector<DccGateRange> TakeUnlistedKeyRanges() {
-    return std::exchange(unlistedKeyRanges, {});
+    return std::exchange(UnlistedKeyRanges(), {});
 }
 
 KeyGateScope::~KeyGateScope() {
@@ -818,8 +821,9 @@ bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count) {
     return std::none_of(memo.entries.begin(), memo.entries.end(), [&](const GpuKeyStore& store) { return store.note != 0 && store.begin <= metaAddress && metaAddress + count <= store.end; });
 }
 
-bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count) {
+bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count, bool publishShadows) {
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    if (!publishShadows && AnyShadowedOverlaps(metaAddress, count)) return false;
     auto* recorder = Recorder::Active();
     return recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count) && !PendingStoreKeys(*recorder, metaAddress, count).has_value();
 }
@@ -868,7 +872,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
             }
         }
         waits.byCoverage[coverage].fetch_add(1, std::memory_order_relaxed);
-        if (coverage == 2 && unlistedKeyRanges.size() < 16) unlistedKeyRanges.push_back({metaAddress, count});
+        if (coverage == 2 && UnlistedKeyRanges().size() < 16) UnlistedKeyRanges().push_back({metaAddress, count});
     }
     return std::nullopt;
 }
