@@ -2876,14 +2876,25 @@ bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }
 
-std::uint64_t Recorder::PendingWriteSerial(std::uint64_t address, std::size_t bytes) const {
-    if (bytes == 0) return 0;
-    const auto end = address + bytes;
-    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
-        if (!overlaps(**it, address, end)) continue;
-        return fenceStatus((*it)->fence) == VK_SUCCESS ? 0 : (*it)->serial;
+std::uint64_t Recorder::LabelBatchSerial(std::uint64_t address, std::size_t bytes, bool& inOpenBatch) const {
+    inOpenBatch = false;
+    if ((bytes != 4 && bytes != 8) || address % 4 != 0) return 0;
+    std::lock_guard tableLock(labelTableMutex);
+    std::uint64_t serial = 0;
+    bool inOpen = false;
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        const auto found = labels.find(address + offset);
+        if (found == labels.end() || found->second.batch == nullptr) return 0;
+        const Batch* batch = found->second.batch;
+        if (batch == open.get()) {
+            inOpen = true;
+            serial = std::max<std::uint64_t>(serial, submissions + 1);
+        } else if (batch->submitted && fenceStatus(batch->fence) != VK_SUCCESS) {
+            serial = std::max<std::uint64_t>(serial, batch->serial);
+        }
     }
-    return 0;
+    inOpenBatch = inOpen;
+    return serial;
 }
 
 bool Recorder::signaled(const Batch& batch) const {

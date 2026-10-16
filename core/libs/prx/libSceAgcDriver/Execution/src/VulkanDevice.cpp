@@ -2144,10 +2144,13 @@ bool VulkanDevice::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) c
     return state->recorder && state->recorder->OpenWriteOverlaps(address, bytes);
 }
 
-std::uint64_t VulkanDevice::SubmitForWrites(std::uint64_t address, std::size_t bytes) {
+std::uint64_t VulkanDevice::SubmitForLabel(std::uint64_t address, std::size_t bytes) {
     if (!state->recorder || !state->recorder->HasTimeline()) return 0;
-    if (state->recorder->OpenWriteOverlaps(address, bytes)) SubmitRecorded(false);
-    return state->recorder->PendingWriteSerial(address, bytes);
+    bool inOpenBatch = false;
+    const auto serial = state->recorder->LabelBatchSerial(address, bytes, inOpenBatch);
+    if (!inOpenBatch) return serial;
+    SubmitRecorded(false);
+    return state->recorder->LabelBatchSerial(address, bytes, inOpenBatch);
 }
 
 bool VulkanDevice::RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const {

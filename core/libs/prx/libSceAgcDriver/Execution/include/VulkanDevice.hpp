@@ -102,10 +102,10 @@ public:
     // Pending-label table lookup and open-batch overlap test for WAIT_REG_MEM (see Recorder).
     std::optional<Graphics::Recorder::LabelHit> PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, Graphics::Recorder::LabelRefusal* refusal = nullptr) const;
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
-    // APS5_LAB_WAIT_DEFER=2, under the mutex: submits the open batch when it notes a write over the range and returns the
-    // serial of the newest submitted batch that does and has not finished (0: none); WaitRecorded(serial) then waits for
-    // the store without the mutex.
-    std::uint64_t SubmitForWrites(std::uint64_t address, std::size_t bytes);
+    // APS5_LAB_WAIT_DEFER=2, under the mutex: submits the open batch when it holds the pending-table entry of the label at
+    // [address, address + bytes) and returns the serial of the batch that stores it, if that batch has not finished (0:
+    // none); WaitRecorded(serial) then waits for the store without the mutex.
+    std::uint64_t SubmitForLabel(std::uint64_t address, std::size_t bytes);
     bool RecordedWritesSettled(std::uint64_t address, std::size_t bytes) const;
     bool StoresPendingOver(std::uint64_t address, std::size_t bytes) const;
     // Fills [address, address + bytes) of host-imported guest memory with a repeating 16-byte pattern,
