@@ -1,0 +1,5 @@
+name=cpu-dumps
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-dumps-77718bcb62-159765
