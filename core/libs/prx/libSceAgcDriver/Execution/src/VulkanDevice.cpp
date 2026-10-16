@@ -3634,6 +3634,8 @@ struct PreparedDispatch {
     // The stage-A pre-sync (see PrepareDispatch): the newest recorder serial waited for without the
     // mutex, whose batches the dispatch reaps under it before stage B (0: nothing waited for).
     std::uint64_t presyncSerial = 0;
+    // APS5_LAB_MUTEX_GATE: the DCC key ranges of the pre-sync's surface list (SettleKeyWriters).
+    std::vector<Graphics::DccGateRange> gateKeys;
     std::shared_ptr<ComputePipelineObjects> objects;
     std::vector<std::uint32_t> describedLayoutKey;
 };
@@ -3645,6 +3647,8 @@ struct RecipeHit {
     std::shared_ptr<ComputePipelineObjects> objects;
     // The pre-sync's serial (0: nothing waited for), reaped by DispatchRecipe.
     std::uint64_t presyncSerial = 0;
+    // APS5_LAB_MUTEX_GATE: the DCC key ranges of the pre-sync's surface list (SettleKeyWriters).
+    std::vector<Graphics::DccGateRange> gateKeys;
     bool indirect = false;
     // APS5_PROFILE_DRAW: the pre-check's time (the driver's 'recipe pre-check' row).
     double precheckMs = 0;
@@ -3659,6 +3663,14 @@ struct PresyncCounters {
     std::atomic<std::uint64_t> waitedUs{0};
     std::atomic<std::uint64_t> keyChecks{0};
     std::atomic<std::uint64_t> keyWaits{0};
+    // APS5_LAB_MUTEX_GATE: dispatches checked at the lock, those that waited (rounds, unlocked wait), those left to the locked wait
+    // after three rounds, and those whose acquisition was nested (no gate).
+    std::atomic<std::uint64_t> gateChecked{0};
+    std::atomic<std::uint64_t> gateWaited{0};
+    std::atomic<std::uint64_t> gateRounds{0};
+    std::atomic<std::uint64_t> gateWaitedUs{0};
+    std::atomic<std::uint64_t> gateExhausted{0};
+    std::atomic<std::uint64_t> gateNested{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -3679,6 +3691,38 @@ bool CachedPrecollect() {
 bool NoPresync() {
     static const bool noPresync = std::getenv("APS5_NO_PRESYNC") != nullptr;
     return noPresync;
+}
+
+// APS5_LAB_MUTEX_LEARN: the key ranges the pre-sync of a resource object also names, learned from the locked key syncs its stage B made
+// (this worker thread's table; a stale entry only names a range that is looked at and not pending).
+bool MutexLearn() {
+    static const bool learn = std::getenv("APS5_LAB_MUTEX_GATE") != nullptr && std::getenv("APS5_LAB_MUTEX_LEARN") != nullptr && std::getenv("APS5_NO_PRESYNC") == nullptr;
+    return learn;
+}
+
+std::unordered_map<const void*, std::vector<Graphics::DccGateRange>>& LearnedKeys() {
+    thread_local std::unordered_map<const void*, std::vector<Graphics::DccGateRange>> table;
+    return table;
+}
+
+void AppendLearned(std::vector<Graphics::PresyncSurface>& surfaces, const void* identity) {
+    if (!MutexLearn() || identity == nullptr) return;
+    const auto& table = LearnedKeys();
+    const auto found = table.find(identity);
+    if (found == table.end()) return;
+    for (const auto& range : found->second) {
+        const bool listed = std::any_of(surfaces.begin(), surfaces.end(), [&](const Graphics::PresyncSurface& surface) { return surface.dccKeys && surface.address <= range.address && range.address + range.bytes <= surface.address + surface.bytes; });
+        if (!listed) surfaces.push_back({range.address, range.bytes, true});
+    }
+}
+
+// The key entries of a pre-sync surface list, for the gate.
+std::vector<Graphics::DccGateRange> GateKeyRanges(std::span<const Graphics::PresyncSurface> surfaces) {
+    std::vector<Graphics::DccGateRange> ranges;
+    for (const auto& surface : surfaces) {
+        if (surface.dccKeys) ranges.push_back({surface.address, surface.bytes});
+    }
+    return ranges;
 }
 
 // Debug aid: APS5_SYNC_DISPATCH=1 waits for every dispatch, as before batching.
@@ -4082,10 +4126,86 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         auto last = counters.lastReport.load();
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
             const auto keyWaitCounts = Graphics::KeyWaitCounts();
+            AgcDriver::ProfilePrint_nid_no_patch("[presync] gate (APS5_LAB_MUTEX_GATE, cumulative): %llu dispatches checked at the lock, %llu waited with the mutex released (%llu rounds, %.0f ms), %llu left to the locked wait after three rounds, %llu nested; locked key syncs (count/ms): queue 0 %llu/%.0f, queue 0x20 %llu/%.0f, other %llu/%.0f; by the gate's view of the range: covered %llu, overlapping %llu, not listed %llu, no gate %llu\n", static_cast<unsigned long long>(counters.gateChecked.load()), static_cast<unsigned long long>(counters.gateWaited.load()), static_cast<unsigned long long>(counters.gateRounds.load()), counters.gateWaitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.gateExhausted.load()), static_cast<unsigned long long>(counters.gateNested.load()), static_cast<unsigned long long>(keyWaitCounts.syncedBy[0]), keyWaitCounts.syncedMs[0], static_cast<unsigned long long>(keyWaitCounts.syncedBy[1]), keyWaitCounts.syncedMs[1], static_cast<unsigned long long>(keyWaitCounts.syncedBy[2]), keyWaitCounts.syncedMs[2], static_cast<unsigned long long>(keyWaitCounts.byCoverage[0]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[1]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[2]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[3]));
             AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
         }
     }
     return serial;
+}
+
+bool VulkanDevice::MutexGate() {
+    static const bool gate = std::getenv("APS5_LAB_MUTEX_GATE") != nullptr && std::getenv("APS5_NO_PRESYNC") == nullptr;
+    return gate;
+}
+
+std::vector<Graphics::DccGateRange> VulkanDevice::SettleKeyWriters(const PreparedDispatch* prepared, const RecipeHit* hit) {
+    const auto* keys = hit != nullptr ? &hit->gateKeys : prepared != nullptr ? &prepared->gateKeys : nullptr;
+    if (keys == nullptr || keys->empty() || !state->recorder || !CanWaitUnlocked()) return {};
+    auto& counters = Presyncs();
+    counters.gateChecked.fetch_add(1, std::memory_order_relaxed);
+    auto& mutex = GuestMemory::GpuMutex();
+    if (mutex.DepthOnThisThread() != 1) {
+        counters.gateNested.fetch_add(1, std::memory_order_relaxed);
+        return *keys;
+    }
+    bool waited = false;
+    for (int round = 0;; ++round) {
+        // The lock-free snapshot is current: every recorder change is made under the mutex this thread holds.
+        const bool pending = std::any_of(keys->begin(), keys->end(), [](const Graphics::DccGateRange& range) { return Graphics::DccKeyWritersPending(range.address, static_cast<std::size_t>(range.bytes)); });
+        if (!pending) break;
+        if (round == 3) {
+            counters.gateExhausted.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        bool open = false;
+        std::uint64_t serial = 0;
+        for (const auto& range : *keys) {
+            const auto bytes = static_cast<std::size_t>(range.bytes);
+            if (!Graphics::DccKeyWriterNeedsSync(range.address, bytes)) continue;
+            const auto info = state->recorder->DescribePendingWrite(range.address, bytes);
+            if (!info.has_value()) continue;
+            open = open || info->open;
+            serial = std::max(serial, info->serial);
+        }
+        if (open) serial = state->recorder->SubmitAndEpoch();
+        if (serial == 0) break;
+        counters.gateRounds.fetch_add(1, std::memory_order_relaxed);
+        waited = true;
+        const auto waitStart = std::chrono::steady_clock::now();
+        mutex.unlock();
+        try {
+            WaitRecorded(serial);
+        } catch (...) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+            mutex.lock();
+            throw;
+        }
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+        mutex.lock();
+        counters.gateWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+        // The batches waited for are reaped here, as the dispatch reaps the pre-sync's, so the lookups find nothing pending.
+        ReapRecorded(serial);
+    }
+    if (waited) counters.gateWaited.fetch_add(1, std::memory_order_relaxed);
+    return *keys;
+}
+
+const void* VulkanDevice::GateIdentity(const PreparedDispatch* prepared, const RecipeHit* hit) const {
+    if (hit != nullptr) return hit->resources.get();
+    if (prepared == nullptr) return nullptr;
+    return prepared->cached != nullptr ? static_cast<const void*>(prepared->cached.get()) : static_cast<const void*>(prepared->resources.get());
+}
+
+void VulkanDevice::LearnKeyRanges(const void* identity, std::span<const Graphics::DccGateRange> ranges) {
+    if (!MutexLearn() || identity == nullptr || ranges.empty()) return;
+    auto& table = LearnedKeys();
+    if (table.size() > 8192) table.clear();
+    auto& known = table[identity];
+    for (const auto& range : ranges) {
+        if (known.size() >= 8) break;
+        const bool have = std::any_of(known.begin(), known.end(), [&](const Graphics::DccGateRange& entry) { return entry.address <= range.address && range.address + range.bytes <= entry.address + entry.bytes; });
+        if (!have) known.push_back(range);
+    }
 }
 
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
@@ -4142,7 +4262,9 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
     // semaphores.
     if (!NoPresync() && CanWaitUnlocked()) {
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
-        const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
+        auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
+        AppendLearned(surfaces, cached != nullptr ? static_cast<const void*>(cached.get()) : static_cast<const void*>(prepared->resources.get()));
+        if (MutexGate()) prepared->gateKeys = GateKeyRanges(surfaces);
         prepared->presyncSerial = presync(surfaces);
         phase(PreparedDispatch::PreparePresync);
     }
@@ -4192,10 +4314,21 @@ std::shared_ptr<RecipeHit> VulkanDevice::PrepareRecipe(const std::shared_ptr<con
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
         if (Graphics::HostImportsUnchanged(graphicsContext(), recipe->presyncProof)) {
             counters.presyncsFromRecipe.fetch_add(1, std::memory_order_relaxed);
-            hit->presyncSerial = presync(recipe->presyncSurfaces);
+            if (MutexLearn()) {
+                auto surfaces = recipe->presyncSurfaces;
+                AppendLearned(surfaces, hit->resources.get());
+                hit->gateKeys = GateKeyRanges(surfaces);
+                hit->presyncSerial = presync(surfaces);
+            } else {
+                if (MutexGate()) hit->gateKeys = GateKeyRanges(recipe->presyncSurfaces);
+                hit->presyncSerial = presync(recipe->presyncSurfaces);
+            }
         } else {
             counters.presyncsRecomputed.fetch_add(1, std::memory_order_relaxed);
-            hit->presyncSerial = presync(hit->resources->PresyncSurfaces());
+            auto surfaces = hit->resources->PresyncSurfaces();
+            AppendLearned(surfaces, hit->resources.get());
+            if (MutexGate()) hit->gateKeys = GateKeyRanges(surfaces);
+            hit->presyncSerial = presync(surfaces);
         }
         if (hit->presyncSerial != 0) counters.presyncWaits.fetch_add(1, std::memory_order_relaxed);
     }

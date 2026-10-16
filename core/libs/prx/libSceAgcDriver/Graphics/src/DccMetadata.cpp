@@ -769,7 +769,13 @@ struct KeyWaitTotals {
     std::atomic<std::uint64_t> known{0};
     std::atomic<std::uint64_t> fillsUncompressed{0};
     std::atomic<std::uint64_t> synced{0};
+    std::array<std::atomic<std::uint64_t>, 3> syncedBy{};
+    std::array<std::atomic<std::uint64_t>, 3> syncedUs{};
+    std::array<std::atomic<std::uint64_t>, 4> byCoverage{};
 };
+
+thread_local const std::vector<DccGateRange>* keyGate = nullptr;
+thread_local std::vector<DccGateRange> unlistedKeyRanges;
 
 KeyWaitTotals& KeyWaits() {
     static KeyWaitTotals totals;
@@ -778,9 +784,28 @@ KeyWaitTotals& KeyWaits() {
 
 }
 
+KeyGateScope::KeyGateScope(std::vector<DccGateRange> settled) : ranges(std::move(settled)), previous(keyGate) {
+    keyGate = &ranges;
+    unlistedKeyRanges.clear();
+}
+
+std::vector<DccGateRange> TakeUnlistedKeyRanges() {
+    return std::exchange(unlistedKeyRanges, {});
+}
+
+KeyGateScope::~KeyGateScope() {
+    keyGate = previous;
+}
+
 DccKeyWaitCounts KeyWaitCounts() {
     const auto& totals = KeyWaits();
-    return {totals.calls.load(std::memory_order_relaxed), totals.noPending.load(std::memory_order_relaxed), totals.known.load(std::memory_order_relaxed), totals.fillsUncompressed.load(std::memory_order_relaxed), totals.synced.load(std::memory_order_relaxed)};
+    DccKeyWaitCounts counts{totals.calls.load(std::memory_order_relaxed), totals.noPending.load(std::memory_order_relaxed), totals.known.load(std::memory_order_relaxed), totals.fillsUncompressed.load(std::memory_order_relaxed), totals.synced.load(std::memory_order_relaxed), {}, {}, {}};
+    for (std::size_t i = 0; i < 3; ++i) {
+        counts.syncedBy[i] = totals.syncedBy[i].load(std::memory_order_relaxed);
+        counts.syncedMs[i] = static_cast<double>(totals.syncedUs[i].load(std::memory_order_relaxed)) / 1000.0;
+    }
+    for (std::size_t i = 0; i < 4; ++i) counts.byCoverage[i] = totals.byCoverage[i].load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count) {
@@ -818,7 +843,29 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     }
     waits.synced.fetch_add(1, std::memory_order_relaxed);
     Recorder::CountSync(2);
+    const auto syncStart = std::chrono::steady_clock::now();
     recorder->SyncThrough(metaAddress, count);
+    {
+        const auto tag = GuestMemory::GpuLockThreadTag();
+        const std::size_t thread = tag == 0 ? 0u : tag == 0x20 ? 1u : 2u;
+        waits.syncedBy[thread].fetch_add(1, std::memory_order_relaxed);
+        waits.syncedUs[thread].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - syncStart).count()), std::memory_order_relaxed);
+        // 0 covered by a range the gate settled, 1 overlapping one, 2 not listed, 3 no gate on this thread.
+        std::size_t coverage = 3;
+        if (keyGate != nullptr) {
+            coverage = 2;
+            const auto end = metaAddress + count;
+            for (const auto& range : *keyGate) {
+                if (range.address <= metaAddress && end <= range.address + range.bytes) {
+                    coverage = 0;
+                    break;
+                }
+                if (range.address < end && metaAddress < range.address + range.bytes) coverage = 1;
+            }
+        }
+        waits.byCoverage[coverage].fetch_add(1, std::memory_order_relaxed);
+        if (coverage == 2 && unlistedKeyRanges.size() < 16) unlistedKeyRanges.push_back({metaAddress, count});
+    }
     return std::nullopt;
 }
 
