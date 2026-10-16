@@ -1,0 +1,5 @@
+name=lead-best4
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best4-965fa7588c-153207
