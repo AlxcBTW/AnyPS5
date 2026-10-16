@@ -2175,6 +2175,18 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     return true;
 }
 
+bool StorageTexture::UntrackedUnchanged() const {
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const auto address = descriptor.baseAddress;
+    if (!keptAtUnwatch.empty() || original.size() != guestBytes || !originalHolds(address, bytes)) return false;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (epoch == 0) return false;
+    const auto* recorder = Recorder::Active();
+    const auto hint = GuestMemory::UntrackedHint(address, bytes);
+    const std::array<std::uint64_t, 5> stamp{hint != 0, hint != 0 ? hint : epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    return (stamp[3] & 1u) == 0 && comparedGuestBytes == stamp;
+}
+
 constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
