@@ -432,6 +432,7 @@ private:
         std::shared_ptr<StorageTexture> source;
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
+        std::array<std::uint64_t, 4> entryUntracked{};
     };
     std::vector<ImageRecord> imageRecords;
     struct PreviousSampled {
@@ -472,6 +473,9 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        // Snapshot textures over memory outside the write watch: the key the lookup kept the
+        // snapshot by (hint, newest stamp, forget serial, newest write note), all zero without one.
+        std::array<std::uint64_t, 4> untracked{};
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
