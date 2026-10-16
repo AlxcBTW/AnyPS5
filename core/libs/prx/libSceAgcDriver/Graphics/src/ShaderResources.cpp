@@ -480,6 +480,8 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
 }
 
 std::uint64_t storageCacheBytes();
+std::uint64_t storageBudgetCap(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t floor);
+std::atomic<std::uint64_t> storageBudgetEvictions{0};
 
 std::optional<std::uint32_t> largestDeviceLocalHeap(const VkPhysicalDeviceMemoryProperties& memory) {
     std::optional<std::uint32_t> heap;
@@ -497,6 +499,20 @@ std::uint64_t forcedCacheBudget() {
     return forced;
 }
 
+std::uint64_t storageBudgetCap(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, const std::uint64_t floor) {
+    const auto heap = largestDeviceLocalHeap(memory);
+    const auto heapBytes = heap ? memory.memoryHeaps[*heap].size : 0u;
+    if (reported == nullptr || !heap) return StorageBudgetCap(heapBytes, 0u, 0u, 0u, 0u, floor);
+    static std::atomic<std::uint64_t> sampledPeak{0};
+    const auto sampled = SampledTextureMemory();
+    const auto previousPeak = sampledPeak.load(std::memory_order_relaxed);
+    const auto peak = std::max(sampled, previousPeak - previousPeak / 64u);
+    sampledPeak.store(peak, std::memory_order_relaxed);
+    const auto caches = sampled + storageCacheBytes();
+    const auto sampledBudget = SampledTextureBudget(memory, reported, caches);
+    return StorageBudgetCap(heapBytes, reported->heapBudget[*heap], reported->heapUsage[*heap], caches, SampledCacheHeadroom(sampledBudget, sampled, peak), floor);
+}
+
 std::uint64_t storageBudget(const Context& context) {
     const auto forced = forcedCacheBudget();
     if (forced != 0) return forced;
@@ -506,6 +522,7 @@ std::uint64_t storageBudget(const Context& context) {
         VkPhysicalDevice device{VK_NULL_HANDLE};
         std::chrono::steady_clock::time_point read{};
         std::uint64_t budget{0};
+        std::uint64_t evictions{0};
     } cached;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(cached.mutex);
@@ -514,9 +531,24 @@ std::uint64_t storageBudget(const Context& context) {
     VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
     properties.pNext = &reported;
     context.memoryProperties2(context.physical, &properties);
+    const auto floor = StorageTextureBudget(context.memory, &reported);
+    const auto evictions = storageBudgetEvictions.load(std::memory_order_relaxed);
+    std::uint64_t budget = floor;
+    if (cached.device == context.physical && cached.budget != 0) {
+        budget = std::max(cached.budget, floor);
+        const auto heap = largestDeviceLocalHeap(context.memory);
+        const auto reportedBudget = heap ? reported.heapBudget[*heap] : 0u;
+        const auto usage = heap ? reported.heapUsage[*heap] : 0u;
+        const auto adjusted = NextStorageBudget(budget, floor, storageBudgetCap(context.memory, &reported, floor), reportedBudget, usage, evictions - cached.evictions);
+        if (adjusted != budget) {
+            std::fprintf(stderr, "[textures] storage cache budget %llu MiB -> %llu MiB (evictions %llu, heap uses %llu of %llu MiB)\n", static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(adjusted >> 20u), static_cast<unsigned long long>(evictions - cached.evictions), static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(reportedBudget >> 20u));
+            budget = adjusted;
+        }
+    }
+    cached.evictions = evictions;
     cached.device = context.physical;
     cached.read = now;
-    cached.budget = StorageTextureBudget(context.memory, &reported);
+    cached.budget = budget;
     return cached.budget;
 }
 
@@ -977,7 +1009,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
             const auto budget = storageBudget(context);
-            while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+            while (!cache.entries.empty() && cache.bytes + entry.accounted > budget) {
+                evicted.push_back(evictStorage(cache, std::prev(cache.entries.end())));
+                storageBudgetEvictions.fetch_add(1, std::memory_order_relaxed);
+            }
             cache.bytes += entry.accounted;
             texture = entry.texture;
             cache.entries.push_front(std::move(entry));
@@ -1000,6 +1035,29 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
 
 }
 
+// The storage cache's cap: half the heap, and no more than what is left of the device budget once
+// the space outside both texture caches, the headroom the sampled cache may still claim and the
+// reserve the growth check keeps are taken out. Growing into that space pushes the heap to its
+// budget, and the allocations that follow (sampled textures, device buffers, staging) fail before
+// the next budget read can shrink this cache again. The sampled cache's budget covers both caches,
+// so only its remaining headroom is held back; a sampled cache at or over its budget holds back
+// nothing and the storage cache may take the space.
+std::uint64_t StorageBudgetCap(const std::uint64_t heapBytes, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t cacheBytes, const std::uint64_t sampledRemaining, const std::uint64_t floor) {
+    std::uint64_t cap = heapBytes / 2u;
+    if (reportedBudget != 0) {
+        const auto reserve = std::max<std::uint64_t>(1024ull << 20u, reportedBudget / 8u);
+        const auto outside = usage - std::min(usage, cacheBytes);
+        const auto pool = reportedBudget > outside + reserve ? reportedBudget - outside - reserve : 0u;
+        cap = std::min(cap, pool > sampledRemaining ? pool - sampledRemaining : 0u);
+    }
+    return std::max(cap, floor);
+}
+
+std::uint64_t SampledCacheHeadroom(const std::uint64_t sampledBudget, const std::uint64_t sampled, const std::uint64_t sampledPeak) {
+    const auto expected = std::min(sampledBudget, sampledPeak + std::max<std::uint64_t>(sampledPeak / 8u, 64ull << 20u));
+    return expected > sampled ? expected - sampled : 0u;
+}
+
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory) {
     const auto heap = largestDeviceLocalHeap(memory);
     return std::max<std::uint64_t>(2048ull << 20u, heap ? memory.memoryHeaps[*heap].size / 4u : 0u);
@@ -1009,6 +1067,20 @@ std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memor
     const auto heap = largestDeviceLocalHeap(memory);
     if (reported == nullptr || !heap || reported->heapBudget[*heap] == 0) return TextureCacheBudget(memory);
     return std::max<std::uint64_t>(512ull << 20u, std::min<std::uint64_t>(TextureCacheBudget(memory), reported->heapBudget[*heap] / 4u));
+}
+
+// The storage cache's budget grows while it evicts under its own budget (its working set does not
+// fit) and shrinks again while the device's memory budget is under pressure, so a title whose
+// storage surfaces do not fit the initial share stops recreating them every frame. The thresholds
+// and the cap come from the measurement in the storage-cache debt entry.
+std::uint64_t NextStorageBudget(const std::uint64_t current, const std::uint64_t floor, const std::uint64_t cap, const std::uint64_t reportedBudget, const std::uint64_t usage, const std::uint64_t evictions) {
+    if (reportedBudget == 0) return current;
+    const auto reserve = std::max<std::uint64_t>(1024ull << 20u, reportedBudget / 8u);
+    const auto step = std::max<std::uint64_t>(current / 8u, 64ull << 20u);
+    if (usage + reserve > reportedBudget) return std::max(floor, current > step ? current - step : floor);
+    if (current > cap) return std::max({floor, cap, current > step ? current - step : floor});
+    if (evictions >= 16u && current < cap && usage + step + reserve <= reportedBudget) return std::min(cap, current + step);
+    return current;
 }
 
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes) {
@@ -4337,15 +4409,20 @@ void ShaderResources::finishImageTables() {
     bda->SetImageTables(std::move(faults), std::move(ranges));
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSurfaces() const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
+std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
+    std::vector<PresyncSurface> surfaces;
     // A surface's lookup reads guest memory on the CPU unless it is served GPU-direct from a host
     // import: a storage image of imported memory uploads and refreshes from the import, and a
     // sampled texture of one views that image (SampledFromStorageEligible), so neither waits for
     // the producer.
     const auto consider = [&](std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes, bool sampled) {
         const bool gpuDirect = sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
-        if (!gpuDirect) surfaces.emplace_back(address, guestBytes);
+        if (!gpuDirect) surfaces.push_back({address, guestBytes, false});
+    };
+    static const bool keyRanges = std::getenv("APS5_NO_DCC_PRESYNC") == nullptr;
+    const auto considerKeys = [&](std::uint64_t dccAddress, std::uint64_t guestBytes) {
+        const auto keyBytes = DccKeyBytes(guestBytes);
+        if (keyRanges && dccAddress != 0 && keyBytes != 0) surfaces.push_back({dccAddress, keyBytes, true});
     };
     if (completed) {
         // A cached object (the resource cache): Revalidate repeats the lookups of the objects the
@@ -4361,18 +4438,22 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
                 const auto& texture = textures[textureIndex++];
                 if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
                 else consider(range.format, range.address, range.bytes, true);
+                considerKeys(range.dccAddress, range.bytes);
             }
         }
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (index != 0 && storageTextures[index] == storageTextures[index - 1]) continue;
             const auto& image = *storageTextures[index];
             consider(image.Descriptor().format, image.Descriptor().baseAddress, image.GuestBytes(), false);
+            considerKeys(image.Descriptor().dccAddress, image.GuestBytes());
         }
         return surfaces;
     }
     if (!imageRecords.empty()) {
         for (const auto& record : imageRecords) {
-            if (record.decoded) consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled);
+            if (!record.decoded) continue;
+            consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled);
+            considerKeys(record.resource.dccAddress, record.guestBytes);
         }
         return surfaces;
     }
@@ -4381,14 +4462,18 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (IsNullTextureResource(words)) return;
         const auto resource = DecodeTextureResource(words);
-        consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+        const auto guestBytes = DescribeSurface(resource).guestBytes;
+        consider(resource.format, resource.baseAddress, guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+        considerKeys(resource.dccAddress, guestBytes);
     });
     for (const auto& binding : deferredCompute.program->bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::ImageTable) continue;
         for (std::size_t element = 0; element < binding.guestDescriptor.size() / 8u; ++element) {
             try {
                 const auto resource = DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(element * 8u, 8u));
-                consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, true);
+                const auto guestBytes = DescribeSurface(resource).guestBytes;
+                consider(resource.format, resource.baseAddress, guestBytes, true);
+                considerKeys(resource.dccAddress, guestBytes);
             } catch (const std::runtime_error&) {
             }
         }
