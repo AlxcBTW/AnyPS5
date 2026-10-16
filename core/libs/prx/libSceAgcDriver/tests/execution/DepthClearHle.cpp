@@ -37,6 +37,14 @@
 #include <thread>
 #include <vector>
 
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
+
 namespace {
 
 using DepthFastClearHarness::Compile;
@@ -474,6 +482,51 @@ void StencilCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mo
     else Require(difference.clears == 1u, label + "the clear was not taken (" + std::to_string(difference.clears) + " clears, " + std::to_string(Declined(difference)) + " declined)");
 }
 
+// A dispatch served from a resource template binds the template's mirror as it is and never calls DepthSurface::Storage: the
+// store-back under the scope is still the clear. Here no dispatch runs at all (the mirror keeps the 0.5 the copy-in gave it), so
+// nothing but the scope can have put the 1.0 in the plane.
+void WithoutStorageCase(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    Graphics::SetDepthClearModeForTest(1);
+    const std::string label = "store-back without Storage(): ";
+    auto& code = NewBlock();
+    std::memcpy(code.Data(), ClearKernel.data(), sizeof(ClearKernel));
+    auto& plane = NewBlock();
+    auto& color = NewBlock();
+    const Surface surface{plane.Address(), 0, 0, false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS}) == Covered, label + "the producer did not cover the plane");
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto words = TextureDescriptor(plane.Address(), Format32Float);
+    const auto resource = Graphics::DecodeTextureResource(words);
+    std::shared_ptr<Graphics::StorageTexture> mirror;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        mirror = Graphics::DepthSurfaceStorage(context, words, resource, 0);
+    }
+    Require(mirror != nullptr, label + "the plane has no mirror");
+
+    SetColor(color, 1.0f);
+    std::vector<std::uint32_t> userData(12);
+    const auto buffer = BufferDescriptor(color.Address(), 16u);
+    std::copy(words.begin(), words.end(), userData.begin());
+    std::copy(buffer.begin(), buffer.end(), userData.begin() + 8);
+    const std::span<const std::uint32_t> kernel(reinterpret_cast<const std::uint32_t*>(code.Data()), ClearKernel.size());
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{8, 8, 1}, 0u, {true, true, true}, false, 2u, {0, 0, 0}};
+    const auto clear = Graphics::MatchStorageImageClear(kernel, userData, compute, {8, 4, 1u});
+    Require(clear.has_value(), label + "the kernel was not recognized");
+    const auto before = Graphics::DepthClearCounts();
+    {
+        Graphics::DepthPlaneClear scope(*clear);
+        Require(scope.Active(), label + "the scope was not installed");
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Require(Graphics::DepthSurfaceStoreBack(context, *mirror), label + "the store-back found no plane");
+    }
+    device.WaitIdle();
+    const auto difference = Difference(Graphics::DepthClearCounts(), before);
+    Require(difference.clears == 1u, label + "the store-back was not the clear (" + std::to_string(difference.clears) + " clears)");
+    Require(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_LESS}) == Covered, label + "the plane does not hold the 1.0 of the clear");
+    Require(Draw(device, shaders, surface, {.depthCompare = VK_COMPARE_OP_GREATER}) == 0u, label + "a texel of the plane is below 0.5");
+}
+
 }
 
 int main() {
@@ -529,6 +582,7 @@ int main() {
         Graphics::SetDepthClearModeForTest(-1);
 
         for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
+        run("store-back without Storage()", [&] { WithoutStorageCase(*device, shaders); });
         for (const int mode : {0, 1, 2}) run(mode == 0 ? "16-bit plane, switch off" : mode == 1 ? "16-bit plane, lever" : "16-bit plane, verify", [&] { SixteenBitCase(*device, shaders, mode); });
         for (const int mode : {0, 1}) run(mode == 0 ? "depth and stencil, switch off" : "depth and stencil, lever", [&] { StencilCase(*device, shaders, mode); });
         for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
