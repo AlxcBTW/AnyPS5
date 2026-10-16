@@ -143,7 +143,13 @@ int depthClearMode() {
 enum DepthClearDecline : std::size_t { DeclineLayers, DeclineFormat, DeclineValue, DeclineColor, DeclinePending, DeclineCoverage, DeclineSize, DeclineCount };
 static_assert(DeclineCount <= 8, "DepthClearStatistics::declined holds eight reasons");
 
+enum DepthClearRefusal : std::size_t { RefuseUserData, RefuseThreads, RefuseGroupIds, RefuseThreadIds, RefuseCoverage, RefuseCount };
+static_assert(RefuseCount <= 8, "DepthClearStatistics::refused holds eight reasons");
+
 struct DepthClearCounters {
+    std::atomic<std::uint64_t> kernelSeen{0};
+    std::atomic<std::uint64_t> offDepth{0};
+    std::array<std::atomic<std::uint64_t>, 8> refused{};
     std::atomic<std::uint64_t> matched{0};
     std::atomic<std::uint64_t> taken{0};
     std::atomic<std::uint64_t> copiesSkipped{0};
@@ -171,9 +177,10 @@ void printDepthClearCounters() {
     last = now;
     const auto& c = depthClearCounters();
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    char line[640];
-    std::snprintf(line, sizeof(line), "[depthclear] mode %d: %llu clear dispatches over depth planes, %llu taken (%llu copy-ins left out, %llu copy-outs replaced by a depth clear, %.0f MiB not copied); declined: layers %llu format %llu value %llu color %llu pending %llu coverage %llu size %llu; verified %llu, violations %llu\n",
-        depthClearMode(), count(c.matched), count(c.taken), count(c.copiesSkipped), count(c.clears), static_cast<double>(c.bytesSkipped.load(std::memory_order_relaxed)) / 1048576.0,
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[depthclear] mode %d: kernel seen %llu (refused: user data %llu threads %llu group ids %llu thread ids %llu coverage %llu; clearing a colour image %llu); %llu clear dispatches over depth planes, %llu taken (%llu copy-ins left out, %llu copy-outs replaced by a depth clear, %.0f MiB not copied); declined: layers %llu format %llu value %llu color %llu pending %llu coverage %llu size %llu; verified %llu, violations %llu\n",
+        depthClearMode(), count(c.kernelSeen), count(c.refused[RefuseUserData]), count(c.refused[RefuseThreads]), count(c.refused[RefuseGroupIds]), count(c.refused[RefuseThreadIds]), count(c.refused[RefuseCoverage]), count(c.offDepth),
+        count(c.matched), count(c.taken), count(c.copiesSkipped), count(c.clears), static_cast<double>(c.bytesSkipped.load(std::memory_order_relaxed)) / 1048576.0,
         count(c.declined[DeclineLayers]), count(c.declined[DeclineFormat]), count(c.declined[DeclineValue]), count(c.declined[DeclineColor]), count(c.declined[DeclinePending]), count(c.declined[DeclineCoverage]), count(c.declined[DeclineSize]),
         count(c.verified), count(c.violations));
     std::fputs(line, stderr);
@@ -181,11 +188,18 @@ void printDepthClearCounters() {
 
 // What the kernel stores into every texel, as the plane holds it: the 16 or 32 bits of the texel and the depth that
 // clears the depth image to them. Nullopt when the clear cannot be taken exactly (the reason counted).
+constexpr std::array<const char*, DeclineCount> declineNames{"layers", "format", "value", "color", "pending", "coverage", "size"};
+thread_local const char* lastDecline = nullptr;
+thread_local std::uint32_t lastColor = 0;
+
 std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clear) {
     auto& counters = depthClearCounters();
     ++counters.matched;
+    lastDecline = nullptr;
+    lastColor = 0;
     const auto decline = [&](DepthClearDecline why) -> std::optional<DepthPlaneOverwrite> {
         ++counters.declined[why];
+        lastDecline = declineNames[why];
         return std::nullopt;
     };
     DepthPlaneOverwrite overwrite;
@@ -228,6 +242,7 @@ std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clea
     } catch (...) {
         return decline(DeclineColor);
     }
+    lastColor = c0;
     switch (kind) {
         case Kind::Unorm16:
             if (c0 == 0u || c0 == 0x80000000u) overwrite.raw = 0u;
@@ -256,6 +271,22 @@ std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clea
     overwrite.width = clear.width;
     overwrite.height = clear.height;
     return overwrite;
+}
+
+// The first dozen clears the matcher passed on, one line each: which image, how many threads, the colour, and what the lever made of it.
+void noteDecision(const StorageImageClear& clear, const std::optional<DepthPlaneOverwrite>& decoded) {
+    static std::atomic<std::uint64_t> decisions{0};
+    if (decisions.fetch_add(1, std::memory_order_relaxed) >= 12u) return;
+    GuestTextureResource view{};
+    try {
+        view = DecodeTextureResource(clear.image);
+    } catch (...) {
+    }
+    char verdict[96];
+    if (decoded) std::snprintf(verdict, sizeof(verdict), "taken as %u-bit raw 0x%x (depth %g)", decoded->bits, decoded->raw, static_cast<double>(decoded->depth));
+    else std::snprintf(verdict, sizeof(verdict), "declined: %s", lastDecline != nullptr ? lastDecline : "?");
+    std::fprintf(stderr, "[depthclear] clear of 0x%llx, %ux%u threads over a %ux%u image (guest format %u, tile %d, dimension %d, layers %u, base layer %u), colour %08x: %s\n",
+        static_cast<unsigned long long>(view.baseAddress), clear.width, clear.height, view.width, view.height, view.format, static_cast<int>(view.tileMode), static_cast<int>(view.dimension), view.depthOrLastArray + 1u, view.baseArray, lastColor, verdict);
 }
 
 class DepthSurface {
@@ -1537,12 +1568,21 @@ std::optional<StorageImageClear> MatchStorageImageClear(std::span<const std::uin
     // x = group.x * 8 + thread.x; colour = s_buffer_load_dwordx4 s[8:11] (the V# in user data 8-11) at offset 0; y = group.y * 8 + thread.y;
     // layer = group.z; image_store colour, (x, y, layer) through the T# in user data 0-7. s12-s14 are the group ids when 12 user registers precede them.
     static constexpr std::array<std::uint32_t, 15> kernel{0xd7460004u, 0x0401060cu, 0xf4280204u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000208u, 0x7e020209u, 0x7e04020au, 0x7e06020bu, 0xf0200f28u, 0x00000004u, 0xbf810000u};
-    if (userData.size() != 12u || compute.numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return std::nullopt;
-    if (!compute.groupIdEnable[0] || !compute.groupIdEnable[1] || !compute.groupIdEnable[2] || compute.threadIdComponentCount < 2u) return std::nullopt;
-    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    if (code.size() < kernel.size() || code[0] != kernel[0] || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    auto& counters = depthClearCounters();
+    ++counters.kernelSeen;
+    const auto refuse = [&](DepthClearRefusal why) -> std::optional<StorageImageClear> {
+        ++counters.refused[why];
+        printDepthClearCounters();
+        return std::nullopt;
+    };
+    if (userData.size() != 12u) return refuse(RefuseUserData);
+    if (compute.numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return refuse(RefuseThreads);
+    if (!compute.groupIdEnable[0] || !compute.groupIdEnable[1] || !compute.groupIdEnable[2]) return refuse(RefuseGroupIds);
+    if (compute.threadIdComponentCount < 2u) return refuse(RefuseThreadIds);
     std::array<std::uint64_t, 3> covered{};
     for (std::size_t axis = 0; axis < 3u; ++axis) covered[axis] = compute.partialThreads[axis] != 0u ? compute.partialThreads[axis] : static_cast<std::uint64_t>(groups[axis]) * compute.numThreads[axis];
-    if (covered[0] == 0u || covered[1] == 0u || covered[2] != 1u) return std::nullopt;
+    if (covered[0] == 0u || covered[1] == 0u || covered[2] != 1u) return refuse(RefuseCoverage);
     StorageImageClear clear;
     std::copy_n(userData.begin(), clear.image.size(), clear.image.begin());
     std::copy_n(userData.begin() + static_cast<std::ptrdiff_t>(clear.image.size()), clear.color.size(), clear.color.begin());
@@ -1563,10 +1603,17 @@ bool DepthPlaneClearEnabled() {
     return depthClearMode() != 0;
 }
 
+void NoteStorageImageClearOffDepth() {
+    ++depthClearCounters().offDepth;
+    printDepthClearCounters();
+}
+
 DepthPlaneClear::DepthPlaneClear(const StorageImageClear& clear) {
     if (depthClearMode() == 0) return;
     printDepthClearCounters();
-    if (auto decoded = decodeOverwrite(clear)) {
+    const auto decoded = decodeOverwrite(clear);
+    noteDecision(clear, decoded);
+    if (decoded) {
         value = *decoded;
         previous = currentOverwrite;
         currentOverwrite = &value;
@@ -1590,6 +1637,9 @@ DepthClearStatistics DepthClearCounts() {
     statistics.verified = counters.verified.load();
     statistics.violations = counters.violations.load();
     for (std::size_t reason = 0; reason < statistics.declined.size(); ++reason) statistics.declined[reason] = counters.declined[reason].load();
+    statistics.kernelSeen = counters.kernelSeen.load();
+    statistics.offDepth = counters.offDepth.load();
+    for (std::size_t reason = 0; reason < statistics.refused.size(); ++reason) statistics.refused[reason] = counters.refused[reason].load();
     return statistics;
 }
 

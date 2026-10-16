@@ -512,11 +512,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     // around the dispatch; its colour is read from guest memory under the mutex with the packet's labels recorded.
     std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
     if (indirectArguments == 0 && !partialLastGroup && Graphics::DepthPlaneClearEnabled()) {
-        if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups); clear && Graphics::StorageImageClearAddress(*clear) != 0 && Graphics::DepthSurfaceAt(Graphics::StorageImageClearAddress(*clear))) {
-            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
-            std::lock_guard clearLock(GuestMemory::GpuMutex());
-            recordLabelsForPacket(localDevice.get(), submission.queue);
-            depthPlaneClear.emplace(*clear);
+        if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups)) {
+            const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
+            if (clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress)) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                std::lock_guard clearLock(GuestMemory::GpuMutex());
+                recordLabelsForPacket(localDevice.get(), submission.queue);
+                depthPlaneClear.emplace(*clear);
+            } else {
+                Graphics::NoteStorageImageClearOffDepth();
+            }
         }
     }
 
