@@ -258,6 +258,8 @@ public:
     bool Reusable() const { return reusable; }
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
+    // Proofs of a storage image that fastRevalidate refused because a registered depth surface covers it (tests read it).
+    static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;

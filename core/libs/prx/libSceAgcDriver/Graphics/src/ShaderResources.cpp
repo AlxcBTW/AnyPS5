@@ -2146,6 +2146,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 // ResourceCache::Find and Touch calls (the [rescache] line).
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
+std::atomic<std::uint64_t> depthGuardRefusals{0};
 
 }
 
@@ -2186,6 +2187,10 @@ void ShaderResources::noteReusable() {
         }
     }
     reusable = true;
+}
+
+std::uint64_t ShaderResources::DepthGuardRefusals() {
+    return depthGuardRefusals.load(std::memory_order_relaxed);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -2722,7 +2727,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         // A depth surface registered over the image's memory is the lookup's to answer, not this image's: cachedStorageTexture
         // hands out the plane's colour mirror (DepthSurfaceStorage), copied in from the depth image anew for every use, and a
         // written image retires the surfaces it lands on. No stamp says whether one appeared after the build, so the walk decides.
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) return fail(FastFail::Depth);
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) {
+            depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+            return fail(FastFail::Depth);
+        }
         bool outside = false;
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
             if (FastProofLevel() < 2) {
@@ -2838,7 +2846,10 @@ bool ShaderResources::fastRevalidateEach() {
         if (own.dccAddress != 0) return false;
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (DepthSurfaceOverlaps(context.device, address, bytes)) return false;
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) {
+            depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
         if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
         if (PendingStorageOverlaps(address, bytes, image)) return false;
         if (!StorageImageCached(context, image)) return false;
