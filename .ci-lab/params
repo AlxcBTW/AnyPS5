@@ -1,0 +1,5 @@
+name=lead-best8
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-lead-best8-762bac0882-265847
