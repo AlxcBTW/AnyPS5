@@ -1,0 +1,5 @@
+name=uppr-main
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-uppr-main-bc3c0fc13c-44900
