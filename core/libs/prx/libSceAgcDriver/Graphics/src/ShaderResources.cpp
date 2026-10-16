@@ -2424,6 +2424,15 @@ struct RevalidateProfile {
     // refresh (its alias, a straddling image) that the re-run accepted; proofs the verify switch
     // checked against the full walk.
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count)> fullByReason{};
+    // The re-run after an own-object refresh that failed again, by the reason of its second failure.
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count)> rerunFails{};
+    // Storage images with DCC keys the proof did not take: the proof of keys is off, the descriptor's
+    // metadata is not the element's, the keys moved since the upload (the lookup refreshes the image).
+    std::array<std::atomic<std::uint64_t>, 3> storageKeyCauses{};
+    // Snapshot textures over memory outside the write watch that the proof left to the walk: keys not
+    // uncompressed, no hint for the range (untrackedKey is zero), a hint but no key kept (partly resident
+    // memory, a write racing the lookup).
+    std::array<std::atomic<std::uint64_t>, 3> leftCauses{};
     std::atomic<std::uint64_t> ownRefreshed{0};
     std::atomic<std::uint64_t> ownStorageRefreshes{0};
     std::atomic<std::uint64_t> ownViewRefreshes{0};
@@ -2479,6 +2488,18 @@ void countKeysProven(bool storage) {
 
 void countFullWalk(FastFail reason) {
     if (BuildProfiled() && reason != FastFail::Count) Revalidations().fullByReason[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countRerunFail(FastFail reason) {
+    if (BuildProfiled() && reason != FastFail::Count) Revalidations().rerunFails[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countStorageKeyCause(std::size_t cause) {
+    if (BuildProfiled()) Revalidations().storageKeyCauses[cause].fetch_add(1, std::memory_order_relaxed);
+}
+
+void countLeftCause(std::size_t cause) {
+    if (BuildProfiled()) Revalidations().leftCauses[cause].fetch_add(1, std::memory_order_relaxed);
 }
 
 void countOwnRefreshFallback(OwnRefreshFallback reason) {
@@ -2554,8 +2575,10 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto reasons = byReason(profile.fastFails, FastFailNames);
     const auto fullReasons = byReason(profile.fullByReason, FastFailNames);
     const auto fallbacks = byReason(profile.ownFallbacks, OwnRefreshFallbackNames);
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
+    const auto reruns = byReason(profile.rerunFails, FastFailNames);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s (re-run failed on:%s), proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped\n", static_cast<unsigned long long>(profile.calls.load()), profile.nanoseconds.load() / 1e6, static_cast<unsigned long long>(profile.fast.load()), static_cast<unsigned long long>(profile.full.load()), static_cast<unsigned long long>(profile.failed.load()), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.load()), static_cast<unsigned long long>(profile.ownStorageRefreshes.load()), static_cast<unsigned long long>(profile.ownViewRefreshes.load()), static_cast<unsigned long long>(profile.ownSourceViews.load()), static_cast<unsigned long long>(profile.refreshedOverlaps.load()), fullReasons.c_str(), fallbacks.c_str(), reruns.c_str(), static_cast<unsigned long long>(profile.proofsVerified.load()), static_cast<unsigned long long>(profile.pendingForeign.load()), static_cast<unsigned long long>(profile.pendingSnapshot.load()), static_cast<unsigned long long>(profile.pendingT1Eligible.load()), static_cast<unsigned long long>(profile.keysProven.load()), static_cast<unsigned long long>(profile.storageKeysProven.load()), static_cast<unsigned long long>(profile.serialSkips.load()), static_cast<unsigned long long>(profile.importSkips.load()));
     const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] storage keys left to the walk: proofs off %llu, metadata not the element's %llu, keys moved since the upload %llu; snapshot textures outside the write watch left to the walk: compressed keys %llu, no hint %llu, hint without a key %llu\n", load(profile.storageKeyCauses[0]), load(profile.storageKeyCauses[1]), load(profile.storageKeyCauses[2]), load(profile.leftCauses[0]), load(profile.leftCauses[1]), load(profile.leftCauses[2]));
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] proof outside the write watch (APS5_LAB_FAST_PROOF=%d): snapshot textures proved %llu, key moved %llu, left to the walk %llu; storage-sourced views proved %llu, stamp moved %llu, left to the walk %llu; storage images proved %llu, stamp moved %llu, left to the walk %llu; fast proofs resting on one %llu; verified %llu, disagreeing %llu; time by path of the calls that succeeded: fast %llu x %.1f us, own-object refresh %llu x %.1f us, full walk %llu x %.1f us\n", FastProofLevel(), load(profile.outside[0][0]), load(profile.outside[0][1]), load(profile.outside[0][2]), load(profile.outside[1][0]), load(profile.outside[1][1]), load(profile.outside[1][2]), load(profile.outside[2][0]), load(profile.outside[2][1]), load(profile.outside[2][2]), load(profile.fastViaOutside), load(profile.outsideVerified), load(profile.outsideMismatch), load(profile.pathCalls[0]), load(profile.pathCalls[0]) != 0 ? load(profile.pathNanoseconds[0]) / 1000.0 / static_cast<double>(load(profile.pathCalls[0])) : 0.0, load(profile.pathCalls[1]), load(profile.pathCalls[1]) != 0 ? load(profile.pathNanoseconds[1]) / 1000.0 / static_cast<double>(load(profile.pathCalls[1])) : 0.0, load(profile.pathCalls[2]), load(profile.pathCalls[2]) != 0 ? load(profile.pathNanoseconds[2]) / 1000.0 / static_cast<double>(load(profile.pathCalls[2])) : 0.0);
 }
 
@@ -2665,6 +2688,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
                 outside = true;
             } else {
                 countOutside(source != nullptr ? 1u : 0u, 2u);
+                if (source == nullptr && BuildProfiled()) countLeftCause(surface.keys != DccKeys::Uncompressed ? 0u : GuestMemory::UntrackedHint(address, bytes) == 0 ? 1u : 2u);
                 return fail(FastFail::Collect);
             }
             ++fastProofsOutside;
@@ -2711,8 +2735,14 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    thread_local std::vector<PendingOverlap>* movedKeysSlot = nullptr;
+    auto& movedKeys = ShaderRecompiler::ThreadOwned(movedKeysSlot);
+    movedKeys.clear();
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
-        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
+        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) {
+            countStorageKeyCause(1);
+            return fail(FastFail::StorageKeys);
+        }
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
         if (image == nullptr) return fail(FastFail::NoRecord);
@@ -2740,7 +2770,19 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
-            if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
+            if (!keyProofs) {
+                countStorageKeyCause(0);
+                return fail(FastFail::StorageKeys);
+            }
+            if (image->ProvedKeys() != image->UploadedKeys()) {
+                // The keys moved since the upload: the lookup refreshes the image (Refresh uploads it again or
+                // clears it), which is also what T1 does for results pending over an element. The image is listed
+                // for that refresh and the other elements are proved by the re-run, not by the walk's lookups.
+                if (!image->Cached()) return fail(FastFail::Evicted);
+                countStorageKeyCause(2);
+                movedKeys.push_back({i, true, false});
+                continue;
+            }
             countKeysProven(true);
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
@@ -2777,10 +2819,15 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!overlapping.empty()) {
             countPendingFail(pending);
+            overlapping.insert(overlapping.end(), movedKeys.begin(), movedKeys.end());
             return fail(FastFail::Pending);
         }
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!movedKeys.empty()) {
+        overlapping.insert(overlapping.end(), movedKeys.begin(), movedKeys.end());
+        return fail(FastFail::StorageKeys);
     }
     if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
@@ -3092,8 +3139,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         if (fallback == OwnRefreshFallback::Count) {
             fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
-            if (fast) ownRefreshed = true;
-            else fallback = OwnRefreshFallback::Rerun;
+            if (fast) {
+                ownRefreshed = true;
+            } else {
+                fallback = OwnRefreshFallback::Rerun;
+                countRerunFail(reason);
+            }
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
