@@ -236,6 +236,19 @@ public:
         std::uint64_t checked, presyncs, keyChecks, keyWaits;
     };
     static PresyncStatistics PresyncCounts();
+    // Lab switch APS5_LAB_DRAW_PRESYNC=1: the pre-sync of a draw, made by the committing thread
+    // WITHOUT GuestMemory::GpuMutex right before the draw's hold. It waits for the recorded writers
+    // of the guest memory the draw reads on the CPU under the hold when a recorded batch writes it:
+    // the depth target's HTILE (DepthSurfaceView), the color targets' DCC keys (by the rule
+    // PrepareDispatch's pre-sync applies to keys) and the index buffer. Returns the serial waited
+    // for (0: none); the caller reaps it under the mutex (ReapRecorded) before the draw, which
+    // then finds those writers finished, as when the GPU had been faster.
+    static bool DrawPresync();
+    std::uint64_t PresyncDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw);
+    struct DrawPresyncStatistics {
+        std::uint64_t checked, surfaces, overlapping, presyncs, htile, keys, index, shadowed;
+    };
+    static DrawPresyncStatistics DrawPresyncCounts();
     // Stage A of a dispatch's resource build, run WITHOUT GuestMemory::GpuMutex before Dispatch or
     // DispatchIndirect: the binding plan, data buffers, imports already serving the guest buffers,
     // read-only copies and the descriptor set (see ShaderResources). The dispatch completes it

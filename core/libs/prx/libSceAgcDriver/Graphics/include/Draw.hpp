@@ -20,6 +20,14 @@ struct HostImport;
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews);
+// Lab switch APS5_LAB_DRAW_PRESYNC (VulkanDevice::PresyncDraw): the unlocked part of a draw's
+// attachment handling, made by the committing thread before the GPU mutex and in the draw's collect
+// epoch. It walks the write watch over the resident color surfaces, their DCC keys and CMASK and the
+// depth target's HTILE, so the locked collects of the same ranges are memo hits, and returns the
+// ranges the locked record reads on the CPU while a recorded batch writes them (the HTILE, the DCC
+// keys) for the pre-sync. Empty when anything about the attachments is unusual (the locked path then
+// decides alone, as without the switch).
+std::vector<PresyncSurface> PrepareDrawUnlocked(const Context& context, const State& state);
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;

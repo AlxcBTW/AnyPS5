@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -556,8 +557,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 1; i < profile.recipeMisses.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
-    std::fprintf(stderr, "%s\n", line);
-    std::fprintf(stderr, "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    constexpr const char* cacheFormat = "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n";
+    if (AgcDriver::AsyncDrawReports_nid_no_patch()) {
+        AgcDriver::ProfilePrint_nid_no_patch("%s\n", static_cast<const char*>(line));
+        AgcDriver::ProfilePrint_nid_no_patch(cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    } else {
+        std::fprintf(stderr, "%s\n", line);
+        std::fprintf(stderr, cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    }
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -1897,6 +1904,41 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     const auto& failures = validationFailures();
     if (const auto found = failures.find(key); found != failures.end()) return found->second;
     return std::nullopt;
+}
+
+std::vector<PresyncSurface> PrepareDrawUnlocked(const Context& context, const State& state) {
+    std::vector<PresyncSurface> surfaces;
+    static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
+    try {
+        for (const auto& color : state.colors) {
+            if (!residentTargets || context.detiler == nullptr || color.samples > 1 || color.arrayLastSlice != 0 || color.tileMode == ColorTileMode::Linear) continue;
+            const auto surface = SurfaceForTarget(color);
+            const auto guestBytes = DescribeSurface(surface).guestBytes;
+            if (surface.baseAddress == 0 || guestBytes == 0) continue;
+            GuestMemory::CollectWrites(surface.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (surface.dccAddress != 0) {
+                const auto keyBytes = DccKeyBytes(guestBytes);
+                if (keyBytes != 0) {
+                    GuestMemory::CollectWrites(surface.dccAddress, keyBytes);
+                    surfaces.push_back({surface.dccAddress, keyBytes, true});
+                }
+            }
+            if (color.cmaskAddress != 0) {
+                const CmaskLayout layout(color.extent.width, color.extent.height);
+                if (layout.Bytes() != 0) GuestMemory::CollectWrites(color.cmaskAddress, layout.Bytes());
+            }
+        }
+        if (state.depth && state.depth->htileAddress != 0 && state.depth->samples == 1u) {
+            const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(state.depth->extent));
+            if (bytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(state.depth->htileAddress), bytes, true)) {
+                GuestMemory::CollectWrites(state.depth->htileAddress, bytes);
+                surfaces.push_back({state.depth->htileAddress, bytes, false});
+            }
+        }
+    } catch (const std::exception&) {
+        surfaces.clear();
+    }
+    return surfaces;
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {

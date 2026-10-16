@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -156,6 +157,15 @@ inline void StopProfileOutput_nid_no_patch() {
 template<typename... TArgs>
 void ProfilePrint_nid_no_patch(const char* format, TArgs... args) {
     ProfileOutput_nid_no_patch().Print(format, args...);
+}
+
+// Lab switch APS5_LAB_ASYNC_DRAW_REPORTS=1: the draw path's 10 s lines ([draws], [rescache] draws,
+// [draw] pipelined) go through the writer above instead of a direct fprintf, which the mingw printf
+// puts into the unbuffered stderr one WriteFile per character while the reporting thread holds the
+// GPU mutex or the draw pipeline's mutex. The bytes written are the same.
+inline bool AsyncDrawReports_nid_no_patch() {
+    static const bool enabled = std::getenv("APS5_LAB_ASYNC_DRAW_REPORTS") != nullptr;
+    return enabled;
 }
 
 }

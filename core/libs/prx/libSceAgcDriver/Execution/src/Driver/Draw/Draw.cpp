@@ -413,6 +413,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
+        const auto presynced = localDevice;
+        const auto presyncSerial = VulkanDevice::DrawPresync() && localDevice != nullptr ? localDevice->PresyncDraw(graphics, drawParameters) : 0;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
         timing.Mark("gpu_mutex_wait");
@@ -423,6 +425,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::fprintf(stderr, "[draw] device replaced during unlocked preparation (%llu)\n", static_cast<unsigned long long>(++replaced));
             localDevice = std::move(current);
         }
+        if (presyncSerial != 0 && localDevice == presynced) localDevice->ReapRecorded(presyncSerial);
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
@@ -560,9 +563,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 }
 
 void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+    const auto presynced = localDevice;
+    const auto presyncSerial = VulkanDevice::DrawPresync() && localDevice != nullptr ? localDevice->PresyncDraw(graphics, drawParameters) : 0;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    if (presyncSerial != 0 && localDevice == presynced) localDevice->ReapRecorded(presyncSerial);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;

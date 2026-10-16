@@ -3667,6 +3667,26 @@ PresyncCounters& Presyncs() {
     return counters;
 }
 
+// APS5_LAB_DRAW_PRESYNC: the draws' pre-syncs (VulkanDevice::PresyncDraw), as [drawpresync] every
+// 10 s under APS5_PROFILE_DRAW (cumulative).
+struct DrawPresyncCounters {
+    std::atomic<std::uint64_t> checked{0};
+    std::atomic<std::uint64_t> surfaces{0};
+    std::atomic<std::uint64_t> overlapping{0};
+    std::atomic<std::uint64_t> presyncs{0};
+    std::atomic<std::uint64_t> waitedUs{0};
+    std::atomic<std::uint64_t> htile{0};
+    std::atomic<std::uint64_t> keys{0};
+    std::atomic<std::uint64_t> index{0};
+    std::atomic<std::uint64_t> shadowed{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DrawPresyncCounters& DrawPresyncs() {
+    static DrawPresyncCounters counters;
+    return counters;
+}
+
 // A cached object's Revalidate collects the write watch over its surfaces under the mutex; the
 // walk is made before the lock instead, so those collects are memo hits (as stage A's precollect
 // does for a build). APS5_NO_CACHED_PRECOLLECT=1 leaves the walks under the lock.
@@ -4091,6 +4111,75 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
 VulkanDevice::PresyncStatistics VulkanDevice::PresyncCounts() {
     const auto& counters = Presyncs();
     return {counters.checked.load(std::memory_order_relaxed), counters.presyncs.load(std::memory_order_relaxed), counters.keyChecks.load(std::memory_order_relaxed), counters.keyWaits.load(std::memory_order_relaxed)};
+}
+
+bool VulkanDevice::DrawPresync() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LAB_DRAW_PRESYNC");
+        return text != nullptr && std::atoi(text) > 0 && !NoPresync();
+    }();
+    return enabled;
+}
+
+std::uint64_t VulkanDevice::PresyncDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw) {
+    if (!DrawPresync() || !CanWaitUnlocked() || GuestMemory::GpuMutex().HeldByThisThread()) return 0;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& counters = DrawPresyncs();
+    counters.checked.fetch_add(1, std::memory_order_relaxed);
+    const auto context = graphicsContext();
+    auto surfaces = Graphics::PrepareDrawUnlocked(context, graphics);
+    const auto htileSurfaces = surfaces.size();
+    if (draw.indexed && draw.indexAddress != 0 && draw.indexCount != 0 && draw.indexSize != 0) surfaces.push_back({draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, false});
+    bool overlaps = false;
+    for (std::size_t index = 0; index < surfaces.size(); ++index) {
+        const auto& surface = surfaces[index];
+        const auto bytes = static_cast<std::size_t>(surface.bytes);
+        counters.surfaces.fetch_add(1, std::memory_order_relaxed);
+        const bool pending = surface.dccKeys ? Graphics::DccKeyWritersPending(surface.address, bytes) : Graphics::Recorder::SnapshotWriteOverlaps(surface.address, bytes);
+        if (profile && surface.dccKeys && Graphics::AnyShadowedOverlaps(surface.address, bytes)) counters.shadowed.fetch_add(1, std::memory_order_relaxed);
+        if (!pending) continue;
+        overlaps = true;
+        (surface.dccKeys ? counters.keys : index >= htileSurfaces ? counters.index : counters.htile).fetch_add(1, std::memory_order_relaxed);
+    }
+    std::uint64_t serial = 0;
+    if (overlaps) {
+        counters.overlapping.fetch_add(1, std::memory_order_relaxed);
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        if (state->recorder) {
+            bool open = false;
+            for (const auto& surface : surfaces) {
+                const auto bytes = static_cast<std::size_t>(surface.bytes);
+                if (surface.dccKeys && !Graphics::DccKeyWriterNeedsSync(surface.address, bytes)) continue;
+                const auto info = state->recorder->DescribePendingWrite(surface.address, bytes);
+                if (!info.has_value()) continue;
+                open = open || info->open;
+                serial = std::max(serial, info->serial);
+            }
+            if (open) serial = state->recorder->SubmitAndEpoch();
+        }
+    }
+    if (serial != 0) {
+        const auto waitStart = std::chrono::steady_clock::now();
+        WaitRecorded(serial);
+        counters.presyncs.fetch_add(1, std::memory_order_relaxed);
+        counters.waitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+    }
+    if (profile) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = counters.lastReport.load();
+        if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
+            const auto take = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+            AgcDriver::ProfilePrint_nid_no_patch("[drawpresync] %llu draws checked, %llu surfaces, %llu draws with a recorded writer (htile %llu, dcc keys %llu, index %llu), %llu pre-syncs waited %.0f ms (cumulative); dcc key ranges under a unit shadow %llu\n", take(counters.checked), take(counters.surfaces), take(counters.overlapping), take(counters.htile), take(counters.keys), take(counters.index), take(counters.presyncs), static_cast<double>(counters.waitedUs.load(std::memory_order_relaxed)) / 1000.0, take(counters.shadowed));
+        }
+    }
+    return serial;
+}
+
+VulkanDevice::DrawPresyncStatistics VulkanDevice::DrawPresyncCounts() {
+    const auto& counters = DrawPresyncs();
+    const auto take = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {take(counters.checked), take(counters.surfaces), take(counters.overlapping), take(counters.presyncs), take(counters.htile), take(counters.keys), take(counters.index), take(counters.shadowed)};
 }
 
 std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderRecompiler::RecompileResult& shader, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t dispatchThreads, std::uint64_t programAddress) {
