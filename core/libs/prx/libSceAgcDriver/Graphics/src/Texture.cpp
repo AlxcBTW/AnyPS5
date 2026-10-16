@@ -77,6 +77,16 @@ thread_local const char* flushReason = nullptr;
 // (units taken from an alias image on the device); set by the constructor and Refresh around
 // upload() and borrowUnits().
 thread_local const char* uploadReason = "first";
+
+// Lab diagnostics (APS5_GUEST_WRITE_RING): the surface as the tag of the ring's surface kinds, and a reason (a string
+// literal of this module) as its address, which the reader resolves through the ring header's module base.
+std::uint64_t SurfaceTagOf(const GuestTextureResource& descriptor, std::uint32_t source) {
+    return GuestWriteRing::SurfaceTag(descriptor.width, descriptor.height, descriptor.depthOrLastArray, descriptor.format, descriptor.mipCount, static_cast<std::uint32_t>(descriptor.tileMode), static_cast<std::uint32_t>(descriptor.dimension), source);
+}
+
+std::uint64_t ReasonTag(const char* reason) {
+    return reinterpret_cast<std::uintptr_t>(reason);
+}
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -268,6 +278,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         const auto guestBytes = geometry.guestBytes;
         Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
+        GuestWriteRing::Record(GuestWriteRing::Kind::TextureCreated, descriptor.baseAddress, guestBytes, SurfaceTagOf(descriptor, 0));
 
         const auto sliceLinearBytes = geometry.sliceLinearBytes;
         Require(arrayLayers == 0 || sliceLinearBytes <= UINT64_MAX / arrayLayers, "detiled texture buffer size overflows");
@@ -508,6 +519,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         copyLayers = geometry.imageLayers;
         copyElementBytes = BytesPerElement(descriptor.format);
         AGC_LOG_DEFERRED(stdout, "Texture address=0x%llx %ux%u mips=%u layers=%u block copy of storage image (guest format %u -> vk %d)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, copyLayers, source->Descriptor().format, static_cast<int>(blockFormat));
+        GuestWriteRing::Record(GuestWriteRing::Kind::TextureCreated, descriptor.baseAddress, geometry.guestBytes, SurfaceTagOf(descriptor, 2));
 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -564,6 +576,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         copyLayers = geometry.imageLayers;
         copyElementBytes = BytesPerElement(descriptor.format);
         AGC_LOG_DEFERRED(stdout, "Texture address=0x%llx %ux%u mips=%u layers=%u depth copy of storage image (vk=%d -> %d)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, copyLayers, static_cast<int>(colorFormat), static_cast<int>(depthFormat));
+        GuestWriteRing::Record(GuestWriteRing::Kind::TextureCreated, descriptor.baseAddress, geometry.guestBytes, SurfaceTagOf(descriptor, 3));
 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         imageInfo.flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
@@ -751,6 +764,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         const auto vkFormat = SampledTextureFormat(context, descriptor.format);
         const auto geometry = DescribeSurface(descriptor);
         AGC_LOG_DEFERRED(stdout, "Texture address=0x%llx %ux%u mips=%u viewed from storage image (vk=%d)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, static_cast<int>(vkFormat));
+        GuestWriteRing::Record(GuestWriteRing::Kind::TextureCreated, descriptor.baseAddress, geometry.guestBytes, SurfaceTagOf(descriptor, 1));
         // Storage images stay in the general layout; the view samples them there.
         layout = VK_IMAGE_LAYOUT_GENERAL;
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
@@ -1076,6 +1090,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     }();
     static_cast<void>(unwatchHooked);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
+    GuestWriteRing::Record(GuestWriteRing::Kind::StorageTextureCreated, texture->descriptor.baseAddress, texture->guestBytes, SurfaceTagOf(texture->descriptor, 0));
     uploadReason = "first";
     texture->upload();
     texture->defaultMip = mipLevel;
@@ -2249,6 +2264,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    GuestWriteRing::Record(GuestWriteRing::Kind::StorageTextureUploaded, descriptor.baseAddress, guestBytes, ReasonTag(uploadReason));
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     // A layer selection applies to the direct path alone (the others upload everything); it names
@@ -4937,6 +4953,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         // Outside the write watch the stored bytes are what the next store compares with.
         const auto saveUnits = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? std::vector<std::uint32_t>{} : prepareStoredSave(layers, skippedLayer);
+        GuestWriteRing::Record(GuestWriteRing::Kind::StorageWriteBackDecided, descriptor.baseAddress, guestBytes, ReasonTag(flushReason));
         for (const auto& [from, to] : keep) GuestWriteRing::Record(GuestWriteRing::Kind::StorageWriteBack, from, to - from, descriptor.baseAddress);
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
@@ -5190,6 +5207,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // Store only the kept ranges' blocks that changed, so concurrent CPU writes to untouched texels
     // survive; `original` follows for the stored layers (the others' guest bytes are unchanged).
     const auto current = host.Bytes();
+    GuestWriteRing::Record(GuestWriteRing::Kind::StorageWriteBackDecided, descriptor.baseAddress, guestBytes, ReasonTag(flushReason));
     for (const auto& [from, to] : keep) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
@@ -5227,6 +5245,7 @@ StorageTexture::~StorageTexture() {
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        GuestWriteRing::Record(GuestWriteRing::Kind::StorageTextureDestroyed, descriptor.baseAddress, guestBytes, SurfaceTagOf(descriptor, dirty ? 1u : 0u));
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);

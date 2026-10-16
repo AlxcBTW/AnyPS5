@@ -105,6 +105,30 @@ void CheckPathTagAndForeignFile() {
     std::filesystem::remove(path);
 }
 
+// The bit layout lab/scripts/guestcrash-ring.py decodes: MD2's R8 array class (1024x1024, last slice 7, format 1, one
+// mip, tile 7, dimension 4) and every field at its widest.
+static_assert(SurfaceTag(1024, 1024, 7, 1, 1, 7, 4, 1) == (1024ull | 1024ull << 15u | 7ull << 30u | 1ull << 41u | 1ull << 50u | 7ull << 54u | 4ull << 59u | 1ull << 62u));
+static_assert(SurfaceTag(0x7fff, 0, 0, 0, 0, 0, 0, 0) == 0x7fffull && SurfaceTag(0, 0x7fff, 0, 0, 0, 0, 0, 0) == 0x7fffull << 15u);
+static_assert(SurfaceTag(0, 0, 0x7ff, 0, 0, 0, 0, 0) == 0x7ffull << 30u && SurfaceTag(0, 0, 0, 0x1ff, 0, 0, 0, 0) == 0x1ffull << 41u);
+static_assert(SurfaceTag(0, 0, 0, 0, 0xf, 0, 0, 0) == 0xfull << 50u && SurfaceTag(0, 0, 0, 0, 0, 0x1f, 0, 0) == 0x1full << 54u);
+static_assert(SurfaceTag(0, 0, 0, 0, 0, 0, 7, 0) == 7ull << 59u && SurfaceTag(0, 0, 0, 0, 0, 0, 0, 3) == 3ull << 62u);
+static_assert(SurfaceTag(0x8000 | 5, 0x8000 | 6, 0x800 | 7, 0x200 | 8, 0x10 | 9, 0x20 | 10, 8 | 3, 4 | 2) == SurfaceTag(5, 6, 7, 8, 9, 10, 3, 2));
+
+void CheckSurfaceTag() {
+    const auto tag = SurfaceTag(1024, 1024, 7, 1, 1, 7, 4, 0);
+    Require((tag & 0x7fffu) == 1024 && ((tag >> 15u) & 0x7fffu) == 1024 && ((tag >> 30u) & 0x7ffu) == 7 && ((tag >> 41u) & 0x1ffu) == 1, "a surface tag does not keep the size, slices and format");
+    Require(((tag >> 50u) & 0xfu) == 1 && ((tag >> 54u) & 0x1fu) == 7 && ((tag >> 59u) & 0x7u) == 4 && (tag >> 62u) == 0, "a surface tag does not keep the mips, tile mode, dimension and source");
+    const auto path = RingPath("surface");
+    Require(Open(path, 8), "the ring file could not be mapped");
+    Record(Kind::StorageTextureCreated, 0x3068010000, 0x700000, tag);
+    Record(Kind::WriteBackRetired, 0x3068010000, 0x10000, 0x3068010000);
+    Record(Kind::MappingChanged, 0x3068000000, 0x1000000, 0);
+    Close();
+    const auto entries = ReadFile(path);
+    Require(entries.size() == 3 && entries[0].kind == 9 && entries[0].tag == tag && entries[1].kind == 13 && entries[2].kind == 15 && entries[2].bytes == 0x1000000, "the image life kinds do not read back with their numbers");
+    std::filesystem::remove(path);
+}
+
 }
 
 int main() {
@@ -114,6 +138,7 @@ int main() {
         CheckWrapKeepsNewest();
         CheckConcurrentRecords();
         CheckPathTagAndForeignFile();
+        CheckSurfaceTag();
     } catch (const std::exception& error) {
         std::cerr << "FAILED: " << error.what() << "\n";
         return 1;
