@@ -2562,6 +2562,49 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 }
 }
 
+namespace {
+std::atomic<int> snapshotRingOverride{-1};
+}
+
+int SnapshotRingMode() {
+    static const int fromEnvironment = []() {
+        const char* text = std::getenv("APS5_LAB_SNAPSHOT_RING");
+        if (text == nullptr || *text == 0) return 0;
+        const std::string value = text;
+        if (value == "1") return SnapshotRingBit | SnapshotSkipBit | SnapshotCountBit;
+        if (value == "ring") return SnapshotRingBit | SnapshotCountBit;
+        if (value == "skip") return SnapshotSkipBit | SnapshotCountBit;
+        return SnapshotCountBit;
+    }();
+    const int forced = snapshotRingOverride.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced : fromEnvironment;
+}
+
+void SetSnapshotRingModeForTest(int mode) {
+    snapshotRingOverride.store(mode, std::memory_order_relaxed);
+}
+
+std::size_t Recorder::RingLiveSlabs() {
+    std::erase_if(ringSlabs, [](const std::weak_ptr<Buffer>& slab) { return slab.expired(); });
+    return ringSlabs.size();
+}
+
+std::shared_ptr<Buffer> Recorder::RingSnapshot(std::size_t bytes) {
+    if (bytes == 0 || bytes > RingMaxSlice) return {};
+    const std::size_t alignment = std::max<std::size_t>({256, static_cast<std::size_t>(context.limits.minStorageBufferOffsetAlignment)});
+    const std::size_t take = (bytes + alignment - 1) / alignment * alignment;
+    if (ringActive == nullptr || ringUsed + take > RingSlabBytes) {
+        ringActive.reset();
+        if (RingLiveSlabs() >= RingMaxSlabs) return {};
+        ringActive = std::make_shared<Buffer>(context, RingSlabBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        ringSlabs.push_back(ringActive);
+        ringUsed = 0;
+    }
+    auto slice = std::make_shared<Buffer>(ringActive, ringUsed, bytes);
+    ringUsed += take;
+    return slice;
+}
+
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
     auto& pool = drawSnapshotPools[SnapshotPool(std::get<1>(entry->first))];
     pool.bytes -= std::get<2>(entry->first);

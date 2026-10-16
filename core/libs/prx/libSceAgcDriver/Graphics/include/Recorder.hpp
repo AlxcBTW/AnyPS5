@@ -41,6 +41,14 @@ class Buffer;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// APS5_LAB_SNAPSHOT_RING (unset: off, nothing changes): "1" = ring and skipping of unchanged descriptor writes,
+// "ring" = ring only, "skip" = skipping only, "0" = counters only. Any set value prints the [snapring] line.
+constexpr int SnapshotRingBit = 1;
+constexpr int SnapshotSkipBit = 2;
+constexpr int SnapshotCountBit = 4;
+int SnapshotRingMode();
+void SetSnapshotRingModeForTest(int mode);
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -106,6 +114,15 @@ public:
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0);
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
+    // APS5_LAB_SNAPSHOT_RING: a read-only storage snapshot as a slice of a large shared buffer instead of a buffer of
+    // its own. Slabs are bump-allocated and freed by reference count (a slice lives as long as the draw, the batch
+    // or the snapshot cache holds it), so no slot is reused while the GPU may read it. Empty when the snapshot is
+    // too large or RingMaxSlabs slabs are still held (the caller then makes an exact buffer as before).
+    static constexpr std::size_t RingSlabBytes = std::size_t{8} << 20u;
+    static constexpr std::size_t RingMaxSlice = std::size_t{256} << 10u;
+    static constexpr std::size_t RingMaxSlabs = 12;
+    std::shared_ptr<Buffer> RingSnapshot(std::size_t bytes);
+    std::size_t RingLiveSlabs();
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -857,6 +874,9 @@ private:
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
+    std::shared_ptr<Buffer> ringActive;
+    std::size_t ringUsed = 0;
+    std::vector<std::weak_ptr<Buffer>> ringSlabs;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;

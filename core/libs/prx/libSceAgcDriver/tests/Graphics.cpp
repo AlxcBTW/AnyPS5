@@ -4260,6 +4260,55 @@ void descriptorSnapshotTests() {
     }
 }
 
+// APS5_LAB_SNAPSHOT_RING: a draw on a recycled set of the same ShaderResources rewrites only the descriptors that changed.
+void descriptorSkipTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    for (const int mode : {0, AgcDriver::Graphics::SnapshotSkipBit}) {
+        AgcDriver::Graphics::SetSnapshotRingModeForTest(mode);
+        mock = MockVulkan{};
+        mock.allowCopies = true;
+        auto context = mockContext();
+        {
+            DescriptorCache cache(context);
+            context.descriptorCache = &cache;
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(context);
+            ShaderRecompiler::RecompileResult vertex, fragment;
+            auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+            binding.bufferWritten = {false, false};
+            vertex.bindings.push_back(binding);
+            fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+            const auto state = AgcDriver::Graphics::DecodeState(makeState());
+            ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+            const auto draw = [&](std::uint32_t pattern) {
+                std::vector<ShaderResources::MovedBuffer> moved;
+                moved.push_back({0, 0, 24, std::vector<std::uint32_t>(6, pattern)});
+                mock.writes.clear();
+                auto snapshots = resources.PrepareDrawBindings(recorder, moved);
+                Require(snapshots != nullptr && snapshots->snapshots.size() == 1, "draw snapshots are missing");
+                const auto written = mock.writes;
+                const auto count = written.size();
+                recorder.Sync();
+                snapshots.reset();
+                return count;
+            };
+            Require(draw(0x11111111u) == 2, "the first draw on a fresh set must write every binding");
+            const auto second = draw(0x22222222u);
+            const auto third = draw(0x22222222u);
+            if (mode == 0) {
+                Require(second == 2 && third == 2, "without the lab switch every draw rewrites every binding");
+            } else {
+                Require(second == 1, "a draw on a recycled set of the same template must rewrite only the binding whose snapshot changed");
+                Require(third == 0, "a draw with unchanged snapshots on a recycled set must write nothing");
+            }
+        }
+        Require(mock.live == 0, "skipped descriptor writes leaked Vulkan objects");
+    }
+    AgcDriver::Graphics::SetSnapshotRingModeForTest(-1);
+}
+
 void resourceTests() {
     mock = MockVulkan{};
     const auto context = mockContext();
@@ -7936,6 +7985,7 @@ int main(int argc, char** argv) {
         resourceTests();
         oversizedDescriptorTests();
         descriptorSnapshotTests();
+        descriptorSkipTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();
         imageTableAllocationTests();

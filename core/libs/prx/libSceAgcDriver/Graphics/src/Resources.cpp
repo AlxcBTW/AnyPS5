@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <atomic>
 #include <exception>
 
 namespace AgcDriver::Graphics {
@@ -15,7 +16,10 @@ VkDeviceSize ClassAllocationBytes(const VkMemoryRequirements& requirements, std:
     return std::max<VkDeviceSize>(requirements.size, (static_cast<VkDeviceSize>(capacity) + alignment - 1) / alignment * alignment);
 }
 
+std::atomic<std::uint64_t> exactRebinds{0};
+
 VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize availableBytes) {
+    exactRebinds.fetch_add(1, std::memory_order_relaxed);
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = size;
     info.usage = usage;
@@ -35,6 +39,10 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
+}
+
+std::uint64_t ExactBufferRebinds() {
+    return exactRebinds.load(std::memory_order_relaxed);
 }
 
 Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : context(context), size(size), capacity(BufferPool::Capacity(size, properties)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
@@ -106,11 +114,24 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
     }
 }
 
+Buffer::Buffer(std::shared_ptr<Buffer> parentBuffer, std::size_t viewOffset, std::size_t size) : context(parentBuffer->context), size(size), capacity(size), usage(parentBuffer->usage), properties(parentBuffer->properties) {
+    Require(size != 0, "zero-sized GPU buffer");
+    Require(parentBuffer->mapping != nullptr && !parentBuffer->parent && viewOffset <= parentBuffer->size && size <= parentBuffer->size - viewOffset, "buffer slice outside its parent");
+    buffer = parentBuffer->buffer;
+    memory = parentBuffer->memory;
+    mapping = static_cast<std::byte*>(parentBuffer->mapping) + viewOffset;
+    if (parentBuffer->deviceAddress != 0) deviceAddress = parentBuffer->deviceAddress + viewOffset;
+    offset = parentBuffer->offset;
+    this->viewOffset = viewOffset;
+    parent = std::move(parentBuffer);
+}
+
 Buffer::~Buffer() {
     release();
 }
 
 void Buffer::release() noexcept {
+    if (parent) return;
     if (ready && cache) {
         cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
         return;
@@ -136,6 +157,7 @@ std::span<std::byte> Buffer::Bytes() {
 
 void Buffer::Invalidate() {
     Require(mapping != nullptr, "cannot invalidate an unmapped GPU buffer");
+    if (parent) return parent->Invalidate();
     VkMappedMemoryRange range{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     range.memory = memory;
     range.offset = offset;

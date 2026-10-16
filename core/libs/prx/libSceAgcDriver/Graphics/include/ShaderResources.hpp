@@ -82,10 +82,15 @@ public:
         VkDescriptorPool pool = VK_NULL_HANDLE;
         std::size_t poolIndex = 0;
         bool updateAfterBind = false;
+        // APS5_LAB_SNAPSHOT_RING: the ShaderResources instance that last wrote every descriptor of this set
+        // (0: unknown) and the buffer infos it wrote, so a draw of the same instance on a recycled set
+        // rewrites only the entries that changed.
+        std::uint64_t owner = 0;
+        std::shared_ptr<std::vector<VkDescriptorBufferInfo>> content;
     };
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Free(const SetAllocation& allocation) noexcept;
-    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
+    SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt, std::uint64_t preferOwner = 0);
     void Recycle(VkDescriptorSetLayout layout, const SetAllocation& allocation) noexcept;
     // APS5_PROFILE_DRAW counters: layouts served from the map / created, sets allocated, pools opened.
     struct Stats {
@@ -498,6 +503,8 @@ private:
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
+    // Never reused: names this object's descriptor template in a recycled set's record.
+    const std::uint64_t instanceId = []() { static std::atomic<std::uint64_t> next{0}; return ++next; }();
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
     std::vector<std::uint64_t> multisampleSources;

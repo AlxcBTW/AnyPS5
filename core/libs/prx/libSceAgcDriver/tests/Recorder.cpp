@@ -2041,6 +2041,36 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.NotePendingWrite(element, elementBytes);
         Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
         snapshotRecorder.Sync();
+        // APS5_LAB_SNAPSHOT_RING: snapshots are slices of one shared buffer, each at its own aligned offset with its exact size.
+        AgcDriver::Graphics::SetSnapshotRingModeForTest(AgcDriver::Graphics::SnapshotRingBit | AgcDriver::Graphics::SnapshotCountBit);
+        std::memset(reinterpret_cast<void*>(element), 0x44, elementBytes);
+        auto ringFirst = resources.PrepareDrawBindings(snapshotRecorder);
+        std::memset(reinterpret_cast<void*>(element), 0x55, elementBytes);
+        auto ringSecond = resources.PrepareDrawBindings(snapshotRecorder);
+        AgcDriver::Graphics::SetSnapshotRingModeForTest(-1);
+        Require(ringFirst != nullptr && ringSecond != nullptr && ringFirst->snapshots.size() == 1 && ringSecond->snapshots.size() == 1, "ring snapshots are missing");
+        const auto& sliceA = *ringFirst->snapshots[0].buffer;
+        const auto& sliceB = *ringSecond->snapshots[0].buffer;
+        Require(sliceA.IsSlice() && sliceB.IsSlice() && sliceA.Handle() == sliceB.Handle(), "ring snapshots do not share one buffer");
+        Require(sliceA.ViewOffset() != sliceB.ViewOffset() && sliceA.ViewOffset() % 256 == 0 && sliceB.ViewOffset() % 256 == 0, "ring slices are not at distinct aligned offsets");
+        Require(const_cast<Buffer&>(sliceA).Bytes().size() == elementBytes && const_cast<Buffer&>(sliceB).Bytes().size() == elementBytes, "a ring slice is not its snapshot's exact size");
+        {
+            auto ringDownload = std::make_shared<Buffer>(snapshotContext, elementBytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto ringCommands = snapshotRecorder.Commands();
+            RecordMemoryBarrier(snapshotContext, ringCommands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const auto ringCopy = snapshotContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+            VkBufferCopy ringRegion{sliceA.ViewOffset(), 0, elementBytes};
+            ringCopy(ringCommands, sliceA.Handle(), ringDownload->Handle(), 1, &ringRegion);
+            ringRegion = {sliceB.ViewOffset(), elementBytes, elementBytes};
+            ringCopy(ringCommands, sliceB.Handle(), ringDownload->Handle(), 1, &ringRegion);
+            RecordMemoryBarrier(snapshotContext, ringCommands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            ringFirst.reset();
+            ringSecond.reset();
+            snapshotRecorder.Sync();
+            const auto ringContents = ringDownload->Bytes();
+            Require(std::all_of(ringContents.begin(), ringContents.begin() + elementBytes, [](std::byte value) { return value == std::byte{0x44}; }), "first ring slice lost its bytes");
+            Require(std::all_of(ringContents.begin() + elementBytes, ringContents.end(), [](std::byte value) { return value == std::byte{0x55}; }), "second ring slice was overwritten by the first or lost its bytes");
+        }
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
     recorder.Activate();

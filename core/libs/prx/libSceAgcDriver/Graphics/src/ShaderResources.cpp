@@ -3673,12 +3673,24 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     return {set, pool, chain.size() - 1, updateAfterBind};
 }
 
-DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
+DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount, std::uint64_t preferOwner) {
     {
         std::lock_guard lock(mutex);
         if (const auto found = recycled.find(layout); found != recycled.end() && !found->second.empty()) {
-            const auto allocation = found->second.back();
-            found->second.pop_back();
+            auto& list = found->second;
+            auto pick = list.end() - 1;
+            if (preferOwner != 0 && pick->owner != preferOwner) {
+                // A set this template wrote last (among the most recently recycled) needs fewer rewrites.
+                const auto limit = std::min<std::size_t>(list.size(), 16);
+                for (std::size_t back = 2; back <= limit; ++back) {
+                    if ((list.end() - back)->owner == preferOwner) {
+                        pick = list.end() - back;
+                        break;
+                    }
+                }
+            }
+            const auto allocation = std::move(*pick);
+            list.erase(pick);
             return allocation;
         }
     }
@@ -4747,8 +4759,48 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+namespace {
+// APS5_LAB_SNAPSHOT_RING counters (cumulative); the [snapring] line goes out at most every 10 s.
+struct SnapRingCounters {
+    std::atomic<std::uint64_t> draws{0}, ringDraws{0}, slices{0}, sliceBytes{0}, sliceNs{0}, denied{0};
+    std::atomic<std::uint64_t> exact{0}, exactBytes{0}, exactNs{0};
+    std::atomic<std::uint64_t> writesTotal{0}, writesIssued{0}, setsResumed{0}, setsFull{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+SnapRingCounters& SnapRing() {
+    static SnapRingCounters counters;
+    return counters;
+}
+
+void ReportSnapRing(Recorder& recorder) {
+    auto& counters = SnapRing();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto get = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load()); };
+    const double sliceMs = static_cast<double>(counters.sliceNs.load()) / 1e6;
+    const double exactMs = static_cast<double>(counters.exactNs.load()) / 1e6;
+    const auto slices = counters.slices.load();
+    const auto exact = counters.exact.load();
+    const double sliceUs = slices != 0 ? sliceMs * 1000.0 / static_cast<double>(slices) : 0.0;
+    const double exactUs = exact != 0 ? exactMs * 1000.0 / static_cast<double>(exact) : 0.0;
+    // Estimate: what the same number of slices would have cost as exact buffers at the exact path's measured mean.
+    const double saved = exact != 0 && slices != 0 ? (exactUs - sliceUs) * static_cast<double>(slices) / 1000.0 : 0.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[snapring] draws with snapshots %llu (%llu served from the ring), ring slices %llu (%llu bytes, %.1f ms, %.2f us each), ring refused %llu, slabs live %zu; exact buffers created %llu (%llu bytes, %.1f ms, %.2f us each), exact pool rebinds %llu (all buffers); est. ms saved %.1f%s; descriptor writes %llu issued of %llu (%llu sets resumed, %llu written in full)\n",
+        get(counters.draws), get(counters.ringDraws), get(counters.slices), get(counters.sliceBytes), sliceMs, sliceUs, get(counters.denied), recorder.RingLiveSlabs(),
+        get(counters.exact), get(counters.exactBytes), exactMs, exactUs, static_cast<unsigned long long>(ExactBufferRebinds()), saved, exact != 0 && slices != 0 ? "" : " (needs both paths in one run)",
+        get(counters.writesIssued), get(counters.writesTotal), get(counters.setsResumed), get(counters.setsFull));
+}
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    const int ringMode = SnapshotRingMode();
+    const bool useRing = (ringMode & SnapshotRingBit) != 0;
+    const bool useSkip = (ringMode & SnapshotSkipBit) != 0;
+    const bool counting = (ringMode & SnapshotCountBit) != 0;
+    std::uint64_t ringSlicesHere = 0;
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;
@@ -4812,7 +4864,31 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto generation = GuestMemory::CollectWrites(begin, bytes);
             buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
             if (buffer == nullptr) {
-                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                // Exactness of the ring: the shader bounds-checks every access against OpArrayLength of the
+                // descriptor (EmitMemoryElementInBounds), and the descriptor below carries the snapshot's exact
+                // offset and range, so a slice of a larger buffer answers out-of-range reads as a separate buffer does.
+                const auto createStart = counting ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                bool fromRing = false;
+                if (useRing) {
+                    buffer = recorder.RingSnapshot(bytes);
+                    fromRing = buffer != nullptr;
+                    if (!fromRing && bytes <= Recorder::RingMaxSlice) SnapRing().denied.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!fromRing) buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                if (counting) {
+                    auto& counters = SnapRing();
+                    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - createStart).count());
+                    if (fromRing) {
+                        counters.slices.fetch_add(1, std::memory_order_relaxed);
+                        counters.sliceBytes.fetch_add(bytes, std::memory_order_relaxed);
+                        counters.sliceNs.fetch_add(ns, std::memory_order_relaxed);
+                        ++ringSlicesHere;
+                    } else {
+                        counters.exact.fetch_add(1, std::memory_order_relaxed);
+                        counters.exactBytes.fetch_add(bytes, std::memory_order_relaxed);
+                        counters.exactNs.fetch_add(ns, std::memory_order_relaxed);
+                    }
+                }
                 std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                 recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
             }
@@ -4843,37 +4919,120 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
     if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0), useSkip ? instanceId : 0);
         result->layout = _layout;
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1), useSkip ? instanceId : 0);
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    auto buffers = descriptorBuffers;
-    auto writes = descriptorWrites;
+    const auto resumable = [&](const DescriptorCache::SetAllocation& set) { return useSkip && set.owner == instanceId && set.content != nullptr && set.content->size() == descriptorBuffers.size(); };
+    const std::array<bool, 2> resume{resumable(result->allocation), resumable(result->fragmentAllocation)};
+    // From here until the update below the set's recorded content is unknown.
+    result->allocation.owner = 0;
+    result->fragmentAllocation.owner = 0;
     std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
-    auto nextWrite = writes.begin();
-    for (const auto& binding : bindings) {
-        while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
-            auto& write = *nextWrite++;
-            write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
-            if (binding.allocations.empty()) continue;
-            const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
-            write.pBufferInfo = buffers.data() + offset;
-            for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
-                const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+    if (!useSkip) {
+        auto buffers = descriptorBuffers;
+        auto writes = descriptorWrites;
+        auto nextWrite = writes.begin();
+        for (const auto& binding : bindings) {
+            while (nextWrite != writes.end() && nextWrite->dstBinding == binding.layout.binding) {
+                auto& write = *nextWrite++;
+                write.dstSet = setOf(binding) == 0 ? result->allocation.set : result->fragmentAllocation.set;
+                if (binding.allocations.empty()) continue;
+                const auto offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                write.pBufferInfo = buffers.data() + offset;
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                    const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                    if (snapshotIndex == selected.size()) continue;
+                    const auto& snapshot = result->snapshots[snapshotIndex];
+                    buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.buffer->ViewOffset(), snapshot.buffer->Bytes().size()};
+                }
+            }
+        }
+        Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+        context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        if (counting) {
+            auto& counters = SnapRing();
+            counters.writesTotal.fetch_add(writes.size(), std::memory_order_relaxed);
+            counters.writesIssued.fetch_add(writes.size(), std::memory_order_relaxed);
+        }
+    } else {
+        // Only the writes whose elements differ from what the set holds. A set recycled for the same
+        // ShaderResources instance still holds that instance's image and sampler entries (never rewritten
+        // after the build) and the buffer infos of its last draw, so a write is skipped exactly when
+        // every element it would write equals what the set already holds; the set then ends up holding
+        // the same descriptors as a full rewrite.
+        thread_local std::vector<VkDescriptorBufferInfo>* bufferSlot = nullptr;
+        thread_local std::vector<VkWriteDescriptorSet>* writeSlot = nullptr;
+        auto& buffers = ShaderRecompiler::ThreadOwned(bufferSlot);
+        auto& writes = ShaderRecompiler::ThreadOwned(writeSlot);
+        buffers.assign(descriptorBuffers.begin(), descriptorBuffers.end());
+        writes.clear();
+        std::size_t total = 0;
+        std::size_t cursor = 0;
+        for (const auto& binding : bindings) {
+            while (cursor < descriptorWrites.size() && descriptorWrites[cursor].dstBinding == binding.layout.binding) {
+                const auto& write = descriptorWrites[cursor++];
+                ++total;
+                const std::size_t setIndex = setOf(binding);
+                auto& set = setIndex == 0 ? result->allocation : result->fragmentAllocation;
+                std::size_t offset = 0;
+                if (write.pBufferInfo != nullptr) {
+                    offset = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                    for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+                        const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
+                        if (snapshotIndex == selected.size()) continue;
+                        const auto& snapshot = result->snapshots[snapshotIndex];
+                        buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.buffer->ViewOffset(), snapshot.buffer->Bytes().size()};
+                    }
+                }
+                if (resume[setIndex]) {
+                    if (write.pBufferInfo == nullptr) continue;
+                    const auto& held = *set.content;
+                    bool same = true;
+                    for (std::size_t element = 0; same && element < write.descriptorCount; ++element) {
+                        const auto& left = buffers[offset + element];
+                        const auto& right = held[offset + element];
+                        same = left.buffer == right.buffer && left.offset == right.offset && left.range == right.range;
+                    }
+                    if (same) continue;
+                }
+                auto copy = write;
+                copy.dstSet = set.set;
+                if (write.pBufferInfo != nullptr) copy.pBufferInfo = buffers.data() + offset;
+                writes.push_back(copy);
+            }
+        }
+        Require(cursor == descriptorWrites.size(), "draw snapshot writes disagree with their descriptor bindings");
+        if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        for (std::size_t setIndex = 0; setIndex < 2; ++setIndex) {
+            auto& set = setIndex == 0 ? result->allocation : result->fragmentAllocation;
+            if (set.set == VK_NULL_HANDLE) continue;
+            if (set.content == nullptr || set.content.use_count() != 1) set.content = std::make_shared<std::vector<VkDescriptorBufferInfo>>();
+            *set.content = buffers;
+            set.owner = instanceId;
+        }
+        if (counting) {
+            auto& counters = SnapRing();
+            counters.writesTotal.fetch_add(total, std::memory_order_relaxed);
+            counters.writesIssued.fetch_add(writes.size(), std::memory_order_relaxed);
+            for (std::size_t setIndex = 0; setIndex < 2; ++setIndex) {
+                if ((setIndex == 0 ? result->allocation.set : result->fragmentAllocation.set) == VK_NULL_HANDLE) continue;
+                (resume[setIndex] ? counters.setsResumed : counters.setsFull).fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
-    Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
-    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    if (counting) {
+        auto& counters = SnapRing();
+        counters.draws.fetch_add(1, std::memory_order_relaxed);
+        if (ringSlicesHere != 0) counters.ringDraws.fetch_add(1, std::memory_order_relaxed);
+        ReportSnapRing(recorder);
+    }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;

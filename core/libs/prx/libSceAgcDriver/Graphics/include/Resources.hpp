@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <cstdint>
+#include <memory>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -9,10 +11,15 @@ namespace AgcDriver::Graphics {
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    // A byte range of `parent` (APS5_LAB_SNAPSHOT_RING): Handle() is the parent's VkBuffer, so a
+    // descriptor must use {Handle(), ViewOffset(), Bytes().size()}; the parent lives as long as the slice.
+    Buffer(std::shared_ptr<Buffer> parent, std::size_t viewOffset, std::size_t size);
     ~Buffer();
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
     VkBuffer Handle() const;
+    VkDeviceSize ViewOffset() const { return viewOffset; }
+    bool IsSlice() const { return parent != nullptr; }
     VkDeviceAddress DeviceAddress() const;
     // Host-visible buffers only: a device-local one (properties without HOST_VISIBLE, the staging
     // shadows of GuestBufferMemory) has no mapping and its bytes move by GPU copies alone.
@@ -39,7 +46,12 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
+    std::shared_ptr<Buffer> parent;
+    VkDeviceSize viewOffset = 0;
 };
+
+// Number of exact-size VkBuffers bound over pooled memory since start (BindExactBuffer, all callers).
+std::uint64_t ExactBufferRebinds();
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
 // elements, which crawls across PCIe, so guest bytes move between host and device buffers with DMA
