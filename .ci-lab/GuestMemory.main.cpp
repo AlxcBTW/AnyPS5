@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
@@ -1358,13 +1359,6 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         }
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    const auto saveBytes = [&] {
-        lock.unlock();
-        beforeUnwatch(first, static_cast<std::size_t>(stop - first));
-        lock.lock();
-    };
-    const bool savedEarly = staysWatched && !before;
-    if (savedEarly) saveBytes();
     bool imported = false;
     {
 #ifdef __APPLE__
@@ -1380,7 +1374,9 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     const WindowCopy window{first, saved, slots};
     if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
-        if (!savedEarly) saveBytes();
+        lock.unlock();
+        beforeUnwatch(first, static_cast<std::size_t>(stop - first));
+        lock.lock();
         unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     }
     return true;
@@ -1941,12 +1937,12 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            mutex.lock();
+            LockSpinning(mutex, HandoffSpinWindow());
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!mutex.try_lock()) {
                 const auto start = std::chrono::steady_clock::now();
-                mutex.lock();
+                LockSpinning(mutex, HandoffSpinWindow());
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -1964,7 +1960,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        mutex.lock();
+        LockSpinning(mutex, HandoffSpinWindow());
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);

@@ -875,6 +875,7 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (run.ranges.empty()) return run;
     if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
     if (begin == run.base && end == run.base + run.bytes) return run;
+    if (run.bytes <= window) return run;
     return {};
 }
 
@@ -1032,8 +1033,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
 }
 
 const HostImport* importJoined(const Context& context, HostImports& state, std::uint64_t begin, std::uint64_t end, const GuestAllocations::Lease& lease) {
-    if (const auto* low = findImport(state, begin, begin + 1); low != nullptr && low->joined) begin = low->base;
-    if (const auto* high = findImport(state, end - 1, end); high != nullptr && high->joined) end = high->base + high->bytes;
+    if (const auto* low = findImport(state, begin, begin + 1); low != nullptr) begin = low->base;
+    if (const auto* high = findImport(state, end - 1, end); high != nullptr) end = high->base + high->bytes;
     auto run = joinedRun(lease, begin, end);
     if (run.ranges.empty()) return nullptr;
     if (const auto failed = state.failedJoins.find(run.base); failed != state.failedJoins.end() && sameRun(failed->second, run)) return nullptr;
@@ -1055,15 +1056,17 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (sameRun(failed->second, run)) return nullptr;
         failures.erase(failed);
     }
-    // The imports this one replaces overlap it; none may be held by a build, and the import must fit the budget (with
-    // what may be evicted) before any of them is retired.
     auto first = state.imports.lower_bound(base);
     if (first != state.imports.begin() && std::prev(first)->second.base + std::prev(first)->second.bytes > base) --first;
     std::uint64_t replaced = 0;
     // A join may replace imports this build already looked up: it runs before any region confirms an import
     // (UploadFinish's pre-pass re-resolves every pointer after it), and a retired import stays alive through the
     // hold (KeepThroughHold). Refusing it there would keep the run copied for good.
-    const auto held = [&](const HostImport& entry) { return !joined && pointerHeld(state, entry); };
+    const auto held = [&](const HostImport& entry) {
+        if (joined || !pointerHeld(state, entry)) return false;
+        const bool expandedWindow = run.ranges.size() == 1 && entry.ranges.size() == 1 && entry.range == run.ranges.front() && base <= entry.base && base + bytes >= entry.base + entry.bytes && bytes > entry.bytes;
+        return !expandedWindow || Recorder::Active() == nullptr;
+    };
     for (auto it = first; it != state.imports.end() && it->first < base + bytes; ++it) {
         if (held(it->second)) return nullptr;
         replaced += it->second.bytes;
@@ -2570,6 +2573,20 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
     return importAccess(context, state, address, address + bytes, lease);
+}
+
+const HostImport* HostImportSpanning(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (const auto* import = HostImportFor(context, address, bytes)) return import;
+    if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (const auto* found = findImport(state, address, address + bytes)) return found;
+    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+    refreshImports(context, state, lease);
+    const auto run = crossedRun(lease, address, address + bytes);
+    if (run.ranges.empty()) return nullptr;
+    const auto* joined = importJoined(context, state, run.base, run.base + run.bytes, lease);
+    return joined != nullptr && findImport(state, address, address + bytes) == joined ? joined : nullptr;
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {

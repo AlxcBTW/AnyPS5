@@ -30,6 +30,9 @@ void FlushCachedTextures(VkDevice device);
 void ClearCachedTextures(VkDevice device);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
+std::uint64_t NextStorageBudget(std::uint64_t current, std::uint64_t floor, std::uint64_t cap, std::uint64_t reportedBudget, std::uint64_t usage, std::uint64_t evictions);
+std::uint64_t StorageBudgetCap(std::uint64_t heapBytes, std::uint64_t reportedBudget, std::uint64_t usage, std::uint64_t cacheBytes, std::uint64_t sampledRemaining, std::uint64_t floor);
+std::uint64_t SampledCacheHeadroom(std::uint64_t sampledBudget, std::uint64_t sampled, std::uint64_t sampledPeak);
 std::uint64_t SampledTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t textureBytes);
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport);
 struct TextureCacheUse {
@@ -121,6 +124,12 @@ struct ImageTableReuseCounts {
     std::uint64_t resolved = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
+
+struct PresyncSurface {
+    std::uint64_t address;
+    std::uint64_t bytes;
+    bool dccKeys;
+};
 
 class ShaderResources {
 public:
@@ -280,7 +289,7 @@ public:
     // Usable right after the deferred constructor, for address-based builds too (it decodes the
     // compiled shader's bindings itself when stage A has not run), and on a completed object from
     // the resource cache (its Revalidate repeats the same lookups), without the device lock.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> PresyncSurfaces() const;
+    std::vector<PresyncSurface> PresyncSurfaces() const;
 
 private:
     friend class AgcDriver::VulkanDevice;
