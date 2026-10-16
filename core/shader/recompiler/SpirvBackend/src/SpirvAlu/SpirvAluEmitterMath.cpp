@@ -1589,11 +1589,6 @@ std::uint32_t EmitF16x2Nan(SpirvEmitterState& state, std::uint32_t result, std::
         candidate = quiet(pick(lanes(nanBits(lhs)), lhs, candidate));
         return pick(lanes(nanBits(result)), candidate, result);
     };
-    static const bool branch = [] {
-        const char* value = std::getenv("APS5_F16_NAN_BRANCH");
-        return value == nullptr || std::string(value) != "0";
-    }();
-    if (!branch) return fix();
     const auto any = minMax ? op(spv::OpBitwiseOr, lhsNan, rhsNan) : nanBits(result);
     return EmitValueOrDefaultIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), any, constant(0u)), u32, result, fix);
 }
