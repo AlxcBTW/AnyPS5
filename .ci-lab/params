@@ -1,0 +1,5 @@
+name=f16-best
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-f16-best-baf2e0e486-130686
