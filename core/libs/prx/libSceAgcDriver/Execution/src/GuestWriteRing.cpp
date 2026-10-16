@@ -158,6 +158,10 @@ void Record(Kind kind, std::uint64_t address, std::uint64_t bytes, std::uint64_t
     entry.tag = tag;
 }
 
+void RecordMappingChange(std::uintptr_t address, std::size_t bytes, int kind) {
+    Record(Kind::MappingChanged, address, bytes, static_cast<std::uint64_t>(kind));
+}
+
 bool Enabled() {
     return active() != nullptr;
 }
