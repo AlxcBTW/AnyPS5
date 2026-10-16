@@ -30,6 +30,7 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "ImageTableAbi.hpp"
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <list>
 #include <map>
@@ -4814,6 +4815,26 @@ HazardFootprint ShaderResources::DispatchFootprint(std::uint64_t indirectArgumen
     footprint.reads = guestMemory.DeviceReads();
     footprint.writes = guestMemory.Writes();
     footprint.images = StorageImages();
+    // Every guest buffer element the shader can reach must lie inside the listed ranges (the lists come from the regions, the
+    // elements from the descriptors): an element the regions miss would be an access the lists do not show.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> listed(footprint.reads);
+    listed.insert(listed.end(), footprint.writes.begin(), footprint.writes.end());
+    std::sort(listed.begin(), listed.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : listed) {
+        if (range.first >= range.second) continue;
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    for (const auto& allocation : allocations) {
+        if (!allocation.guest || allocation.size == 0) continue;
+        const std::uint64_t end = allocation.address + allocation.size;
+        const auto after = std::upper_bound(merged.begin(), merged.end(), allocation.address, [](std::uint64_t value, const auto& range) { return value < range.first; });
+        if (after == merged.begin() || std::prev(after)->second < end) {
+            footprint.unknown = "unlisted element";
+            return footprint;
+        }
+    }
     if (indirectArguments != 0) footprint.reads.emplace_back(indirectArguments, indirectArguments + 12);
     return footprint;
 }

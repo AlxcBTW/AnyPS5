@@ -1390,21 +1390,23 @@ int HazardMode() {
     return forced >= 0 ? forced : environment;
 }
 std::atomic<std::uint64_t> hazardDispatches{0}, hazardKnown{0}, hazardRuns{0}, hazardJoined{0}, hazardSettled{0}, hazardRecorded{0}, hazardViolations{0};
-std::atomic<std::uint64_t> hazardUnknown[6]{};
+std::atomic<std::uint64_t> hazardUnknown[7]{};
 std::atomic<std::uint64_t> hazardSettledBy[static_cast<std::size_t>(Recorder::DebtEnd::Count)]{};
 std::atomic<std::uint64_t> hazardRunLengths[8]{};
+std::atomic<std::uint64_t> hazardPassFollowers{0}, hazardPassKept{0};
+std::atomic<std::uint64_t> hazardPassBlocked[static_cast<std::size_t>(Recorder::DebtEnd::Count)]{};
 std::atomic<std::int64_t> traceHazardsLeft{[] {
     const char* text = std::getenv("APS5_TRACE_HAZARDS");
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
 }()};
 constexpr const char* DebtEndNames[static_cast<std::size_t>(Recorder::DebtEnd::Count)] = {"raw", "waw", "war", "image", "ineligible", "unknown", "uncovered", "other", "submit"};
-constexpr const char* HazardUnknownNames[6] = {"address-based", "address table", "fault buffer", "private buffers", "workgroup memory", "other"};
+constexpr const char* HazardUnknownNames[7] = {"address-based", "address table", "fault buffer", "private buffers", "workgroup memory", "unlisted element", "other"};
 
 std::size_t HazardUnknownIndex(const char* reason) {
-    for (std::size_t i = 0; i < 5; ++i) {
+    for (std::size_t i = 0; i < 6; ++i) {
         if (std::strcmp(reason, HazardUnknownNames[i]) == 0) return i;
     }
-    return 5;
+    return 6;
 }
 
 // The first range of a list, for the trace lines.
@@ -1426,6 +1428,10 @@ bool Recorder::HazardVerify() {
     return HazardMode() == 2;
 }
 
+void Recorder::NoteHostReadOwed() {
+    if (open != nullptr) open->hostReadOwed = true;
+}
+
 void Recorder::SetHazardMode(int mode) {
     hazardModeForced.store(mode, std::memory_order_relaxed);
 }
@@ -1434,13 +1440,16 @@ Recorder::HazardStatistics Recorder::HazardCounts() {
     HazardStatistics counts;
     counts.dispatches = hazardDispatches.load(std::memory_order_relaxed);
     counts.known = hazardKnown.load(std::memory_order_relaxed);
-    for (std::size_t i = 0; i < 6; ++i) counts.unknownBy[i] = hazardUnknown[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < 7; ++i) counts.unknownBy[i] = hazardUnknown[i].load(std::memory_order_relaxed);
     counts.runs = hazardRuns.load(std::memory_order_relaxed);
     counts.joined = hazardJoined.load(std::memory_order_relaxed);
     counts.settled = hazardSettled.load(std::memory_order_relaxed);
     counts.recorded = hazardRecorded.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < static_cast<std::size_t>(DebtEnd::Count); ++i) counts.settledBy[i] = hazardSettledBy[i].load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < 8; ++i) counts.runLengths[i] = hazardRunLengths[i].load(std::memory_order_relaxed);
+    counts.passFollowers = hazardPassFollowers.load(std::memory_order_relaxed);
+    counts.passKept = hazardPassKept.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < static_cast<std::size_t>(DebtEnd::Count); ++i) counts.passBlockedBy[i] = hazardPassBlocked[i].load(std::memory_order_relaxed);
     counts.violations = hazardViolations.load(std::memory_order_relaxed);
     return counts;
 }
@@ -1474,8 +1483,32 @@ VkCommandBuffer Recorder::CommandsForDispatch(const HazardFootprint& footprint, 
     else hazardUnknown[HazardUnknownIndex(footprint.unknown)].fetch_add(1, std::memory_order_relaxed);
     auto& debt = open->debt;
     open->debtKept = false;
-    if (!debt.Active()) return commandsOpen(coveredAccess);
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    if (HazardVerify() && open->renderPass.open) {
+        // Only counted: what a narrowed recorder could do for a dispatch behind an open render pass, whose barrier is the pass's
+        // own (the pass-end barrier is recorded below as before).
+        hazardPassFollowers.fetch_add(1, std::memory_order_relaxed);
+        DebtEnd why = DebtEnd::OtherCommand;
+        bool keepable = false;
+        if (!footprint.Known()) why = DebtEnd::Unknown;
+        else if (!follower) why = DebtEnd::Ineligible;
+        else if (open->renderPass.fenced || open->renderPass.afterPass) why = DebtEnd::OtherCommand;
+        else if ((open->passStartCovered & shaderAccess) != shaderAccess) why = DebtEnd::Uncovered;
+        else {
+            switch (open->passHazards.Check(footprint.Access(), false)) {
+                case PassHazard::None: keepable = true; break;
+                case PassHazard::ReadAfterWrite: why = DebtEnd::ReadAfterWrite; break;
+                case PassHazard::WriteAfterWrite: why = DebtEnd::WriteAfterWrite; break;
+                case PassHazard::WriteAfterRead: why = DebtEnd::WriteAfterRead; break;
+                case PassHazard::Image: why = DebtEnd::Image; break;
+                default: why = DebtEnd::Unknown; break;
+            }
+        }
+        if (keepable) hazardPassKept.fetch_add(1, std::memory_order_relaxed);
+        else hazardPassBlocked[static_cast<std::size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        if (HazardTraceTurn()) std::fprintf(stderr, "[hazard] a dispatch behind an open render pass: %s (%s)\n", keepable ? "could skip the pass's barrier" : "needs it", keepable ? "independent" : DebtEndNames[static_cast<std::size_t>(why)]);
+    }
+    if (!debt.Active()) return commandsOpen(coveredAccess);
     DebtEnd end = DebtEnd::OtherCommand;
     bool keep = false;
     PassHazard hazard = PassHazard::None;
@@ -1570,7 +1603,9 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
-        const auto commands = Commands();
+        VkAccessFlags startCovered = 0;
+        const auto commands = Commands(&startCovered);
+        open->passStartCovered = startCovered;
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
@@ -1580,8 +1615,12 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
-    const auto commands = Commands();
-    if (!elide) open->passHazards.Clear();
+    VkAccessFlags startCovered = 0;
+    const auto commands = Commands(&startCovered);
+    if (!elide) {
+        open->passStartCovered = startCovered;
+        open->passHazards.Clear();
+    }
     open->passHazards.BeginPass();
     return {commands, false, !elide};
 }
@@ -2017,10 +2056,19 @@ void reportBarriers() {
             std::snprintf(text, sizeof(text), " %zu%s:%llu", i + 1, i == 7 ? "+" : "", delta(now.runLengths[i], reported.runLengths[i]));
             lengths += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, element outside the ranges %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
             Recorder::HazardVerify() ? "verify (every barrier recorded, decisions on the side)" : "narrowed", delta(now.dispatches, reported.dispatches), delta(now.known, reported.known),
-            delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]),
+            delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]), delta(now.unknownBy[6], reported.unknownBy[6]),
             delta(now.runs, reported.runs), delta(now.joined, reported.joined), delta(now.settled, reported.settled), Recorder::HazardVerify() ? "would be recorded" : "recorded", ends.c_str(), lengths.c_str(), static_cast<unsigned long long>(now.violations));
+        if (Recorder::HazardVerify()) {
+            std::string blocked;
+            for (std::size_t i = 0; i < static_cast<std::size_t>(Recorder::DebtEnd::Count); ++i) {
+                char text[48];
+                std::snprintf(text, sizeof(text), " %s %llu", DebtEndNames[i], delta(now.passBlockedBy[i], reported.passBlockedBy[i]));
+                blocked += text;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[hazard] behind an open render pass (10 s): %llu dispatches, %llu could skip the pass's barrier (independent of everything the pass touched); the others by cause:%s\n", delta(now.passFollowers, reported.passFollowers), delta(now.passKept, reported.passKept), blocked.c_str());
+        }
         reported = now;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[samples] occlusion dumps (cumulative): %llu queued (%llu inside an open pass), %llu recorded at once; %llu segments closed; %llu folds of queued dumps\n", static_cast<unsigned long long>(dumpsQueued.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsQueuedInPass.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpsAtOnce.load(std::memory_order_relaxed)), static_cast<unsigned long long>(segmentsClosed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(dumpFolds.load(std::memory_order_relaxed)));

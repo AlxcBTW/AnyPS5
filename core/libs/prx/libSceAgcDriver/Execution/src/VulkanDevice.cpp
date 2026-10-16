@@ -4424,12 +4424,18 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recorder.EndGpuTiming(gpuTiming);
     const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    // Lab (APS5_LAB_NO_HOST_STAGE=1): the trailing barrier does not make the dispatch's writes visible to the host. Nothing reads them
+    // there before the batch ends (a CPU read of a pending write waits for the batch, a label store has its own host barrier), and
+    // Submit records one ALL_COMMANDS -> HOST barrier for the batch (NoteHostReadOwed), so the host sees them at the fence as before.
+    static const bool noHostStage = std::getenv("APS5_LAB_NO_HOST_STAGE") != nullptr;
+    const VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | (noHostStage ? 0u : VK_ACCESS_HOST_READ_BIT);
+    const VkPipelineStageFlags trailingStages = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | (noHostStage ? 0u : VK_PIPELINE_STAGE_HOST_BIT);
+    if (noHostStage) recorder.NoteHostReadOwed();
     // Lab: with a listed footprint the recorder may owe the barrier (it records it before the next command that is not an
     // independent dispatch, or at Submit); then nothing is covered yet.
-    const bool owed = hazard && recorder.OweDispatchBarrier(footprint, Graphics::OwedBarrier{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess}, shaderAccess);
+    const bool owed = hazard && recorder.OweDispatchBarrier(footprint, Graphics::OwedBarrier{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, trailingStages, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess}, shaderAccess);
     if (!owed) {
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, trailingStages, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
         Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
     }
     recorder.EndGpuTiming(trailingTiming);

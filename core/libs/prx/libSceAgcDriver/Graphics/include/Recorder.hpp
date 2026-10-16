@@ -75,6 +75,9 @@ public:
     static bool HazardEnabled() { return HazardBarriers() || HazardVerify(); }
     // Tests: 0 off, 1 narrowed, 2 verify; -1 leaves the decision to the environment (the default).
     static void SetHazardMode(int mode);
+    // Lab (APS5_LAB_NO_HOST_STAGE=1, see VulkanDevice::recordDispatch): the batch's one host-read barrier at Submit stands in for the
+    // host destination the dispatches' trailing barriers leave out.
+    void NoteHostReadOwed();
     // The command buffer for a dispatch with the accesses `footprint`. `follower`: whether the dispatch may be recorded behind a
     // run at all (a direct dispatch that needs no data refresh and no argument read before its own barrier). `coveredAccess` as
     // in Commands(); when the dispatch kept the run (it is recorded behind the owed barrier) it reports what the barrier before
@@ -89,14 +92,21 @@ public:
     struct HazardStatistics {
         std::uint64_t dispatches = 0;
         std::uint64_t known = 0;
-        // Unlisted accesses by reason: address-based, address table, fault buffer, private buffers, workgroup memory, other.
-        std::uint64_t unknownBy[6] = {};
+        // Unlisted accesses by reason: address-based, address table, fault buffer, private buffers, workgroup memory, an element
+        // outside the listed ranges, other.
+        std::uint64_t unknownBy[7] = {};
         std::uint64_t runs = 0;
         std::uint64_t joined = 0;
         std::uint64_t settled = 0;
         // Owed barriers really recorded (narrowed mode; verify mode records them when the dispatches ask).
         std::uint64_t recorded = 0;
         std::uint64_t settledBy[static_cast<std::size_t>(DebtEnd::Count)] = {};
+        // Verify mode only: dispatches that found a render pass open, how many could be recorded behind it without the pass's
+        // barrier (an independent, listed dispatch behind a pass that is neither fenced nor has a store proxy and whose start
+        // covered shader accesses), and the others by cause (the DebtEnd names; 'other' is a fenced pass or one with a proxy).
+        std::uint64_t passFollowers = 0;
+        std::uint64_t passKept = 0;
+        std::uint64_t passBlockedBy[static_cast<std::size_t>(DebtEnd::Count)] = {};
         // Runs by length (1..7, 8 or more), counted when a run ends.
         std::uint64_t runLengths[8] = {};
         // Would-keep decisions the brute-force check disagreed with (verify mode).
@@ -687,6 +697,9 @@ private:
         // tracked (APS5_LAB_HAZARD_VERIFY); see BarrierDebt. `debtKept`: the dispatch being recorded joined the run. `debtMembers`:
         // verify mode only, the run members' lists for the brute-force check.
         BarrierDebt debt;
+        // What the command before the open pass group left covered (Commands() at its start): the shader accesses a dispatch behind
+        // the pass could rely on for the commands before it.
+        VkAccessFlags passStartCovered = 0;
         bool debtKept = false;
         std::vector<HazardFootprint> debtMembers;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
