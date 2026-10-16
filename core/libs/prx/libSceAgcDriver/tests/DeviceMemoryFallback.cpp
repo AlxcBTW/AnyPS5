@@ -53,6 +53,34 @@ void Choose(const char* what, bool budgetExtension, std::uint64_t budget, std::u
     Expect(type == expected, std::string(what) + ": chose memory type " + std::to_string(type) + ", expected " + std::to_string(expected));
 }
 
+void StoragePlacementTests() {
+    const std::uint32_t both = (1u << HostType) | (1u << DeviceType);
+    const auto choose = [&](const char* what, bool budgetRule, bool budgetExtension, std::uint64_t budget, std::uint64_t usage, std::uint32_t mask, std::uint32_t expected, bool pastBudget) {
+        reportedBudget = budget;
+        reportedUsage = usage;
+        Context context = mockContext(budgetExtension);
+        context.storageBudgetPlacement = budgetRule;
+        const auto placement = context.StorageMemoryType(mask, 64 * MiB);
+        Expect(placement.type == expected, std::string(what) + ": chose memory type " + std::to_string(placement.type) + ", expected " + std::to_string(expected));
+        Expect(placement.pastBudget == pastBudget, std::string(what) + ": past the budget " + std::to_string(placement.pastBudget) + ", expected " + std::to_string(pastBudget));
+        if (budgetExtension) Expect(placement.usage == usage && placement.budget == budget, std::string(what) + ": the reported usage and budget were not kept");
+    };
+    choose("storage texture with room in the budget", false, true, 3000 * MiB, 2000 * MiB, both, DeviceType, false);
+    choose("storage texture that fills the budget exactly", false, true, 3000 * MiB, 2936 * MiB, both, DeviceType, false);
+    choose("storage texture past the budget stays device-local", false, true, 3000 * MiB, 2937 * MiB, both, DeviceType, true);
+    choose("storage texture with usage already over the budget stays device-local", false, true, 2952 * MiB, 3633 * MiB, both, DeviceType, true);
+    choose("storage texture without VK_EXT_memory_budget", false, false, 0, 0, both, DeviceType, false);
+    choose("storage texture with an unreported budget", false, true, 0, 4000 * MiB, both, DeviceType, false);
+    choose("budget rule: storage texture with room in the budget", true, true, 3000 * MiB, 2000 * MiB, both, DeviceType, false);
+    choose("budget rule: storage texture past the budget goes to host memory", true, true, 3000 * MiB, 2937 * MiB, both, HostType, true);
+    choose("budget rule: no host type allowed", true, true, 3000 * MiB, 3000 * MiB, 1u << DeviceType, DeviceType, true);
+    Context context = mockContext(true);
+    Expect(context.HostMemoryType(both) == HostType, "the host fallback is the type outside the device-local heap");
+    Expect(context.HostMemoryType(1u << DeviceType) == context.memory.memoryTypeCount, "a mask without a host type has no host fallback");
+    Expect(context.HostMemory(HostType) && !context.HostMemory(DeviceType), "host memory is told by the heap's device-local flag");
+    Expect(!context.HostMemory(context.memory.memoryTypeCount), "a type past the list is not host memory");
+}
+
 void BufferPlacementTests() {
     constexpr auto coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     Context context = mockContext(true);
@@ -105,6 +133,7 @@ int main() {
         Choose("allocation exceeds the budget", true, 3000 * MiB, 2937 * MiB, both, HostType);
         Choose("usage already over the budget", true, 2952 * MiB, 3633 * MiB, both, HostType);
         Choose("no host type allowed", true, 3000 * MiB, 3000 * MiB, 1u << DeviceType, DeviceType);
+        StoragePlacementTests();
         BufferPlacementTests();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());

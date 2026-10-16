@@ -38,6 +38,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+constexpr VkDeviceSize LargeStoragePlacementBytes = 32ull << 20u;
+
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
@@ -1135,8 +1137,25 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         allocation.allocationSize = requirements.size;
         memoryBytes = requirements.size;
-        allocation.memoryTypeIndex = context.DeviceMemoryType(requirements.memoryTypeBits, requirements.size, "storage texture");
-        Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &memory), "vkAllocateMemory storage texture");
+        const auto placement = context.StorageMemoryType(requirements.memoryTypeBits, requirements.size);
+        allocation.memoryTypeIndex = placement.type;
+        const auto allocate = context.Function<PFN_vkAllocateMemory>("vkAllocateMemory");
+        auto allocated = allocate(context.device, &allocation, nullptr, &memory);
+        bool refused = false;
+        if (allocated == VK_ERROR_OUT_OF_DEVICE_MEMORY && !context.storageBudgetPlacement) {
+            if (const auto host = context.HostMemoryType(requirements.memoryTypeBits); host != context.memory.memoryTypeCount && host != allocation.memoryTypeIndex) {
+                refused = true;
+                memory = VK_NULL_HANDLE;
+                allocation.memoryTypeIndex = host;
+                allocated = allocate(context.device, &allocation, nullptr, &memory);
+            }
+        }
+        if (allocated != VK_SUCCESS) memory = VK_NULL_HANDLE;
+        Check(allocated, "vkAllocateMemory storage texture");
+        if (const bool host = context.HostMemory(allocation.memoryTypeIndex); (host || placement.pastBudget) && requirements.size >= LargeStoragePlacementBytes) {
+            const char* where = refused ? "in host memory, device-local memory refused" : host ? "in host memory by the device-local budget" : "in device-local memory past its budget";
+            std::fprintf(stderr, "[gpu] storage texture 0x%llx %ux%u layers %u mips %u format %u: %llu MiB %s (type %u, heap usage %llu of %llu MiB)\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, geometry.imageLayers, descriptor.mipCount, descriptor.format, static_cast<unsigned long long>(requirements.size >> 20u), where, allocation.memoryTypeIndex, static_cast<unsigned long long>(placement.usage >> 20u), static_cast<unsigned long long>(placement.budget >> 20u));
+        }
         Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, memory, 0), "vkBindImageMemory storage");
     } catch (...) {
         release();

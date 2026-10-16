@@ -229,6 +229,7 @@ struct Context {
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
+    bool storageBudgetPlacement = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
@@ -308,6 +309,47 @@ struct Context {
             return i;
         }
         return type;
+    }
+
+    bool HostMemory(std::uint32_t type) const {
+        return type < memory.memoryTypeCount && (memory.memoryHeaps[memory.memoryTypes[type].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0;
+    }
+
+    std::uint32_t HostMemoryType(std::uint32_t mask) const {
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if ((mask & (1u << i)) != 0 && HostMemory(i)) return i;
+        }
+        return memory.memoryTypeCount;
+    }
+
+    struct StoragePlacement {
+        std::uint32_t type = 0;
+        bool pastBudget = false;
+        VkDeviceSize usage = 0;
+        VkDeviceSize budget = 0;
+    };
+
+    StoragePlacement StorageMemoryType(std::uint32_t mask, VkDeviceSize bytes) const {
+        StoragePlacement placement{MemoryType(mask, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        const auto heap = memory.memoryTypes[placement.type].heapIndex;
+        if (memoryProperties2 != nullptr && physical != VK_NULL_HANDLE) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+            VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+            memoryProperties2(physical, &properties);
+            placement.budget = reported.heapBudget[heap];
+            placement.usage = reported.heapUsage[heap];
+            placement.pastBudget = placement.budget != 0 && (placement.usage >= placement.budget || bytes > placement.budget - placement.usage);
+        }
+        if (storageBudgetPlacement) {
+            placement.type = DeviceMemoryType(mask, bytes, "storage texture");
+            return placement;
+        }
+        if (!placement.pastBudget) return placement;
+        static std::atomic<std::uint64_t> kept{0}, keptBytes{0};
+        const auto count = kept.fetch_add(1) + 1;
+        const auto total = keptBytes.fetch_add(bytes) + bytes;
+        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] storage texture: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes kept in device-local memory type %u; %llu such allocations, %llu MiB\n", heap, static_cast<unsigned long long>(placement.usage >> 20u), static_cast<unsigned long long>(placement.budget >> 20u), static_cast<unsigned long long>(bytes), placement.type, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+        return placement;
     }
 };
 

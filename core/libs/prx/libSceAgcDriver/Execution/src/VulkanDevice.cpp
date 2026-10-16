@@ -3504,6 +3504,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.sampleLocationGridSampleCounts = state->sampleLocationGridSampleCounts;
     context.memoryProperties2 = state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr;
     context.singlePassStorage = state->storageImageWithoutFormat;
+    static const bool storageBudgetPlacement = std::getenv("APS5_NO_DEVICE_LOCAL_STORAGE") != nullptr;
+    context.storageBudgetPlacement = storageBudgetPlacement;
     return context;
 }
 
