@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -148,6 +149,7 @@ struct PthreadPrivate {
     std::atomic<bool> cancelPending{false};
     std::mutex cancelLock;
     TimedWait::Condition* cancelWait = nullptr;
+    std::atomic<int> labHostPriority{std::numeric_limits<int>::min()};
 
     explicit PthreadPrivate(const PthreadAttrPrivate* attr = nullptr);
     ~PthreadPrivate();
