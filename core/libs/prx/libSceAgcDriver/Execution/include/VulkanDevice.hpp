@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <chrono>
@@ -263,6 +264,19 @@ public:
         double argumentReadMs;
     };
     IndirectOutcome DispatchIndirect(const ShaderRecompiler::RecompileResult& shader, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::uint64_t programAddress = 0, std::shared_ptr<PreparedDispatch> prepared = nullptr, std::shared_ptr<const Recipe>* recipe = nullptr);
+    // APS5_LAB_MUTEX_GATE (job 28c). Called with GuestMemory::GpuMutex held by the dispatch's own acquisition (depth 1), before
+    // stage B: the stage-A pre-sync repeated under the mutex over the DCC key ranges it named. A recorded writer of such a
+    // range whose keys the CPU cannot know (what WaitForKeyWriters would wait for under the mutex) that was recorded after the
+    // pre-sync looked, or that the pre-sync did not wait for, is waited for here with the mutex released (the batch holding it
+    // is submitted first when it is the open one), then reaped under it, and the ranges are looked at again (at most three
+    // rounds, then stage B waits under the mutex as before). Nothing is skipped: the wait stage B would have made happens
+    // earlier, while the other workers can record. Returns the ranges looked at, for the key-wait counters.
+    static bool MutexGate();
+    std::vector<Graphics::DccGateRange> SettleKeyWriters(const PreparedDispatch* prepared, const RecipeHit* hit);
+    // APS5_LAB_MUTEX_LEARN: the resource object a dispatch runs with, and the key ranges its stage B waited for under the mutex that
+    // the pre-sync's list did not name; the next pre-sync of that object (this worker's table) names them too.
+    const void* GateIdentity(const PreparedDispatch* prepared, const RecipeHit* hit) const;
+    static void LearnKeyRanges(const void* identity, std::span<const Graphics::DccGateRange> ranges);
     // A value-equal dispatch-cache hit with a recipe (design_cpu_final M4), in two steps.
     // PrepareRecipe, WITHOUT GuestMemory::GpuMutex: the pre-checks (recipes on, the recipe's
     // device is this one, its template and pipeline objects still alive), the template's

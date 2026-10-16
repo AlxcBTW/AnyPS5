@@ -401,6 +401,13 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         GuestMemory::TagGpuLockSite(indirectArguments != 0 ? GuestMemory::GpuLockSite::Indirect : GuestMemory::GpuLockSite::Dispatch);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         phaseTiming.Phase(PhaseLockWait);
+        // APS5_LAB_MUTEX_GATE: the key writers recorded since the pre-sync are waited for with the mutex released (VulkanDevice::SettleKeyWriters).
+        std::optional<Graphics::KeyGateScope> keyGate;
+        const void* gateIdentity = nullptr;
+        if (VulkanDevice::MutexGate() && (prepared != nullptr || recipeHit != nullptr)) {
+            gateIdentity = localDevice->GateIdentity(prepared.get(), recipeHit.get());
+            keyGate.emplace(localDevice->SettleKeyWriters(prepared.get(), recipeHit.get()));
+        }
 
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(PhaseLabels);
@@ -428,6 +435,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             }
         } catch (const std::exception& error) {
             if (rethrow(error)) return;
+        }
+        if (keyGate.has_value() && gateIdentity != nullptr) {
+            const auto unlisted = Graphics::TakeUnlistedKeyRanges();
+            VulkanDevice::LearnKeyRanges(gateIdentity, unlisted);
         }
         if (builtRecipe != nullptr) {
             if (dataHit) {
