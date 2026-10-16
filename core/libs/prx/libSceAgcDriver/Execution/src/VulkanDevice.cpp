@@ -4344,6 +4344,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
+            // Lab: a dispatch that refreshed was predicted not to follow a run (`follower` above); if it did, the transfer wrote words
+            // an earlier dispatch of the run may still read, with no barrier between them.
+            if (hazard && recorder.DispatchKept()) recorder.NoteHazardViolation("a dispatch kept behind a run recorded a refresh of its data buffers (the prediction of RefreshData differs from the refresh)");
         } else {
             ++d.templateSameWords;
         }

@@ -1390,7 +1390,7 @@ int HazardMode() {
     return forced >= 0 ? forced : environment;
 }
 std::atomic<std::uint64_t> hazardDispatches{0}, hazardKnown{0}, hazardRuns{0}, hazardJoined{0}, hazardSettled{0}, hazardRecorded{0}, hazardViolations{0};
-std::atomic<std::uint64_t> hazardUnknown[7]{};
+std::atomic<std::uint64_t> hazardUnknown[8]{};
 std::atomic<std::uint64_t> hazardSettledBy[static_cast<std::size_t>(Recorder::DebtEnd::Count)]{};
 std::atomic<std::uint64_t> hazardRunLengths[8]{};
 std::atomic<std::uint64_t> hazardPassFollowers{0}, hazardPassKept{0};
@@ -1400,13 +1400,13 @@ std::atomic<std::int64_t> traceHazardsLeft{[] {
     return text != nullptr ? static_cast<std::int64_t>(std::strtoll(text, nullptr, 10)) : std::int64_t{0};
 }()};
 constexpr const char* DebtEndNames[static_cast<std::size_t>(Recorder::DebtEnd::Count)] = {"raw", "waw", "war", "image", "ineligible", "unknown", "uncovered", "other", "submit"};
-constexpr const char* HazardUnknownNames[7] = {"address-based", "address table", "fault buffer", "private buffers", "workgroup memory", "unlisted element", "other"};
+constexpr const char* HazardUnknownNames[8] = {"address-based", "address table", "fault buffer", "private buffers", "workgroup memory", "unlisted element", "shared mapping", "other"};
 
 std::size_t HazardUnknownIndex(const char* reason) {
-    for (std::size_t i = 0; i < 6; ++i) {
+    for (std::size_t i = 0; i < 7; ++i) {
         if (std::strcmp(reason, HazardUnknownNames[i]) == 0) return i;
     }
-    return 6;
+    return 7;
 }
 
 // The first range of a list, for the trace lines.
@@ -1432,6 +1432,11 @@ void Recorder::NoteHostReadOwed() {
     if (open != nullptr) open->hostReadOwed = true;
 }
 
+void Recorder::NoteHazardViolation(const char* what) {
+    hazardViolations.fetch_add(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[hazard] VIOLATION: %s\n", what);
+}
+
 void Recorder::SetHazardMode(int mode) {
     hazardModeForced.store(mode, std::memory_order_relaxed);
 }
@@ -1440,7 +1445,7 @@ Recorder::HazardStatistics Recorder::HazardCounts() {
     HazardStatistics counts;
     counts.dispatches = hazardDispatches.load(std::memory_order_relaxed);
     counts.known = hazardKnown.load(std::memory_order_relaxed);
-    for (std::size_t i = 0; i < 7; ++i) counts.unknownBy[i] = hazardUnknown[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < 8; ++i) counts.unknownBy[i] = hazardUnknown[i].load(std::memory_order_relaxed);
     counts.runs = hazardRuns.load(std::memory_order_relaxed);
     counts.joined = hazardJoined.load(std::memory_order_relaxed);
     counts.settled = hazardSettled.load(std::memory_order_relaxed);
@@ -2056,9 +2061,9 @@ void reportBarriers() {
             std::snprintf(text, sizeof(text), " %zu%s:%llu", i + 1, i == 7 ? "+" : "", delta(now.runLengths[i], reported.runLengths[i]));
             lengths += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, element outside the ranges %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, element outside the ranges %llu, shared mapping %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
             Recorder::HazardVerify() ? "verify (every barrier recorded, decisions on the side)" : "narrowed", delta(now.dispatches, reported.dispatches), delta(now.known, reported.known),
-            delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]), delta(now.unknownBy[6], reported.unknownBy[6]),
+            delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]), delta(now.unknownBy[6], reported.unknownBy[6]), delta(now.unknownBy[7], reported.unknownBy[7]),
             delta(now.runs, reported.runs), delta(now.joined, reported.joined), delta(now.settled, reported.settled), Recorder::HazardVerify() ? "would be recorded" : "recorded", ends.c_str(), lengths.c_str(), static_cast<unsigned long long>(now.violations));
         if (Recorder::HazardVerify()) {
             std::string blocked;

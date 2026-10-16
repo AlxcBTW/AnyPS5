@@ -4811,6 +4811,7 @@ HazardFootprint ShaderResources::DispatchFootprint(std::uint64_t indirectArgumen
     else if (usesBda) footprint.unknown = "address table";
     else if (bda != nullptr) footprint.unknown = "fault buffer";
     else if (guestMemory.CopiedBytes() != 0) footprint.unknown = "private buffers";
+    else if (guestMemory.SharedMapping()) footprint.unknown = "shared mapping";
     if (!footprint.Known()) return footprint;
     footprint.reads = guestMemory.DeviceReads();
     footprint.writes = guestMemory.Writes();

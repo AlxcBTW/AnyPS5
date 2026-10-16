@@ -4526,6 +4526,19 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceRe
     return result;
 }
 
+bool GuestBufferMemory::SharedMapping() const {
+    if (!uploaded || committed) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    const auto shared = [&](const Region& region) {
+        // A staged region (gpuCopy) names the import it copies from by its range.
+        const HostImport* entry = region.direct != nullptr ? region.direct : region.gpuCopy ? findImport(state, region.begin, region.end) : nullptr;
+        return entry != nullptr && (entry->alias != nullptr || entry->dmaBuf);
+    };
+    if (space != nullptr && std::any_of(space->base.begin(), space->base.end(), shared)) return true;
+    return std::any_of(regions.begin(), regions.end(), shared);
+}
+
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

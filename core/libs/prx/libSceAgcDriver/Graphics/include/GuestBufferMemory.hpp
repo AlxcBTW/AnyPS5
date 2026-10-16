@@ -308,6 +308,10 @@ public:
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
+    // Whether a region is served by an import of memory that several guest views may map (an alias mapping of a shared section, or a
+    // dma-buf import): the guest addresses of such a region do not name its pages uniquely, so a comparison of ranges cannot show
+    // that two uses of it are independent. The hazard-driven barriers (Recorder::CommandsForDispatch) keep the full barrier then.
+    bool SharedMapping() const;
 
 private:
     struct Region {

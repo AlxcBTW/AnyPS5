@@ -4818,7 +4818,9 @@ void barrierDebtTests(Recorder& recorder) {
     // an independent dispatch is recorded behind the owed barrier and reports what the run's head covered
     recorder.CommandsForDispatch(independent, true, &covered);
     Require(covered == shaderAccess, "a kept dispatch reports the head's coverage so it skips its leading barrier");
+    Require(recorder.DispatchKept(), "the recorder knows the dispatch joined the run");
     Require(recorder.OweDispatchBarrier(independent, trailing, shaderAccess), "the kept dispatch owes the barrier too");
+    Require(!recorder.DispatchKept(), "the mark ends with the dispatch's own barrier decision");
     now = counts();
     Require(now.joined == before.joined + 1 && now.runs == before.runs + 1 && now.settled == before.settled && now.recorded == before.recorded, "an independent dispatch joined the run; nothing was recorded");
     // a dispatch that reads what the run wrote settles it, and the settled barrier covers what the dispatch's own would have
@@ -4861,6 +4863,10 @@ void barrierDebtTests(Recorder& recorder) {
     recorder.Submit();
     now = counts();
     Require(ends(now, before, Recorder::DebtEnd::Submit) == 1 && now.recorded == before.recorded + 1, "Submit records the owed barrier");
+    // a case the exactness argument rules out is counted with the violations
+    const auto violations = counts().violations;
+    recorder.NoteHazardViolation("test: a kept dispatch recorded a refresh");
+    Require(counts().violations == violations + 1, "a violation is counted");
     recorder.Sync();
 
     // Verify mode: every barrier is recorded by the dispatch, the decisions are made on the side.

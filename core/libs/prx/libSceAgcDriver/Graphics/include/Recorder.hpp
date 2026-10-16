@@ -87,14 +87,18 @@ public:
     // caller records nothing and does not MarkCovered); false: the caller records it as before. `headCovered`: what a run that
     // starts here can say its head made visible to later shader accesses.
     bool OweDispatchBarrier(const HazardFootprint& footprint, const OwedBarrier& barrier, VkAccessFlags headCovered);
+    // Whether the dispatch being recorded joined a run (CommandsForDispatch kept it; OweDispatchBarrier clears the mark).
+    bool DispatchKept() const { return open != nullptr && open->debtKept; }
+    // A case the exactness argument rules out happened (it is counted with the violations of the verify mode and printed).
+    void NoteHazardViolation(const char* what);
     // Why an owed barrier was recorded (or, in verify mode, would have been).
     enum class DebtEnd : std::uint8_t { ReadAfterWrite, WriteAfterWrite, WriteAfterRead, Image, Ineligible, Unknown, Uncovered, OtherCommand, Submit, Count };
     struct HazardStatistics {
         std::uint64_t dispatches = 0;
         std::uint64_t known = 0;
         // Unlisted accesses by reason: address-based, address table, fault buffer, private buffers, workgroup memory, an element
-        // outside the listed ranges, other.
-        std::uint64_t unknownBy[7] = {};
+        // outside the listed ranges, memory that guest views may share, other.
+        std::uint64_t unknownBy[8] = {};
         std::uint64_t runs = 0;
         std::uint64_t joined = 0;
         std::uint64_t settled = 0;
