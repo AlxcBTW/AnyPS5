@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
 
@@ -43,6 +44,10 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
                 dispatch(queue, direct, submission);
                 return;
             }
+        }
+        if (submission.queue == 0 && DrawPipeline::Active()) {
+            auto& pipeline = DrawPipeline::Queue0();
+            if (pipeline.Busy() && pipeline.Overlaps(arguments, 3 * sizeof(std::uint32_t))) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
         }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
