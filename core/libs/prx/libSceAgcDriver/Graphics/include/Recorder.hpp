@@ -75,6 +75,10 @@ public:
     static bool HazardEnabled() { return HazardBarriers() || HazardVerify(); }
     // Tests: 0 off, 1 narrowed, 2 verify; -1 leaves the decision to the environment (the default).
     static void SetHazardMode(int mode);
+    // APS5_LAB_HAZARD_UNSAFE=1 (narrowed mode only): a control for external synchronization validation. A dispatch that overlaps the
+    // run is kept behind it anyway, so the barrier it really needs goes missing and the validation layer has hazards to find (a
+    // validation run that finds none here cannot vouch for the narrowed mode). The picture is wrong on purpose. Tests: 0/1, -1 = environment.
+    static void SetHazardUnsafe(int mode);
     // Lab (APS5_LAB_NO_HOST_STAGE=1, see VulkanDevice::recordDispatch): the batch's one host-read barrier at Submit stands in for the
     // host destination the dispatches' trailing barriers leave out.
     void NoteHostReadOwed();
@@ -115,6 +119,8 @@ public:
         std::uint64_t runLengths[8] = {};
         // Would-keep decisions the brute-force check disagreed with (verify mode).
         std::uint64_t violations = 0;
+        // Dispatches kept despite a hazard by APS5_LAB_HAZARD_UNSAFE.
+        std::uint64_t unsafeKept = 0;
     };
     static HazardStatistics HazardCounts();
     struct DrawPassStart {

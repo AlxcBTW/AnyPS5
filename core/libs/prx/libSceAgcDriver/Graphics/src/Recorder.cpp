@@ -1390,6 +1390,13 @@ int HazardMode() {
     return forced >= 0 ? forced : environment;
 }
 std::atomic<std::uint64_t> hazardDispatches{0}, hazardKnown{0}, hazardRuns{0}, hazardJoined{0}, hazardSettled{0}, hazardRecorded{0}, hazardViolations{0};
+std::atomic<int> hazardUnsafeForced{-1};
+bool HazardUnsafe() {
+    static const bool environment = std::getenv("APS5_LAB_HAZARD_UNSAFE") != nullptr;
+    const int forced = hazardUnsafeForced.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced != 0 : environment;
+}
+std::atomic<std::uint64_t> hazardUnsafeKept{0};
 std::atomic<std::uint64_t> hazardUnknown[8]{};
 std::atomic<std::uint64_t> hazardSettledBy[static_cast<std::size_t>(Recorder::DebtEnd::Count)]{};
 std::atomic<std::uint64_t> hazardRunLengths[8]{};
@@ -1441,6 +1448,10 @@ void Recorder::SetHazardMode(int mode) {
     hazardModeForced.store(mode, std::memory_order_relaxed);
 }
 
+void Recorder::SetHazardUnsafe(int mode) {
+    hazardUnsafeForced.store(mode, std::memory_order_relaxed);
+}
+
 Recorder::HazardStatistics Recorder::HazardCounts() {
     HazardStatistics counts;
     counts.dispatches = hazardDispatches.load(std::memory_order_relaxed);
@@ -1456,6 +1467,7 @@ Recorder::HazardStatistics Recorder::HazardCounts() {
     counts.passKept = hazardPassKept.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < static_cast<std::size_t>(DebtEnd::Count); ++i) counts.passBlockedBy[i] = hazardPassBlocked[i].load(std::memory_order_relaxed);
     counts.violations = hazardViolations.load(std::memory_order_relaxed);
+    counts.unsafeKept = hazardUnsafeKept.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -1526,6 +1538,13 @@ VkCommandBuffer Recorder::CommandsForDispatch(const HazardFootprint& footprint, 
             case DebtVerdict::Uncovered: end = DebtEnd::Uncovered; break;
             case DebtVerdict::Hazard:
                 end = hazard == PassHazard::ReadAfterWrite ? DebtEnd::ReadAfterWrite : hazard == PassHazard::WriteAfterWrite ? DebtEnd::WriteAfterWrite : hazard == PassHazard::WriteAfterRead ? DebtEnd::WriteAfterRead : hazard == PassHazard::Image ? DebtEnd::Image : DebtEnd::Unknown;
+                if (HazardUnsafe() && HazardBarriers()) {
+                    // The control of APS5_LAB_HAZARD_UNSAFE: the hazard is ignored, the dispatch joins the run.
+                    static const bool announced = [] { std::fprintf(stderr, "[hazard] APS5_LAB_HAZARD_UNSAFE: dispatches that overlap a run are kept behind it; the output is wrong on purpose (a control for external synchronization validation)\n"); return true; }();
+                    (void)announced;
+                    keep = true;
+                    hazardUnsafeKept.fetch_add(1, std::memory_order_relaxed);
+                }
                 break;
             case DebtVerdict::NotOwed: break;
         }
@@ -2061,10 +2080,10 @@ void reportBarriers() {
             std::snprintf(text, sizeof(text), " %zu%s:%llu", i + 1, i == 7 ? "+" : "", delta(now.runLengths[i], reported.runLengths[i]));
             lengths += text;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, element outside the ranges %llu, shared mapping %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative)\n",
+        AgcDriver::ProfilePrint_nid_no_patch("[hazard] %s (10 s): %llu dispatches, %llu with listed accesses (not listed: address-based %llu, address table %llu, fault buffer %llu, private buffers %llu, workgroup memory %llu, element outside the ranges %llu, shared mapping %llu, other %llu); %llu runs started, %llu dispatches kept behind a run (no barrier between independent dispatches); %llu owed barriers %s, by cause:%s; run lengths%s; violations %llu (cumulative); unsafe keeps %llu (cumulative)\n",
             Recorder::HazardVerify() ? "verify (every barrier recorded, decisions on the side)" : "narrowed", delta(now.dispatches, reported.dispatches), delta(now.known, reported.known),
             delta(now.unknownBy[0], reported.unknownBy[0]), delta(now.unknownBy[1], reported.unknownBy[1]), delta(now.unknownBy[2], reported.unknownBy[2]), delta(now.unknownBy[3], reported.unknownBy[3]), delta(now.unknownBy[4], reported.unknownBy[4]), delta(now.unknownBy[5], reported.unknownBy[5]), delta(now.unknownBy[6], reported.unknownBy[6]), delta(now.unknownBy[7], reported.unknownBy[7]),
-            delta(now.runs, reported.runs), delta(now.joined, reported.joined), delta(now.settled, reported.settled), Recorder::HazardVerify() ? "would be recorded" : "recorded", ends.c_str(), lengths.c_str(), static_cast<unsigned long long>(now.violations));
+            delta(now.runs, reported.runs), delta(now.joined, reported.joined), delta(now.settled, reported.settled), Recorder::HazardVerify() ? "would be recorded" : "recorded", ends.c_str(), lengths.c_str(), static_cast<unsigned long long>(now.violations), static_cast<unsigned long long>(now.unsafeKept));
         if (Recorder::HazardVerify()) {
             std::string blocked;
             for (std::size_t i = 0; i < static_cast<std::size_t>(Recorder::DebtEnd::Count); ++i) {

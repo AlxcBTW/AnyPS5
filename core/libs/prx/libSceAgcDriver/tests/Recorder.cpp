@@ -4863,6 +4863,21 @@ void barrierDebtTests(Recorder& recorder) {
     recorder.Submit();
     now = counts();
     Require(ends(now, before, Recorder::DebtEnd::Submit) == 1 && now.recorded == before.recorded + 1, "Submit records the owed barrier");
+    // the control of APS5_LAB_HAZARD_UNSAFE keeps a dispatch that overlaps the run, and only while it is set
+    recorder.CommandsForDispatch(first, true, &covered);
+    Require(recorder.OweDispatchBarrier(first, trailing, shaderAccess), "a run for the unsafe control");
+    Recorder::SetHazardUnsafe(1);
+    before = counts();
+    recorder.CommandsForDispatch(overlapping, true, &covered);
+    now = counts();
+    Require(now.unsafeKept == before.unsafeKept + 1 && now.joined == before.joined + 1 && now.settled == before.settled && covered == shaderAccess, "the unsafe control kept a dispatch that overlaps the run");
+    Require(recorder.OweDispatchBarrier(overlapping, trailing, shaderAccess), "it owes the barrier as a member of the run");
+    Recorder::SetHazardUnsafe(-1);
+    before = counts();
+    recorder.CommandsForDispatch(overlapping, true, &covered);
+    now = counts();
+    Require(now.unsafeKept == before.unsafeKept && ends(now, before, Recorder::DebtEnd::ReadAfterWrite) == 1, "without the control the same dispatch settles the run");
+    recorder.Submit();
     // a case the exactness argument rules out is counted with the violations
     const auto violations = counts().violations;
     recorder.NoteHazardViolation("test: a kept dispatch recorded a refresh");
