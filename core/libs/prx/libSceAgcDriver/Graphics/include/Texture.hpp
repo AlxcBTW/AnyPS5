@@ -64,6 +64,9 @@ struct AliasHandOverCounts {
     std::uint64_t fallbacks = 0;
     std::uint64_t keptForCpu = 0;
     std::uint64_t resurrected = 0;
+    // Of those, units whose memory had left the write watch: their guest bytes are saved at the
+    // resurrect, so a CPU store made after the range left the watch is not kept there.
+    std::uint64_t resurrectedUnwatched = 0;
     std::uint64_t supersededLost = 0;
     std::uint64_t skippedUnits = 0;
     std::uint64_t verifiedUnits = 0;

@@ -7809,7 +7809,7 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
     constexpr std::array<std::uint8_t, 8> green{0, 0, 0x00, 0x3c, 0, 0, 0x00, 0x3c};
-    enum class Order { Superseded, ReadFirst, Rewritten, ReadLookup, Recleared };
+    enum class Order { Superseded, ReadFirst, Rewritten, ReadLookup, Recleared, ReclearedUnwatched };
     enum class Content { KeysClear, Memory };
     struct Outcome {
         std::vector<std::byte> bytes;
@@ -7818,7 +7818,7 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         AliasHandOverCounts counts;
     };
     const auto name = [&](Order order, Content content) {
-        return what + (content == Content::KeysClear ? ", B under clear keys" : ", B from memory") + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : order == Order::ReadLookup ? ", B looked up for a read" : ", B written, then cleared again before its write-back");
+        return what + (content == Content::KeysClear ? ", B under clear keys" : ", B from memory") + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : order == Order::ReadLookup ? ", B looked up for a read" : order == Order::Recleared ? ", B written, then cleared again before its write-back" : ", B written, its memory left the write watch, then B cleared again before its write-back");
     };
     const auto run = [&](bool handOver, Order order, Content content) {
         const auto where = name(order, content) + (handOver ? ", on" : ", off");
@@ -7874,7 +7874,8 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 imageB->Refresh();
             }
             draw(imageB, {{0.0f, 1.0f, 0.0f, 1.0f}});
-            if (order == Order::Recleared) {
+            const bool recleared = order == Order::Recleared || order == Order::ReclearedUnwatched;
+            if (recleared) {
                 // The title fast-clears B again before anything stored B's results: they die under the
                 // new keys, and memory holds what lay under them in the eager order, A's results. B's
                 // write recorded a fill of its keys to uncompressed: it lands first (the title's
@@ -7882,6 +7883,13 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 recorder.Submit();
                 device.WaitQueue();
                 recorder.Sync();
+                // The memory leaves the write watch while B's results are pending (the unwatch hook
+                // saves the bytes under pending units): A's superseded units come back without saved
+                // bytes of their own.
+                if (order == Order::ReclearedUnwatched) {
+                    AgcDriver::GuestMemory::Unwatch(address, bytes);
+                    Require(!AgcDriver::GuestMemory::Watched(address, bytes), where + ": the block stayed in the write watch");
+                }
                 std::memset(memory + surfaceA, 0x40, keyCount);
                 {
                     const RefreshUseScope scope(use);
@@ -7896,7 +7904,7 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
             device.WaitQueue();
             recorder.Sync();
             outcome.bytes = readMemory(address, surfaceA);
-            if (order != Order::Recleared) Require(holds(readImage(imageB, 128, 128, 8), green), where + ": B lost its results");
+            if (!recleared) Require(holds(readImage(imageB, 128, 128, 8), green), where + ": B lost its results");
             Require(StorageTexture::FindPending(address, surfaceA) == nullptr, where + ": results stayed pending after the final flush");
         }
         const auto after = TakeAliasHandOverCounts();
@@ -7908,6 +7916,7 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         outcome.counts.deviceUnits = after.deviceUnits - before.deviceUnits;
         outcome.counts.keptForCpu = after.keptForCpu - before.keptForCpu;
         outcome.counts.resurrected = after.resurrected - before.resurrected;
+        outcome.counts.resurrectedUnwatched = after.resurrectedUnwatched - before.resurrectedUnwatched;
         outcome.counts.supersededLost = after.supersededLost - before.supersededLost;
         recorder.Submit();
         device.WaitQueue();
@@ -7958,6 +7967,21 @@ bool aliasHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 Require(on.counts.voided >= 2 && on.counts.superseded <= 1, label + ": A's write did not void its hand-over (voided " + std::to_string(on.counts.voided) + ", superseded " + std::to_string(on.counts.superseded) + ")");
             }
         }
+    }
+    if (watched) {
+        // Last, as the block stays outside the write watch: the hand-over first, while the block is
+        // still watched, then the eager order over the same memory, unwatched from the start.
+        const auto label = name(Order::ReclearedUnwatched, Content::KeysClear);
+        const auto on = run(true, Order::ReclearedUnwatched, Content::KeysClear);
+        const auto off = run(false, Order::ReclearedUnwatched, Content::KeysClear);
+        bool aHeld = true;
+        for (std::size_t i = 0; i < surfaceA; i += 4) aHeld = aHeld && std::memcmp(off.bytes.data() + i, red.data(), 4) == 0;
+        Require(aHeld, label + ": A's results did not reach guest memory without the hand-over");
+        Require(on.imageB == off.imageB && on.imageB2 == off.imageB2, label + ": B held other texels with the hand-over than without");
+        Require(on.bytes == off.bytes, label + ": the hand-over left other guest bytes than without it");
+        Require(on.counts.superseded == 2 && on.counts.resurrected == 2 && on.counts.resurrectedUnwatched == 2, label + ": did not bring A's two units back with their bytes saved (superseded " + std::to_string(on.counts.superseded) + ", resurrected " + std::to_string(on.counts.resurrected) + ", outside the watch " + std::to_string(on.counts.resurrectedUnwatched) + ")");
+        Require(on.counts.fallbacks == 0 && on.counts.keptForCpu == 0 && on.counts.supersededLost == 0, label + ": a hand-over fell back, met a CPU store or lost superseded results");
+        Require(off.counts.handedOver == 0 && off.counts.resurrected == 0, label + ": units were handed over without the hand-over");
     }
     std::cout << what << ": ok\n";
     return true;
