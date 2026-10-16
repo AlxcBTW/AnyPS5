@@ -63,6 +63,8 @@ struct AliasHandOverCounts {
     std::uint64_t voided = 0;
     std::uint64_t fallbacks = 0;
     std::uint64_t keptForCpu = 0;
+    std::uint64_t resurrected = 0;
+    std::uint64_t supersededLost = 0;
     std::uint64_t skippedUnits = 0;
     std::uint64_t verifiedUnits = 0;
     std::uint64_t verifyMismatches = 0;
@@ -397,7 +399,8 @@ public:
 private:
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
     // The alias hand-over (APS5_LAB_ALIAS_HANDOVER, see the switches above). Held by the taker B:
-    // units (A's, B's) of the pending image A that B's refresh left pending, at A's version then;
+    // units (A's, B's) of the pending image A that B's refresh left pending, at A's results version
+    // then (resultsVersion: moves with A's writes alone, not with its uploads);
     // `device`: B took them on the device (A's retiled bytes, detiled into B), `held`: from an
     // earlier refresh, B's content still the one taken then (`takerVersion`). A unit is handed over
     // only when it lies inside B, B's elements cover all of it (B's write-back stores it whole) and B
@@ -703,7 +706,19 @@ private:
     bool wholeUnitsKnown = false;
     std::vector<HandOver> handedFrom;
     std::vector<std::weak_ptr<StorageTexture>> handedTo;
-    std::vector<bool> supersededUnits;
+    // Moves with every write of this image's own results (markLayersPending).
+    std::uint64_t resultsVersion = 0;
+    // Per unit of this image whose results superseded another image's handed unit, until this
+    // image stores the unit: whose unit it was (at its results version). When this image's results
+    // there die unstored under new clear keys (Refresh), the other image's results are what memory
+    // holds in the eager order, so they are pending again and stored right then (resurrectSuperseded).
+    struct Superseded {
+        std::weak_ptr<StorageTexture> image;
+        std::uint64_t version = 0;
+        std::uint32_t unit = 0;
+    };
+    std::map<std::uint32_t, Superseded> supersededFrom;
+    void resurrectSuperseded(const std::vector<std::uint32_t>& units);
 };
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome

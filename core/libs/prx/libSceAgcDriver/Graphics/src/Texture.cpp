@@ -122,7 +122,7 @@ thread_local RefreshUse refreshUse = RefreshUse::Read;
 thread_local std::uint64_t threadWriteBacks = 0, threadWriteBackBytes = 0;
 // The path of this thread's last StorageTexture::upload: 0 GPU clear, 1 direct, 2 CPU, -1 none.
 thread_local int lastUploadPath = -1;
-enum AliasRefusal : std::size_t { RefusedNotInside, RefusedTakerPartial, RefusedTakerPending, RefusedSourcePartial, RefusedSourceChanged, RefusedKeys, RefusedNotImported, RefusalCount };
+enum AliasRefusal : std::size_t { RefusedNotInside, RefusedTakerPartial, RefusedTakerPending, RefusedSourcePartial, RefusedSourceChanged, RefusedShared, RefusedKeys, RefusedNotImported, RefusalCount };
 struct AliasCensus {
     // By RefreshUse: refreshes whose flush stored something, the write-backs and bytes it stored,
     // and the flush's time.
@@ -131,7 +131,7 @@ struct AliasCensus {
     // upload of the changed units (read), 2 neither; with the bytes the flush had stored.
     std::array<std::atomic<std::uint64_t>, 3> outcomes{}, outcomeBytes{};
     std::array<std::atomic<std::uint64_t>, RefusalCount> refusals{};
-    std::atomic<std::uint64_t> handedOver{0}, deviceUnits{0}, deviceBytes{0}, superseded{0}, storedLater{0}, takerAdvanced{0}, voided{0}, fallbacks{0}, keptForCpu{0}, skippedUnits{0}, verifyDecisions{0}, verifiedUnits{0}, verifyMismatches{0};
+    std::atomic<std::uint64_t> handedOver{0}, deviceUnits{0}, deviceBytes{0}, superseded{0}, storedLater{0}, takerAdvanced{0}, voided{0}, fallbacks{0}, keptForCpu{0}, resurrected{0}, supersededLost{0}, skippedUnits{0}, verifyDecisions{0}, verifiedUnits{0}, verifyMismatches{0};
 };
 AliasCensus& Census() {
     static AliasCensus census;
@@ -158,7 +158,7 @@ void reportAlias() {
     std::array<unsigned long long, RefusalCount> refused{};
     for (std::size_t i = 0; i < RefusalCount; ++i) refused[i] = take(census.refusals[i]);
     static constexpr const char* modeNames[3] = {"off", "clear", "all"};
-    AgcDriver::ProfilePrint_nid_no_patch("[alias] storage-refresh flushes (10 s) by use (refreshes/write-backs/MiB/ms):%s; after the flush: cleared %llu/%.1f MiB, re-read %llu/%.1f MiB, other %llu/%.1f MiB; hand-over %s%s%s: units left pending %llu (on the device %llu, %.1f MiB), superseded %llu, stored later %llu (taker advanced %llu), voided %llu, fallbacks %llu, kept for the CPU %llu; refused units: not inside %llu, taker partial %llu, taker pending %llu, source partial %llu, source changed %llu; refused refreshes: keys %llu, not imported %llu; verify: decisions %llu, device units %llu, mismatches %llu\n", uses.c_str(), cleared.first, cleared.second, reread.first, reread.second, other.first, other.second, modeNames[static_cast<int>(AliasMode())], AliasSkip() ? ", SKIP (not exact)" : "", AliasVerify() ? ", VERIFY (eager order)" : "", delta(counts.handedOver, reported.handedOver), delta(counts.deviceUnits, reported.deviceUnits), static_cast<double>(take(census.deviceBytes)) / 1048576.0, delta(counts.superseded, reported.superseded), delta(counts.storedLater, reported.storedLater), delta(counts.takerAdvanced, reported.takerAdvanced), delta(counts.voided, reported.voided), delta(counts.fallbacks, reported.fallbacks), delta(counts.keptForCpu, reported.keptForCpu), refused[RefusedNotInside], refused[RefusedTakerPartial], refused[RefusedTakerPending], refused[RefusedSourcePartial], refused[RefusedSourceChanged], refused[RefusedKeys], refused[RefusedNotImported], take(census.verifyDecisions), delta(counts.verifiedUnits, reported.verifiedUnits), delta(counts.verifyMismatches, reported.verifyMismatches));
+    AgcDriver::ProfilePrint_nid_no_patch("[alias] storage-refresh flushes (10 s) by use (refreshes/write-backs/MiB/ms):%s; after the flush: cleared %llu/%.1f MiB, re-read %llu/%.1f MiB, other %llu/%.1f MiB; hand-over %s%s%s: units left pending %llu (on the device %llu, %.1f MiB), superseded %llu, stored later %llu (taker advanced %llu), voided %llu, fallbacks %llu, kept for the CPU %llu, resurrected %llu, superseded lost %llu; refused units: not inside %llu, taker partial %llu, taker pending %llu, source partial %llu, source changed %llu, shared %llu; refused refreshes: keys %llu, not imported %llu; verify: decisions %llu, device units %llu, mismatches %llu\n", uses.c_str(), cleared.first, cleared.second, reread.first, reread.second, other.first, other.second, modeNames[static_cast<int>(AliasMode())], AliasSkip() ? ", SKIP (not exact)" : "", AliasVerify() ? ", VERIFY (eager order)" : "", delta(counts.handedOver, reported.handedOver), delta(counts.deviceUnits, reported.deviceUnits), static_cast<double>(take(census.deviceBytes)) / 1048576.0, delta(counts.superseded, reported.superseded), delta(counts.storedLater, reported.storedLater), delta(counts.takerAdvanced, reported.takerAdvanced), delta(counts.voided, reported.voided), delta(counts.fallbacks, reported.fallbacks), delta(counts.keptForCpu, reported.keptForCpu), delta(counts.resurrected, reported.resurrected), delta(counts.supersededLost, reported.supersededLost), refused[RefusedNotInside], refused[RefusedTakerPartial], refused[RefusedTakerPending], refused[RefusedSourcePartial], refused[RefusedSourceChanged], refused[RefusedShared], refused[RefusedKeys], refused[RefusedNotImported], take(census.verifyDecisions), delta(counts.verifiedUnits, reported.verifiedUnits), delta(counts.verifyMismatches, reported.verifyMismatches));
     if (counts.skippedUnits != reported.skippedUnits) AgcDriver::ProfilePrint_nid_no_patch("[alias] APS5_LAB_ALIAS_SKIP (not exact): %llu pending units dropped unstored (10 s)\n", delta(counts.skippedUnits, reported.skippedUnits));
     reported = counts;
 }
@@ -1836,6 +1836,8 @@ AliasHandOverCounts TakeAliasHandOverCounts() {
     counts.voided = load(census.voided);
     counts.fallbacks = load(census.fallbacks);
     counts.keptForCpu = load(census.keptForCpu);
+    counts.resurrected = load(census.resurrected);
+    counts.supersededLost = load(census.supersededLost);
     counts.skippedUnits = load(census.skippedUnits);
     counts.verifiedUnits = load(census.verifiedUnits);
     counts.verifyMismatches = load(census.verifyMismatches);
@@ -2171,6 +2173,7 @@ bool StorageTexture::Refresh() {
     bool pendingResults = false;
     bool anyStored = false;
     bool dropped = false;
+    std::vector<std::uint32_t> resurrect;
     // A unit is one 64 KiB block, which the CPU's bytes win whole once a store stamped it:
     // nothing of its results is stored, and the unit re-uploads from memory below. A keys change
     // alone (the title marking the surface uncompressed behind a pass) leaves unstamped units
@@ -2217,6 +2220,13 @@ bool StorageTexture::Refresh() {
                 CaptureTrace::Log("drop-unit image=%llx unit=%u generation=%llu stamped=%d keys=%d", static_cast<unsigned long long>(descriptor.baseAddress), layer, static_cast<unsigned long long>(layerGeneration[layer]), layer < stampedBlocks.size() && stampedBlocks[layer] != 0, static_cast<int>(keys));
                 layerPending[layer] = false;
                 dropped = true;
+                // Results that superseded another image's handed unit die unstored: under new clear
+                // keys that image's results are what memory holds in the eager order (brought back
+                // below); a CPU store wins the block in either order (the block rule).
+                if (!supersededFrom.empty()) {
+                    if (keysChanged && IsDccClear(keys)) resurrect.push_back(layer);
+                    else if (supersededFrom.erase(layer) != 0) Census().supersededLost.fetch_add(1, std::memory_order_relaxed);
+                }
                 continue;
             }
         } else if (direct) {
@@ -2225,6 +2235,7 @@ bool StorageTexture::Refresh() {
         stored[layer] = true;
         anyStored = true;
     }
+    if (!resurrect.empty()) resurrectSuperseded(resurrect);
     if (anyStored && !keysChanged && descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle)) stored.assign(trackedLayers, true);
     if (pendingResults) {
         static std::atomic<int> reports{0};
@@ -2258,10 +2269,10 @@ bool StorageTexture::Refresh() {
                 Census().deviceBytes.fetch_add(theirs.size() * 65536, std::memory_order_relaxed);
             }
         }
-        // The handed units stay out of every store the upload may cause, and it takes the device
-        // units from the buffer above.
+        // The upload takes the device units from the buffer above. A flush the upload causes is a
+        // reader of the memory: it stores handed units as any reader does (no filter).
         const auto previousUpload = std::exchange(handOverUpload, handedFrom.empty() ? nullptr : &uploadState);
-        const auto previousFilters = std::exchange(handOverFilters, handedFrom.empty() || filters.empty() ? handOverFilters : &filters);
+        const auto previousFilters = std::exchange(handOverFilters, nullptr);
         struct Restore {
             const HandOverUpload* upload;
             const std::vector<HandOverFilter>* filters;
@@ -2313,7 +2324,7 @@ bool StorageTexture::otherPendingOverlaps(bool exceptHandOvers) const {
     // at the version it handed them over at (a write of its own voids the hand-over first).
     const auto handedOver = [&](const StorageTexture* texture) {
         for (const auto& handOver : handedFrom) {
-            if (handOver.image.lock().get() != texture || texture->version != handOver.version) continue;
+            if (handOver.image.lock().get() != texture || texture->resultsVersion != handOver.version) continue;
             for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
                 if (!texture->layerPending[unit] || !overlaps(texture->layerBegin(unit), static_cast<std::size_t>(texture->layerBytes(unit)))) continue;
                 if (std::none_of(handOver.units.begin(), handOver.units.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& pair) { return pair.first == unit; })) return false;
@@ -2565,9 +2576,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // are stored first, as without the hand-over, and the upload reads them from guest memory.
     if (handingOver && uploadedKeys != handOverUpload->keys) {
         Census().fallbacks.fetch_add(1, std::memory_order_relaxed);
-        const auto previousFilters = std::exchange(handOverFilters, nullptr);
         static_cast<void>(FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage refresh", PublishScope::None));
-        handOverFilters = previousFilters;
         now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     }
     const bool keysHeld = !handingOver || uploadedKeys == handOverUpload->keys;
@@ -3606,6 +3615,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     // New results of this image: what it handed over to other images is no longer what they hold
     // (their next refresh decides again, see voidHandedTo).
     if (!handedTo.empty()) voidHandedTo();
+    ++resultsVersion;
     for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
     // This image's results now cover the units other images handed over to it: its write-back
     // stores every byte of them, so theirs are dead (supersedeHandedFrom).
@@ -3620,6 +3630,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
             borrowedUnits[unit] = false;
             if (source->version != borrowedVersion || !source->layerPending[unit]) continue;
             source->layerPending[unit] = false;
+            source->supersededFrom.erase(unit);
             unitsSuperseded.fetch_add(1, std::memory_order_relaxed);
             superseded = true;
         }
@@ -4232,6 +4243,8 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
         layerPending[layer] = false;
         layerOriginal[layer] = false;
         cancelStoredSave(layer);
+        // Every block CPU-written since: the block rule decides in either order.
+        if (supersededFrom.erase(layer) != 0) Census().supersededLost.fetch_add(1, std::memory_order_relaxed);
     }
     if (!anyLayerPending()) {
         ++dropped;
@@ -4296,6 +4309,8 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             texture->layerPending.assign(texture->trackedLayers, false);
             texture->layerOriginal.assign(texture->trackedLayers, false);
             texture->cancelStoredSaves();
+            // The fill overwrites what such results superseded too.
+            texture->supersededFrom.clear();
             it = pending.textures.erase(it);
             ++discarded;
         } else if (texture != exempt && texture->blockUnits && texture->overlaps(address, bytes)) {
@@ -4309,6 +4324,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
                 texture->layerPending[unit] = false;
                 texture->layerOriginal[unit] = false;
                 texture->cancelStoredSave(unit);
+                texture->supersededFrom.erase(unit);
                 unitsDropped.fetch_add(1, std::memory_order_relaxed);
                 dropped = true;
             }
@@ -4473,10 +4489,14 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     }
     std::size_t droppedUnits = 0;
     const bool wasDirty = dirty;
+    std::vector<std::uint32_t> resurrect;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         droppedUnits = static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true));
+        for (std::uint32_t unit = 0; unit < trackedLayers && !supersededFrom.empty(); ++unit) {
+            if (layerPending[unit] && supersededFrom.count(unit) != 0) resurrect.push_back(unit);
+        }
         layerPending.assign(trackedLayers, false);
         if (dirty) {
             dirty = false;
@@ -4484,6 +4504,9 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
             BumpPendingSerial();
         }
     }
+    // As a refresh under new clear keys (see resurrectSuperseded).
+    if (!resurrect.empty()) resurrectSuperseded(resurrect);
+    supersededFrom.clear();
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -4936,19 +4959,36 @@ std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const Stora
         census.refusals[RefusedKeys].fetch_add(1, std::memory_order_relaxed);
         return handOvers;
     }
-    if (device && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr) {
+    // The device path records into the active recorder (retileUnitsTo, uploadUnitsFrom).
+    if (device && (Recorder::Active() == nullptr || HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == nullptr)) {
         census.refusals[RefusedNotImported].fetch_add(1, std::memory_order_relaxed);
         return handOvers;
     }
     const auto& whole = wholeUnitsOf();
     std::vector<std::shared_ptr<StorageTexture>> sources;
+    // Per unit of this surface, how many pending images hold results in it (every one, the alias
+    // and the images never handed over included): a unit pending in two images is stored in the
+    // eager order, never handed over (which image's bytes reach memory is then the stores' order).
+    std::vector<std::uint8_t> owners(trackedLayers, 0);
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        const auto surfaceEnd = descriptor.baseAddress + guestBytes;
         for (auto* texture : pending.textures) {
-            if (texture == this || texture == alias || !texture->blockUnits || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            if (texture == this || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
+            const bool storesWhole = texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed;
+            for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+                if (!texture->layerPending[unit] && !storesWhole) continue;
+                const auto begin = std::max(texture->layerBegin(unit), descriptor.baseAddress);
+                const auto end = std::min(texture->layerBegin(unit) + texture->layerBytes(unit), surfaceEnd);
+                if (begin >= end) continue;
+                const auto first = static_cast<std::size_t>((begin - descriptor.baseAddress) / trackedLayerBytes);
+                const auto last = std::min(static_cast<std::size_t>((end - 1 - descriptor.baseAddress) / trackedLayerBytes), owners.size() - 1);
+                for (auto mine = first; mine <= last; ++mine) owners[mine] = static_cast<std::uint8_t>(std::min(owners[mine] + 1, 2));
+            }
+            if (texture == alias || !texture->blockUnits) continue;
             // An image under a clear code stores whole (and its keys): never handed over.
-            if (texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed) continue;
+            if (storesWhole) continue;
             if (auto alive = texture->weak_from_this().lock()) sources.push_back(std::move(alive));
         }
     }
@@ -4958,7 +4998,7 @@ std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const Stora
     if (device) GuestMemory::CollectWritesUncached(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto end = descriptor.baseAddress + guestBytes;
     for (const auto& source : sources) {
-        HandOver handOver{source, source->version, {}, device};
+        HandOver handOver{source, source->resultsVersion, {}, device};
         const auto* theirWhole = device ? &source->wholeUnitsOf() : nullptr;
         for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) {
             if (!source->layerPending[unit]) continue;
@@ -4976,6 +5016,10 @@ std::vector<StorageTexture::HandOver> StorageTexture::handOversUnder(const Stora
             }
             if (layerPending[mine]) {
                 census.refusals[RefusedTakerPending].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            if (owners[mine] > 1) {
+                census.refusals[RefusedShared].fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (device) {
@@ -5213,12 +5257,13 @@ void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t coun
             const auto [theirs, mine] = pair;
             if (mine < first || mine >= first + count) return false;
             // A source written since voided its hand-overs (voidHandedTo); gone or stored: nothing left.
-            if (source == nullptr || source->version != handOver.version || theirs >= source->trackedLayers || !source->layerPending[theirs]) return true;
+            if (source == nullptr || source->resultsVersion != handOver.version || theirs >= source->trackedLayers || !source->layerPending[theirs]) return true;
             source->layerPending[theirs] = false;
             source->layerOriginal[theirs] = false;
             source->cancelStoredSave(theirs);
-            if (supersededUnits.size() != trackedLayers) supersededUnits.assign(trackedLayers, false);
-            supersededUnits[mine] = true;
+            // What the source's results there superseded is dead with them.
+            source->supersededFrom.erase(theirs);
+            supersededFrom[mine] = {source, handOver.version, theirs};
             ++dropped;
             return true;
         });
@@ -5247,6 +5292,31 @@ void StorageTexture::voidHandedTo() {
         Census().voided.fetch_add(voided, std::memory_order_relaxed);
         BumpPendingSerial();
     }
+}
+
+void StorageTexture::resurrectSuperseded(const std::vector<std::uint32_t>& units) {
+    // This image's results in the units died unstored under new clear keys. In the eager order the
+    // other image's results were stored before this image's own, so memory holds them under the
+    // keys: they are pending in that image again (its image still holds them unless it wrote the
+    // unit since, which stored this image's results first) and stored right away, before this
+    // image's refresh collects the generation its clear is current at.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto mine : units) {
+        const auto found = supersededFrom.find(mine);
+        if (found == supersededFrom.end()) continue;
+        const auto record = found->second;
+        supersededFrom.erase(found);
+        auto source = record.image.lock();
+        if (source == nullptr || source->resultsVersion != record.version || record.unit >= source->trackedLayers || source->layerPending[record.unit]) {
+            Census().supersededLost.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        source->layerPending[record.unit] = true;
+        source->reconcilePending();
+        ranges.emplace_back(source->layerBegin(record.unit), source->layerBytes(record.unit));
+        Census().resurrected.fetch_add(1, std::memory_order_relaxed);
+    }
+    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, static_cast<std::size_t>(bytes), nullptr, "storage refresh", PublishScope::None));
 }
 
 std::size_t StorageTexture::dropPendingOverForSkip(const StorageTexture* alias) {
@@ -5469,6 +5539,13 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
             return;
         }
     }
+    // A flush nested in the store (a CPU-path write-back reads its range through the flush hook) is
+    // a reader: it stores handed units as any reader does.
+    const auto previousFilters = std::exchange(handOverFilters, nullptr);
+    struct Restore {
+        const std::vector<HandOverFilter>* filters;
+        ~Restore() { handOverFilters = filters; }
+    } restore{previousFilters};
     writeBackLayers(layers);
 }
 
@@ -5583,7 +5660,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // The alias hand-over's one deviation class (see ALIAS report): a unit whose results a
     // hand-over kept out of guest memory, now left to a CPU store that landed meanwhile (the keep
     // rule above), would have kept the CPU's bytes over those results instead. Counted, not changed.
-    if (!handedTo.empty() || !supersededUnits.empty()) {
+    if (!handedTo.empty() || !supersededFrom.empty()) {
         std::vector<bool> handed(trackedLayers, false);
         for (const auto& weak : handedTo) {
             const auto taker = weak.lock();
@@ -5597,9 +5674,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!layers[layer]) continue;
-            const bool superseded = layer < supersededUnits.size() && supersededUnits[layer];
+            // This store settles the superseded unit either way (stored, or left to the CPU).
+            const bool superseded = supersededFrom.erase(layer) != 0;
             if (skippedLayer[layer] && (handed[layer] || superseded)) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
-            if (superseded) supersededUnits[layer] = false;
         }
     }
     // Debug aid: APS5_TRACE_FLUSH also names the blocks a write-back leaves to the CPU.
@@ -5628,7 +5705,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 for (const auto& [theirs, mine] : handOver.units) {
                     if (theirs >= layers.size() || !layers[theirs] || !layerPending[theirs] || mine >= taker->trackedLayers) continue;
                     Census().storedLater.fetch_add(1, std::memory_order_relaxed);
-                    if (handOver.version != version) continue;
+                    if (handOver.version != resultsVersion) continue;
                     const auto begin = taker->layerBegin(mine);
                     const auto bytes = static_cast<std::size_t>(taker->layerBytes(mine));
                     GuestMemory::CollectWritesUncached(begin, bytes);
