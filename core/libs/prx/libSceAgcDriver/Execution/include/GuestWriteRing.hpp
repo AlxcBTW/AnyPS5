@@ -64,9 +64,11 @@ constexpr char Magic[8] = {'A', 'P', 'S', '5', 'W', 'R', 'G', '1'};
 // ranges) carry the address of their reason, a string literal of the driver module (the header holds its base; 0 when
 // none was named). WriteBackRetired and PublishRetired name a range of a write-back or a shadow publish whose batch
 // retired (its bytes have reached guest memory), tagged as the decision's entry; the store window check takes them
-// (APS5_GUEST_WRITE_RACE). MappingChanged is a guest range whose mapping or protection changed (libc's invalidator: an
-// unmap, a map, a protection change or a heap decommit), tag 0.
+// (APS5_GUEST_WRITE_RACE). MappingChanged is a guest range whose mapping or protection changed, tagged with what changed
+// it (libc's GuestAllocations::ChangeKind: 1 a map, 2 a free, 3 a protection change, 4 an unmap, 5 an image unregistered,
+// 6 a release outside a mutation, the guest heap's); RecordMappingChange is the change observer that records it.
 void Record(Kind kind, std::uint64_t address, std::uint64_t bytes, std::uint64_t tag);
+void RecordMappingChange(std::uintptr_t address, std::size_t bytes, int kind);
 
 // The tag of the surface kinds: width (bits 0-14), height (15-29), depth or last array slice (30-40), guest format
 // (41-49), mip count (50-53), tile mode (54-58), dimension (59-61) and the source (62-63: a sampled texture read from guest

@@ -10,6 +10,9 @@
 
 namespace GuestAllocations {
 
+// What a registry mutation did to a range, as the change observer reports it.
+enum class ChangeKind : int { Map = 1, Free = 2, Protect = 3, Unmap = 4, UnregisterImage = 5, Release = 6 };
+
 struct Range {
     std::uint64_t address;
     std::size_t bytes;
@@ -85,6 +88,9 @@ void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t 
 void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)(std::uintptr_t address, std::size_t bytes));
 void GuestAllocationsSetGpuMapObserver_nid_postfix(void (*callback)(const Mapped& ranges, std::uint64_t generation));
 void GuestAllocationsSetUnmapObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
+// Lab diagnostics (the AGC driver's APS5_GUEST_WRITE_RING): runs after the invalidator for every changed range, with what
+// changed it (ChangeKind); an invalidation outside a mutation (a guest heap release) reports ChangeKind::Release.
+void GuestAllocationsSetChangeObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes, int kind));
 void GuestAllocationsNoteGpuMapping_nid_postfix(void* mutation, const void* pointer, std::size_t bytes);
 }
 
