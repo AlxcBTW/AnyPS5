@@ -1298,33 +1298,14 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
-struct UnwatchRecord {
-    std::uint64_t address = 0;
-    std::uint64_t bytes = 0;
-    std::uint64_t serial = 0;
-    const char* path = nullptr;
-};
-std::array<UnwatchRecord, 32> unwatchRing;
-std::size_t unwatchRingNext = 0;
-
-bool unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, const char* path) {
-    if (!tracker.watched) return false;
+void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
-    const bool changed = tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix());
+    if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
 #else
-    const bool changed = GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes);
+    if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) unwatchSerial.fetch_add(1, std::memory_order_release);
 #endif
-    if (!changed) return false;
-    const auto serial = unwatchSerial.fetch_add(1, std::memory_order_release) + 1;
-    unwatchRing[unwatchRingNext++ % unwatchRing.size()] = {address, bytes, serial, path};
-    return true;
-}
-
-void saveUnlocked(std::unique_lock<std::mutex>& lock, std::uint64_t address, std::size_t bytes) {
-    lock.unlock();
-    beforeUnwatch(address, bytes);
-    lock.lock();
 }
 
 }
@@ -1333,30 +1314,13 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
     unwatchHook.store(hook, std::memory_order_release);
 }
 
-std::string RecentUnwatches(std::uint64_t address, std::size_t bytes) {
-    auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
-    std::string text;
-    int shown = 0;
-    for (std::size_t back = 1; back <= unwatchRing.size() && shown < 8; ++back) {
-        const auto& record = unwatchRing[(unwatchRingNext + unwatchRing.size() - back) % unwatchRing.size()];
-        if (record.path == nullptr) break;
-        if (record.address >= address + bytes || address >= record.address + record.bytes) continue;
-        char entry[192];
-        std::snprintf(entry, sizeof(entry), " [#%llu %s 0x%llx+0x%llx]", static_cast<unsigned long long>(record.serial), record.path, static_cast<unsigned long long>(record.address), static_cast<unsigned long long>(record.bytes));
-        text += entry;
-        ++shown;
-    }
-    return text;
-}
-
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    unwatchLocked(tracker, address, bytes, "Unwatch");
+    unwatchLocked(tracker, address, bytes);
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
@@ -1395,8 +1359,6 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         }
     }
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-    const bool savedEarly = staysWatched && !before;
-    if (savedEarly) saveUnlocked(lock, first, static_cast<std::size_t>(stop - first));
     bool imported = false;
     {
 #ifdef __APPLE__
@@ -1406,14 +1368,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (!imported) return false;
     if (!staysWatched) {
-        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), "import (page walk incomplete)");
-        unwatchLocked(tracker, address, bytes, "import (leaves the watch)");
+        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+        unwatchLocked(tracker, address, bytes);
         return true;
     }
     const WindowCopy window{first, saved, slots};
     if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
-        if (!savedEarly) saveUnlocked(lock, first, static_cast<std::size_t>(stop - first));
-        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), "import fallback (page walk could not vouch)");
+        lock.unlock();
+        beforeUnwatch(first, static_cast<std::size_t>(stop - first));
+        lock.lock();
+        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
     }
     return true;
 }
@@ -1528,7 +1492,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
-    auto lock = lockTracker(tracker);
+    const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (bytes == 0) return 0;
     ++tracker.generation;
@@ -1546,8 +1510,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
-            if (GpuMutex().HeldByThisThread()) saveUnlocked(lock, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
-            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst), "MarkWritten (page walk incomplete)");
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
         }
