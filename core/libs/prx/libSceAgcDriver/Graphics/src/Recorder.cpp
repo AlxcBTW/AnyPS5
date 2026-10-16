@@ -3461,6 +3461,7 @@ void Recorder::FlushDeferredReleases() {
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
+    PerformanceTimer syncThroughTiming("Recorder.SyncThrough");
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
@@ -3653,6 +3654,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
+        PerformanceTimer unlockedTiming("Recorder.UnlockedWait");
         result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
@@ -3795,12 +3797,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        PerformanceTimer fenceTiming("Recorder.FenceWait");
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        fenceTiming.Mark(signaledAtStart ? "signaled" : GuestMemory::GpuMutex().HeldByThisThread() ? "locked" : "unlocked");
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
