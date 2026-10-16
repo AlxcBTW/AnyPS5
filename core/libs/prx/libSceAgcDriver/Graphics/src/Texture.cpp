@@ -96,21 +96,25 @@ std::atomic<std::uint64_t> untrackedCompares{0};
 // The alias hand-over's switches (Texture.hpp) and the [alias] census. The census rows are per 10 s
 // (taken by the report); the hand-over counts are cumulative (TakeAliasHandOverCounts).
 std::atomic<int> aliasModeOverride{-1};
-bool LabSwitch(const char* name) {
+// A switch's value in lower case (empty when unset).
+std::string LabValue(const char* name) {
     const char* text = std::getenv(name);
-    if (text == nullptr || *text == '\0') return false;
-    std::string value(text);
+    std::string value(text != nullptr ? text : "");
     for (auto& c : value) {
         if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
     }
-    return value != "0" && value != "off" && value != "false" && value != "no";
+    return value;
+}
+bool LabSwitch(const char* name) {
+    const auto value = LabValue(name);
+    return !value.empty() && value != "0" && value != "off" && value != "false" && value != "no";
 }
 AliasHandOverMode AliasMode() {
     const auto forced = aliasModeOverride.load(std::memory_order_relaxed);
     if (forced >= 0) return static_cast<AliasHandOverMode>(forced);
     static const auto mode = [] {
         if (!LabSwitch("APS5_LAB_ALIAS_HANDOVER")) return AliasHandOverMode::Off;
-        return std::strcmp(std::getenv("APS5_LAB_ALIAS_HANDOVER"), "clear") == 0 ? AliasHandOverMode::Clear : AliasHandOverMode::All;
+        return LabValue("APS5_LAB_ALIAS_HANDOVER") == "clear" ? AliasHandOverMode::Clear : AliasHandOverMode::All;
     }();
     return mode;
 }
@@ -2364,8 +2368,11 @@ bool StorageTexture::otherPendingOverlaps(bool exceptHandOvers) const {
     // Every pending unit of the image over this surface handed over to this image, the image still
     // at the version it handed them over at (a write of its own voids the hand-over first).
     const auto handedOver = [&](const StorageTexture* texture) {
+        // The image by its owner, without a strong reference: a last owner's destructor would take
+        // the registry's lock held here.
+        const auto image = texture->weak_from_this();
         for (const auto& handOver : handedFrom) {
-            if (handOver.image.lock().get() != texture || texture->resultsVersion != handOver.version) continue;
+            if (handOver.image.expired() || handOver.image.owner_before(image) || image.owner_before(handOver.image) || texture->resultsVersion != handOver.version) continue;
             for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
                 if (!texture->layerPending[unit] || !overlaps(texture->layerBegin(unit), static_cast<std::size_t>(texture->layerBytes(unit)))) continue;
                 if (std::none_of(handOver.units.begin(), handOver.units.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& pair) { return pair.first == unit; })) return false;
@@ -5359,12 +5366,12 @@ void StorageTexture::supersedeHandedFrom(std::uint32_t first, std::uint32_t coun
     // registry's lock (a last owner's destructor takes that lock) and after the GPU mutex (as in
     // FlushPending).
     std::vector<std::shared_ptr<StorageTexture>> sources;
-    for (const auto& handOver : handedFrom) {
-        if (auto source = handOver.image.lock()) sources.push_back(std::move(source));
-    }
     // Draws and dispatches hold the GPU mutex here already; a store on another thread must not run
     // while the units change hands.
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    for (const auto& handOver : handedFrom) {
+        if (auto source = handOver.image.lock()) sources.push_back(std::move(source));
+    }
     // A source another thread's FlushPending took (listed in pending.flushing, it waits for this
     // mutex) would store nothing of the units superseded below, and its reader would see the bytes
     // from before the source's results: the source stores them now, as the eager order did before
@@ -5463,7 +5470,8 @@ void StorageTexture::resurrectSuperseded(const std::vector<std::uint32_t>& units
             if (record.savedAtUnwatch && record.unwatchBytes.size() == bytes) {
                 std::memcpy(source->original.data() + offset, record.unwatchBytes.data(), record.unwatchBytes.size());
                 for (const auto from : record.keptBlocks) source->keptAtUnwatch.emplace(from, record.savedGeneration);
-                if (!record.keptBlocks.empty()) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
+                // keptAtUnwatchHolds asks for the generation the blocks were saved at.
+                if (!record.keptBlocks.empty() && record.savedGeneration == source->layerGeneration[record.unit]) Census().keptForCpu.fetch_add(1, std::memory_order_relaxed);
             } else {
                 GuestMemory::ReadCommittedUnsynced(begin, std::span(source->original).subspan(offset, static_cast<std::size_t>(bytes)));
             }
