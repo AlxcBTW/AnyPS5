@@ -42,6 +42,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice = device;
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
+    if (LabCode("compute", 0u, address, std::span<const std::uint32_t>(snapshot.code).subspan(codeOffset))) return;
     std::array<std::uint32_t, 5> resolved{};
     ResolvedDispatch ahead;
     bool fromAhead = false;
