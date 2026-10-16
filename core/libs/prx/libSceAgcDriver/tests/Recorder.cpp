@@ -4040,6 +4040,148 @@ bool staleGenerationTests(const Device& device, Recorder& recorder) {
 #endif
 }
 
+bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: results pending after a block left the watch not tested\n";
+        return false;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t unit = 65536;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    static_assert(surfaceBytes == 4 * unit);
+    const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
+    const auto decided = PrepareImportWatch(base);
+    SetImportWatch(base, ImportWatch::Watch);
+    struct Restore {
+        const Context& context;
+        ImportWatch decided;
+        ~Restore() { SetImportWatch(context, decided); }
+    } restore{base, decided};
+    enum class Write { None, AfterPending, BeforePending };
+    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending}) {
+        const std::string what = write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : "a CPU write before the results were pending again";
+        void* block = AllocateWatched(surfaceBytes, unit);
+        if (block == nullptr) {
+            std::cout << "no write watching: results pending after a block left the watch not tested\n";
+            return false;
+        }
+        auto* memory = static_cast<std::uint8_t*>(block);
+        std::memset(memory, 0x5a, surfaceBytes);
+        const auto address = reinterpret_cast<std::uint64_t>(block);
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(block, surfaceBytes, true, true, true);
+        }
+        struct Unregister {
+            const Context& context;
+            void* block;
+            std::uint64_t address;
+            ~Unregister() {
+                {
+                    GuestAllocations::Mutation mutation;
+                    mutation.Remove(block);
+                }
+                HostImportFor(context, address, surfaceBytes);
+                ReleaseWatched(block, surfaceBytes);
+            }
+        } unregister{base, block, address};
+        AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
+        TextureDetiler detiler(base);
+        auto context = base;
+        context.detiler = &detiler;
+        GuestTextureResource resource{};
+        resource.baseAddress = address;
+        resource.width = side;
+        resource.height = side;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kR64KBX;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        Require(DescribeSurface(resource).guestBytes == surfaceBytes, "(p) unexpected surface size");
+        {
+            auto image = StorageTexture::Create(context, detiler, resource, 0);
+            recorder.Keep(image);
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const auto clear = [&](const VkClearColorValue& value) {
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                image->MarkDirty();
+            };
+            const auto store = [&] {
+                image->WriteBack();
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+            };
+            const auto writePage = [&] {
+                for (std::size_t i = 0; i < 4096; ++i) memory[2 * unit + i] = pattern(i);
+            };
+            const bool onPath = AgcDriver::GuestMemory::Watched(address, surfaceBytes) && HostImportFor(context, address, surfaceBytes) != nullptr;
+#ifdef _WIN32
+            if (!onPath) {
+                std::cout << "the image's host import left its memory unwatched: results pending after a block left the watch not tested\n";
+                return false;
+            }
+#else
+            Require(onPath, "(p) " + what + ": the image is not on the path under test");
+#endif
+            Require(!image->GuestSnapshotValid(), "(p) " + what + ": the upload left saved guest bytes while its memory was watched");
+            AgcDriver::GuestMemory::Unwatch(address + 3 * unit, unit);
+            Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes) && AgcDriver::GuestMemory::Watched(address, 3 * unit), "(p) " + what + ": the last block did not leave the watch alone");
+            if (write == Write::BeforePending) writePage();
+            clear(VkClearColorValue{{0.0f, 1.0f, 0.0f, 1.0f}});
+            if (write == Write::AfterPending) writePage();
+            try {
+                store();
+            } catch (...) {
+                try {
+                    recorder.Submit();
+                    device.WaitQueue();
+                    recorder.Sync();
+                } catch (...) {
+                }
+                throw;
+            }
+            std::vector<std::byte> read(surfaceBytes);
+            AgcDriver::GuestMemory::Read(address, read);
+            constexpr std::array<std::uint8_t, 4> green{0, 255, 0, 255};
+            const auto isGreen = [&](std::size_t at) {
+                for (std::size_t c = 0; c < 4; ++c) {
+                    if (std::to_integer<std::uint8_t>(read[at + c]) != green[c]) return false;
+                }
+                return true;
+            };
+            std::string units;
+            for (std::size_t u = 0; u < 4; ++u) {
+                std::size_t greens = 0, untouched = 0, other = 0, rawGreens = 0;
+                for (std::size_t at = u * unit; at < (u + 1) * unit; at += 4) {
+                    if (isGreen(at)) ++greens;
+                    else if (std::to_integer<std::uint8_t>(read[at]) == 0x5a) ++untouched;
+                    else ++other;
+                    if (memory[at] == green[0] && memory[at + 1] == green[1] && memory[at + 2] == green[2] && memory[at + 3] == green[3]) ++rawGreens;
+                }
+                units += " unit " + std::to_string(u) + ": " + std::to_string(greens) + " green words, " + std::to_string(untouched) + " untouched, " + std::to_string(other) + " other, " + std::to_string(rawGreens) + " green in the raw memory;";
+            }
+            for (std::size_t at = 0; at < surfaceBytes; at += 4) {
+                if (write != Write::None && at >= 2 * unit && at < 3 * unit) continue;
+                Require(isGreen(at), "(p) " + what + ": GPU results were not stored at +0x" + std::to_string(at) + ";" + units);
+            }
+            if (write != Write::None) {
+                for (std::size_t i = 0; i < 4096; ++i) Require(std::to_integer<std::uint8_t>(read[2 * unit + i]) == pattern(i), "(p) " + what + ": the GPU results overwrote the CPU's bytes;" + units);
+            }
+        }
+        recorder.Sync();
+    }
+    return true;
+}
+
 // A write-back stores the texels of an image and leaves every other byte of the surface's memory
 // as it was: the padding of the tile blocks the surface covers only partly (its last block column
 // and row), the tail block of a mip chain, the bytes between the mips and the pitch padding of a
@@ -8160,6 +8302,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unwalked-import-only") return staleGenerationTests<true>(device, recorder) ? 0 : 77;
+        if (argc == 2 && std::string_view(argv[1]) == "--pending-after-unwatch-only") return pendingAfterLeavingWatchTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
             completionCountTests(device, recorder);
             afterRecordedWorkTests(device, recorder);
@@ -8369,6 +8512,7 @@ int main(int argc, char** argv) {
         importWatchTests(device);
         staleGenerationTests<false>(device, recorder);
         staleGenerationTests<true>(device, recorder);
+        pendingAfterLeavingWatchTests(device, recorder);
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
