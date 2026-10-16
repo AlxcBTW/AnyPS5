@@ -1,4 +1,5 @@
 #include "../include/Pthread.hpp"
+#include "../include/LabThreadPriority.hpp"
 #include "../include/ThreadLifecycle.hpp"
 #include "../include/WindowsThreadLocal.hpp"
 #include "../include/Cancel.hpp"
@@ -587,6 +588,44 @@ static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
     });
     CpuTopology::PinTraced(thread.name.c_str(), handle, mask);
 }
+
+static bool LabThreadPrioritiesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LAB_THREAD_PRIORITIES");
+        return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// APS5_LAB_THREAD_PRIORITIES=1 (see LabThreadPriority.hpp): the thread's guest priority as a Windows priority. A thread
+// whose mapped level did not change keeps it without a call (background workers flip between two guest priorities per
+// task). The first line names the mapping, the first 64 changes the threads, then a count at powers of two.
+static void ApplyLabPriority(PthreadPrivate& thread, HANDLE handle, int guestPriority) {
+    if (!LabThreadPrioritiesEnabled() || handle == nullptr) return;
+    const int host = LabThreadPriority::HostPriority(guestPriority);
+    if (thread.labHostPriority.exchange(host, std::memory_order_relaxed) == host) return;
+    static std::once_flag summary;
+    std::call_once(summary, [] {
+        std::fprintf(stderr, "[thread-priority] APS5_LAB_THREAD_PRIORITIES: guest 256-511 -> normal, 512-703 -> below normal, 704 and up -> lowest; the layer's own threads stay at normal\n");
+    });
+    static std::atomic<std::uint64_t> changes{0};
+    const auto count = changes.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!SetThreadPriority(handle, host)) {
+        static std::atomic<int> failures{0};
+        if (failures.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[thread-priority] SetThreadPriority(%s) failed for a guest thread (error %lu)\n", LabThreadPriority::HostPriorityName(host), GetLastError());
+        return;
+    }
+    if (count <= 64) {
+        std::string name;
+        {
+            std::lock_guard lock(thread.nameLock);
+            name = thread.name;
+        }
+        std::fprintf(stderr, "[thread-priority] '%s' guest %d -> %s\n", name.c_str(), guestPriority, LabThreadPriority::HostPriorityName(host));
+    } else if ((count & (count - 1)) == 0) {
+        std::fprintf(stderr, "[thread-priority] %llu guest priority changes applied\n", static_cast<unsigned long long>(count));
+    }
+}
 #endif
 
 struct NativeThreadArgs {
@@ -619,6 +658,7 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
             SetThreadDescription(GetCurrentThread(), description.c_str());
             ApplyJobAffinity(*self, nullptr);
         }
+        ApplyLabPriority(*self, GetCurrentThread(), self->priority.load(std::memory_order_relaxed));
         args->initialized.set_value();
     } catch (...) {
         args->initialized.set_exception(std::current_exception());
@@ -977,6 +1017,9 @@ void APS5_VABI scePthreadTestcancel() {
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
     thread->priority.store(prio, std::memory_order_relaxed);
+#ifdef _WIN32
+    ApplyLabPriority(*thread, thread == CurrentGuestState().current ? GetCurrentThread() : static_cast<HANDLE>(thread->nativeHandle), prio);
+#endif
     return SCE_OK;
 }
 
