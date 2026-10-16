@@ -776,7 +776,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     std::string buffer;
     Writer writer(buffer);
     writer.WriteU32(0x41505335u);
-    writer.WriteU32(31u);
+    writer.WriteU32(request.target.nativeFloat16Arithmetic ? 31u : 30u);
     writeShaderBinary(writer, request.shader);
     writeGuestContext(writer, request.context);
     writeSpirvTarget(writer, request.target);
@@ -801,7 +801,7 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.vertexSubgroups);
     writer.WriteBool(request.target.float16DenormPreserve);
     writer.WriteU32Span(request.context.linkedCallFallbacks);
-    writer.WriteBool(request.target.nativeFloat16Arithmetic);
+    if (request.target.nativeFloat16Arithmetic) writer.WriteBool(true);
     return base64Encode(buffer);
 }
 
