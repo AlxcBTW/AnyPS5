@@ -1930,15 +1930,21 @@ bool GpuHoldProfiled() {
     return profiled;
 }
 
+// The hold profile (GuestMemory.hpp, APS5_LAB_HOLD_PROFILE); defined after ThreadToken.
+void HoldProfileAcquired();
+void HoldProfileEnded(std::uint64_t heldNs);
+
 void BeginHold(std::size_t site) {
     auto& stats = LockStats();
     stats.holdSite = site;
     stats.holdStart = std::chrono::steady_clock::now();
+    HoldProfileAcquired();
 }
 
 void EndHold() {
     auto& stats = LockStats();
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
+    HoldProfileEnded(static_cast<std::uint64_t>(heldNs));
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
@@ -1985,6 +1991,181 @@ const void* ThreadToken() {
 }
 
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+}
+
+// ---- Hold profile (lab step 0 of the mutex split) ----
+
+struct HoldProfileAccess {
+    static bool Owned(const GpuMutexType& mutex) { return mutex.owner.load(std::memory_order_relaxed) == ThreadToken(); }
+    static std::uint32_t Depth(const GpuMutexType& mutex) { return Owned(mutex) ? mutex.depth : 0; }
+};
+
+bool HoldProfiled() {
+    static const bool profiled = GpuHoldProfiled() && std::getenv("APS5_LAB_HOLD_PROFILE") != nullptr;
+    return profiled;
+}
+
+namespace {
+
+constexpr std::size_t HoldSites = GpuLockSiteCount + 1;
+constexpr std::size_t HoldUnlockedSite = GpuLockSiteCount;
+constexpr std::size_t HoldKinds = static_cast<std::size_t>(HoldSpanKind::Count);
+constexpr std::size_t HoldEventCount = static_cast<std::size_t>(HoldEvent::Count);
+// One cell per (holder thread column, site): holds, held ns, ns per span kind, count per event.
+constexpr std::size_t HoldStride = 2 + HoldKinds + HoldEventCount;
+constexpr std::size_t HoldCells = HolderColumns * HoldSites * HoldStride;
+constexpr const char* HoldKindNames[HoldKinds] = {"record-rest", "command", "descriptor", "bookkeeping", "submit", "gpu-wait", "completion"};
+constexpr const char* HoldEventNames[HoldEventCount] = {"sync", "syncthrough", "syncthrough-released", "flush-pending", "submit", "finish", "locked-wait", "lease-wait", "held-check-true", "held-check-false", "depth-check", "adjacent-reacquire"};
+constexpr std::int64_t AdjacentNs = 50'000;
+
+std::array<std::atomic<std::uint64_t>, HoldCells>& HoldCounters() {
+    static std::array<std::atomic<std::uint64_t>, HoldCells> cells{};
+    return cells;
+}
+
+std::size_t HoldColumn() {
+    auto& stats = LockStats();
+    if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(stats.tag));
+    return static_cast<std::size_t>(stats.holderColumn);
+}
+
+// The calling thread's cell: its current hold's site, or 'unlocked' outside any hold.
+std::size_t HoldCell() {
+    const auto site = HoldProfileAccess::Depth(GpuMutex()) != 0 ? LockStats().holdSite : HoldUnlockedSite;
+    return (HoldColumn() * HoldSites + site) * HoldStride;
+}
+
+struct HoldThreadState {
+    std::chrono::steady_clock::time_point lap;
+    HoldSpanKind current = HoldSpanKind::Count;
+    std::int64_t lastReleaseNs = 0;
+};
+
+HoldThreadState& HoldThread() {
+    thread_local HoldThreadState state;
+    return state;
+}
+
+std::int64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void ChargeLap(HoldThreadState& state, std::chrono::steady_clock::time_point now) {
+    if (state.current != HoldSpanKind::Count) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - state.lap).count();
+        HoldCounters()[HoldCell() + 2 + static_cast<std::size_t>(state.current)].fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
+    }
+    state.lap = now;
+}
+
+void HoldProfileAcquired() {
+    if (!HoldProfiled()) return;
+    // An outermost acquisition right after this thread's previous release: one of a run the
+    // committer could take once.
+    auto& state = HoldThread();
+    if (state.lastReleaseNs != 0 && NowNs() - state.lastReleaseNs < AdjacentNs) NoteHoldEvent(HoldEvent::Adjacent);
+}
+
+void HoldProfileEnded(std::uint64_t heldNs) {
+    if (!HoldProfiled()) return;
+    // Called while the hold's site is still current but the depth is already 0.
+    const auto cell = (HoldColumn() * HoldSites + LockStats().holdSite) * HoldStride;
+    auto& cells = HoldCounters();
+    cells[cell].fetch_add(1, std::memory_order_relaxed);
+    cells[cell + 1].fetch_add(heldNs, std::memory_order_relaxed);
+}
+
+void ReportHoldProfile(std::chrono::steady_clock::time_point now, bool print) {
+    static std::array<std::uint64_t, HoldCells> previous{};
+    static std::chrono::steady_clock::time_point last = now;
+    const auto interval = std::chrono::duration<double>(now - last).count();
+    last = now;
+    auto& cells = HoldCounters();
+    std::array<std::uint64_t, HoldCells> current{};
+    for (std::size_t i = 0; i < HoldCells; ++i) current[i] = cells[i].load(std::memory_order_relaxed);
+    for (std::size_t column = 0; column < HolderColumns; ++column) {
+        std::string text;
+        for (std::size_t site = 0; site < HoldSites; ++site) {
+            const auto base = (column * HoldSites + site) * HoldStride;
+            std::array<std::uint64_t, HoldStride> d{};
+            std::uint64_t any = 0;
+            for (std::size_t i = 0; i < HoldStride; ++i) any += d[i] = current[base + i] - previous[base + i];
+            if (any == 0) continue;
+            double spans = 0;
+            for (std::size_t k = 0; k < HoldKinds; ++k) spans += static_cast<double>(d[2 + k]) / 1e6;
+            const double heldMs = static_cast<double>(d[1]) / 1e6;
+            char line[192];
+            std::snprintf(line, sizeof(line), " | %s %llu holds %.0f ms; spans %.0f ms (", site == HoldUnlockedSite ? "unlocked" : GpuLockSiteNames[site], static_cast<unsigned long long>(d[0]), heldMs, spans);
+            text += line;
+            for (std::size_t k = 0; k < HoldKinds; ++k) {
+                if (d[2 + k] == 0) continue;
+                std::snprintf(line, sizeof(line), "%s %.1f ", HoldKindNames[k], static_cast<double>(d[2 + k]) / 1e6);
+                text += line;
+            }
+            if (site != HoldUnlockedSite) {
+                std::snprintf(line, sizeof(line), "unspanned %.1f", std::max(0.0, heldMs - spans));
+                text += line;
+            }
+            text += ") events:";
+            for (std::size_t e = 0; e < HoldEventCount; ++e) {
+                if (d[2 + HoldKinds + e] == 0) continue;
+                std::snprintf(line, sizeof(line), " %s %llu", HoldEventNames[e], static_cast<unsigned long long>(d[2 + HoldKinds + e]));
+                text += line;
+            }
+        }
+        if (text.empty() || !print) continue;
+        char holder[24];
+        AgcDriver::ProfilePrint_nid_no_patch("[holdprof] %s (%.0f s)%s\n", HolderName(column, holder, sizeof(holder)), interval, text.c_str());
+    }
+    previous = current;
+}
+
+// Every outermost release checks the clock; the one that finds the interval over prints.
+void MaybeReportHoldProfile() {
+    static std::atomic<std::int64_t> next{0};
+    // APS5_LAB_HOLD_PROFILE_SECONDS shortens the interval (the unit test).
+    static const std::int64_t intervalNs = [] {
+        const char* text = std::getenv("APS5_LAB_HOLD_PROFILE_SECONDS");
+        const double seconds = text != nullptr ? std::atof(text) : 0.0;
+        return seconds > 0.0 ? static_cast<std::int64_t>(seconds * 1e9) : std::int64_t{10000000000};
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    const auto nowNs = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    auto due = next.load(std::memory_order_relaxed);
+    if (due != 0 && nowNs < due) return;
+    if (!next.compare_exchange_strong(due, nowNs + intervalNs, std::memory_order_acq_rel)) return;
+    // The first call (due == 0) only sets the baseline: counts before it belong to start-up.
+    ReportHoldProfile(now, due != 0);
+}
+
+}
+
+void NoteHoldEvent(HoldEvent event) {
+    if (!HoldProfiled()) return;
+    HoldCounters()[HoldCell() + 2 + HoldKinds + static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+HoldSpan::HoldSpan(HoldSpanKind kind) {
+    if (!HoldProfiled()) return;
+    active = true;
+    auto& state = HoldThread();
+    ChargeLap(state, std::chrono::steady_clock::now());
+    previous = state.current;
+    state.current = kind;
+}
+
+void HoldSpan::Switch(HoldSpanKind kind) {
+    if (!active) return;
+    auto& state = HoldThread();
+    ChargeLap(state, std::chrono::steady_clock::now());
+    state.current = kind;
+}
+
+HoldSpan::~HoldSpan() {
+    if (!active) return;
+    auto& state = HoldThread();
+    ChargeLap(state, std::chrono::steady_clock::now());
+    state.current = previous;
 }
 
 void GpuMutexType::acquired() {
@@ -2034,18 +2215,25 @@ void GpuMutexType::unlock() {
     mutex.unlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
+    if (outermost && HoldProfiled()) {
+        HoldThread().lastReleaseNs = NowNs();
+        MaybeReportHoldProfile();
+    }
     if (outermost) {
         if (auto* hook = gpuUnlockHook.load(std::memory_order_acquire); hook != nullptr) hook();
     }
 }
 
 bool GpuMutexType::HeldByThisThread() const {
-    return owner.load(std::memory_order_relaxed) == ThreadToken();
+    const bool held = owner.load(std::memory_order_relaxed) == ThreadToken();
+    if (HoldProfiled()) NoteHoldEvent(held ? HoldEvent::HeldTrue : HoldEvent::HeldFalse);
+    return held;
 }
 
 std::uint32_t GpuMutexType::DepthOnThisThread() const {
     // `depth` is written by the holder only, so it is read only when that is this thread.
-    return HeldByThisThread() ? depth : 0;
+    if (HoldProfiled()) NoteHoldEvent(HoldEvent::DepthCheck);
+    return HoldProfileAccess::Depth(*this);
 }
 
 void AssertGpuLockHeld(const char* where) {
@@ -2096,6 +2284,7 @@ void GpuMutexType::lock() {
         if (depth == 1 && holders) {
             stats.holdSite = site;
             stats.holdStart = now;
+            HoldProfileAcquired();
         }
         const auto waitedMs = std::chrono::duration<double, std::milli>(now - start).count();
         stats.waitedMs += waitedMs;
@@ -2168,7 +2357,8 @@ void MarkPresenterThread() {
 }
 
 void NoteLockedGpuWait(double ms) {
-    if (!GpuLockProfiled() || GpuMutex().DepthOnThisThread() == 0) return;
+    if (!GpuLockProfiled() || HoldProfileAccess::Depth(GpuMutex()) == 0) return;
+    NoteHoldEvent(HoldEvent::LockedWait);
     auto& stats = LockStats();
     ++stats.lockedGpuWaits;
     stats.lockedGpuWaitMs += ms;

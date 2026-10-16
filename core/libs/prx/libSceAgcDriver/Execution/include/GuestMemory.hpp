@@ -154,6 +154,7 @@ public:
     std::uint32_t DepthOnThisThread() const;
 
 private:
+    friend struct HoldProfileAccess;
     void acquired();
     std::recursive_mutex mutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
@@ -189,6 +190,41 @@ void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);
+
+// Hold profile (lab step 0 of the mutex split; APS5_LAB_HOLD_PROFILE=1 together with APS5_PROFILE_DRAW=1,
+// off otherwise and then free apart from one branch): says what the GpuMutex holds are made of and
+// which calls inside them a shared (non-exclusive) hold could not make. Every 10 s one [holdprof]
+// line per thread and hold site, through the asynchronous profile writer.
+//  - HoldSpan times a region of the calling thread, exclusive of the spans nested in it, by kind:
+//    the recorder's own work (Command: vkCmd* writes and barriers; Descriptor: descriptor sets and
+//    data refreshes; Bookkeeping: batch notes, keeps, stores; Submit: closing and submitting the
+//    batch), GpuWait (fences and the timeline), Completion (completion actions and write-backs) and
+//    Rest (the span's own remainder, for the record phase of a draw: what is not recorder work).
+//    Time in no span is reported as 'unspanned' (held minus all spans).
+//  - NoteHoldEvent counts calls that need the exclusive device: a recorder Sync or SyncThrough, a
+//    SyncThrough that gave the mutex up for its wait, a StorageTexture::FlushPending that flushed, a
+//    submit, a batch finished, a locked GPU wait, a lease wait, and the HeldByThisThread /
+//    DepthOnThisThread checks (the 37 places that branch on holding the mutex), and Adjacent: an
+//    outermost acquisition that follows the thread's previous release within 50 us (a hold the
+//    committer could have merged with the one before it: one lock per batch, not per call).
+// All of it is charged to the thread's current hold site (or 'unlocked' outside any hold).
+enum class HoldSpanKind : std::uint8_t { Rest = 0, Command, Descriptor, Bookkeeping, Submit, GpuWait, Completion, Count };
+enum class HoldEvent : std::uint8_t { Sync = 0, SyncThrough, SyncReleased, FlushPending, Submit, Finish, LockedWait, LeaseWait, HeldTrue, HeldFalse, DepthCheck, Adjacent, Count };
+bool HoldProfiled();
+void NoteHoldEvent(HoldEvent event);
+class HoldSpan {
+public:
+    explicit HoldSpan(HoldSpanKind kind);
+    ~HoldSpan();
+    HoldSpan(const HoldSpan&) = delete;
+    HoldSpan& operator=(const HoldSpan&) = delete;
+    // Ends the current region and starts the next one of this span with `kind`.
+    void Switch(HoldSpanKind kind);
+
+private:
+    bool active = false;
+    HoldSpanKind previous = HoldSpanKind::Count;
+};
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();

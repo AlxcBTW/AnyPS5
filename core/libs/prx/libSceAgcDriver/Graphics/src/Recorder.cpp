@@ -1563,6 +1563,7 @@ void Recorder::ensureOpen() {
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
+    const GuestMemory::HoldSpan storeSpan(GuestMemory::HoldSpanKind::Bookkeeping);
     ensureOpen();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -3320,6 +3321,8 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::Submit);
+    const GuestMemory::HoldSpan submitSpan(GuestMemory::HoldSpanKind::Submit);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -3422,6 +3425,7 @@ struct RestoreSyncSite {
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
 VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+    const GuestMemory::HoldSpan gpuWaitSpan(GuestMemory::HoldSpanKind::GpuWait);
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -3472,6 +3476,7 @@ void Recorder::Sync() {
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
     Submit();
+    if (!inFlight.empty()) GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::Sync);
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -3490,6 +3495,7 @@ void Recorder::FlushDeferredReleases() {
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
+    GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::SyncThrough);
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
@@ -3519,7 +3525,10 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
         // The hook's wait without the mutex: its own acquisition is the outermost on this thread.
         const auto source = announcedSource;
         const void* site = announcedSite != nullptr ? announcedSite : __builtin_return_address(0);
-        if (syncThroughUnlocked(address, end, source, site)) return;
+        if (syncThroughUnlocked(address, end, source, site)) {
+            GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::SyncReleased);
+            return;
+        }
         // A completion-store wait (kill switch above) is already counted as 'waited'.
         if (completionDepth == 0) ++holdCounters.hookLockedWaits;
     }
@@ -3785,8 +3794,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         }
     } finishingScope{*this, batch.get()};
+    GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::Finish);
     finishing.push_back(batch.get());
     if (wait) {
+        const GuestMemory::HoldSpan gpuWaitSpan(GuestMemory::HoldSpanKind::GpuWait);
         // APS5_PROFILE_DRAW: how long the CPU waits for recorded GPU work, reported every 10 s.
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         static double waitedMs = 0;
@@ -3865,6 +3876,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
+        const GuestMemory::HoldSpan completionSpan(GuestMemory::HoldSpanKind::Completion);
         for (auto& action : batch->completions) {
             try {
                 action();

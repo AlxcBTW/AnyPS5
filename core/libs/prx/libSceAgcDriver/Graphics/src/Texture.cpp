@@ -3487,6 +3487,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (trace) {
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
+    GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::FlushPending);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
