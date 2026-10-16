@@ -2123,6 +2123,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
         try {
             auto* recorder = Recorder::Active();
             if (recorder != nullptr && !recorder->Idle()) {
+                GuestMemory::NoteHoldEvent(GuestMemory::HoldEvent::LeaseWait);
                 Recorder::CountSync(4);
                 recorder->Sync();
                 synced = true;

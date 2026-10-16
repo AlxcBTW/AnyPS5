@@ -4515,6 +4515,8 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 }
 
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
+    // Lab hold profile (APS5_LAB_HOLD_PROFILE): the whole function is recorder work; only its kinds differ.
+    GuestMemory::HoldSpan holdSpan(GuestMemory::HoldSpanKind::Bookkeeping);
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
@@ -4548,8 +4550,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Command);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -4560,6 +4564,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recordStep(PhaseRecordKeeps);
     if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
+        holdSpan.Switch(GuestMemory::HoldSpanKind::Descriptor);
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
@@ -4574,7 +4579,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.templateSameWords;
         }
         recordStep(PhaseRecordDataRefresh);
+        holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     }
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Command);
     using CommandClass = Graphics::Recorder::CommandClass;
     if (Graphics::Recorder::BarrierValidate()) {
         if (argumentImport != nullptr) {
@@ -4658,6 +4665,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
+    holdSpan.Switch(GuestMemory::HoldSpanKind::Bookkeeping);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
