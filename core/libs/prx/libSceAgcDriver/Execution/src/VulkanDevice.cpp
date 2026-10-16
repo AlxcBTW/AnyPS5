@@ -4126,7 +4126,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         auto last = counters.lastReport.load();
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
             const auto keyWaitCounts = Graphics::KeyWaitCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[presync] gate (APS5_LAB_MUTEX_GATE, cumulative): %llu dispatches checked at the lock, %llu waited with the mutex released (%llu rounds, %.0f ms), %llu left to the locked wait after three rounds, %llu nested; locked key syncs (count/ms): queue 0 %llu/%.0f, queue 0x20 %llu/%.0f, other %llu/%.0f; by the gate's view of the range: covered %llu, overlapping %llu, not listed %llu, no gate %llu\n", static_cast<unsigned long long>(counters.gateChecked.load()), static_cast<unsigned long long>(counters.gateWaited.load()), static_cast<unsigned long long>(counters.gateRounds.load()), counters.gateWaitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.gateExhausted.load()), static_cast<unsigned long long>(counters.gateNested.load()), static_cast<unsigned long long>(keyWaitCounts.syncedBy[0]), keyWaitCounts.syncedMs[0], static_cast<unsigned long long>(keyWaitCounts.syncedBy[1]), keyWaitCounts.syncedMs[1], static_cast<unsigned long long>(keyWaitCounts.syncedBy[2]), keyWaitCounts.syncedMs[2], static_cast<unsigned long long>(keyWaitCounts.byCoverage[0]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[1]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[2]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[3]));
+            AgcDriver::ProfilePrint_nid_no_patch("[presync] gate (APS5_LAB_MUTEX_GATE, cumulative): %llu dispatches checked at the lock, %llu waited with the mutex released (%llu rounds, %.0f ms), %llu left to the locked wait after three rounds, %llu nested; locked key syncs (count/ms): queue 0 %llu/%.0f, queue 0x20 %llu/%.0f, other %llu/%.0f; by the gate's view of the range: covered %llu, overlapping %llu, not listed %llu, no gate %llu; by the quick predicate just before: pending %llu, not pending %llu\n", static_cast<unsigned long long>(counters.gateChecked.load()), static_cast<unsigned long long>(counters.gateWaited.load()), static_cast<unsigned long long>(counters.gateRounds.load()), counters.gateWaitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.gateExhausted.load()), static_cast<unsigned long long>(counters.gateNested.load()), static_cast<unsigned long long>(keyWaitCounts.syncedBy[0]), keyWaitCounts.syncedMs[0], static_cast<unsigned long long>(keyWaitCounts.syncedBy[1]), keyWaitCounts.syncedMs[1], static_cast<unsigned long long>(keyWaitCounts.syncedBy[2]), keyWaitCounts.syncedMs[2], static_cast<unsigned long long>(keyWaitCounts.byCoverage[0]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[1]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[2]), static_cast<unsigned long long>(keyWaitCounts.byCoverage[3]), static_cast<unsigned long long>(keyWaitCounts.byQuick[0]), static_cast<unsigned long long>(keyWaitCounts.byQuick[1]));
             AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
         }
     }
@@ -4150,17 +4150,16 @@ std::vector<Graphics::DccGateRange> VulkanDevice::SettleKeyWriters(const Prepare
     }
     bool waited = false;
     for (int round = 0;; ++round) {
-        // The lock-free snapshot is current: every recorder change is made under the mutex this thread holds.
-        const bool pending = std::any_of(keys->begin(), keys->end(), [](const Graphics::DccGateRange& range) { return Graphics::DccKeyWritersPending(range.address, static_cast<std::size_t>(range.bytes)); });
-        if (!pending) break;
-        if (round == 3) {
-            counters.gateExhausted.fetch_add(1, std::memory_order_relaxed);
-            break;
-        }
+        // The decision is WaitForKeyWriters' own, made now with the mutex held: a range is waited for when a recorded write overlaps it
+        // (the lock-free snapshot is current, every recorder change is made under the mutex this thread holds) and its keys are not
+        // known (DccKeyWriterNeedsSync: PendingStoreKeys, which counts a memoized driver key store only while it is the newest write
+        // over the range). The quick predicate DccKeyWritersPending of the pre-sync takes any memoized store covering the range as
+        // known, so a guest write recorded after the store was invisible to it (job 28c: all remaining locked syncs were of listed ranges).
         bool open = false;
         std::uint64_t serial = 0;
         for (const auto& range : *keys) {
             const auto bytes = static_cast<std::size_t>(range.bytes);
+            if (!Graphics::Recorder::SnapshotWriteOverlaps(range.address, bytes)) continue;
             if (!Graphics::DccKeyWriterNeedsSync(range.address, bytes)) continue;
             const auto info = state->recorder->DescribePendingWrite(range.address, bytes);
             if (!info.has_value()) continue;
@@ -4169,6 +4168,10 @@ std::vector<Graphics::DccGateRange> VulkanDevice::SettleKeyWriters(const Prepare
         }
         if (open) serial = state->recorder->SubmitAndEpoch();
         if (serial == 0) break;
+        if (round == 3) {
+            counters.gateExhausted.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
         counters.gateRounds.fetch_add(1, std::memory_order_relaxed);
         waited = true;
         const auto waitStart = std::chrono::steady_clock::now();

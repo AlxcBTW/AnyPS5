@@ -772,6 +772,7 @@ struct KeyWaitTotals {
     std::array<std::atomic<std::uint64_t>, 3> syncedBy{};
     std::array<std::atomic<std::uint64_t>, 3> syncedUs{};
     std::array<std::atomic<std::uint64_t>, 4> byCoverage{};
+    std::array<std::atomic<std::uint64_t>, 2> byQuick{};
 };
 
 thread_local const std::vector<DccGateRange>* keyGate = nullptr;
@@ -799,12 +800,13 @@ KeyGateScope::~KeyGateScope() {
 
 DccKeyWaitCounts KeyWaitCounts() {
     const auto& totals = KeyWaits();
-    DccKeyWaitCounts counts{totals.calls.load(std::memory_order_relaxed), totals.noPending.load(std::memory_order_relaxed), totals.known.load(std::memory_order_relaxed), totals.fillsUncompressed.load(std::memory_order_relaxed), totals.synced.load(std::memory_order_relaxed), {}, {}, {}};
+    DccKeyWaitCounts counts{totals.calls.load(std::memory_order_relaxed), totals.noPending.load(std::memory_order_relaxed), totals.known.load(std::memory_order_relaxed), totals.fillsUncompressed.load(std::memory_order_relaxed), totals.synced.load(std::memory_order_relaxed), {}, {}, {}, {}};
     for (std::size_t i = 0; i < 3; ++i) {
         counts.syncedBy[i] = totals.syncedBy[i].load(std::memory_order_relaxed);
         counts.syncedMs[i] = static_cast<double>(totals.syncedUs[i].load(std::memory_order_relaxed)) / 1000.0;
     }
     for (std::size_t i = 0; i < 4; ++i) counts.byCoverage[i] = totals.byCoverage[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < 2; ++i) counts.byQuick[i] = totals.byQuick[i].load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -843,6 +845,8 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     }
     waits.synced.fetch_add(1, std::memory_order_relaxed);
     Recorder::CountSync(2);
+    // What the quick predicate would have said (the pre-sync and the first gate used it), before the sync removes the writer.
+    waits.byQuick[DccKeyWritersPending(metaAddress, count) ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
     const auto syncStart = std::chrono::steady_clock::now();
     recorder->SyncThrough(metaAddress, count);
     {
