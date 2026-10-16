@@ -40,3 +40,9 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Verbose output of the new tests
+        if: always()
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: ctest --test-dir build -V --timeout 120 -R "^(agc_driver_dispatch_move)$" 2>&1 | tail -n 120
