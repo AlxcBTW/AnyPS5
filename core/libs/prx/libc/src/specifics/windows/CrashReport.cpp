@@ -253,6 +253,89 @@ bool ReadWord(std::uint64_t address, std::uint64_t* value) {
     return ReadCode(address, reinterpret_cast<std::uint8_t*>(value), sizeof(*value)) == sizeof(*value);
 }
 
+std::uint64_t EnvironmentNumber(const char* name) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || *text == '\0') return 0;
+    return std::strtoull(text, nullptr, 0);
+}
+
+// The guest libc's abort() stores its reason in the thread block and executes int 0x45, which a Windows
+// user thread takes as a general-protection fault: an access violation whose address is all ones.
+bool IsGuestAbortTrap(std::uint64_t rip) {
+    std::uint8_t bytes[2] = {};
+    return ReadCode(rip, bytes, sizeof(bytes)) == sizeof(bytes) && bytes[0] == 0xcd && bytes[1] == 0x45;
+}
+
+void ReportWords(const char* prefix, std::uint64_t address) {
+    const auto* words = reinterpret_cast<const std::uint64_t*>(address);
+    Report("%s0x%016llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", prefix, static_cast<unsigned long long>(address), words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+}
+
+// Lab diagnostics: APS5_CRASH_STACK_BYTES=<n> prints the faulting thread's stack words from rsp, then the eight words
+// at every distinct stack word that points at readable data outside the stack, so a heap object a caller frame kept
+// (a destructor's this, a container's elements) can be named after the crash.
+void ReportStackWords(std::uint64_t rsp) {
+    const auto bytes = std::min<std::uint64_t>(EnvironmentNumber("APS5_CRASH_STACK_BYTES"), std::uint64_t{1} << 20);
+    if (bytes == 0) return;
+    const auto first = rsp & ~std::uint64_t{7};
+    Report("  stack words from rsp 0x%016llx (APS5_CRASH_STACK_BYTES):\n", static_cast<unsigned long long>(rsp));
+    std::uint64_t end = first;
+    std::uint64_t readablePage = 0;
+    for (std::uint64_t at = first; at < first + bytes; at += 32) {
+        std::uint64_t words[4] = {};
+        int count = 0;
+        for (; count < 4; ++count) {
+            const auto slot = at + static_cast<std::uint64_t>(count) * 8;
+            const auto page = slot & ~std::uint64_t{0xfff};
+            if (page != readablePage) {
+                if (!IsReadable(slot)) break;
+                readablePage = page;
+            }
+            words[count] = *reinterpret_cast<const std::uint64_t*>(slot);
+        }
+        if (count == 0) break;
+        char text[192];
+        int used = std::snprintf(text, sizeof(text), "    +0x%04llx:", static_cast<unsigned long long>(at - first));
+        for (int k = 0; k < count && used > 0 && used < static_cast<int>(sizeof(text)); ++k) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %016llx", static_cast<unsigned long long>(words[k]));
+        Report("%s\n", text);
+        end = at + static_cast<std::uint64_t>(count) * 8;
+        if (count < 4) break;
+    }
+    const std::uint64_t stackLow = first > 0x100000 ? first - 0x100000 : 0;
+    const std::uint64_t stackHigh = end + 0x100000;
+    std::uint64_t seen[256];
+    std::size_t seenCount = 0;
+    Report("  data at stack words that point outside the stack (8 words each):\n");
+    for (std::uint64_t slot = first; slot + 8 <= end && seenCount < std::size(seen); slot += 8) {
+        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
+        if (value < 0x10000 || (value & 7) != 0 || value > 0x7fffffffffffull || (value >= stackLow && value < stackHigh)) continue;
+        if (std::find(seen, seen + seenCount, value) != seen + seenCount) continue;
+        if (IsExecutable(value) || !IsReadable(value) || !IsReadable(value + 0x38)) continue;
+        seen[seenCount++] = value;
+        char prefix[48];
+        std::snprintf(prefix, sizeof(prefix), "    [+0x%04llx] ", static_cast<unsigned long long>(slot - first));
+        ReportWords(prefix, value);
+    }
+}
+
+// Lab diagnostics: APS5_CRASH_PEEK=<hex address>[,<hex address>...] prints eight words at each (up to 16), for guest
+// globals such as a table's vector.
+void ReportPeeks() {
+    const char* text = std::getenv("APS5_CRASH_PEEK");
+    if (text == nullptr || *text == '\0') return;
+    Report("  words at APS5_CRASH_PEEK:\n");
+    const char* cursor = text;
+    for (int k = 0; k < 16 && *cursor != '\0'; ++k) {
+        char* next = nullptr;
+        const auto address = static_cast<std::uint64_t>(std::strtoull(cursor, &next, 16));
+        if (next == cursor) break;
+        if (address >= 0x10000 && (address & 7) == 0 && IsReadable(address) && IsReadable(address + 0x38)) ReportWords("    ", address);
+        else Report("    0x%016llx: not readable\n", static_cast<unsigned long long>(address));
+        cursor = next;
+        while (*cursor == ',' || *cursor == ' ') ++cursor;
+    }
+}
+
 void ReportUndeliverableException(const EXCEPTION_POINTERS* info, std::uint64_t frame) {
     const auto* record = info->ExceptionRecord;
     char type[256] = "of unknown type";
@@ -315,6 +398,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("\nFATAL: unhandled exception 0x%08lx on thread %lu '%s'\n", record->ExceptionCode, GetCurrentThreadId(), threadName);
     DescribeAddress(context->Rip, line, sizeof(line));
     Report("  rip %s\n", line);
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && IsGuestAbortTrap(context->Rip)) Report("  guest abort(): the title's own abort trap (int 0x45); the address below is the general-protection placeholder, not a pointer\n");
     if (record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
         std::uint8_t bytes[8];
         const std::size_t available = ReadCode(context->Rip, bytes, sizeof(bytes));
@@ -364,6 +448,8 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
         frame = next;
     }
     ReportStackCandidates(context->Rsp, 16, 0x2000);
+    ReportStackWords(context->Rsp);
+    ReportPeeks();
     if (context->Rip == 0 || !IsExecutable(context->Rip)) {
         // A jump into nothing usually follows a return through a clobbered frame; the frames that just
         // returned are still below rsp.
