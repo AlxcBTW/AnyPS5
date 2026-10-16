@@ -75,6 +75,7 @@ public:
     };
     DispatchCacheFootprint DispatchCacheSize();
     static std::uint64_t DispatchCacheBytes();
+    std::shared_ptr<const ShaderRegistry> RegisteredShaders();
 
 private:
     friend class SampledReadScope;
