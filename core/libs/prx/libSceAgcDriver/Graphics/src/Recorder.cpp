@@ -1230,6 +1230,34 @@ std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, s
     return labelTableOwner->lookupLabel(address, bytes, afterStamp, refusal);
 }
 
+bool Recorder::LookupLabelRaw(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, RawLabel& out) {
+    std::lock_guard tableLock(labelTableMutex);
+    if (labelTableOwner == nullptr) return false;
+    return labelTableOwner->lookupLabelRaw(address, bytes, afterStamp, out);
+}
+
+bool Recorder::lookupLabelRaw(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, RawLabel& out) const {
+    out = RawLabel{};
+    if (labels.empty() || (bytes != 4 && bytes != 8) || address % 4 != 0) return false;
+    out.closed = true;
+    out.generation = std::numeric_limits<std::uint64_t>::max();
+    for (std::size_t offset = 0; offset < bytes; offset += 4) {
+        const auto dword = address + offset;
+        if (queuedLabels.find(dword) != queuedLabels.end()) return false;
+        const auto found = labels.find(dword);
+        if (found == labels.end() || found->second.batch == nullptr) return false;
+        const auto& entry = found->second;
+        out.value |= static_cast<std::uint64_t>(entry.value) << (offset * 8u);
+        out.late = out.late || entry.stamp <= afterStamp;
+        out.overwritten = out.overwritten || entry.overwritten;
+        out.behindCompletion = out.behindCompletion || entry.behindCompletion;
+        if (entry.generation == 0) out.closed = false;
+        else out.generation = std::min(out.generation, entry.generation);
+    }
+    if (!out.closed) out.generation = 0;
+    return true;
+}
+
 bool Recorder::WideLabelIn(std::uint64_t address, std::size_t bytes) {
     std::lock_guard tableLock(labelTableMutex);
     return labelTableOwner != nullptr && labelTableOwner->wideLabelInLocked(address, bytes);
