@@ -558,13 +558,19 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     constexpr const char* cacheFormat = "[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n";
+    bool printedLine = false;
+    bool printedCache = false;
     if (AgcDriver::AsyncDrawReports_nid_no_patch()) {
-        AgcDriver::ProfilePrint_nid_no_patch("%s\n", static_cast<const char*>(line));
-        AgcDriver::ProfilePrint_nid_no_patch(cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
-    } else {
-        std::fprintf(stderr, "%s\n", line);
-        std::fprintf(stderr, cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+        try {
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", static_cast<const char*>(line));
+            printedLine = true;
+            AgcDriver::ProfilePrint_nid_no_patch(cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+            printedCache = true;
+        } catch (const std::exception&) {
+        }
     }
+    if (!printedLine) std::fprintf(stderr, "%s\n", line);
+    if (!printedCache) std::fprintf(stderr, cacheFormat, static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     profile.totalsUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
@@ -1906,7 +1912,7 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
-std::vector<PresyncSurface> PrepareDrawUnlocked(const Context& context, const State& state) {
+std::vector<PresyncSurface> PrepareDrawUnlocked(const Context& context, const State& state, bool walk) {
     std::vector<PresyncSurface> surfaces;
     static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
     try {
@@ -1915,23 +1921,23 @@ std::vector<PresyncSurface> PrepareDrawUnlocked(const Context& context, const St
             const auto surface = SurfaceForTarget(color);
             const auto guestBytes = DescribeSurface(surface).guestBytes;
             if (surface.baseAddress == 0 || guestBytes == 0) continue;
-            GuestMemory::CollectWrites(surface.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (walk) GuestMemory::CollectWrites(surface.baseAddress, static_cast<std::size_t>(guestBytes));
             if (surface.dccAddress != 0) {
                 const auto keyBytes = DccKeyBytes(guestBytes);
                 if (keyBytes != 0) {
-                    GuestMemory::CollectWrites(surface.dccAddress, keyBytes);
+                    if (walk) GuestMemory::CollectWrites(surface.dccAddress, keyBytes);
                     surfaces.push_back({surface.dccAddress, keyBytes, true});
                 }
             }
-            if (color.cmaskAddress != 0) {
+            if (walk && color.cmaskAddress != 0) {
                 const CmaskLayout layout(color.extent.width, color.extent.height);
                 if (layout.Bytes() != 0) GuestMemory::CollectWrites(color.cmaskAddress, layout.Bytes());
             }
         }
-        if (state.depth && state.depth->htileAddress != 0 && state.depth->samples == 1u) {
+        if (state.depth && state.depth->htileAddress != 0 && state.depth->samples == 1u && !HasResidentDepthGuards_nid_no_patch()) {
             const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(state.depth->extent));
             if (bytes != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(state.depth->htileAddress), bytes, true)) {
-                GuestMemory::CollectWrites(state.depth->htileAddress, bytes);
+                if (walk) GuestMemory::CollectWrites(state.depth->htileAddress, bytes);
                 surfaces.push_back({state.depth->htileAddress, bytes, false});
             }
         }

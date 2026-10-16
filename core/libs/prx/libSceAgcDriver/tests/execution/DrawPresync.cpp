@@ -14,6 +14,7 @@
 #endif
 #include <windows.h>
 #endif
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -132,6 +134,12 @@ void RequireNothingPending(std::uint64_t address, std::size_t bytes, const char*
     Require(recorder == nullptr || !recorder->PendingWriteOverlaps(address, bytes), what);
 }
 
+void RequirePendingUntilReaped(std::uint64_t address, std::size_t bytes, const char* what) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes), what);
+}
+
 void RequireWords(const std::uint8_t* data, std::size_t bytes, std::uint32_t expected, const char* what) {
     for (std::size_t offset = 0; offset + 4 <= bytes; offset += 4) {
         std::uint32_t word = 0;
@@ -170,12 +178,13 @@ void RunHtileFill(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto after = AgcDriver::VulkanDevice::DrawPresyncCounts();
     Require(serial != 0, "the pre-sync did not wait for the recorded fill of the draw's HTILE");
     Require(after.htile == before.htile + 1 && after.overlapping == before.overlapping + 1 && after.presyncs == before.presyncs + 1, "the pre-sync did not count the HTILE writer it waited for");
+    RequireWords(htile, bytes, pattern[0], "the HTILE right after the pre-sync, before any reap (the pre-sync did not wait for the fill)");
+    RequirePendingUntilReaped(AddressOf(htile), bytes, "the HTILE fill is no longer pending before the draw's reap (the pre-sync reaped it itself)");
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         device.ReapRecorded(serial);
     }
     RequireNothingPending(AddressOf(htile), bytes, "the HTILE fill is still pending after the pre-sync and its reap");
-    RequireWords(htile, bytes, pattern[0], "the HTILE after the pre-synced fill");
 }
 
 void RunIndexFill(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -192,12 +201,23 @@ void RunIndexFill(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto after = AgcDriver::VulkanDevice::DrawPresyncCounts();
     Require(serial != 0, "the pre-sync did not wait for the recorded fill of the draw's index buffer");
     Require(after.index == before.index + 1 && after.presyncs == before.presyncs + 1, "the pre-sync did not count the index writer it waited for");
+    RequireWords(indices, IndexBytes, pattern[0], "the index buffer right after the pre-sync, before any reap (the pre-sync did not wait for the fill)");
+    RequirePendingUntilReaped(AddressOf(indices), IndexBytes, "the index fill is no longer pending before the draw's reap (the pre-sync reaped it itself)");
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         device.ReapRecorded(serial);
     }
     RequireNothingPending(AddressOf(indices), IndexBytes, "the index fill is still pending after the pre-sync and its reap");
-    RequireWords(indices, IndexBytes, pattern[0], "the index buffer after the pre-synced fill");
+    const auto indirect = AgcDriver::VulkanDevice::DrawPresyncCounts();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.FillBuffer(AddressOf(indices), IndexBytes, pattern), "the second fill of the index buffer was not recorded");
+    }
+    auto indirectDraw = draw;
+    indirectDraw.indirect.emplace();
+    Require(device.PresyncDraw(AgcDriver::Graphics::State{}, indirectDraw) == 0 && AgcDriver::VulkanDevice::DrawPresyncCounts().index == indirect.index, "the pre-sync waited for the declared index range of an indirect draw, which reads per record");
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    device.WaitIdle();
 }
 
 void RunKeyFill(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -216,6 +236,8 @@ void RunKeyFill(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(after.keys == before.keys + 1, "the pre-sync did not see the pending fill of the color target's keys");
     Require(serial == 0 && after.presyncs == before.presyncs, "the pre-sync waited for a fill whose keys the locked lookup derives from the pending stores");
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr && recorder->OpenWriteOverlaps(AddressOf(keys), KeyBytes), "the pre-sync submitted the open batch for a fill it did not wait for");
     device.WaitIdle();
 }
 
@@ -241,6 +263,7 @@ void RunKeyKernel(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto after = AgcDriver::VulkanDevice::DrawPresyncCounts();
     Require(serial != 0, "the pre-sync did not wait for the kernel that copies data over the color target's keys");
     Require(after.keys == before.keys + 1 && after.presyncs == before.presyncs + 1, "the pre-sync did not count the key writer it waited for");
+    RequirePendingUntilReaped(AddressOf(keys), KeyBytes, "the key copy is no longer pending before the draw's reap (the pre-sync reaped it itself)");
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         device.ReapRecorded(serial);

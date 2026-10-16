@@ -162,9 +162,13 @@ void ProfilePrint_nid_no_patch(const char* format, TArgs... args) {
 // Lab switch APS5_LAB_ASYNC_DRAW_REPORTS=1: the draw path's 10 s lines ([draws], [rescache] draws,
 // [draw] pipelined) go through the writer above instead of a direct fprintf, which the mingw printf
 // puts into the unbuffered stderr one WriteFile per character while the reporting thread holds the
-// GPU mutex or the draw pipeline's mutex. The bytes written are the same.
+// GPU mutex or the draw pipeline's mutex. The bytes written are the same; a writer that stopped or
+// failed makes the caller print the line directly as before.
 inline bool AsyncDrawReports_nid_no_patch() {
-    static const bool enabled = std::getenv("APS5_LAB_ASYNC_DRAW_REPORTS") != nullptr;
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LAB_ASYNC_DRAW_REPORTS");
+        return text != nullptr && std::atoi(text) > 0;
+    }();
     return enabled;
 }
 
