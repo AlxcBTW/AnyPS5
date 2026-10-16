@@ -1641,6 +1641,13 @@ void refreshMirror(ImageMirror& mirror, std::uint64_t address, std::uint64_t byt
     compareBlocks(blocks);
 }
 
+// Lab diagnostics: a CollectWrites that answered 0 for a heap mirror's range. Says whether the write watch still covers all of it
+// and whether all of it is committed (a walk over uncommitted pages fails as well), and which paths took ranges out of the watch lately.
+void reportLostWatch(const char* what, std::uint64_t begin, std::uint64_t bytes) {
+    const auto commitment = GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(bytes));
+    std::fprintf(stderr, "[write-watch] %s range 0x%llx+0x%llx has no write watch: watched whole %d, committed whole %d; recent unwatches over it:%s\n", what, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), GuestMemory::Watched(begin, static_cast<std::size_t>(bytes)) ? 1 : 0, commitment.whole ? 1 : 0, GuestMemory::RecentUnwatches(begin, static_cast<std::size_t>(bytes)).c_str());
+}
+
 void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t generation, std::vector<RefreshBlock>& blocks) {
     constexpr std::uint64_t block = 65536;
     thread_local std::vector<std::uint8_t>* changedSlot = nullptr;
@@ -1672,6 +1679,7 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
         prepareRange(begin, bytes);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
+        if (generation == 0) reportLostWatch("heap mirror", begin, bytes);
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
         first = last;
@@ -1774,6 +1782,7 @@ bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks)
     if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
     syncRange(mirror.base, mirror.bytes);
     const auto generation = collectPieces(pieces);
+    if (generation == 0) reportLostWatch("sparse heap mirror", mirror.base, mirror.bytes);
     Require(generation != 0, "a sparse heap mirror's range is no longer write-watched");
     appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
     return true;
@@ -1809,6 +1818,7 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
         const auto& run = space.heapRuns[index];
         prepareRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
+        if (generation == 0) reportLostWatch("heap mirror run", run.begin, run.bytes);
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         const auto since = space.verified[index].load(std::memory_order_relaxed);
         if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
