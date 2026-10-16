@@ -508,6 +508,18 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
 
+    // Lab APS5_LAB_DEPTH_CLEAR_HLE: a UAV clear of a depth plane (see Graphics::StorageImageClear) records no copies of the plane
+    // around the dispatch; its colour is read from guest memory under the mutex with the packet's labels recorded.
+    std::optional<Graphics::DepthPlaneClear> depthPlaneClear;
+    if (indirectArguments == 0 && !partialLastGroup && Graphics::DepthPlaneClearEnabled()) {
+        if (const auto clear = Graphics::MatchStorageImageClear(std::span(snapshot.code).subspan(codeOffset), userData, compute, groups); clear && Graphics::DepthSurfaceAt(Graphics::StorageImageClearAddress(*clear))) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+            std::lock_guard clearLock(GuestMemory::GpuMutex());
+            recordLabelsForPacket(localDevice.get(), submission.queue);
+            depthPlaneClear.emplace(*clear);
+        }
+    }
+
     for (;;) {
 
         std::shared_ptr<PreparedDispatch> prepared;
