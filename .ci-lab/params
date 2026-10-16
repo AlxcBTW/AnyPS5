@@ -1,0 +1,5 @@
+name=cpu-fastproof-move
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-cpu-fastproof-move-91f661021b-134230
