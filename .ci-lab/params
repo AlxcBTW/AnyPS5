@@ -1,0 +1,5 @@
+name=gpu-dc1
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-dc1-6b23c409de-215672
