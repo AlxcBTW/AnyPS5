@@ -1238,32 +1238,42 @@ void rawLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabelRaw(a, 4, 5, raw) && !Recorder::LookupLabelRaw(b, 8, 5, raw), "(7) entries outlived their batch");
 }
 
-// Recorder::PendingWriteSerial (APS5_LAB_WAIT_DEFER=2): the serial that lands the newest submitted write over a range.
-void pendingWriteSerialTests(Recorder& recorder) {
+// Recorder::LabelBatchSerial (APS5_LAB_WAIT_DEFER=2): the serial of the batch that holds a label's pending-table entry.
+void labelBatchSerialTests(Recorder& recorder) {
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
-    constexpr std::uint64_t a = 0x75000, b = 0x75100;
+    const std::array<std::byte, 8> pair{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}, std::byte{2}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t a = 0x75000, b = 0x75100, c = 0x75200;
+    bool inOpen = true;
     recorder.Sync();
-    Require(recorder.PendingWriteSerial(a, 4) == 0 && recorder.PendingWriteSerial(a, 0) == 0, "(1) an empty recorder has a target");
+    Require(recorder.LabelBatchSerial(a, 4, inOpen) == 0 && !inOpen, "(1) an empty table has a serial");
     recorder.NoteLabel(a, one, 10, 0);
-    Require(recorder.OpenWriteOverlaps(a, 4) && recorder.PendingWriteSerial(a, 4) == 0, "(2) the open batch is a target");
+    Require(recorder.LabelBatchSerial(a, 4, inOpen) == recorder.OpenSerial() && inOpen, "(2) the open batch's label is not reported as open");
+    Require(recorder.LabelBatchSerial(a, 2, inOpen) == 0 && !inOpen && recorder.LabelBatchSerial(a + 2, 4, inOpen) == 0 && recorder.LabelBatchSerial(a, 12, inOpen) == 0, "(2) an odd-sized or misaligned range has a serial");
+    Require(recorder.LabelBatchSerial(b, 4, inOpen) == 0 && !inOpen && recorder.LabelBatchSerial(a, 8, inOpen) == 0, "(2) a dword without an entry has a serial");
     recorder.Submit();
     const auto first = recorder.Submissions();
-    Require(!recorder.OpenWriteOverlaps(a, 4), "(3) the submitted batch is still open");
-    const auto target = recorder.PendingWriteSerial(a, 4);
-    // The GPU may have finished already (fence signaled): no target then.
-    Require(target == 0 || target == first, "(3) the label's batch is not the target");
-    Require(recorder.PendingWriteSerial(b, 4) == 0 && recorder.PendingWriteSerial(a + 8, 4) == 0, "(3) a range nothing writes has a target");
+    const auto submitted = recorder.LabelBatchSerial(a, 4, inOpen);
+    // The GPU may have finished already (fence signaled): no serial then.
+    Require(!inOpen && (submitted == 0 || submitted == first), "(3) the submitted batch is not the label's batch");
     recorder.NoteLabel(a, one, 11, 0);
-    recorder.NoteLabel(b, one, 12, 0);
+    recorder.NoteLabel(b, pair, 12, 0);
+    Require(recorder.LabelBatchSerial(a, 4, inOpen) == recorder.OpenSerial() && inOpen, "(4) a newer store of the dword is not the open batch's");
+    Require(recorder.LabelBatchSerial(b, 8, inOpen) == recorder.OpenSerial() && inOpen, "(4) an 8-byte label is not the open batch's");
     recorder.Submit();
     const auto second = recorder.Submissions();
     Require(second == first + 1, "(4) the second submit did not take the next serial");
-    const auto newest = recorder.PendingWriteSerial(a, 4);
-    Require(newest == 0 || newest == second, "(4) the newest batch writing the label is not the target");
-    const auto other = recorder.PendingWriteSerial(b, 4);
-    Require(other == 0 || other == second, "(4) the second label's batch is not the target");
+    const auto newest = recorder.LabelBatchSerial(a, 4, inOpen);
+    Require(!inOpen && (newest == 0 || newest == second), "(4) the newest store of the dword is not the target");
+    // (5) A dword in each of two batches reports the later one.
+    recorder.NoteLabel(c, one, 13, 0);
+    recorder.Submit();
+    recorder.NoteLabel(c + 4, one, 14, 0);
+    recorder.Submit();
+    const auto third = recorder.Submissions();
+    const auto both = recorder.LabelBatchSerial(c, 8, inOpen);
+    Require(!inOpen && (both == 0 || both == third), "(5) a label split over two batches does not report the later one");
     recorder.Sync();
-    Require(recorder.PendingWriteSerial(a, 4) == 0 && recorder.PendingWriteSerial(b, 4) == 0, "(5) a finished batch is a target");
+    Require(recorder.LabelBatchSerial(a, 4, inOpen) == 0 && recorder.LabelBatchSerial(c, 8, inOpen) == 0 && !inOpen, "(6) a finished batch is a target");
 }
 
 void largeLabelTests(Recorder& recorder) {
@@ -8359,9 +8369,8 @@ int main(int argc, char** argv) {
         recorder.Activate();
         if (argc == 2 && std::string_view(argv[1]) == "--label-table-only") {
             rawLabelTests(recorder);
-            pendingWriteSerialTests(recorder);
-            std::cout << "label table tests passed
-";
+            labelBatchSerialTests(recorder);
+            std::cout << "label table tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
@@ -8419,7 +8428,7 @@ int main(int argc, char** argv) {
             labelTests(recorder);
             lateLabelTests(recorder);
         rawLabelTests(recorder);
-        pendingWriteSerialTests(recorder);
+        labelBatchSerialTests(recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
@@ -8575,7 +8584,7 @@ int main(int argc, char** argv) {
         labelTests(recorder);
         lateLabelTests(recorder);
         rawLabelTests(recorder);
-        pendingWriteSerialTests(recorder);
+        labelBatchSerialTests(recorder);
         largeLabelTests(recorder);
         unchangedSinceTests();
         closeRaceTests(device, recorder);
