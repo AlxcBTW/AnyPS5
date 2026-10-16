@@ -343,6 +343,12 @@ void CheckGuestWriteRing() {
     for (std::size_t k = 5; k < 9; ++k) current[k] = std::byte{0x66};
     WriteChanged(base + 16384, current, original);
     Write(base + 20480, label);
+    CollectWritesUncached(base, 2 * Block);
+    const auto decided = TrackerGeneration();
+    MarkWritten(base + 4096, 64);
+    static_cast<volatile std::uint8_t*>(memory)[Block + 100] = 0x77;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{base, base + 2 * Block}}};
+    CheckStoreWindow(stored, decided, true, 0x1234);
     Unwatch(base + Block, Block);
     Ring::Close();
     const auto entries = Ring::ReadFile(path);
@@ -356,6 +362,8 @@ void CheckGuestWriteRing() {
     Require(has(Ring::Kind::CpuStore, base + 16384 + 5, 4), "WriteChanged did not record the bytes it changed");
     Require(has(Ring::Kind::CpuStore, base + 20480, 64), "Write left no CPU entry with its call site in the guest write ring");
     Require(std::any_of(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(Ring::Kind::Unwatch) && entry.tag == Ring::PathTag("Unwatch"); }), "an unwatch left no entry with its path in the guest write ring");
+    const auto windows = std::count_if(entries.begin(), entries.end(), [&](const Ring::Entry& entry) { return entry.kind == static_cast<std::uint8_t>(Ring::Kind::PublishWindowCpuStore); });
+    Require(windows == 1 && has(Ring::Kind::PublishWindowCpuStore, base + Block, static_cast<std::uint32_t>(Block)), "the store window check does not name exactly the block a CPU store reached after the decision");
     std::filesystem::remove(path);
 }
 
