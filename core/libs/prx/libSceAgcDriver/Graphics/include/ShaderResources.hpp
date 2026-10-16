@@ -8,6 +8,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <limits>
 #include <list>
@@ -661,6 +662,10 @@ public:
     static std::uint64_t Finds();
     static std::uint64_t Touches();
     void Clear();
+    // Moves (before the map changes, under the cache mutex) with every insert, removal, eviction and
+    // clear; a lookup's LRU touch does not move it. A caller that found (or missed) a key at
+    // generation G and still reads G later knows a new lookup of that key returns the same object.
+    std::uint64_t Generation() const { return generation.load(std::memory_order_acquire); }
     std::size_t Size() const;
     std::size_t Capacity() const;
     void SetBase(std::size_t entries, std::size_t shrinkWindow);
@@ -683,6 +688,7 @@ private:
         }
     };
     mutable std::mutex mutex;
+    std::atomic<std::uint64_t> generation{0};
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     std::size_t capacity = 0;
