@@ -13,6 +13,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
@@ -117,6 +121,136 @@ DepthSamplingState prepareDepthSampling(const Context& context, const DepthTarge
     for (const auto& range : state.initial) GuestMemory::CollectWritesUncached(range.address, range.bytes);
     if (!GuestMemory::UnchangedSinceAll(state.initial)) return refuse("guest writes raced native multisample depth import");
     return state;
+}
+
+// Lab: UAV clears of depth planes (StorageImageClear in DepthSurface.hpp). 0 off, 1 the lever, 2 the lever with a
+// read-back check of the first sixteen clears and every APS5_LAB_DEPTH_CLEAR_VERIFY_EVERY-th (default 8) after.
+std::atomic<int> depthClearModeForced{-1};
+std::atomic<std::uint32_t> depthClearPerturb{0};
+
+int depthClearMode() {
+    const int forced = depthClearModeForced.load(std::memory_order_relaxed);
+    if (forced >= 0) return forced;
+    static const int mode = [] {
+        const char* verify = std::getenv("APS5_LAB_DEPTH_CLEAR_VERIFY");
+        if (verify != nullptr && verify[0] != '\0' && verify[0] != '0') return 2;
+        const char* lever = std::getenv("APS5_LAB_DEPTH_CLEAR_HLE");
+        return lever != nullptr && lever[0] != '\0' && lever[0] != '0' ? 1 : 0;
+    }();
+    return mode;
+}
+
+enum DepthClearDecline : std::size_t { DeclineLayers, DeclineFormat, DeclineValue, DeclineColor, DeclinePending, DeclineCoverage, DeclineSize, DeclineCount };
+static_assert(DeclineCount <= 8, "DepthClearStatistics::declined holds eight reasons");
+
+struct DepthClearCounters {
+    std::atomic<std::uint64_t> matched{0};
+    std::atomic<std::uint64_t> taken{0};
+    std::atomic<std::uint64_t> copiesSkipped{0};
+    std::atomic<std::uint64_t> clears{0};
+    std::atomic<std::uint64_t> bytesSkipped{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> violations{0};
+    std::array<std::atomic<std::uint64_t>, 8> declined{};
+};
+
+DepthClearCounters& depthClearCounters() {
+    static DepthClearCounters counters;
+    return counters;
+}
+
+// The clear the calling thread's dispatch is recorded under (DepthPlaneClear), if any.
+thread_local DepthPlaneOverwrite* currentOverwrite = nullptr;
+
+void printDepthClearCounters() {
+    static std::mutex mutex;
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    const auto& c = depthClearCounters();
+    const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    char line[640];
+    std::snprintf(line, sizeof(line), "[depthclear] mode %d: %llu clear dispatches over depth planes, %llu taken (%llu copy-ins left out, %llu copy-outs replaced by a depth clear, %.0f MiB not copied); declined: layers %llu format %llu value %llu color %llu pending %llu coverage %llu size %llu; verified %llu, violations %llu\n",
+        depthClearMode(), count(c.matched), count(c.taken), count(c.copiesSkipped), count(c.clears), static_cast<double>(c.bytesSkipped.load(std::memory_order_relaxed)) / 1048576.0,
+        count(c.declined[DeclineLayers]), count(c.declined[DeclineFormat]), count(c.declined[DeclineValue]), count(c.declined[DeclineColor]), count(c.declined[DeclinePending]), count(c.declined[DeclineCoverage]), count(c.declined[DeclineSize]),
+        count(c.verified), count(c.violations));
+    std::fputs(line, stderr);
+}
+
+// What the kernel stores into every texel, as the plane holds it: the 16 or 32 bits of the texel and the depth that
+// clears the depth image to them. Nullopt when the clear cannot be taken exactly (the reason counted).
+std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clear) {
+    auto& counters = depthClearCounters();
+    ++counters.matched;
+    const auto decline = [&](DepthClearDecline why) -> std::optional<DepthPlaneOverwrite> {
+        ++counters.declined[why];
+        return std::nullopt;
+    };
+    DepthPlaneOverwrite overwrite;
+    overwrite.image = clear.image;
+    try {
+        overwrite.view = DecodeTextureResource(clear.image);
+    } catch (...) {
+        return decline(DeclineFormat);
+    }
+    const auto& view = overwrite.view;
+    const bool oneLayer = view.dimension == TextureDimension::k2D || (view.dimension == TextureDimension::k2DArray && view.baseArray == 0 && view.depthOrLastArray == 0);
+    if (!oneLayer || view.baseLevel != 0) return decline(DeclineLayers);
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    try {
+        format = ResolveTextureFormat(view.format);
+    } catch (...) {
+        return decline(DeclineFormat);
+    }
+    enum class Kind { Unorm16, Uint16, Float32, Uint32 };
+    Kind kind;
+    switch (format) {
+        case VK_FORMAT_R16_UNORM: kind = Kind::Unorm16; break;
+        case VK_FORMAT_R16_UINT: kind = Kind::Uint16; break;
+        case VK_FORMAT_R32_SFLOAT: kind = Kind::Float32; break;
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32_SINT: kind = Kind::Uint32; break;
+        default: return decline(DeclineFormat);
+    }
+    // The colour: s_buffer_load_dwordx4 at offset 0 of the V# in user data 8-11. A one-channel image takes the x channel.
+    const std::uint64_t base = clear.color[0] | (static_cast<std::uint64_t>(clear.color[1] & 0xffffu) << 32u);
+    const std::uint64_t stride = (clear.color[1] >> 16u) & 0x3fffu;
+    const std::uint64_t extent = stride == 0 ? clear.color[2] : static_cast<std::uint64_t>(clear.color[2]) * stride;
+    if (base == 0 || (base & 3u) != 0u || extent < 16u || !GuestMemory::Accessible(reinterpret_cast<const void*>(base), 16)) return decline(DeclineColor);
+    if (const auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(base, 16)) return decline(DeclinePending);
+    const std::pair<std::uint64_t, std::uint64_t> colorRange{base, base + 16u};
+    if (StorageTexture::AnyPendingOverlaps(std::span(&colorRange, 1))) return decline(DeclinePending);
+    std::uint32_t c0 = 0;
+    GuestMemory::Read(base, std::as_writable_bytes(std::span(&c0, 1)), 4);
+    switch (kind) {
+        case Kind::Unorm16:
+            if (c0 == 0u || c0 == 0x80000000u) overwrite.raw = 0u;
+            else if (c0 == 0x3f800000u) overwrite.raw = 0xffffu;
+            else return decline(DeclineValue);
+            overwrite.bits = 16u;
+            overwrite.depth = static_cast<float>(overwrite.raw) / 65535.0f;
+            break;
+        case Kind::Uint16:
+            if (c0 > 0xffffu) return decline(DeclineValue);
+            overwrite.raw = c0;
+            overwrite.bits = 16u;
+            overwrite.depth = static_cast<float>(overwrite.raw) / 65535.0f;
+            break;
+        case Kind::Float32:
+        case Kind::Uint32: {
+            const auto depth = std::bit_cast<float>(c0);
+            if (c0 != 0u && !(std::isnormal(depth) && depth > 0.0f && depth <= 1.0f)) return decline(DeclineValue);
+            overwrite.raw = c0;
+            overwrite.bits = 32u;
+            overwrite.depth = depth;
+            break;
+        }
+    }
+    overwrite.width = clear.width;
+    overwrite.height = clear.height;
+    return overwrite;
 }
 
 class DepthSurface {
@@ -249,6 +383,10 @@ public:
     }
 
     void RecordClear(VkImageAspectFlags aspects) {
+        RecordClearValue(aspects, clearDepth, clearStencil);
+    }
+
+    void RecordClearValue(VkImageAspectFlags aspects, float depth, std::uint8_t stencil) {
         written = ++depthWrites;
         auto* recorder = RecorderFor(context);
         std::unique_ptr<CommandBatch> batch;
@@ -257,7 +395,7 @@ public:
         const VkImageSubresourceRange range{aspects, 0, 1, 0, 1};
         constexpr VkAccessFlags access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access, VK_ACCESS_TRANSFER_WRITE_BIT);
-        const VkClearDepthStencilValue clear{clearDepth, clearStencil};
+        const VkClearDepthStencilValue clear{depth, stencil};
         context.Function<PFN_vkCmdClearDepthStencilImage>("vkCmdClearDepthStencilImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, access);
         if (batch) batch->SubmitAndWait();
@@ -400,6 +538,7 @@ public:
             throw std::runtime_error(text);
         }
         RequireStorable(resource);
+        auto* overwrite = stencil ? nullptr : PlaneOverwritten(words);
         ApplyFastClear();
         auto& plane = stencil ? stencilPlane : depthPlane;
         if (plane.storage == nullptr || plane.storage->Descriptor().format != resource.format || plane.storage->Descriptor().tileMode != resource.tileMode || plane.storage->Descriptor().baseAddress != resource.baseAddress || plane.storage->Descriptor().dimension != resource.dimension) {
@@ -407,15 +546,129 @@ public:
             if (plane.storage != nullptr) plane.replaced.push_back(plane.storage);
             plane.storage = StorageTexture::Create(context, *context.detiler, resource, 0);
         }
-        copyPlane(plane, plane.storage, stencil, true);
+        if (overwrite != nullptr) {
+            // The dispatch stores one value to every texel of the plane and reads none: the mirror needs no copy of the depth image.
+            overwrite->armed = true;
+            ++depthClearCounters().copiesSkipped;
+        } else {
+            copyPlane(plane, plane.storage, stencil, true);
+        }
         return plane.storage;
+    }
+
+    // The clear (DepthPlaneClear) the calling thread's dispatch is recorded under, when it stores through `words` to every texel of this plane.
+    DepthPlaneOverwrite* PlaneOverwritten(std::span<const std::uint32_t> words) const {
+        auto* overwrite = currentOverwrite;
+        if (overwrite == nullptr || words.size() < overwrite->image.size() || !std::equal(overwrite->image.begin(), overwrite->image.end(), words.begin())) return nullptr;
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        auto& declined = depthClearCounters().declined;
+        if (overwrite->bits != (d16 ? 16u : 32u)) {
+            ++declined[DeclineSize];
+            return nullptr;
+        }
+        if (overwrite->width < target.extent.width || overwrite->height < target.extent.height) {
+            ++declined[DeclineCoverage];
+            return nullptr;
+        }
+        return overwrite;
+    }
+
+    // The dispatch recorded under a DepthPlaneClear stored its value to every texel of `mirror` (its copy-in was left
+    // out): the depth image takes the value by a clear, which is what the copy-out would have written.
+    bool StoreOverwrite(const StorageTexture& mirror) {
+        auto* overwrite = currentOverwrite;
+        if (overwrite == nullptr || !overwrite->armed) return false;
+        const auto& described = mirror.Descriptor();
+        const auto& view = overwrite->view;
+        if (described.baseAddress != view.baseAddress || described.format != view.format || described.tileMode != view.tileMode || described.dimension != view.dimension) return false;
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "depth surface storage clears need an active recorder");
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto bytes = static_cast<std::size_t>(target.extent.width) * target.extent.height * (d16 ? 2u : 4u);
+        recorder->Commands();
+        const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
+        RecordClearValue(VK_IMAGE_ASPECT_DEPTH_BIT, overwrite->depth, clearStencil);
+        recorder->EndGpuTiming(timing, bytes);
+        auto& counters = depthClearCounters();
+        ++counters.clears;
+        counters.bytesSkipped += 2u * bytes;
+        overwrite->armed = false;
+        if (depthClearMode() >= 2) VerifyOverwrite(mirror, *overwrite);
+        printDepthClearCounters();
+        return true;
+    }
+
+    // Verify mode: reads the mirror (what the kernel stored) and the depth image (what the clear stored) back when the
+    // batch completes and counts every texel that differs from the value the lever predicted.
+    void VerifyOverwrite(const StorageTexture& mirror, const DepthPlaneOverwrite& overwrite) {
+        static std::atomic<std::uint64_t> seen{0};
+        static const std::uint64_t every = [] {
+            const char* text = std::getenv("APS5_LAB_DEPTH_CLEAR_VERIFY_EVERY");
+            const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+            return value != 0ull ? value : 8ull;
+        }();
+        const auto index = seen.fetch_add(1, std::memory_order_relaxed);
+        if (index >= 16u && index % every != 0u) return;
+        auto* recorder = Recorder::Active();
+        Require(recorder != nullptr, "depth surface storage clear checks need an active recorder");
+        const std::uint32_t texelBytes = overwrite.bits / 8u;
+        const std::size_t texels = static_cast<std::size_t>(target.extent.width) * target.extent.height;
+        auto fromMirror = std::make_shared<Buffer>(context, texels * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto fromDepth = std::make_shared<Buffer>(context, texels * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder->Commands();
+        recorder->Keep(std::const_pointer_cast<StorageTexture>(mirror.shared_from_this()));
+        VkBufferImageCopy depthRegion{0, 0, 0, {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+        VkBufferImageCopy colorRegion = depthRegion;
+        colorRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const auto copy = context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+        copy(commands, mirror.Image(), VK_IMAGE_LAYOUT_GENERAL, fromMirror->Handle(), 1, &colorRegion);
+        copy(commands, image, VK_IMAGE_LAYOUT_GENERAL, fromDepth->Handle(), 1, &depthRegion);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        const std::uint32_t expected = overwrite.raw ^ depthClearPerturb.load(std::memory_order_relaxed);
+        const auto plane = target.address;
+        const auto width = target.extent.width;
+        const auto height = target.extent.height;
+        recorder->OnComplete([fromMirror, fromDepth, expected, texelBytes, texels, plane, width, height] {
+            struct Mismatch {
+                std::uint64_t count = 0;
+                std::size_t first = 0;
+                std::uint32_t value = 0;
+            };
+            const auto scan = [&](Buffer& buffer) {
+                buffer.Invalidate();
+                const auto bytes = buffer.Bytes();
+                Mismatch found;
+                for (std::size_t texel = 0; texel < texels; ++texel) {
+                    std::uint32_t word = 0;
+                    std::memcpy(&word, bytes.data() + texel * texelBytes, texelBytes);
+                    if (word == expected) continue;
+                    if (found.count++ == 0) {
+                        found.first = texel;
+                        found.value = word;
+                    }
+                }
+                return found;
+            };
+            const auto mirrorBad = scan(*fromMirror);
+            const auto depthBad = scan(*fromDepth);
+            auto& counters = depthClearCounters();
+            if (mirrorBad.count != 0 || depthBad.count != 0) {
+                ++counters.violations;
+                std::fprintf(stderr, "[depthclear] VIOLATION plane 0x%llx %ux%u: every texel should hold %08x; the mirror after the dispatch differs at %llu texels (first %zu holds %08x), the depth image after the clear differs at %llu texels (first %zu holds %08x)\n",
+                    static_cast<unsigned long long>(plane), width, height, expected, static_cast<unsigned long long>(mirrorBad.count), mirrorBad.first, mirrorBad.value, static_cast<unsigned long long>(depthBad.count), depthBad.first, depthBad.value);
+                return;
+            }
+            const auto verified = ++counters.verified;
+            if (verified <= 4u || verified % 64u == 0u) std::fprintf(stderr, "[depthclear] verified plane 0x%llx %ux%u: all %zu texels of the mirror and of the depth image hold %08x (%llu checked)\n", static_cast<unsigned long long>(plane), width, height, texels, expected, static_cast<unsigned long long>(verified));
+        });
     }
 
     bool StoreBack(const StorageTexture& candidate) {
         for (const bool stencil : {false, true}) {
             auto& plane = stencil ? stencilPlane : depthPlane;
             if (plane.storage.get() == &candidate) {
-                copyPlane(plane, plane.storage, stencil, false);
+                if (stencil || !StoreOverwrite(candidate)) copyPlane(plane, plane.storage, stencil, false);
                 written = ++depthWrites;
                 return true;
             }
@@ -1263,6 +1516,71 @@ void NoteMemoryValueFill(const MemoryValueFill& fill) {
     std::uint32_t value = 0;
     GuestMemory::Read(fill.valueAddress, std::as_writable_bytes(std::span(&value, 1)), 4);
     NoteDepthMetadataFill(fill.address, fill.bytes, value);
+}
+
+std::optional<StorageImageClear> MatchStorageImageClear(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::array<std::uint32_t, 3>& groups) {
+    // x = group.x * 8 + thread.x; colour = s_buffer_load_dwordx4 s[8:11] (the V# in user data 8-11) at offset 0; y = group.y * 8 + thread.y;
+    // layer = group.z; image_store colour, (x, y, layer) through the T# in user data 0-7. s12-s14 are the group ids when 12 user registers precede them.
+    static constexpr std::array<std::uint32_t, 15> kernel{0xd7460004u, 0x0401060cu, 0xf4280204u, 0xfa000000u, 0xd7460005u, 0x0405060du, 0x7e0c020eu, 0xbf8cc07fu, 0x7e000208u, 0x7e020209u, 0x7e04020au, 0x7e06020bu, 0xf0200f28u, 0x00000004u, 0xbf810000u};
+    if (userData.size() != 12u || compute.numThreads != std::array<std::uint32_t, 3>{8u, 8u, 1u}) return std::nullopt;
+    if (!compute.groupIdEnable[0] || !compute.groupIdEnable[1] || !compute.groupIdEnable[2] || compute.threadIdComponentCount < 2u) return std::nullopt;
+    if (code.size() < kernel.size() || !std::equal(kernel.begin(), kernel.end(), code.begin())) return std::nullopt;
+    std::array<std::uint64_t, 3> covered{};
+    for (std::size_t axis = 0; axis < 3u; ++axis) covered[axis] = compute.partialThreads[axis] != 0u ? compute.partialThreads[axis] : static_cast<std::uint64_t>(groups[axis]) * compute.numThreads[axis];
+    if (covered[0] == 0u || covered[1] == 0u || covered[2] != 1u) return std::nullopt;
+    StorageImageClear clear;
+    std::copy_n(userData.begin(), clear.image.size(), clear.image.begin());
+    std::copy_n(userData.begin() + static_cast<std::ptrdiff_t>(clear.image.size()), clear.color.size(), clear.color.begin());
+    clear.width = static_cast<std::uint32_t>(std::min<std::uint64_t>(covered[0], std::numeric_limits<std::uint32_t>::max()));
+    clear.height = static_cast<std::uint32_t>(std::min<std::uint64_t>(covered[1], std::numeric_limits<std::uint32_t>::max()));
+    return clear;
+}
+
+std::uint64_t StorageImageClearAddress(const StorageImageClear& clear) {
+    try {
+        return DecodeTextureResource(clear.image).baseAddress;
+    } catch (...) {
+        return 0u;
+    }
+}
+
+bool DepthPlaneClearEnabled() {
+    return depthClearMode() != 0;
+}
+
+DepthPlaneClear::DepthPlaneClear(const StorageImageClear& clear) {
+    if (depthClearMode() == 0) return;
+    if (auto decoded = decodeOverwrite(clear)) {
+        value = *decoded;
+        previous = currentOverwrite;
+        currentOverwrite = &value;
+        installed = true;
+        ++depthClearCounters().taken;
+    }
+    printDepthClearCounters();
+}
+
+DepthPlaneClear::~DepthPlaneClear() {
+    if (installed) currentOverwrite = previous;
+}
+
+DepthClearStatistics DepthClearCounts() {
+    const auto& counters = depthClearCounters();
+    DepthClearStatistics statistics;
+    statistics.matched = counters.matched.load();
+    statistics.taken = counters.taken.load();
+    statistics.copiesSkipped = counters.copiesSkipped.load();
+    statistics.clears = counters.clears.load();
+    statistics.bytesSkipped = counters.bytesSkipped.load();
+    statistics.verified = counters.verified.load();
+    statistics.violations = counters.violations.load();
+    for (std::size_t reason = 0; reason < statistics.declined.size(); ++reason) statistics.declined[reason] = counters.declined[reason].load();
+    return statistics;
+}
+
+void SetDepthClearModeForTest(int mode, std::uint32_t perturb) {
+    depthClearModeForced.store(mode, std::memory_order_relaxed);
+    depthClearPerturb.store(perturb, std::memory_order_relaxed);
 }
 
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments) {
