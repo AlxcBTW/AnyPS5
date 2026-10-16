@@ -193,6 +193,18 @@ public:
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    // Lab notes: where the storage images this use binds live. `images` counts every storage image (a sampled texture's storage
+    // source included), `written` those the shader writes, `host` and `hostWritten` the ones whose memory the device-local budget
+    // placed in host memory (StorageTexture::HostPlaced), `bytes` and `hostBytes` their allocations.
+    struct ImagePlacement {
+        std::uint32_t images = 0;
+        std::uint32_t written = 0;
+        std::uint32_t host = 0;
+        std::uint32_t hostWritten = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t hostBytes = 0;
+    };
+    ImagePlacement StoragePlacement() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;

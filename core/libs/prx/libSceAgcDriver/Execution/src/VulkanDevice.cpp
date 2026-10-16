@@ -4394,8 +4394,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         if (!resources.HoldsLease()) {
             for (const auto& [begin, end] : resources.InPlaceReads()) inPlaceBytes += end - begin;
         }
-        char text[384];
-        std::snprintf(text, sizeof(text), "DISPATCH prog=0x%llx grp=%ux%ux%u sg=%u lds=%u ind=%d inplace=%.2fMiB imgs=%zu lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.shader->program->hostSubgroupSize, record.shader->program->workgroupMemoryDwords, argumentImport != nullptr ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, resources.StorageImages().size(), resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
+        const auto placement = resources.StoragePlacement();
+        char text[512];
+        std::snprintf(text, sizeof(text), "DISPATCH prog=0x%llx grp=%ux%ux%u sg=%u lds=%u ind=%d inplace=%.2fMiB imgs=%zu imgw=%u hostimgs=%u hostw=%u imgmib=%.1f hostimgmib=%.1f lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.shader->program->hostSubgroupSize, record.shader->program->workgroupMemoryDwords, argumentImport != nullptr ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, resources.StorageImages().size(), placement.written, placement.host, placement.hostWritten, static_cast<double>(placement.bytes) / 1048576.0, static_cast<double>(placement.hostBytes) / 1048576.0, resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
         recorder.LabNote(gpuTiming, text);
     }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));

@@ -4714,6 +4714,26 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     return images;
 }
 
+ShaderResources::ImagePlacement ShaderResources::StoragePlacement() const {
+    ImagePlacement placement;
+    const auto add = [&](const StorageTexture& image, bool written) {
+        ++placement.images;
+        placement.bytes += image.AllocationBytes();
+        if (written) ++placement.written;
+        if (!image.HostPlaced()) return;
+        ++placement.host;
+        placement.hostBytes += image.AllocationBytes();
+        if (written) ++placement.hostWritten;
+    };
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageTextures[index] != nullptr) add(*storageTextures[index], storageWritten[index]);
+    }
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr) add(*texture->StorageSource(), false);
+    }
+    return placement;
+}
+
 bool ShaderResources::HasCachedStorageImages() const {
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& image) { return image != nullptr && !image->Cached(); })) return false;
     return std::none_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->StorageSource() != nullptr && !texture->StorageSource()->Cached(); });

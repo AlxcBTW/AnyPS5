@@ -1765,7 +1765,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (Recorder::LabLogging()) {
         // Lab only (APS5_LAB_RANGELOG): what the pass (first draw) and every draw of it are, for the [labrange] line.
         std::string note;
-        char text[480];
+        char text[640];
         if (!continued) {
             std::snprintf(text, sizeof(text), "PASS why=%s readsTarget=%d gpuInd=%d meshInd=%d capture=%d fenced=%d barrier=%d extent=%ux%u spp=%u layers=%u", start.reason, readsTarget ? 1 : 0, gpuIndirect ? 1 : 0, meshIndirect ? 1 : 0, capture ? 1 : 0, fenced ? 1 : 0, start.barrier ? 1 : 0, state.renderExtent.width, state.renderExtent.height, state.samples, state.renderLayers);
             note += text;
@@ -1777,6 +1777,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 std::snprintf(text, sizeof(text), " depth=0x%llx:%ux%u:f%d", static_cast<unsigned long long>(state.depth->address), state.depth->extent.width, state.depth->extent.height, static_cast<int>(state.depth->format));
                 note += text;
             }
+            std::uint32_t hostTargets = 0;
+            for (const auto& target : record.targets) {
+                if (target != nullptr && target->HostPlaced()) ++hostTargets;
+            }
+            std::snprintf(text, sizeof(text), " hosttargets=%u of %zu", hostTargets, record.targets.size());
+            note += text;
             note += " | ";
         }
         std::uint64_t inPlaceBytes = 0, deviceBytes = 0;
@@ -1786,7 +1792,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         std::uint32_t blends = 0;
         for (const auto& blend : state.blends) blends += blend.blendEnable == VK_TRUE ? 1u : 0u;
-        std::snprintf(text, sizeof(text), "DRAW vs=0x%llx ps=0x%llx %s=%u inst=%u ind=%d topo=%d rect=%d blend=%u dtest=%d dwrite=%d inplace=%.2fMiB dev=%.2fMiB imgs=%zu lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(draw.labVertex), static_cast<unsigned long long>(draw.labFragment), draw.indexed ? "idx" : "vtx", draw.indexCount, draw.instanceCount, draw.indirect ? 1 : 0, static_cast<int>(state.topology), state.rectList ? 1 : 0, blends, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, static_cast<double>(deviceBytes) / 1048576.0, resources.StorageImages().size(), resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
+        const auto placement = resources.StoragePlacement();
+        std::snprintf(text, sizeof(text), "DRAW vs=0x%llx ps=0x%llx %s=%u inst=%u ind=%d topo=%d rect=%d blend=%u dtest=%d dwrite=%d inplace=%.2fMiB dev=%.2fMiB imgs=%zu hostimgs=%u hostimgmib=%.1f lease=%d bda=%d copied=%zu", static_cast<unsigned long long>(draw.labVertex), static_cast<unsigned long long>(draw.labFragment), draw.indexed ? "idx" : "vtx", draw.indexCount, draw.instanceCount, draw.indirect ? 1 : 0, static_cast<int>(state.topology), state.rectList ? 1 : 0, blends, state.depthTest ? 1 : 0, state.depthWrite ? 1 : 0, static_cast<double>(inPlaceBytes) / 1048576.0, static_cast<double>(deviceBytes) / 1048576.0, resources.StorageImages().size(), placement.host, static_cast<double>(placement.hostBytes) / 1048576.0, resources.HoldsLease() ? 1 : 0, resources.UsesAddressTable() ? 1 : 0, resources.CopiedBytes());
         labDrawNote = text;
         note += text;
         recorder->LabNotePass(drawTiming, note);
