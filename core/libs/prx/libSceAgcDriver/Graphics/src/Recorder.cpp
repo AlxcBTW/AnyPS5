@@ -2876,6 +2876,16 @@ bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
 }
 
+std::uint64_t Recorder::PendingWriteSerial(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (!overlaps(**it, address, end)) continue;
+        return fenceStatus((*it)->fence) == VK_SUCCESS ? 0 : (*it)->serial;
+    }
+    return 0;
+}
+
 bool Recorder::signaled(const Batch& batch) const {
     return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
 }

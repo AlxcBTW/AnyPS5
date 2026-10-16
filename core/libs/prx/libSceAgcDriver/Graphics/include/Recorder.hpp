@@ -172,6 +172,11 @@ public:
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    // APS5_LAB_WAIT_DEFER=2: the serial of the newest SUBMITTED batch that notes a write over the range (a label's
+    // store included) and has not finished, for WaitSerial without the mutex (HasTimeline); 0 when no submitted
+    // batch notes a write there or the newest one's fence already signaled. The open batch is not considered: the
+    // caller submits it first when OpenWriteOverlaps.
+    std::uint64_t PendingWriteSerial(std::uint64_t address, std::size_t bytes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the

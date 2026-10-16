@@ -7,7 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -37,12 +39,28 @@ void PollSleep() {
     std::this_thread::sleep_for(std::chrono::microseconds(200));
 }
 
-bool Driver::waitDeferEnabled() {
-    static const bool on = [] {
+namespace {
+
+// APS5_LAB_WAIT_DEFER: bit 0 the deferral of step 1, bit 1 landings that wait on the producer's timeline serial.
+unsigned WaitDeferBits() {
+    static const unsigned bits = [] {
         const char* text = std::getenv("APS5_LAB_WAIT_DEFER");
-        return text != nullptr && *text != 0 && std::strcmp(text, "0") != 0;
+        if (text == nullptr || *text == 0 || std::strcmp(text, "0") == 0) return 0u;
+        if (std::strcmp(text, "2") == 0) return 3u;
+        if (std::strcmp(text, "2s") == 0) return 2u;
+        return 1u;
     }();
-    return on;
+    return bits;
+}
+
+}
+
+bool Driver::waitDeferEnabled() {
+    return (WaitDeferBits() & 1u) != 0;
+}
+
+bool Driver::waitTimelineLanding() {
+    return (WaitDeferBits() & 2u) != 0;
 }
 
 namespace {
@@ -78,6 +96,44 @@ void ReportDeferStats() {
 }
 
 void DeferCount(std::atomic<std::uint64_t>& value, std::uint64_t amount = 1) { value.fetch_add(amount, std::memory_order_relaxed); }
+
+// APS5_LAB_WAIT_DEFER=2 / 2s counters, printed as one [waitdefer2] line every 10 s.
+constexpr std::size_t LandCauseCount = 8;
+struct TimelineStats {
+    // Landings by what forced them (deferred and plain ones), those that found the compare unsatisfied, and the time they waited.
+    std::array<std::atomic<std::uint64_t>, LandCauseCount> lands{}, waited{}, waitedUs{};
+    // Landings that began a timeline wait attempt, and how each attempt ended: the producer's batch was waited for on the GPU
+    // (and the compare then held / did not hold), or nothing submitted notes a write over the label (still polling).
+    std::atomic<std::uint64_t> attempts{0}, waits{0}, waitUs{0}, held{0}, notHeld{0}, noTarget{0}, openSubmits{0}, skippedQueue0Dormant{0};
+    // Deferred waits (step 1) by what the landing found: the worker translated for the whole gap while the label was pending
+    // (exact when the landing then had to wait), or the label may have landed earlier in the gap (an upper bound).
+    std::atomic<std::uint64_t> savedExactUs{0}, savedUpperUs{0}, deferredLands{0};
+    std::atomic<std::int64_t> reported{0};
+} timelineStats;
+
+constexpr const char* LandCauseNames[LandCauseCount] = {"effect", "predicated", "dispatch", "draw", "cond_exec", "read", "end", "other"};
+
+void ReportTimelineStats() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = timelineStats.reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        timelineStats.reported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !timelineStats.reported.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    char causes[512];
+    int length = 0;
+    for (std::size_t i = 0; i < LandCauseCount && length < 440; ++i) {
+        const auto lands = take(timelineStats.lands[i]), waited = take(timelineStats.waited[i]), waitedUs = take(timelineStats.waitedUs[i]);
+        if (lands != 0) length += std::snprintf(causes + length, sizeof(causes) - static_cast<std::size_t>(length), " %s %llu/%llu/%.1f ms", LandCauseNames[i], lands, waited, waitedUs / 1000.0);
+    }
+    causes[length] = 0;
+    const auto attempts = take(timelineStats.attempts), waits = take(timelineStats.waits), waitUs = take(timelineStats.waitUs), held = take(timelineStats.held), notHeld = take(timelineStats.notHeld), noTarget = take(timelineStats.noTarget), openSubmits = take(timelineStats.openSubmits), dormant = take(timelineStats.skippedQueue0Dormant);
+    const auto exactUs = take(timelineStats.savedExactUs), upperUs = take(timelineStats.savedUpperUs), deferredLands = take(timelineStats.deferredLands);
+    AgcDriver::ProfilePrint_nid_no_patch("[waitdefer2] (10 s): landings by cause (landings/found unsatisfied/ms waited):%s; timeline: %llu landings tried, %llu waited on the GPU for %.1f ms (compare held after %llu, not after %llu), no submitted batch noting the label %llu, open batch submitted %llu, skipped with queue 0 dormant %llu; deferred waits landed %llu: translation overlapped %.1f ms exactly (landing had to wait), up to %.1f ms more (landing found it satisfied)\n",
+                                         causes, attempts, waits, waitUs / 1000.0, held, notHeld, noTarget, openSubmits, dormant, deferredLands, exactUs / 1000.0, upperUs / 1000.0);
+}
 
 }
 
@@ -132,7 +188,8 @@ void Driver::notePendingWait(std::span<const std::uint32_t> packet, std::uint32_
     waits.push_back(wait);
 }
 
-void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
+void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred, LandCause cause) {
+    static_assert(static_cast<std::size_t>(LandCause::Count) == LandCauseCount);
     auto& waits = pendingWaits();
     if (waits.empty()) return;
     if (onlyDeferred && std::none_of(waits.begin(), waits.end(), [](const PendingWait& wait) { return wait.deferred; })) return;
@@ -143,6 +200,7 @@ void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
         std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
     };
     static thread_local LandStats stats;
+    const bool timelineCounts = waitTimelineLanding();
     const PacketHistory none{};
     std::vector<PendingWait> kept;
     for (const auto& wait : waits) {
@@ -153,12 +211,21 @@ void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         ++stats.lands;
         const auto started = std::chrono::steady_clock::now();
+        std::uint64_t gapUs = 0;
         if (wait.deferred) {
+            gapUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(started - wait.noted).count());
             DeferCount(deferStats.lands);
-            DeferCount(deferStats.gapUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(started - wait.noted).count()));
+            DeferCount(deferStats.gapUs, gapUs);
         }
+        if (timelineCounts) DeferCount(timelineStats.lands[static_cast<std::size_t>(cause)]);
         if (Pm4::WaitSatisfiedUnchecked(packet)) {
-            if (wait.deferred) DeferCount(deferStats.landedFree);
+            if (wait.deferred) {
+                DeferCount(deferStats.landedFree);
+                if (timelineCounts) {
+                    DeferCount(timelineStats.deferredLands);
+                    DeferCount(timelineStats.savedUpperUs, gapUs);
+                }
+            }
             continue;
         }
         waitMemory(packet, queue, none, wait.received, false, true, wait.deferred);
@@ -166,6 +233,10 @@ void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
         ++stats.waited;
         stats.waitedMs += ms;
         stats.maxMs = std::max(stats.maxMs, ms);
+        if (timelineCounts) {
+            DeferCount(timelineStats.waited[static_cast<std::size_t>(cause)]);
+            DeferCount(timelineStats.waitedUs[static_cast<std::size_t>(cause)], static_cast<std::uint64_t>(ms * 1000.0));
+        }
         if (wait.deferred) {
             const auto us = static_cast<std::uint64_t>(ms * 1000.0);
             DeferCount(deferStats.landedWaited);
@@ -173,11 +244,16 @@ void Driver::landPendingWaits(std::uint32_t queue, bool onlyDeferred) {
             auto seen = deferStats.maxUs.load(std::memory_order_relaxed);
             while (seen < us && !deferStats.maxUs.compare_exchange_weak(seen, us, std::memory_order_relaxed)) {
             }
+            if (timelineCounts) {
+                DeferCount(timelineStats.deferredLands);
+                DeferCount(timelineStats.savedExactUs, gapUs);
+            }
         }
     }
     if (onlyDeferred) waits = std::move(kept);
     else waits.clear();
     if (waitDeferEnabled()) ReportDeferStats();
+    if (timelineCounts) ReportTimelineStats();
     if (profile && std::chrono::steady_clock::now() - stats.reported > std::chrono::seconds(10)) {
         AgcDriver::ProfilePrint_nid_no_patch("[landwait] queue 0x%x (10 s): %llu waits landed before a guest read, %llu had to wait for the GPU: %.1f ms in total, max %.2f ms\n", queue, static_cast<unsigned long long>(stats.lands), static_cast<unsigned long long>(stats.waited), stats.waitedMs, stats.maxMs);
         stats = LandStats{};
@@ -479,6 +555,57 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint32_t polls = 0;
     StallWatch stall(queue);
     std::chrono::steady_clock::time_point settledAt{};
+
+    // APS5_LAB_WAIT_DEFER=2: a landing (the compare must hold in guest memory) of a compute worker waits for the producer's batch on
+    // the GPU timeline, without the mutex, instead of polling memory. Only the way the thread sleeps changes: the loop below
+    // re-reads memory after every wait and keeps polling when the compare still does not hold (a recycled slot, a label stored by a
+    // completion, a producer that is not recorded yet). The wait covers the newest submitted batch that notes a write over the
+    // label, so it ends at the latest when that batch's store ran. Queue 0 and a dormant queue 0 keep polling: their polls reap
+    // completions (flips, interrupts) that a blocked worker would leave to others.
+    const bool timelineLanding = requireMemory && queue != 0 && waitTimelineLanding();
+    std::uint64_t timelineWaited = 0;
+    bool timelineTried = false, timelineNoTarget = false, timelineDormant = false;
+    const auto landOnTimeline = [&] {
+        if (queue0Dormant.load(std::memory_order_relaxed)) {
+            if (!timelineDormant) {
+                timelineDormant = true;
+                DeferCount(timelineStats.skippedQueue0Dormant);
+            }
+            return false;
+        }
+        if (GuestMemory::GpuMutex().HeldByThisThread()) return false;
+        std::shared_ptr<VulkanDevice> target;
+        std::uint64_t serial = 0;
+        bool openSubmitted = false;
+        {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Wait);
+            std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+            if (!gpuLock.owns_lock()) return false;
+            target = device.Load();
+            if (target == nullptr || !target->CanWaitUnlocked()) return false;
+            openSubmitted = target->OpenWriteOverlaps(awaited, awaitedBytes);
+            serial = target->SubmitForWrites(awaited, awaitedBytes);
+        }
+        if (!timelineTried) {
+            timelineTried = true;
+            DeferCount(timelineStats.attempts);
+        }
+        if (openSubmitted) DeferCount(timelineStats.openSubmits);
+        if (serial == 0 || serial <= timelineWaited) {
+            if (timelineWaited == 0 && !timelineNoTarget) {
+                timelineNoTarget = true;
+                DeferCount(timelineStats.noTarget);
+            }
+            return false;
+        }
+        const auto begin = std::chrono::steady_clock::now();
+        target->WaitRecorded(serial);
+        timelineWaited = serial;
+        DeferCount(timelineStats.waits);
+        DeferCount(timelineStats.waitUs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - begin).count()));
+        DeferCount(Pm4::WaitSatisfiedUnchecked(packet) ? timelineStats.held : timelineStats.notHeld);
+        return true;
+    };
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
@@ -497,6 +624,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             std::this_thread::yield();
         }
         CheckFailure();
+        if (timelineLanding && !spinning && landOnTimeline()) continue;
         if (pollService(!spinning)) {
             if (!deferredNow) account.outcome = 1;
             return;

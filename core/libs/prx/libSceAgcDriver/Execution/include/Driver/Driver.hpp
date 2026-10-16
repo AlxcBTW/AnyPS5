@@ -262,8 +262,13 @@ private:
     };
     static std::vector<PendingWait>& pendingWaits();
     static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, bool deferred = false);
-    void landPendingWaits(std::uint32_t queue, bool onlyDeferred = false);
+    // What forced a landing (APS5_LAB_WAIT_DEFER=2 counts the landings and their waits by cause).
+    enum class LandCause : std::uint8_t { Effect, Predicated, Dispatch, Draw, CondExec, Read, End, Other, Count };
+    void landPendingWaits(std::uint32_t queue, bool onlyDeferred = false, LandCause cause = LandCause::Other);
+    // APS5_LAB_WAIT_DEFER: unset or 0 off; 1 step 1 (deferral); 2 step 1 and landings that wait on the producer's timeline serial;
+    // 2s the timeline landings alone.
     static bool waitDeferEnabled();
+    static bool waitTimelineLanding();
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
         std::array<std::uint32_t, 5> packet{};

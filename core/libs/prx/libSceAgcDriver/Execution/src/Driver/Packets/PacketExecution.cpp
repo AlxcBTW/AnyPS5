@@ -185,7 +185,7 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
-        if (waitDeferEnabled() && landsDeferredWaits(header, opcode)) landPendingWaits(submission.queue, true);
+        if (waitDeferEnabled() && landsDeferredWaits(header, opcode)) landPendingWaits(submission.queue, true, LandCause::Effect);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueClockStorePacket(packet, opcode, submission.queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
@@ -211,7 +211,7 @@ void Driver::execute(const Submission& submission) {
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (predicated) {
-            landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue, false, LandCause::Predicated);
             recordQueuedLabelsBeforeRead(submission.queue);
             if (!Pm4::PredicationPasses(queue)) {
                 cursor = opcode == 0x3f ? submission.conditionalEnds.at(cursor) : nextCursor;
@@ -323,7 +323,7 @@ void Driver::execute(const Submission& submission) {
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
-            landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue, false, LandCause::Dispatch);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
@@ -355,7 +355,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
-            landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue, false, LandCause::Draw);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
@@ -387,13 +387,13 @@ void Driver::execute(const Submission& submission) {
             });
             finishDrawPacket(drawn);
         } else if (opcode == 0x22) {
-            landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue, false, LandCause::CondExec);
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto condition = Pm4::ReadCondition(packet);
             if (condition == 0) nextCursor = submission.conditionalEnds.at(cursor);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x COND_EXEC at DWORD %zu reads 0x%x at 0x%llx: %s %zu dwords\n", TraceMs(), submission.queue, cursor, condition, static_cast<unsigned long long>(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u)), condition == 0 ? "skips" : "executes", submission.conditionalEnds.at(cursor) - cursor - count);
         } else if (opcode == 0x91) {
-            landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue, false, LandCause::Read);
             recordQueuedLabelsBeforeRead(submission.queue);
             Pm4::Execute(packet, queue);
         } else if (sampleDump && !wroteOnGpu) {
@@ -416,7 +416,7 @@ void Driver::execute(const Submission& submission) {
     }
 
     // A submission is consumed only once its waits hold: a deferred one is verified before the end is visible.
-    if (waitDeferEnabled()) landPendingWaits(submission.queue, true);
+    if (waitDeferEnabled()) landPendingWaits(submission.queue, true, LandCause::End);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

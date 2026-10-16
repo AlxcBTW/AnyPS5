@@ -1238,6 +1238,34 @@ void rawLabelTests(Recorder& recorder) {
     Require(!Recorder::LookupLabelRaw(a, 4, 5, raw) && !Recorder::LookupLabelRaw(b, 8, 5, raw), "(7) entries outlived their batch");
 }
 
+// Recorder::PendingWriteSerial (APS5_LAB_WAIT_DEFER=2): the serial that lands the newest submitted write over a range.
+void pendingWriteSerialTests(Recorder& recorder) {
+    const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    constexpr std::uint64_t a = 0x75000, b = 0x75100;
+    recorder.Sync();
+    Require(recorder.PendingWriteSerial(a, 4) == 0 && recorder.PendingWriteSerial(a, 0) == 0, "(1) an empty recorder has a target");
+    recorder.NoteLabel(a, one, 10, 0);
+    Require(recorder.OpenWriteOverlaps(a, 4) && recorder.PendingWriteSerial(a, 4) == 0, "(2) the open batch is a target");
+    recorder.Submit();
+    const auto first = recorder.Submissions();
+    Require(!recorder.OpenWriteOverlaps(a, 4), "(3) the submitted batch is still open");
+    const auto target = recorder.PendingWriteSerial(a, 4);
+    // The GPU may have finished already (fence signaled): no target then.
+    Require(target == 0 || target == first, "(3) the label's batch is not the target");
+    Require(recorder.PendingWriteSerial(b, 4) == 0 && recorder.PendingWriteSerial(a + 8, 4) == 0, "(3) a range nothing writes has a target");
+    recorder.NoteLabel(a, one, 11, 0);
+    recorder.NoteLabel(b, one, 12, 0);
+    recorder.Submit();
+    const auto second = recorder.Submissions();
+    Require(second == first + 1, "(4) the second submit did not take the next serial");
+    const auto newest = recorder.PendingWriteSerial(a, 4);
+    Require(newest == 0 || newest == second, "(4) the newest batch writing the label is not the target");
+    const auto other = recorder.PendingWriteSerial(b, 4);
+    Require(other == 0 || other == second, "(4) the second label's batch is not the target");
+    recorder.Sync();
+    Require(recorder.PendingWriteSerial(a, 4) == 0 && recorder.PendingWriteSerial(b, 4) == 0, "(5) a finished batch is a target");
+}
+
 void largeLabelTests(Recorder& recorder) {
     constexpr std::uint64_t slot = 0x71000, small = slot + 0x10, outside = slot - 4, wide = 0x72000;
     const std::array<std::byte, 4> one{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
@@ -8329,6 +8357,13 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--label-table-only") {
+            rawLabelTests(recorder);
+            pendingWriteSerialTests(recorder);
+            std::cout << "label table tests passed
+";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--copied-direct-only") {
             copiedDirectOrderingTests(device, recorder);
             return 0;
@@ -8384,6 +8419,7 @@ int main(int argc, char** argv) {
             labelTests(recorder);
             lateLabelTests(recorder);
         rawLabelTests(recorder);
+        pendingWriteSerialTests(recorder);
             largeLabelTests(recorder);
             std::cout << "Completion label storage and ordering tests passed\n";
             return 0;
@@ -8539,6 +8575,7 @@ int main(int argc, char** argv) {
         labelTests(recorder);
         lateLabelTests(recorder);
         rawLabelTests(recorder);
+        pendingWriteSerialTests(recorder);
         largeLabelTests(recorder);
         unchangedSinceTests();
         closeRaceTests(device, recorder);
