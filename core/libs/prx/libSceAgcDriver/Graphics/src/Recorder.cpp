@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -1907,7 +1908,17 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
-std::uint32_t Recorder::beginTiming(std::uint64_t key) {
+std::uint32_t Recorder::BeginGpuTiming(CommandClass which, std::uint64_t tag) {
+    if (!GpuTimingEnabled()) return NoTiming;
+    Commands();
+    return beginTiming(ClassKey(which), tag);
+}
+
+const char* Recorder::CommandClassName(std::uint32_t which) {
+    return which < CommandClasses ? CommandClassNames[which] : nullptr;
+}
+
+std::uint32_t Recorder::beginTiming(std::uint64_t key, std::uint64_t tag) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
@@ -1934,6 +1945,11 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(tag);
+    if (context.checkpointMarker != nullptr && key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
+        const auto marker = DriverCheckpointMarker(static_cast<std::uint32_t>(key - ClassKey(CommandClass::DispatchLeading)), tag);
+        context.checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(marker)));
+    }
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2405,8 +2421,23 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> intervals;
     intervals.reserve(batch.timedKeys.size());
     std::unique_lock lock(timingMutex);
+    static const double longNs = [] {
+        const char* text = std::getenv("APS5_GPU_LONG_MS");
+        return (text != nullptr ? std::atof(text) : 250.0) * 1e6;
+    }();
     for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
         const auto ns = static_cast<double>(stamps[i * 2 + 1] - stamps[i * 2]) * period;
+        if (longNs > 0 && ns >= longNs) {
+            const auto key = batch.timedKeys[i];
+            const auto tag = i < batch.timedTags.size() ? batch.timedTags[i] : 0;
+            char name[64];
+            if (i == batch.batchTiming) std::snprintf(name, sizeof(name), "batch");
+            else if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+            else std::snprintf(name, sizeof(name), "program 0x%llx", static_cast<unsigned long long>(key));
+            char where[48] = "";
+            if (tag != 0) std::snprintf(where, sizeof(where), ", guest address 0x%llx", static_cast<unsigned long long>(tag));
+            std::fprintf(stderr, "[gpu-long] %s ran %.0f ms on the GPU in batch %llu (%.1f MiB%s; %zu timed ranges in the batch)\n", name, ns / 1e6, static_cast<unsigned long long>(batch.serial), static_cast<double>(batch.timedBytes[i]) / 1048576.0, where, batch.timedKeys.size());
+        }
         if (i == batch.batchTiming) {
             // The whole batch: apart from the per-program totals it contains.
             batch.gpuStartNs = static_cast<double>(stamps[i * 2]) * period;

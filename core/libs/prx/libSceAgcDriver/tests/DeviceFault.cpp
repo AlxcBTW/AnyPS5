@@ -91,6 +91,38 @@ void Checkpoints() {
     Require(lines.size() == 1 && lines[0] == "[device-fault] no checkpoint reached", "an empty checkpoint list was not reported");
 }
 
+const char* MockClassName(std::uint32_t commandClass) {
+    return commandClass == 10 ? "storage-upload" : commandClass == 9 ? "draw" : nullptr;
+}
+
+std::vector<std::uint64_t> markers;
+
+VKAPI_ATTR void VKAPI_CALL MockMarkedCheckpoints(VkQueue, std::uint32_t* count, VkCheckpointDataNV* data) {
+    if (data == nullptr) {
+        *count = static_cast<std::uint32_t>(markers.size());
+        return;
+    }
+    for (std::uint32_t i = 0; i < *count; ++i) {
+        data[i].stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        data[i].pCheckpointMarker = reinterpret_cast<void*>(static_cast<std::uintptr_t>(markers[i]));
+    }
+}
+
+void DriverCheckpoints() {
+    Require(AgcDriver::DriverCheckpointMarker(10, 0x324cb40000ull) == (AgcDriver::DriverCheckpointBit | (10ull << 48u) | 0x324cb40000ull), "the driver marker layout changed");
+    Require(AgcDriver::DriverCheckpointMarker(10, 0xabcd00324cb40000ull) == AgcDriver::DriverCheckpointMarker(10, 0x324cb40000ull), "an address past 48 bits leaked into the class");
+    markers = {AgcDriver::DriverCheckpointMarker(10, 0x324cb40000ull), AgcDriver::DriverCheckpointMarker(9, 0), AgcDriver::DriverCheckpointMarker(12, 0x1000ull), 0x14c02fe400ull};
+    auto lines = AgcDriver::DeviceFaultReport(VK_NULL_HANDLE, nullptr, FakeQueue(), MockMarkedCheckpoints, MockClassName);
+    Require(lines.size() == 4, "each marked checkpoint gets one line");
+    Require(lines[0] == "[device-fault] checkpoint: driver storage-upload of 0x324cb40000 at stage 0x1", "a driver class checkpoint with an address was not named");
+    Require(lines[1] == "[device-fault] checkpoint: driver draw at stage 0x1", "a driver class checkpoint without an address was not named");
+    Require(lines[2] == "[device-fault] checkpoint: driver class 12 of 0x1000 at stage 0x1", "an unnamed driver class was not numbered");
+    Require(lines[3] == "[device-fault] checkpoint: program 0x14c02fe400 at stage 0x1", "a program checkpoint changed");
+    lines = AgcDriver::DeviceFaultReport(VK_NULL_HANDLE, nullptr, FakeQueue(), MockMarkedCheckpoints);
+    Require(lines.size() == 4 && lines[0] == "[device-fault] checkpoint: driver class 10 of 0x324cb40000 at stage 0x1", "a report without class names did not number the class");
+    markers.clear();
+}
+
 void Nothing() {
     faultCalls = 0;
     Require(AgcDriver::DeviceFaultReport(FakeDevice(), nullptr, FakeQueue(), nullptr).empty(), "a device without either extension reported something");
@@ -113,6 +145,7 @@ int main() {
         FaultInfo();
         FaultInfoFails();
         Checkpoints();
+        DriverCheckpoints();
         Nothing();
         AddressKinds();
     } catch (const std::exception& error) {

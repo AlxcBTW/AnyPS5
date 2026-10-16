@@ -1819,7 +1819,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         const auto faultInfo = deviceFault ? state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT") : nullptr;
         const auto checkpointData = checkpoints ? state->DeviceFunction<PFN_vkGetQueueCheckpointDataNV>("vkGetQueueCheckpointDataNV") : nullptr;
         Graphics::DeviceLostHook() = [device = state->device, queue = state->queue, faultInfo, checkpointData] {
-            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData)) std::fprintf(stderr, "%s\n", line.c_str());
+            for (const auto& line : DeviceFaultReport(device, faultInfo, queue, checkpointData, &Graphics::Recorder::CommandClassName)) std::fprintf(stderr, "%s\n", line.c_str());
         };
         Graphics::DeviceLostOwner() = state.get();
         state->deviceLostHook = true;
@@ -3506,6 +3506,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.singlePassStorage = state->storageImageWithoutFormat;
     static const bool storageBudgetPlacement = std::getenv("APS5_NO_DEVICE_LOCAL_STORAGE") != nullptr;
     context.storageBudgetPlacement = storageBudgetPlacement;
+    context.checkpointMarker = state->checkpointMarker;
     return context;
 }
 

@@ -31,7 +31,33 @@ inline std::string DeviceFaultText(const char (&text)[VK_MAX_DESCRIPTION_SIZE]) 
     return std::string(text, strnlen(text, VK_MAX_DESCRIPTION_SIZE));
 }
 
-inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData) {
+inline constexpr std::uint64_t DriverCheckpointBit = 1ull << 63u;
+inline constexpr std::uint64_t DriverCheckpointAddressMask = (1ull << 48u) - 1u;
+
+constexpr std::uint64_t DriverCheckpointMarker(std::uint32_t commandClass, std::uint64_t address) {
+    return DriverCheckpointBit | (static_cast<std::uint64_t>(commandClass & 0x7fffu) << 48u) | (address & DriverCheckpointAddressMask);
+}
+
+using CheckpointClassName = const char* (*)(std::uint32_t commandClass);
+
+inline std::string DeviceFaultCheckpoint(std::uint64_t marker, VkPipelineStageFlagBits stage, CheckpointClassName className) {
+    char line[160];
+    if ((marker & DriverCheckpointBit) == 0) {
+        std::snprintf(line, sizeof(line), "[device-fault] checkpoint: program 0x%llx at stage 0x%x", static_cast<unsigned long long>(marker), static_cast<unsigned>(stage));
+        return line;
+    }
+    const auto commandClass = static_cast<std::uint32_t>((marker >> 48u) & 0x7fffu);
+    const char* name = className != nullptr ? className(commandClass) : nullptr;
+    char what[48];
+    if (name != nullptr) std::snprintf(what, sizeof(what), "%s", name);
+    else std::snprintf(what, sizeof(what), "class %u", commandClass);
+    const auto address = marker & DriverCheckpointAddressMask;
+    if (address != 0) std::snprintf(line, sizeof(line), "[device-fault] checkpoint: driver %s of 0x%llx at stage 0x%x", what, static_cast<unsigned long long>(address), static_cast<unsigned>(stage));
+    else std::snprintf(line, sizeof(line), "[device-fault] checkpoint: driver %s at stage 0x%x", what, static_cast<unsigned>(stage));
+    return line;
+}
+
+inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDeviceFaultInfoEXT faultInfo, VkQueue queue, PFN_vkGetQueueCheckpointDataNV checkpointData, CheckpointClassName className = nullptr) {
     std::vector<std::string> lines;
     char line[VK_MAX_DESCRIPTION_SIZE + 128];
     if (checkpointData != nullptr && queue != VK_NULL_HANDLE) {
@@ -41,10 +67,7 @@ inline std::vector<std::string> DeviceFaultReport(VkDevice device, PFN_vkGetDevi
         if (count != 0) checkpointData(queue, &count, points.data());
         points.resize(count);
         if (points.empty()) lines.emplace_back("[device-fault] no checkpoint reached");
-        for (const auto& point : points) {
-            std::snprintf(line, sizeof(line), "[device-fault] checkpoint: program 0x%llx at stage 0x%x", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker)), static_cast<unsigned>(point.stage));
-            lines.emplace_back(line);
-        }
+        for (const auto& point : points) lines.emplace_back(DeviceFaultCheckpoint(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(point.pCheckpointMarker)), point.stage, className));
     }
     if (faultInfo == nullptr || device == VK_NULL_HANDLE) return lines;
     VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};

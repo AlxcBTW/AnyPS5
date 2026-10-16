@@ -137,7 +137,9 @@ Set `APS5_PIPELINE_STATS=1` to capture and print driver statistics for each newl
 
 ## Device loss reports
 
-On a device that supports `VK_EXT_device_fault`, the first `VK_ERROR_DEVICE_LOST` prints the driver's fault description, the faulting addresses and the vendor fault codes as `[device-fault]` lines. Set `APS5_GPU_CHECKPOINTS=1` to also record a `VK_NV_device_diagnostic_checkpoints` marker with the program address before each compute dispatch; the report then lists the last markers the GPU reached. Checkpoints are disabled by default and ignored on devices without the extension.
+On a device that supports `VK_EXT_device_fault`, the first `VK_ERROR_DEVICE_LOST` prints the driver's fault description, the faulting addresses and the vendor fault codes as `[device-fault]` lines. Set `APS5_GPU_CHECKPOINTS=1` to also record a `VK_NV_device_diagnostic_checkpoints` marker with the program address before each compute dispatch; the report then lists the last markers the GPU reached. With `APS5_PROFILE_GPU=1` as well, every timed range of the driver's own command classes (the `[gputime]` classes: storage uploads and write-backs, clears, copies, draws, fills and the others) gets a marker too, and the report names it as `checkpoint: driver <class> of <guest address>`, the guest address being the storage image's. Checkpoints are disabled by default and ignored on devices without the extension.
+
+With `APS5_PROFILE_GPU=1`, a timed range or a whole batch that ran at least `APS5_GPU_LONG_MS` milliseconds on the GPU (default 250, 0 disables it) is printed when its timestamps are read, as a `[gpu-long]` line with the class or program, the bytes it moved, the storage image's guest address and the batch. On Windows a GPU that preempts compute work only between dispatches (dxdiag: `Compute Preemption: Dispatch`) resets the device when one command runs past the GPU timeout (`TdrDelay`, 2 s by default), so these lines show the commands that come close.
 
 ## Storage texture placement
 

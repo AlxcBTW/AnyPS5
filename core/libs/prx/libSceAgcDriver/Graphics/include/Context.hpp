@@ -230,6 +230,7 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     bool storageBudgetPlacement = false;
+    PFN_vkCmdSetCheckpointNV checkpointMarker = nullptr;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
     VkSampleCountFlags sampleLocationGridSampleCounts = 0;
     PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;

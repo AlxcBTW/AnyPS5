@@ -465,6 +465,8 @@ public:
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    std::uint32_t BeginGpuTiming(CommandClass which, std::uint64_t tag);
+    static const char* CommandClassName(std::uint32_t which);
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1
@@ -570,6 +572,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint64_t> timedTags;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -705,7 +708,7 @@ private:
     std::shared_ptr<void> segmentPools;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
-    std::uint32_t beginTiming(std::uint64_t key);
+    std::uint32_t beginTiming(std::uint64_t key, std::uint64_t tag = 0);
     // Vulkan entry points resolved once (constructor): the loader's vkGetDeviceProcAddr is a name
     // lookup per call, paid by every reap, store and submit otherwise. APS5_NO_PROC_TABLE=1 leaves
     // them null and resolves per call as before; vkWaitSemaphoresKHR stays a lazy lookup (timeline
