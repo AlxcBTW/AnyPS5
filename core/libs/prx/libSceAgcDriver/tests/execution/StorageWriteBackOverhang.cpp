@@ -75,6 +75,7 @@ void Write(std::uint8_t* texels) {
     AgcDriverWaitIdle_nid_postfix();
     AgcDriver::Graphics::StorageTexture::FlushAllPending("test");
     AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(texels), SurfaceBytes);
 }
 
 class GuestSurface {
@@ -152,7 +153,6 @@ int main() {
         std::fprintf(stderr, "diag: after the first Write: whole %zu texels, split %zu texels\n", countTexels(whole.Data()), countTexels(split.Data()));
         Write(split.Data());
         std::fprintf(stderr, "diag: after the second Write: whole %zu texels, split %zu texels\n", countTexels(whole.Data()), countTexels(split.Data()));
-        Require(false, "diag: forced failure to show the output");
         const auto* expected = whole.Data();
         const auto* stored = split.Data();
         const auto texel = [](const std::uint8_t* at) { return !std::all_of(at, at + 8, [](std::uint8_t byte) { return byte == 0 || byte == Sentinel; }); };
