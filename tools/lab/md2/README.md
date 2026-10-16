@@ -44,8 +44,12 @@ skips it), then "Escape from Squid Coast" with the HUD. Keep the `_sd` of that r
 from it with `-SaveSeed <name>` and reach the HUD in 80-95 s.
 
 On `main` the world load aborts ("storing storage image results pending over memory outside the write watch ...")
-without #6308. Our gameplay numbers have #5372 as well. On 8 GB cards use #6194 (with the budget revision posted there)
-or `APS5_TEXTURE_CACHE_MIB=3072`.
+without #6308. Our gameplay numbers have #5372 as well. On 8 GB cards leave `APS5_TEXTURE_CACHE_MIB` unset for
+gameplay rows: a forced 3072 MiB pushes the device-local heap past its budget and storage textures into host memory
+(slower rows, and GPU timeouts once a large one lands there), while the automatic budget keeps the heap under it
+(measured on an RTX 4060 8 GB and an RTX 5070 Laptop 8 GB, 16.10.). At the title, `main`'s automatic budget is too
+small on 8 GB cards; #6194 with the budget revision posted there grows it. #4472 keeps released device buffers from
+holding the heap when the budget is set larger than the card can hold.
 
 Example row:
 
