@@ -320,20 +320,60 @@ void ReportStackWords(std::uint64_t rsp) {
 
 // Lab diagnostics: APS5_CRASH_PEEK=<hex address>[,<hex address>...] prints eight words at each (up to 16), for guest
 // globals such as a table's vector.
-void ReportPeeks() {
+std::size_t PeekAddresses(std::uint64_t (&addresses)[16]) {
     const char* text = std::getenv("APS5_CRASH_PEEK");
-    if (text == nullptr || *text == '\0') return;
-    Report("  words at APS5_CRASH_PEEK:\n");
+    if (text == nullptr) return 0;
+    std::size_t count = 0;
     const char* cursor = text;
-    for (int k = 0; k < 16 && *cursor != '\0'; ++k) {
+    while (count < std::size(addresses) && *cursor != '\0') {
         char* next = nullptr;
         const auto address = static_cast<std::uint64_t>(std::strtoull(cursor, &next, 16));
         if (next == cursor) break;
-        if (address >= 0x10000 && (address & 7) == 0 && IsReadable(address) && IsReadable(address + 0x38)) ReportWords("    ", address);
-        else Report("    0x%016llx: not readable\n", static_cast<unsigned long long>(address));
+        addresses[count++] = address;
         cursor = next;
         while (*cursor == ',' || *cursor == ' ') ++cursor;
     }
+    return count;
+}
+
+bool PeekReadable(std::uint64_t address) {
+    return address >= 0x10000 && (address & 7) == 0 && IsReadable(address) && IsReadable(address + 0x38);
+}
+
+void ReportPeeks() {
+    std::uint64_t addresses[16];
+    const auto count = PeekAddresses(addresses);
+    if (count == 0) return;
+    Report("  words at APS5_CRASH_PEEK:\n");
+    for (std::size_t k = 0; k < count; ++k) {
+        if (PeekReadable(addresses[k])) ReportWords("    ", addresses[k]);
+        else Report("    0x%016llx: not readable\n", static_cast<unsigned long long>(addresses[k]));
+    }
+}
+
+// Lab diagnostics: with APS5_CRASH_PEEK, APS5_PEEK_EVERY_MS=<ms> also prints the words at those addresses from a host
+// thread whenever they changed (looked at every <ms>), so a guest global's life (a lazily built table, a registry that
+// grows) shows in a row that does not crash.
+DWORD WINAPI PeekWatch(LPVOID parameter) {
+    const auto every = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(parameter));
+    std::uint64_t addresses[16];
+    const auto count = PeekAddresses(addresses);
+    std::uint64_t last[16][8] = {};
+    bool seen[16] = {};
+    const auto start = GetTickCount64();
+    for (;;) {
+        for (std::size_t k = 0; k < count; ++k) {
+            std::uint64_t words[8];
+            SIZE_T copied = 0;
+            if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(addresses[k]), words, sizeof(words), &copied) || copied != sizeof(words)) continue;
+            if (seen[k] && std::memcmp(words, last[k], sizeof(words)) == 0) continue;
+            seen[k] = true;
+            std::memcpy(last[k], words, sizeof(words));
+            Report("[peek] %llu ms 0x%016llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", static_cast<unsigned long long>(GetTickCount64() - start), static_cast<unsigned long long>(addresses[k]), words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        }
+        Sleep(every);
+    }
+    return 0;
 }
 
 void ReportUndeliverableException(const EXCEPTION_POINTERS* info, std::uint64_t frame) {
@@ -661,6 +701,9 @@ const bool g_crashReportInstalled = [] {
             if (end && *end == 0) seconds = value;
         }
         if (seconds > 0) CreateThread(nullptr, 0, HangWatchdog, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
+    }
+    if (const auto every = EnvironmentNumber("APS5_PEEK_EVERY_MS"); every > 0 && std::getenv("APS5_CRASH_PEEK") != nullptr) {
+        CreateThread(nullptr, 0, PeekWatch, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(std::min<std::uint64_t>(every, 60000))), 0, nullptr);
     }
     return true;
 }();
