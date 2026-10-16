@@ -353,7 +353,9 @@ public:
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
     // APS5_LAB_FAST_PROOF=2: whether the memory of an image outside the write watch is, by the stamp
-    // compareUntracked takes, what its last byte compare found equal to the saved bytes. Reads only.
+    // compareUntracked takes, what its last byte compare found equal to the saved bytes and no recorded
+    // GPU write is over it. Takes the range's write-watch hint (UntrackedHint collects the OS dirty bits
+    // into the tracker's stamps, as compareUntracked does) and changes nothing else.
     bool UntrackedUnchanged() const;
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
@@ -640,6 +642,21 @@ struct LookupOutcomes {
     std::array<double, Count> ms{};
 };
 LookupOutcomes& ThreadLookupOutcomes();
+
+// APS5_VERIFY_PROOFS: while an object of this class lives on a thread, that thread's lookups do not
+// trust the write-watch hint for memory outside the write watch (the snapshot keep rule of
+// cachedTexture, the memo of StorageTexture::compareUntracked) and compare bytes, so a verification
+// walk beside a proof judges the memory itself and not the hint the proof rested on.
+class UntrackedBypass {
+public:
+    UntrackedBypass();
+    ~UntrackedBypass();
+    UntrackedBypass(const UntrackedBypass&) = delete;
+    UntrackedBypass& operator=(const UntrackedBypass&) = delete;
+    static bool Active();
+private:
+    bool previous;
+};
 
 }
 
