@@ -1,0 +1,5 @@
+name=gpu-lab7
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-lab7-8a03a7b89c-159632
