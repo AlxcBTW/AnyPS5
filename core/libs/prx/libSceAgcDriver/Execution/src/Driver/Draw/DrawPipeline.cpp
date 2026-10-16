@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -102,6 +103,22 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         *top = 0;
     }
     drainOpcodes = {};
+    drainText += "; packet drain waits by opcode (ms):";
+    for (int shown = 0; shown < 6; ++shown) {
+        const auto top = std::max_element(drainOpcodeNs.begin(), drainOpcodeNs.begin() + 0x100);
+        if (*top == 0) break;
+        char item[48];
+        std::snprintf(item, sizeof(item), " 0x%02x %.1f", static_cast<unsigned>(top - drainOpcodeNs.begin()), static_cast<double>(*top) / 1e6);
+        drainText += item;
+        *top = 0;
+    }
+    drainOpcodeNs = {};
+    {
+        char item[64];
+        std::snprintf(item, sizeof(item), "; committer idle %.1f ms", static_cast<double>(committerIdleNs) / 1e6);
+        drainText += item;
+        committerIdleNs = 0;
+    }
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
@@ -112,13 +129,20 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (PerformanceTrace::Configured()) PerformanceTrace::BindThread("draw committer");
     for (;;) {
         Commit* commit = nullptr;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty(); });
+            const auto idleStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            {
+                PerformanceTimer idleTiming("Draw.CommitterIdle");
+                wake.wait(lock, [&] { return !items.empty(); });
+            }
+            if (profile) committerIdleNs += elapsedNs(idleStart);
             committerWaiting = false;
             commit = stopped ? nullptr : &items.front().commit;
         }
@@ -127,6 +151,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            PerformanceTimer commitTiming("Draw.Commit");
             if (commit != nullptr) (*commit)();
         } catch (const std::exception&) {
             failed = true;
@@ -157,15 +182,19 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
+    const auto index = static_cast<std::size_t>(reason);
+    PerformanceTimer drainTiming("Draw.Drain");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
     --idleWaiters;
-    const auto index = static_cast<std::size_t>(reason);
+    drainTiming.Mark(DrainNames[index]);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    const auto waited = elapsedNs(start);
+    drainWaitNs[index] += waited;
+    drainOpcodeNs[std::min<std::uint32_t>(opcode, 0x100)] += waited;
     rethrowFailure();
 }
 
