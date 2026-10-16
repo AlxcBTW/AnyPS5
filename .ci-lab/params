@@ -1,0 +1,5 @@
+name=devlost-storage
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-devlost-storage-11cc2d5685-199579
