@@ -3,7 +3,7 @@
 # artifact. Fork only (AlxcBTW/AnyPS5), never proposed upstream. Started by tools/ci-build.sh, which pushes the
 # tree plus this file and .ci-lab/params to ci/lab/<name>. It is a push workflow on purpose: workflow_dispatch
 # would need the file on the fork's main.
-name: Lab bench
+name: Lab bench f16
 
 on:
   push:
@@ -57,6 +57,14 @@ jobs:
           restore-keys: ccache-windows-
           max-size: 2G
           evict-old-files: job
+      - name: Fetch FFmpeg prebuilts
+        run: |
+          # 3rdparty/ffmpeg-core downloads its prebuilt package during Configure, and that download fails now and then
+          # with an SSL error on the runners. Fetch it here with retries into the path Configure checks first.
+          sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)
+          mkdir -p build/externals
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 5 -o "build/externals/$sha-ffmpeg-mingw-x64.zip" \
+            "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/$sha/ffmpeg-mingw-x64.zip"
       - name: Configure
         run: |
           # The lab's -g1 include (lab/g1-agcdriver.cmake): function names and line tables for two targets, no code change.
