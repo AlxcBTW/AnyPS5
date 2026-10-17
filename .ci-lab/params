@@ -1,0 +1,5 @@
+name=refresh-lever
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-refresh-lever-f2b429e335-118166
