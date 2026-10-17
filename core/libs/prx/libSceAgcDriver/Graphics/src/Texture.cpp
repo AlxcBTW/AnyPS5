@@ -1172,6 +1172,7 @@ public:
     using iterator = std::vector<StorageTexture*>::iterator;
     iterator begin() { return textures.begin(); }
     iterator end() { return textures.end(); }
+    std::size_t size() const { return textures.size(); }
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
         ++version;

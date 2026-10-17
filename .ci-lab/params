@@ -2,4 +2,4 @@ name=holdprof3
 build_type=Release
 g1=off
 cmake=
-artifact=lab-libs-holdprof3-99d9596565-116364
+artifact=lab-libs-holdprof3-e8ceb136ea-120782
