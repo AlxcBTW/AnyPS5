@@ -2142,10 +2142,10 @@ constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 
 std::array<std::uint64_t, 2> StorageTexture::unitContentHash(std::uint32_t unit, bool flushGpuWrites) const {
     constexpr std::size_t chunkBytes = 65536;
-    static thread_local std::vector<std::byte> chunk(chunkBytes);
     std::array<std::uint64_t, 2> hash{0x5eed7e0d00000001ull, 0x5eed7e0d00000002ull};
     const auto begin = layerBegin(unit);
     const auto bytes = static_cast<std::size_t>(layerBytes(unit));
+    std::vector<std::byte> chunk(std::min(chunkBytes, bytes));
     for (std::size_t at = 0; at < bytes; at += chunkBytes) {
         const auto part = std::span<std::byte>(chunk).first(std::min(chunkBytes, bytes - at));
         if (flushGpuWrites) GuestMemory::ReadCommitted(begin + at, part);
