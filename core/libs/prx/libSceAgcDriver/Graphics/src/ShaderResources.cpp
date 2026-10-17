@@ -775,6 +775,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
             if (viewServes(*it)) {
                 if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) {
+                    const GuestMemory::MutexWindowFence fence;
                     it->source->Refresh();
                 }
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
@@ -1034,6 +1035,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         }
         if (it != cache.entries.end()) {
             if (it->texture != refreshed) {
+                const GuestMemory::MutexWindowFence fence;
                 it->texture->Refresh();
             }
             cache.entries.splice(cache.entries.begin(), cache.entries, it);

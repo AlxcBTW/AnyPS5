@@ -1877,6 +1877,7 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
+    const bool aliasFree = alias == nullptr;
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
@@ -1889,8 +1890,31 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    bool windowFlushed = false;
+    auto windowOutcome = WindowOutcome::Refused;
+    if (GuestMemory::MutexWindowEnabled()) {
+        windowOutcome = refreshWindow(aliasFree, exempt.previous != nullptr, windowFlushed);
+        if (windowOutcome == WindowOutcome::Applied) {
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshUnchanged, start);
+            return true;
+        }
+        GuestMemory::NoteMutexWindow(GuestMemory::MutexWindowEvent::FallThrough);
+    }
+    const bool verifyWindow = windowOutcome != WindowOutcome::Refused && GuestMemory::MutexWindowVerify();
+    const auto verifyEnd = [&](bool result, bool byStamps, bool compared, bool keysChanged) {
+        if (!verifyWindow) return;
+        GuestMemory::NoteMutexWindow(GuestMemory::MutexWindowEvent::VerifyCompared);
+        const bool would = windowOutcome == WindowOutcome::WouldApply;
+        const bool fullUnchangedByStamps = result && byStamps;
+        if (would && !fullUnchangedByStamps) {
+            GuestMemory::NoteMutexWindow(GuestMemory::MutexWindowEvent::VerifyDisagree);
+            if (GuestMemory::MutexWindowDisagreements() <= 20) AgcDriver::ProfilePrint_nid_no_patch("[mutexwindow] DISAGREE refresh 0x%llx+0x%llx: the window said unchanged by stamps, the full locked path returned %d (stamped %d, compared %d, keys changed %d, generation %llu)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), result, byStamps, compared, keysChanged, static_cast<unsigned long long>(generation));
+        } else if (!would && result) {
+            GuestMemory::NoteMutexWindow(GuestMemory::MutexWindowEvent::VerifyConservative);
+        }
+    };
     // No publish: the upload below reads the stored units from the unit shadow itself.
-    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
+    const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None) || windowFlushed;
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
@@ -2006,21 +2030,7 @@ bool StorageTexture::Refresh() {
         const bool lookupUnneeded = lever != 0 && unchanged && alias == nullptr;
         const int importMode = RefreshLeverImportMode();
         if (lookupUnneeded && importMode == 0) LeverCount(LeverStats().importSkipped);
-        const auto lookupImport = [&]() -> const HostImport* {
-            const auto size = static_cast<std::size_t>(guestBytes);
-            if (importMode == 0) return HostImportFor(context, descriptor.baseAddress, size);
-            HostImportLookup outcome = HostImportLookup::Miss;
-            const auto* cached = HostImportForCached(context, descriptor.baseAddress, size, importLookup, outcome);
-            LeverCount(outcome == HostImportLookup::Hit ? LeverStats().importHits : outcome == HostImportLookup::EpochMoved ? LeverStats().importEpochMoves : LeverStats().importMisses);
-            if (importMode == 2) {
-                const auto* full = HostImportFor(context, descriptor.baseAddress, size);
-                if (full != cached) {
-                    const auto number = LeverStats().importDifferences.fetch_add(1, std::memory_order_relaxed);
-                    if (number < 20) AgcDriver::ProfilePrint_nid_no_patch("[refreshlever] DISAGREE import lookup 0x%llx+0x%llx: cached %p, full %p\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<const void*>(cached), static_cast<const void*>(full));
-                }
-            }
-            return cached;
-        };
+        const auto lookupImport = [&]() -> const HostImport* { return refreshImportLookup(importMode); };
         if (!(lookupUnneeded && lever == 1 && importMode == 0 && !keepLookup)) direct = keys == DccKeys::Uncompressed && lookupImport() != nullptr;
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
@@ -2054,6 +2064,7 @@ bool StorageTexture::Refresh() {
         refreshGeneration();
         takeRefreshProof(alias != nullptr);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
+        verifyEnd(true, stamped, compared, keysChanged);
         return true;
     }
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
@@ -2152,7 +2163,133 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    verifyEnd(false, false, compared, keysChanged);
     return false;
+}
+
+const HostImport* StorageTexture::refreshImportLookup(int importMode) {
+    const auto size = static_cast<std::size_t>(guestBytes);
+    if (importMode == 0) return HostImportFor(context, descriptor.baseAddress, size);
+    HostImportLookup outcome = HostImportLookup::Miss;
+    const auto* cached = HostImportForCached(context, descriptor.baseAddress, size, importLookup, outcome);
+    LeverCount(outcome == HostImportLookup::Hit ? LeverStats().importHits : outcome == HostImportLookup::EpochMoved ? LeverStats().importEpochMoves : LeverStats().importMisses);
+    if (importMode == 2) {
+        const auto* full = HostImportFor(context, descriptor.baseAddress, size);
+        if (full != cached) {
+            const auto number = LeverStats().importDifferences.fetch_add(1, std::memory_order_relaxed);
+            if (number < 20) AgcDriver::ProfilePrint_nid_no_patch("[refreshlever] DISAGREE import lookup 0x%llx+0x%llx: cached %p, full %p\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<const void*>(cached), static_cast<const void*>(full));
+        }
+    }
+    return cached;
+}
+
+StorageTexture::WindowOutcome StorageTexture::refreshWindow(bool aliasFree, bool nested, bool& flushed) {
+    namespace Memory = GuestMemory;
+    using Event = Memory::MutexWindowEvent;
+    Memory::NoteMutexWindow(Event::Attempt);
+    Memory::ReportMutexWindow();
+    const auto refuse = [](Event event) {
+        Memory::NoteMutexWindow(event);
+        return WindowOutcome::Refused;
+    };
+    const auto fail = [](Event event) {
+        Memory::NoteMutexWindow(event);
+        return WindowOutcome::Declined;
+    };
+    if (!aliasFree) return refuse(Event::RefusedAlias);
+    const auto lever = RefreshLeverMode();
+    if (nested || lever == 2) return refuse(Event::RefusedOther);
+    if (Memory::MutexWindowFence::Held()) return refuse(Event::RefusedFence);
+    if (Memory::GpuMutex().DepthOnThisThread() != 1) return refuse(Event::RefusedDepth);
+    if (Recorder::InCompletion()) return refuse(Event::RefusedCompletion);
+    if (generation == 0) return refuse(Event::RefusedUntracked);
+    auto* recorder = Recorder::Active();
+    const auto self = weak_from_this().lock();
+    if (recorder == nullptr || self == nullptr) return refuse(Event::RefusedOther);
+    const auto base = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const auto keysAt = descriptor.dccAddress;
+    const auto keyCount = keysAt != 0 ? static_cast<std::size_t>(guestBytes / 256) : std::size_t{0};
+    if (keysAt != 0 && keyCount == 0) return refuse(Event::RefusedOther);
+    flushed = FlushPending(base, bytes, nullptr, "storage refresh", PublishScope::None);
+    if (flushed || Recorder::SnapshotWriteOverlaps(base, bytes)) return refuse(Event::RefusedWrites);
+    if (keysAt != 0 && (Recorder::SnapshotWriteOverlaps(keysAt, keyCount) || (uploadedKeys == DccKeys::Uncompressed && recorder->PendingWriteOverlaps(keysAt, keyCount)))) return refuse(Event::RefusedKeyWriters);
+    struct Snapshot {
+        std::uint64_t generation;
+        std::uint64_t version;
+        std::uint64_t pendingSerial;
+        std::uint64_t writeGeneration;
+        DccKeys uploadedKeys;
+        DccKeys filledKeys;
+        DccKeyProof keyProof;
+        std::vector<std::uint64_t> layerGeneration;
+        std::vector<bool> layerPending;
+        bool dirty;
+        bool cached;
+        const Recorder* recorder;
+    };
+    const Snapshot snap{generation, version, PendingSerial(), Recorder::WriteGeneration(), uploadedKeys, filledKeys, keyProof, layerGeneration, layerPending, dirty, Cached(), recorder};
+    const auto unchangedByStamps = [&] {
+        if (blockUnits) return Memory::UnchangedSince(base, bytes, snap.generation);
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (!Memory::UnchangedSince(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)), snap.layerGeneration[layer])) return false;
+        }
+        return true;
+    };
+    enum class Verdict { Unchanged, Changed, Untracked, Keys, KeyWriters, Exception };
+    Verdict verdict = Verdict::Exception;
+    DccKeyProof proof = snap.keyProof;
+    {
+        Memory::GpuMutexWindow window;
+        if (!window.Open()) return WindowOutcome::Refused;
+        try {
+            verdict = [&] {
+                if (Memory::CollectWrites(base, bytes) == 0) return Verdict::Untracked;
+                DccKeys keys = DccKeys::Uncompressed;
+                if (keysAt != 0) {
+                    if (Recorder::SnapshotWriteOverlaps(keysAt, keyCount)) return Verdict::KeyWriters;
+                    keys = ProvedClearKeys(descriptor, guestBytes, proof);
+                    if (proof.generation == 0) return Verdict::Keys;
+                }
+                if (keys != snap.uploadedKeys) return Verdict::Changed;
+                return unchangedByStamps() ? Verdict::Unchanged : Verdict::Changed;
+            }();
+        } catch (...) {
+            verdict = Verdict::Exception;
+        }
+    }
+    switch (verdict) {
+    case Verdict::Unchanged: break;
+    case Verdict::Changed: return fail(Event::BailChanged);
+    case Verdict::Untracked: return fail(Event::BailUntracked);
+    case Verdict::Keys: return fail(Event::BailKeys);
+    case Verdict::KeyWriters: return fail(Event::BailKeyWriters);
+    case Verdict::Exception: return fail(Event::BailException);
+    }
+    if (Cached() != snap.cached || Recorder::Active() != snap.recorder || generation != snap.generation || version != snap.version || uploadedKeys != snap.uploadedKeys || filledKeys != snap.filledKeys || dirty != snap.dirty || keyProof.keys != snap.keyProof.keys || keyProof.generation != snap.keyProof.generation || layerGeneration != snap.layerGeneration || layerPending != snap.layerPending) return fail(Event::FailFields);
+    if (CompletePendingCpuWrites(context, base, bytes) || (keysAt != 0 && CompletePendingCpuWrites(context, keysAt, DccKeyBytes(guestBytes)))) return fail(Event::FailCpuWrites);
+    if (pendingAlias() != nullptr) return fail(Event::FailPending);
+    if (PendingSerial() != snap.pendingSerial && otherPendingOverlaps()) return fail(Event::FailPending);
+    if (keysAt != 0 && snap.uploadedKeys == DccKeys::Uncompressed && recorder->PendingWriteOverlaps(keysAt, keyCount)) return fail(Event::FailKeyWriters);
+    const auto current = Memory::CollectWrites(base, bytes);
+    if (current == 0 || !unchangedByStamps()) return fail(Event::FailStamps);
+    if (keysAt != 0 && (Memory::CollectWrites(keysAt, keyCount) == 0 || !Memory::UnchangedSince(keysAt, keyCount, proof.generation))) return fail(Event::FailKeys);
+    if (Recorder::WriteGeneration() != snap.writeGeneration && (Recorder::SnapshotWriteOverlaps(base, bytes) || (keysAt != 0 && Recorder::SnapshotWriteOverlaps(keysAt, keyCount)))) return fail(Event::FailWrites);
+    if (keysAt != 0) keyProof = proof;
+    Memory::NoteMutexWindow(Event::RecheckPassed);
+    if (Memory::MutexWindowVerify()) return WindowOutcome::WouldApply;
+    if (ProvedKeys() != snap.uploadedKeys) return fail(Event::FailKeys);
+    const int importMode = RefreshLeverImportMode();
+    static const bool keepLookup = std::getenv("APS5_LAB_REFRESH_LEVER_KEEP_IMPORT_LOOKUP") != nullptr;
+    if (lever != 0 && importMode == 0) LeverCount(LeverStats().importSkipped);
+    if (!(lever != 0 && importMode == 0 && !keepLookup) && snap.uploadedKeys == DccKeys::Uncompressed) refreshImportLookup(importMode);
+    if (lever == 1 && blockUnits) LeverCount(LeverStats().quick);
+    ++Profile().storageReused;
+    layerGeneration.assign(trackedLayers, current);
+    refreshGeneration();
+    takeRefreshProof(false);
+    Memory::NoteMutexWindow(Event::Applied);
+    return WindowOutcome::Applied;
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
