@@ -1,0 +1,5 @@
+name=gpu-ablation
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-gpu-ablation-2df11737d1-153368
