@@ -467,6 +467,9 @@ private:
     bool anyLayerPending() const;
     void refreshGeneration();
     bool refreshProved();
+    enum class WindowOutcome : std::uint8_t { Refused, Declined, WouldApply, Applied };
+    WindowOutcome refreshWindow(bool aliasFree, bool nested, bool& flushed);
+    const HostImport* refreshImportLookup(int importMode);
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's

@@ -1523,7 +1523,10 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     surface->clearDepth = target.clearDepth;
     surface->clearStencil = target.clearStencil;
     takePlanes(*surface);
-    if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
+    if (created && !inherits && target.htileAddress == 0) {
+        const GuestMemory::MutexWindowFence fence;
+        surface->TakeStorage();
+    }
     if (cleared && (!created || inherits)) {
         if (target.samples != 1u) surface->sampling.refusal = "native multisample depth fast-clear transition is not implemented";
         surface->pendingClear |= VK_IMAGE_ASPECT_DEPTH_BIT;
