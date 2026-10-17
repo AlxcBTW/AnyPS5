@@ -521,7 +521,9 @@ void PlaneFillCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int 
 }
 
 int main(int argc, char** argv) {
-    const bool reverse = argc > 1 && std::string(argv[1]) == "reverse";
+    const auto flag = [&](const char* name) { return std::find(argv + 1, argv + argc, std::string(name)) != argv + argc; };
+    const bool reverseGroups = flag("groups");
+    const bool reverseModes = flag("modes");
     int failures = 0;
     const auto run = [&](const char* name, auto&& body) {
         try {
@@ -567,9 +569,9 @@ int main(int argc, char** argv) {
             {"plane fill, switch off", "plane fill, lever", PlaneFillCase},
             {"driver submit, switch off", "driver submit, lever", DriverMatchCase},
         };
-        if (reverse) std::reverse(groups.begin(), groups.end());
+        if (reverseGroups) std::reverse(groups.begin(), groups.end());
         for (const auto& group : groups) {
-            for (const int mode : reverse ? std::array<int, 2>{1, 0} : std::array<int, 2>{0, 1}) run(mode == 0 ? group.off : group.lever, [&] { group.body(*device, shaders, mode); });
+            for (const int mode : reverseModes ? std::array<int, 2>{1, 0} : std::array<int, 2>{0, 1}) run(mode == 0 ? group.off : group.lever, [&] { group.body(*device, shaders, mode); });
         }
         Graphics::SetDepthPlaneClearForTest(true);
         LibcRunShutdown_nid_postfix();
