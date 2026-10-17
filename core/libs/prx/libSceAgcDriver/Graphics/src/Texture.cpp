@@ -1896,6 +1896,8 @@ bool StorageTexture::Refresh() {
             }
             if (!unchanged) scanBlocks();
         }
+        std::optional<GuestMemory::HoldSubSpan> loopsSpan;
+        loopsSpan.emplace(GuestMemory::HoldSub::RfLoops);
         // "cpu" names a CPU store in both models; a block without a generation (untracked) says
         // nothing about who wrote it.
         if (compared && !keysChanged) {
@@ -1920,6 +1922,7 @@ bool StorageTexture::Refresh() {
             unchanged = true;
             stamped = false;
         }
+        loopsSpan.reset();
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
         {
@@ -1973,6 +1976,8 @@ bool StorageTexture::Refresh() {
     // results land everywhere else in those layers; the unchanged pending layers keep their
     // results on the GPU when the direct path leaves them alone, and are stored otherwise. The
     // image stays registered throughout (the store clears what it stored).
+    std::optional<GuestMemory::HoldSubSpan> storedSpan;
+    storedSpan.emplace(GuestMemory::HoldSub::RfStoredLoops);
     std::vector<bool> stored(trackedLayers, false);
     bool pendingResults = false;
     bool anyStored = false;
@@ -2036,6 +2041,7 @@ bool StorageTexture::Refresh() {
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
     }
+    storedSpan.reset();
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
         {
