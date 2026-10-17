@@ -1,0 +1,5 @@
+name=mutex-window
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-mutex-window-45765b212b-138623
