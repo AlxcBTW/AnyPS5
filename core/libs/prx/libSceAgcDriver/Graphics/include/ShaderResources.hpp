@@ -264,6 +264,16 @@ public:
         ProofFailure failure = ProofFailure::None;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    struct ProofEpochStats {
+        std::uint64_t asked;
+        std::uint64_t skipped;
+        std::uint64_t proofsRun;
+        std::uint64_t fullWalks;
+        std::uint64_t verified;
+        std::uint64_t disagreements;
+    };
+    static ProofEpochStats ProofEpochCounts();
+    static void SetProofEpochMode(int mode);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -512,6 +522,22 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    struct ProofEpoch {
+        using Range = std::pair<std::uint64_t, std::size_t>;
+        struct Image {
+            const StorageTexture* image;
+            std::uint64_t generation;
+            DccKeys uploaded;
+            DccKeys filled;
+        };
+        bool valid = false;
+        std::uint64_t stamps = 0;
+        std::vector<Range> ranges;
+        std::vector<Image> images;
+        std::vector<Range> storageSurfaces;
+    };
+    ProofEpoch proofEpoch;
+    bool proofEpochSkip(std::uint64_t serialBefore, std::size_t& refusal);
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
