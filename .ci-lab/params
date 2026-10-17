@@ -1,0 +1,5 @@
+name=levers-a
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-levers-a-e104cea893-114385
