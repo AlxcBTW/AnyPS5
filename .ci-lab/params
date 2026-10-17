@@ -1,0 +1,5 @@
+name=reval-lever
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-reval-lever-1f30aded9c-139065
