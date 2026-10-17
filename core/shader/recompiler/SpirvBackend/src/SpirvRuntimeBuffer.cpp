@@ -7,6 +7,8 @@
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <string>
 #include <vector>
@@ -169,8 +171,13 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
-    const auto bounds = EmitMemoryElementInBounds(state, access, last);
-    const auto inBounds = enable != 0u ? both(state, enable, bounds) : bounds;
+    static const bool skipBounds = [] {
+        const bool on = std::getenv("APS5_LAB_SKIP_BOUNDS") != nullptr && *std::getenv("APS5_LAB_SKIP_BOUNDS") == '1';
+        if (on) std::fprintf(stderr, "[lab] APS5_LAB_SKIP_BOUNDS=1: direct buffer loads omit the descriptor-range check and rely on device robustBufferAccess for out-of-range words (stores, atomics and BDA keep their checks). Ablation, NOT exact: out-of-range reads may return values other than zero.\n");
+        return on;
+    }();
+    const auto bounds = skipBounds ? 0u : EmitMemoryElementInBounds(state, access, last);
+    const auto inBounds = skipBounds ? 0u : (enable != 0u ? both(state, enable, bounds) : bounds);
     const auto load = [&](std::uint32_t word) {
         const auto value = state.module.AllocateId();
         const auto pointer = EmitMemoryElementPointer(state, access, word);
@@ -188,6 +195,14 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
         return EmitAndConstant(state, value, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
     };
     const auto highShift = Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32u), shift);
+    if (skipBounds) {
+        const auto unguarded = [&] {
+            const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(index), shift);
+            const auto high = EmitValueOrZeroIfCondition(state, unaligned, [&] { return Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(next), highShift); });
+            return combine(low, high);
+        };
+        return enable != 0u ? EmitValueOrZeroIfCondition(state, enable, unguarded) : unguarded();
+    }
     if (!LoadsSelectable(state, access)) {
         return EmitValueOrZeroIfCondition(state, inBounds, [&] {
             const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(index), shift);

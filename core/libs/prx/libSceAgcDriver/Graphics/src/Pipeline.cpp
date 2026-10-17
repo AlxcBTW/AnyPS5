@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <list>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -22,7 +23,7 @@
 
 namespace AgcDriver::Graphics {
 
-void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
+void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline, const char* tag) {
     if (!context.pipelineExecutableInfo) return;
     const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
     const auto getStatistics = context.Function<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
@@ -43,27 +44,32 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
         statistics.resize(count);
         const auto& property = properties[index];
-        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        std::fprintf(stderr, "[pipeline-stats] %sexecutable=%u stages=0x%x subgroup=%u name=%s\n", tag, index, property.stages, property.subgroupSize, property.name);
+        std::string summary;
         for (const auto& statistic : statistics) {
-            std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
+            char value[64];
             switch (statistic.format) {
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
-                std::fprintf(stderr, "%s", statistic.value.b32 ? "true" : "false");
+                std::snprintf(value, sizeof(value), "%s", statistic.value.b32 ? "true" : "false");
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
-                std::fprintf(stderr, "%lld", static_cast<long long>(statistic.value.i64));
+                std::snprintf(value, sizeof(value), "%lld", static_cast<long long>(statistic.value.i64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
-                std::fprintf(stderr, "%llu", static_cast<unsigned long long>(statistic.value.u64));
+                std::snprintf(value, sizeof(value), "%llu", static_cast<unsigned long long>(statistic.value.u64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
-                std::fprintf(stderr, "%.17g", statistic.value.f64);
+                std::snprintf(value, sizeof(value), "%.17g", statistic.value.f64);
                 break;
             default:
                 throw std::runtime_error("unsupported pipeline statistic format");
             }
-            std::fprintf(stderr, " (%s)\n", statistic.description);
+            std::fprintf(stderr, "[pipeline-stats] %sexecutable=%u %s=%s (%s)\n", tag, index, statistic.name, value, statistic.description);
+            std::string name(statistic.name);
+            std::replace(name.begin(), name.end(), ' ', '_');
+            summary += " " + name + "=" + value;
         }
+        std::fprintf(stderr, "[pipeline-stats-line] %sexecutable=%u stages=0x%x subgroup=%u%s\n", tag, index, property.stages, property.subgroupSize, summary.c_str());
     }
 }
 
