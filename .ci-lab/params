@@ -1,0 +1,5 @@
+name=pending-save-b
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pending-save-b-ecee5c4c25-132411
