@@ -105,6 +105,18 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+std::atomic<std::uint64_t> pendingSaveWatched{0}, pendingSaveMatched{0}, pendingSaveChanged{0}, pendingSaveNoBaseline{0}, pendingSaveAvoided{0}, pendingSaveOccurred{0};
+std::atomic<std::int64_t> pendingSaveReported{0};
+
+void reportPendingSave() {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = pendingSaveReported.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !pendingSaveReported.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto watched = take(pendingSaveWatched), matched = take(pendingSaveMatched), changed = take(pendingSaveChanged), noBaseline = take(pendingSaveNoBaseline), avoided = take(pendingSaveAvoided), occurred = take(pendingSaveOccurred);
+    AgcDriver::ProfilePrint_nid_no_patch("[pendingsave] units captured because still watched %llu, captured because the baseline matched %llu; refusals kept because changed %llu, because no baseline %llu; unwatched-span stores past the Require(!unsavedOutsideWatch) %llu, Require hits %llu (10 s)\n", watched, matched, changed, noBaseline, avoided, occurred);
+}
+
 struct StorageTraffic {
     std::mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -120,6 +132,7 @@ StorageTraffic& Traffic() {
 }
 
 void reportStorageTraffic(StorageTraffic& traffic) {
+    reportPendingSave();
     const auto now = std::chrono::steady_clock::now();
     if (now - traffic.lastReport < std::chrono::seconds(10)) return;
     traffic.lastReport = now;
@@ -3348,11 +3361,27 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    reportPendingSave();
+    const auto baselineKept = [&](std::uint32_t) { return generationBaseline.size() == guestBytes; };
     std::vector<bool> unsaved(trackedLayers, false);
     bool anyUnsaved = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
         const bool noBaseline = !layerPending[layer] && !layerOriginal[layer];
-        unsaved[layer] = noBaseline && (layerGeneration[layer] == 0 || (savedTicket[layer] == 0 && (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer))) || guestMatchesUpload(layer))));
+        bool capture = noBaseline && layerGeneration[layer] == 0;
+        if (noBaseline && layerGeneration[layer] != 0 && savedTicket[layer] == 0) {
+            if (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)))) {
+                capture = true;
+                pendingSaveWatched.fetch_add(1, std::memory_order_relaxed);
+            } else if (!baselineKept(layer)) {
+                pendingSaveNoBaseline.fetch_add(1, std::memory_order_relaxed);
+            } else if (guestMatchesUpload(layer)) {
+                capture = true;
+                pendingSaveMatched.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                pendingSaveChanged.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        unsaved[layer] = capture;
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved, true);
@@ -4847,6 +4876,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             else keep.emplace_back(from, to);
         }
     }
+    if (!tracked && !unsavedOutsideWatch) pendingSaveAvoided.fetch_add(1, std::memory_order_relaxed);
+    if (unsavedOutsideWatch) pendingSaveOccurred.fetch_add(1, std::memory_order_relaxed);
     if (unsavedOutsideWatch) {
         // Lab diagnostics: the store below refuses this case; name the image, its units and the paths that took its memory out of
         // the write watch lately, so a repro says which write-back it is and why no bytes were compared.
