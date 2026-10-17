@@ -1179,8 +1179,19 @@ int RefreshLeverMode() {
     return mode;
 }
 
+int RefreshLeverImportMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_LAB_REFRESH_LEVER");
+        if (text == nullptr) return 0;
+        if (std::strcmp(text, "2") == 0) return 1;
+        return std::strcmp(text, "verify2") == 0 ? 2 : 0;
+    }();
+    return mode;
+}
+
 struct RefreshLeverStats {
     std::atomic<std::uint64_t> calls{0}, queries{0}, returned{0}, disagreements{0}, importSkipped{0}, quick{0};
+    std::atomic<std::uint64_t> importHits{0}, importMisses{0}, importEpochMoves{0}, importDifferences{0};
     std::atomic<std::int64_t> reported{0};
 };
 
@@ -1204,7 +1215,10 @@ void ReportRefreshLever() {
     if (now - last < 10'000'000'000ll || !stats.reported.compare_exchange_strong(last, now)) return;
     const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
     const auto calls = take(stats.calls), queries = take(stats.queries), returned = take(stats.returned), quick = take(stats.quick), skipped = take(stats.importSkipped);
-    AgcDriver::ProfilePrint_nid_no_patch("[refreshlever] (10 s, mode %s): %llu refreshes, %llu on the quick unchanged path, %llu index queries, %llu entries returned, %llu host-import lookups skipped%s, disagreements %llu (since start)\n", RefreshLeverMode() == 2 ? "verify" : "on", calls, quick, queries, returned, skipped, RefreshLeverMode() == 2 ? " (would skip)" : "", static_cast<unsigned long long>(stats.disagreements.load(std::memory_order_relaxed)));
+    const auto hits = take(stats.importHits), misses = take(stats.importMisses), moves = take(stats.importEpochMoves);
+    const int importMode = RefreshLeverImportMode();
+    const char* modeName = importMode == 2 ? "verify2" : importMode == 1 ? "cached import lookup" : RefreshLeverMode() == 2 ? "verify" : "on";
+    AgcDriver::ProfilePrint_nid_no_patch("[refreshlever] (10 s, mode %s): %llu refreshes, %llu on the quick unchanged path, %llu index queries, %llu entries returned, %llu host-import lookups skipped%s, disagreements %llu (since start); import cache: %llu hits, %llu misses, %llu epoch moves, verify2 differences %llu (since start)\n", modeName, calls, quick, queries, returned, skipped, RefreshLeverMode() == 2 ? " (would skip)" : "", static_cast<unsigned long long>(stats.disagreements.load(std::memory_order_relaxed)), hits, misses, moves, static_cast<unsigned long long>(stats.importDifferences.load(std::memory_order_relaxed)));
 }
 
 // The first 20 differences of the verify mode, with their details.
@@ -1990,8 +2004,24 @@ bool StorageTexture::Refresh() {
         // does not need its result (APS5_LAB_REFRESH_LEVER_KEEP_IMPORT_LOOKUP=1 still makes it).
         static const bool keepLookup = std::getenv("APS5_LAB_REFRESH_LEVER_KEEP_IMPORT_LOOKUP") != nullptr;
         const bool lookupUnneeded = lever != 0 && unchanged && alias == nullptr;
-        if (lookupUnneeded) LeverCount(LeverStats().importSkipped);
-        if (!(lookupUnneeded && lever == 1 && !keepLookup)) direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        const int importMode = RefreshLeverImportMode();
+        if (lookupUnneeded && importMode == 0) LeverCount(LeverStats().importSkipped);
+        const auto lookupImport = [&]() -> const HostImport* {
+            const auto size = static_cast<std::size_t>(guestBytes);
+            if (importMode == 0) return HostImportFor(context, descriptor.baseAddress, size);
+            HostImportLookup outcome = HostImportLookup::Miss;
+            const auto* cached = HostImportForCached(context, descriptor.baseAddress, size, importLookup, outcome);
+            LeverCount(outcome == HostImportLookup::Hit ? LeverStats().importHits : outcome == HostImportLookup::EpochMoved ? LeverStats().importEpochMoves : LeverStats().importMisses);
+            if (importMode == 2) {
+                const auto* full = HostImportFor(context, descriptor.baseAddress, size);
+                if (full != cached) {
+                    const auto number = LeverStats().importDifferences.fetch_add(1, std::memory_order_relaxed);
+                    if (number < 20) AgcDriver::ProfilePrint_nid_no_patch("[refreshlever] DISAGREE import lookup 0x%llx+0x%llx: cached %p, full %p\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<const void*>(cached), static_cast<const void*>(full));
+                }
+            }
+            return cached;
+        };
+        if (!(lookupUnneeded && lever == 1 && importMode == 0 && !keepLookup)) direct = keys == DccKeys::Uncompressed && lookupImport() != nullptr;
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
