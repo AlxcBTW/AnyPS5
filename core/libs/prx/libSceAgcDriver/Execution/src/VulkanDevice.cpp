@@ -67,6 +67,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <utility>
 
@@ -1531,6 +1532,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     // Guest shaders routinely read past descriptor ranges; robust access turns that into zeros
     // instead of a GPU fault that loses the device.
     enabled.robustBufferAccess = available.robustBufferAccess;
+    unsigned noRobust = 0;
+    if (const char* text = std::getenv("APS5_LAB_NO_ROBUST_BUFFER"); text != nullptr && !compileOnly) noRobust = *text == '2' ? 2u : *text == '1' ? 1u : 0u;
+    if (noRobust != 0) {
+        enabled.robustBufferAccess = VK_FALSE;
+        std::fprintf(stderr, "[lab] APS5_LAB_NO_ROBUST_BUFFER=%u: robustBufferAccess off, robustImageAccess %s, robustBufferAccess2/robustImageAccess2 were never enabled. UPPER-BOUND ablation, NOT exact: the recompiler bounds-checks direct buffer loads and stores against the descriptor range, but not vertex-input and index-buffer fetches%s; a device loss or wrong picture is a finding, not a bug.\n", noRobust, noRobust == 2 ? "off" : "on", noRobust == 2 ? " nor storage and sampled image texel accesses (no coordinate check except 3D slice range)" : "");
+    }
     VkDeviceQueueCreateInfo queueInfos[3]{queueInfo, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
     if (available.sparseBinding && state->dmaBufImport) {
         std::uint32_t families = 0;
@@ -1733,7 +1740,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         demoteFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &demoteFeatures;
     }
-    VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, VK_TRUE};
+    VkPhysicalDeviceImageRobustnessFeaturesEXT imageRobustnessFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT, nullptr, noRobust == 2 ? VK_FALSE : VK_TRUE};
     if (imageRobustness) {
         imageRobustnessFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &imageRobustnessFeatures;
@@ -4638,6 +4645,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    if (state->pipelineExecutableInfo && record.programAddress != 0) {
+        static std::mutex mappedMutex;
+        static auto* mapped = new std::unordered_set<std::uint64_t>();
+        std::lock_guard mappedLock(mappedMutex);
+        if (mapped->insert(record.programAddress).second) std::fprintf(stderr, "[pipeline-map] program=0x%llx variant=0x%llx words=%zu\n", static_cast<unsigned long long>(record.programAddress), static_cast<unsigned long long>(record.shader->program->PipelineVariantId()), record.shader->program->spirv.size());
+    }
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     if (clearing) {
         Graphics::RecordClearKernel(context, commands, clearMirror);
@@ -4764,7 +4777,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     state->computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
     if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
-    Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+    if (context.pipelineExecutableInfo) {
+        char tag[96];
+        std::snprintf(tag, sizeof(tag), "program=0x%llx variant=0x%llx words=%zu ", static_cast<unsigned long long>(programAddress != 0 ? programAddress : shader.variantId), static_cast<unsigned long long>(shader.PipelineVariantId()), shader.spirv.size());
+        Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline, tag);
+    }
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(programAddress));
     return objects;
 }
