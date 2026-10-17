@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -346,6 +347,17 @@ public:
 private:
     ReadSite previous;
 };
+enum class HookKind : std::uint8_t { None = 0, Read, ReadCommitted, Equals, Write, WriteChanged, Direct, Count };
+struct HookAccess {
+    std::uint64_t address;
+    std::size_t bytes;
+    const void* caller;
+    HookKind kind;
+};
+bool HookCallersEnabled();
+const char* HookKindName(HookKind kind);
+HookAccess CurrentHookAccess();
+std::array<std::uint64_t, static_cast<std::size_t>(HookKind::Count)> TakeHookCallCounts();
 // Return addresses above the caller as offsets into the driver's module (the same form as the
 // [guestmem] callers, symbolized with nm against the driver's image; an address outside the module
 // is written as 0), newest first, skipping `skip` frames above the caller; returns how many were

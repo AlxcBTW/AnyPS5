@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HookCallers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -361,6 +362,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     for (const auto& [begin, end] : ranges) GuestWriteRing::Record(GuestWriteRing::Kind::ShadowPublish, begin, end - begin, shadow->importBase);
+    if (reason == PublishReason::Hook) HookCallers::NotePublish(ranges, bytes, units);
     const auto decided = GuestMemory::StoreWindowCheckEnabled() ? GuestMemory::TrackerGeneration() : 0;
     recordCopies(*shadow, copies, ranges, bytes);
     if (decided != 0) {

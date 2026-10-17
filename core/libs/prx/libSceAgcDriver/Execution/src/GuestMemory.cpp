@@ -2520,14 +2520,67 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     readGuard.store(guard, std::memory_order_release);
 }
 
+namespace {
+
+thread_local HookAccess currentHookAccess{0, 0, nullptr, HookKind::None};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(HookKind::Count)> hookCalls{};
+
+struct HookAccessGuard {
+    HookAccess previous;
+    HookAccessGuard(std::uint64_t address, std::size_t bytes, HookKind kind, const void* caller) : previous(currentHookAccess) {
+        currentHookAccess = {address, bytes, caller, kind};
+        hookCalls[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    }
+    ~HookAccessGuard() { currentHookAccess = previous; }
+    HookAccessGuard(const HookAccessGuard&) = delete;
+    HookAccessGuard& operator=(const HookAccessGuard&) = delete;
+};
+
+void flushFrom(std::uint64_t address, std::size_t bytes, HookKind kind, const void* caller) {
+    const auto hook = flushHook.load(std::memory_order_acquire);
+    if (!hook) return;
+    if (!HookCallersEnabled()) {
+        hook(address, bytes);
+        return;
+    }
+    const HookAccessGuard access(address, bytes, kind, caller);
+    hook(address, bytes);
+}
+
+}
+
+bool HookCallersEnabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LAB_HOOK_CALLERS");
+        return text != nullptr && text[0] != 0 && text[0] != 0x30;
+    }();
+    return enabled;
+}
+
+const char* HookKindName(HookKind kind) {
+    static const char* const names[static_cast<std::size_t>(HookKind::Count)] = {"none", "read", "read-committed", "equals", "write", "write-changed", "direct"};
+    const auto index = static_cast<std::size_t>(kind);
+    return index < static_cast<std::size_t>(HookKind::Count) ? names[index] : "?";
+}
+
+HookAccess CurrentHookAccess() {
+    return currentHookAccess;
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(HookKind::Count)> TakeHookCallCounts() {
+    std::array<std::uint64_t, static_cast<std::size_t>(HookKind::Count)> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = hookCalls[i].exchange(0, std::memory_order_relaxed);
+    return counts;
+}
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
-    if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
+    flushFrom(address, bytes, HookKind::Direct, __builtin_return_address(0));
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    flushFrom(address, destination.size(), HookKind::Read, __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);
@@ -2557,7 +2610,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    flushFrom(address, destination.size(), HookKind::ReadCommitted, __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
@@ -2573,7 +2626,7 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
-    FlushGpuWrites(address, bytes.size());
+    flushFrom(address, bytes.size(), HookKind::Equals, __builtin_return_address(0));
     return EqualsCommittedUnsynced(address, bytes);
 }
 
@@ -2638,7 +2691,7 @@ void writeChangedFrom(std::uint64_t address, std::span<const std::byte> current,
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
     const ReadSiteScope site(ReadSite::Store);
-    FlushGpuWrites(address, current.size());
+    flushFrom(address, current.size(), HookKind::WriteChanged, reinterpret_cast<const void*>(caller));
     const TimedAccess timed(CounterChangedWrite, current.size());
     auto* destination = reinterpret_cast<std::byte*>(address);
     CheckRange(destination, current.size(), 1, true);
@@ -2674,7 +2727,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     if (source.empty()) return;
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);
-    FlushGpuWrites(address, source.size());
+    flushFrom(address, source.size(), HookKind::Write, __builtin_return_address(0));
     const TimedAccess timed(CounterWrite, source.size());
     CountWriteCaller(__builtin_return_address(0));
     const auto caller = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));

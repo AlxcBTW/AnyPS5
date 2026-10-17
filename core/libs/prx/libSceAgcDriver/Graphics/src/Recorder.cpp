@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HookCallers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -1916,6 +1917,7 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
     presentSerial.fetch_add(1, std::memory_order_relaxed);
+    HookCallers::ReportIfDue();
 }
 
 std::uint64_t Recorder::Presents() {
