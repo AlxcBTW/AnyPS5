@@ -4628,9 +4628,10 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         ImportWatch decided;
         ~Restore() { SetImportWatch(context, decided); }
     } restore{base, decided};
-    enum class Write { None, AfterPending, BeforePending };
-    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending}) {
-        const std::string what = write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : "a CPU write before the results were pending again";
+    enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite };
+    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite}) {
+        const bool unwatchedWrite = write == Write::UnwatchedFullClear || write == Write::UnwatchedPartialWrite;
+        const std::string what = write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : "a CPU write into the unwatched block before results that cover part of it";
         void* block = AllocateWatched(surfaceBytes, unit);
         if (block == nullptr) {
             std::cout << "no write watching: results pending after a block left the watch not tested\n";
@@ -4705,11 +4706,50 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             Require(!image->GuestSnapshotValid(), "(p) " + what + ": the upload left saved guest bytes while its memory was watched");
             AgcDriver::GuestMemory::Unwatch(address + 3 * unit, unit);
             Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes) && AgcDriver::GuestMemory::Watched(address, 3 * unit), "(p) " + what + ": the last block did not leave the watch alone");
+            const auto cpuUnit = [](std::size_t i) { return i % 4 == 0 ? static_cast<std::uint8_t>(0x11) : static_cast<std::uint8_t>(i * 131u + 7u); };
             if (write == Write::BeforePending) writePage();
-            clear(VkClearColorValue{{0.0f, 1.0f, 0.0f, 1.0f}});
+            if (unwatchedWrite) {
+                for (std::size_t i = 0; i < unit; ++i) memory[3 * unit + i] = cpuUnit(i);
+            }
+            if (write == Write::UnwatchedPartialWrite) {
+                constexpr std::uint32_t patch = 16;
+                Buffer staging(context, patch * patch * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                const auto bytes = staging.Bytes();
+                for (std::size_t at = 0; at < patch * patch * 4; at += 4) {
+                    bytes[at] = std::byte{0};
+                    bytes[at + 1] = std::byte{255};
+                    bytes[at + 2] = std::byte{0};
+                    bytes[at + 3] = std::byte{255};
+                }
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageOffset = {static_cast<std::int32_t>(side - 64), static_cast<std::int32_t>(side - 64), 0};
+                copy.imageExtent = {patch, patch, 1};
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                image->MarkDirty();
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+            } else {
+                clear(VkClearColorValue{{0.0f, 1.0f, 0.0f, 1.0f}});
+            }
             if (write == Write::AfterPending) writePage();
+            bool refused = false;
             try {
                 store();
+            } catch (const std::exception&) {
+                try {
+                    recorder.Submit();
+                    device.WaitQueue();
+                    recorder.Sync();
+                } catch (...) {
+                }
+                if (!unwatchedWrite) throw;
+                refused = true;
+                static_cast<void>(StorageTexture::DiscardPendingInside(address, surfaceBytes));
             } catch (...) {
                 try {
                     recorder.Submit();
@@ -4718,6 +4758,35 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 } catch (...) {
                 }
                 throw;
+            }
+            if (unwatchedWrite) {
+                if (refused) {
+                    std::cout << "(p) " + what + ": refused rather than stored\n";
+                    for (std::size_t i = 0; i < unit; ++i) Require(memory[3 * unit + i] == cpuUnit(i), "(p) " + what + ": the refused write-back changed the CPU's bytes");
+                    recorder.Sync();
+                    continue;
+                }
+                std::vector<std::byte> storedUnit(unit);
+                AgcDriver::GuestMemory::Read(address + 3 * unit, storedUnit);
+                std::size_t greens = 0;
+                for (std::size_t at = 0; at < unit; at += 4) {
+                    const bool green = std::to_integer<std::uint8_t>(storedUnit[at]) == 0 && std::to_integer<std::uint8_t>(storedUnit[at + 1]) == 255 && std::to_integer<std::uint8_t>(storedUnit[at + 2]) == 0 && std::to_integer<std::uint8_t>(storedUnit[at + 3]) == 255;
+                    bool cpu = true;
+                    for (std::size_t c = 0; c < 4; ++c) cpu = cpu && std::to_integer<std::uint8_t>(storedUnit[at + c]) == cpuUnit(at + c);
+                    Require(green || cpu, "(p) " + what + ": a texel the GPU did not write holds neither the CPU's bytes nor a result, at +0x" + std::to_string(at));
+                    greens += green;
+                }
+                if (write == Write::UnwatchedFullClear) Require(greens == unit / 4, "(p) " + what + ": " + std::to_string(greens) + " of " + std::to_string(unit / 4) + " words took the GPU result");
+                else Require(greens == 16 * 16, "(p) " + what + ": " + std::to_string(greens) + " words took the GPU result, want 256");
+                std::vector<std::byte> rest(3 * unit);
+                AgcDriver::GuestMemory::Read(address, rest);
+                for (std::size_t at = 0; at < 3 * unit; at += 4) {
+                    const bool green = std::to_integer<std::uint8_t>(rest[at]) == 0 && std::to_integer<std::uint8_t>(rest[at + 1]) == 255 && std::to_integer<std::uint8_t>(rest[at + 2]) == 0 && std::to_integer<std::uint8_t>(rest[at + 3]) == 255;
+                    if (write == Write::UnwatchedFullClear) Require(green, "(p) " + what + ": the watched units did not take the GPU result at +0x" + std::to_string(at));
+                    else Require(std::to_integer<std::uint8_t>(rest[at]) == 0x5a, "(p) " + what + ": the watched units changed where the GPU wrote nothing, at +0x" + std::to_string(at));
+                }
+                recorder.Sync();
+                continue;
             }
             std::vector<std::byte> read(surfaceBytes);
             AgcDriver::GuestMemory::Read(address, read);
