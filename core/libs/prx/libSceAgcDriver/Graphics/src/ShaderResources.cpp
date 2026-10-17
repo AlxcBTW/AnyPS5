@@ -2582,6 +2582,86 @@ bool EpochRevalidate() {
     return enabled;
 }
 
+// APS5_LAB_REVAL_REASONS=1: why Revalidate took the full walk, by the first check of the fast proof that
+// failed (RevalFine splits FastFail further), with the walk's time per reason, printed every 10 s with
+// zeros included. Counters only; no decision depends on them.
+enum class RevalFine : std::size_t {
+    NoRecordSize, NoRecordInvalid, DepthHolds,
+    SnapOutsideLevel0, SnapOutsideClearSingle, SnapOutsideCompressed, SnapOutsideNoKeyEpoch0, SnapOutsideNoKeyNoHint, SnapOutsideNoKeyForgetOdd, SnapOutsideNoKeyKeyedNow, SnapOutsideDepthAt, SnapOutsideKeyMoved,
+    ViewOutsideLevel1, ViewOutsideEvicted, ViewOutsideMoved,
+    SnapKeysUnproven, SnapKeysMoved, ViewImageKeys, ViewSurfaceKeys, ViewSourceEvicted,
+    StorageElementKeys, StorageNull, StorageDepth, StorageOutsideLevel1, StorageOutsideEvicted, StorageOutsideMoved, StorageProvedKeys, StorageEvicted,
+    ClearedViewScan, Pending, PendingT1Disabled, PendingT1Snapshot, PendingT1Keys, PendingT1ForeignView, PendingT1SurfaceKey, PendingT1NotImported, PendingT1Uncached,
+    MemoryChanged, ImagesNotCached, None, Count
+};
+constexpr std::array<const char*, static_cast<std::size_t>(RevalFine::Count)> RevalFineNames{
+    "no-record-size", "no-record-invalid", "depth-surface-holds",
+    "snap-outside:level0", "snap-outside:clear-single", "snap-outside:compressed-keys", "snap-outside:no-key,epoch0", "snap-outside:no-key,no-hint", "snap-outside:no-key,forget-odd", "snap-outside:no-key,keyed-now", "snap-outside:depth-surface", "snap-outside:key-moved",
+    "view-outside:level1", "view-outside:evicted", "view-outside:stamp-moved",
+    "snap-keys:unproven", "snap-keys:moved", "view-keys:image", "view-keys:surface", "view-source-evicted",
+    "storage-keys:element", "storage-null", "storage-depth", "storage-outside:level1", "storage-outside:evicted", "storage-outside:stamp-moved", "storage-keys:proved", "storage-evicted",
+    "cleared-view-scan", "pending", "pending:t1-disabled", "pending:t1-snapshot", "pending:t1-keys", "pending:t1-foreign-view", "pending:t1-surface-key", "pending:t1-not-imported", "pending:t1-uncached",
+    "memory-changed", "images-not-cached", "none"};
+
+thread_local RevalFine lastRevalFine = RevalFine::None;
+
+bool RevalReasonsEnabled() {
+    static const bool enabled = std::getenv("APS5_LAB_REVAL_REASONS") != nullptr;
+    return enabled;
+}
+
+struct RevalReasonStats {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalFine::Count)> walks{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalFine::Count)> walkNanoseconds{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalFine::Count)> walkFailed{};
+    std::array<std::atomic<std::uint64_t>, 4> calls{};
+    std::array<std::atomic<std::uint64_t>, 4> nanoseconds{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+RevalReasonStats& RevalReasons() {
+    static RevalReasonStats stats;
+    return stats;
+}
+
+void countRevalWalk(RevalFine fine, std::chrono::steady_clock::time_point start, bool walked) {
+    auto& stats = RevalReasons();
+    const auto elapsed = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    const auto index = static_cast<std::size_t>(fine);
+    stats.walks[index].fetch_add(1, std::memory_order_relaxed);
+    stats.walkNanoseconds[index].fetch_add(elapsed, std::memory_order_relaxed);
+    if (!walked) stats.walkFailed[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+// path: 0 fast, 1 fast after an own-object refresh, 2 full walk, 3 failed outright.
+void countRevalCall(std::size_t path, std::chrono::steady_clock::time_point start) {
+    auto& stats = RevalReasons();
+    const auto now = std::chrono::steady_clock::now();
+    stats.calls[path].fetch_add(1, std::memory_order_relaxed);
+    stats.nanoseconds[path].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+    auto last = stats.lastReport.load();
+    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    const auto millis = [](const std::atomic<std::uint64_t>& value) { return static_cast<double>(value.load(std::memory_order_relaxed)) / 1e6; };
+    std::string reasons;
+    for (std::size_t i = 0; i < RevalFineNames.size(); ++i) {
+        char text[160];
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f ms/%llu failed;", RevalFineNames[i], load(stats.walks[i]), millis(stats.walkNanoseconds[i]), load(stats.walkFailed[i]));
+        reasons += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[reval-reasons] cumulative: fast %llu (%.1f ms), own-refresh %llu (%.1f ms), full walk %llu (%.1f ms), failed %llu (%.1f ms); full walks by reason (count/walk time/walk found another object):%s\n", load(stats.calls[0]), millis(stats.nanoseconds[0]), load(stats.calls[1]), millis(stats.nanoseconds[1]), load(stats.calls[2]), millis(stats.nanoseconds[2]), load(stats.calls[3]), millis(stats.nanoseconds[3]), reasons.c_str());
+}
+
+// Why a snapshot over memory outside the write watch has no usable untracked key right now (counter only).
+RevalFine NoKeyReason(std::uint64_t address, std::size_t bytes) {
+    if (GuestMemory::CollectEpoch() == 0) return RevalFine::SnapOutsideNoKeyEpoch0;
+    if (GuestMemory::UntrackedHint(address, bytes) == 0) return RevalFine::SnapOutsideNoKeyNoHint;
+    if ((GuestMemory::ForgetSerial() & 1u) != 0) return RevalFine::SnapOutsideNoKeyForgetOdd;
+    return RevalFine::SnapOutsideNoKeyKeyedNow;
+}
+
+
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
@@ -2624,12 +2704,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     accepted = false;
     fastProofsOutside = 0;
     if (!EpochRevalidate()) return fastRevalidateEach();
-    const auto fail = [&reason](FastFail why) {
+    const auto fail = [&reason](FastFail why, RevalFine fine) {
         reason = why;
+        lastRevalFine = fine;
         countFastFail(why);
         return false;
     };
-    if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
+    if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord, RevalFine::NoRecordSize);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
@@ -2654,9 +2735,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     };
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
-        if (!surface.valid) return fail(FastFail::NoRecord);
+        if (!surface.valid) return fail(FastFail::NoRecord, RevalFine::NoRecordInvalid);
         if (surface.depth) {
-            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth, RevalFine::DepthHolds);
             continue;
         }
         const auto address = surface.resource.baseAddress;
@@ -2668,27 +2749,32 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             const auto level = FastProofLevel();
             if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
                 // A depth surface registered over the memory is the lookup's to return (DepthSurfaceTexture).
-                if (DepthSurfaceAt(address)) return fail(FastFail::Depth);
+                if (DepthSurfaceAt(address)) return fail(FastFail::Depth, RevalFine::SnapOutsideDepthAt);
                 const bool held = untrackedKey(address, bytes) == surface.untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
                 countOutside(0, held ? 0u : 1u);
-                if (!held) return fail(FastFail::Collect);
+                if (!held) return fail(FastFail::Collect, RevalFine::SnapOutsideKeyMoved);
                 outside = true;
             } else if (level >= 2 && source != nullptr) {
-                if (!source->Cached()) return fail(FastFail::Evicted);
+                if (!source->Cached()) return fail(FastFail::Evicted, RevalFine::ViewOutsideEvicted);
                 const bool held = source->UntrackedUnchanged();
                 countOutside(1, held ? 0u : 1u);
-                if (!held) return fail(FastFail::Collect);
+                if (!held) return fail(FastFail::Collect, RevalFine::ViewOutsideMoved);
                 outside = true;
             } else {
                 countOutside(source != nullptr ? 1u : 0u, 2u);
-                return fail(FastFail::Collect);
+                RevalFine fine = RevalFine::SnapOutsideLevel0;
+                if (RevalReasonsEnabled()) {
+                    if (source != nullptr) fine = RevalFine::ViewOutsideLevel1;
+                    else if (level >= 1) fine = surface.keys == DccKeys::ClearSingle ? RevalFine::SnapOutsideClearSingle : surface.keys != DccKeys::Uncompressed ? RevalFine::SnapOutsideCompressed : NoKeyReason(address, bytes);
+                }
+                return fail(FastFail::Collect, fine);
             }
             ++fastProofsOutside;
         }
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
-            if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return fail(FastFail::Keys);
+            if (surface.resource.dccAddress != 0 && TextureClearKeys(surface.resource, surface.bytes) != surface.keys) return fail(FastFail::Keys, RevalFine::SnapKeysUnproven);
             scannedKeys[i] = surface.keys;
             if (!unchanged) query(address, address + bytes, source, source != nullptr && surface.keys != DccKeys::Uncompressed ? source : nullptr, {i, false, source != nullptr && surface.keys == DccKeys::Uncompressed});
         } else if (source != nullptr) {
@@ -2699,9 +2785,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // proof when they are the image's, else from the texture's.
             const auto& own = source->Descriptor();
             const auto sourceKeys = source->ProvedKeys();
-            if (sourceKeys != source->UploadedKeys()) return fail(FastFail::Keys);
+            if (sourceKeys != source->UploadedKeys()) return fail(FastFail::Keys, RevalFine::ViewImageKeys);
             const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : SameKeySurface(source, surface.resource, surface.bytes) ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
-            if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress && (keys != DccKeys::Uncompressed || !StorageImageServesKeys(*source, surface.resource.dccAddress))) return fail(FastFail::Keys);
+            if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress && (keys != DccKeys::Uncompressed || !StorageImageServesKeys(*source, surface.resource.dccAddress))) return fail(FastFail::Keys, RevalFine::ViewSurfaceKeys);
             scannedKeys[i] = keys;
             // A view of a fast-cleared surface stays one only while its image still has results
             // pending over it (cachedTexture's hit rule), unless the image's own descriptor names
@@ -2714,13 +2800,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         } else {
             // A snapshot holds its clear texels or the guest bytes: the keys must be what it was made under.
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
-            if (keys != surface.keys) return fail(FastFail::Keys);
+            if (keys != surface.keys) return fail(FastFail::Keys, RevalFine::SnapKeysMoved);
             scannedKeys[i] = keys;
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
             if (surface.resource.dccAddress != 0) countKeysProven(false);
         }
         if (source != nullptr) {
-            if (!source->Cached()) return fail(FastFail::Evicted);
+            if (!source->Cached()) return fail(FastFail::Evicted, RevalFine::ViewSourceEvicted);
             if (!outside) queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
         } else if (!outside) {
@@ -2728,27 +2814,27 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
-        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
+        if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys, RevalFine::StorageElementKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
-        if (image == nullptr) return fail(FastFail::NoRecord);
+        if (image == nullptr) return fail(FastFail::NoRecord, RevalFine::StorageNull);
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (DepthSurfaceOverlaps(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
-            return fail(FastFail::Depth);
+            return fail(FastFail::Depth, RevalFine::StorageDepth);
         }
         bool outside = false;
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
             if (FastProofLevel() < 2) {
                 countOutside(2, 2);
-                return fail(FastFail::Collect);
+                return fail(FastFail::Collect, RevalFine::StorageOutsideLevel1);
             }
-            if (!image->Cached()) return fail(FastFail::Evicted);
+            if (!image->Cached()) return fail(FastFail::Evicted, RevalFine::StorageOutsideEvicted);
             const bool held = image->UntrackedUnchanged();
             countOutside(2, held ? 0u : 1u);
-            if (!held) return fail(FastFail::Collect);
+            if (!held) return fail(FastFail::Collect, RevalFine::StorageOutsideMoved);
             outside = true;
             ++fastProofsOutside;
         }
@@ -2756,16 +2842,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
             // byte-compare fallback; the image's generation is left where it is.
-            if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
+            if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys, RevalFine::StorageProvedKeys);
             countKeysProven(true);
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
-        if (!image->Cached()) return fail(FastFail::Evicted);
+        if (!image->Cached()) return fail(FastFail::Evicted, RevalFine::StorageEvicted);
         if (!outside) queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
     if (!pending.empty()) {
-        if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
+        if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView, RevalFine::ClearedViewScan);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
         // names the view's own source: the lookup views the source (cachedTexture's hit rule)
         // and touches nothing else. A surface whose own object T1 refreshed in this Revalidate
@@ -2793,13 +2879,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!overlapping.empty()) {
             countPendingFail(pending);
-            return fail(FastFail::Pending);
+            return fail(FastFail::Pending, RevalFine::Pending);
         }
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
-    if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
+    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed, RevalFine::MemoryChanged);
+    if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted, RevalFine::ImagesNotCached);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         auto& surface = validatedTextures[i];
@@ -2993,6 +3079,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool reasons = RevalReasonsEnabled();
+    const auto reasonsStart = reasons ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
         CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
@@ -3007,6 +3095,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     bool ownedPath = false;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
         if (profile) countRevalidate(fast, ok, start, ownedPath);
+        if (reasons) countRevalCall(!ok ? 3u : !fast ? 2u : ownedPath ? 1u : 0u, reasonsStart);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
     };
@@ -3095,6 +3184,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
+    lastRevalFine = RevalFine::None;
     bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
@@ -3115,6 +3205,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             else fallback = OwnRefreshFallback::Rerun;
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
+        if (fallback != OwnRefreshFallback::Count && fallback != OwnRefreshFallback::Rerun) lastRevalFine = static_cast<RevalFine>(static_cast<std::size_t>(RevalFine::PendingT1Disabled) + static_cast<std::size_t>(fallback));
     }
     ownedPath = ownRefreshed;
     const bool viaOutside = fast && fastProofsOutside != 0;
@@ -3122,7 +3213,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
-        if (!fullWalk()) {
+        const auto walkStart = reasons ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool walked = fullWalk();
+        if (reasons) countRevalWalk(lastRevalFine, walkStart, walked);
+        if (!walked) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
