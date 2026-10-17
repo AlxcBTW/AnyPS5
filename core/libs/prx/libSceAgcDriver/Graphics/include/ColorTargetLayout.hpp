@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -46,6 +47,7 @@ public:
     std::size_t Alignment() const { return ColorTileModeBlockBytes(mode); }
     std::uint32_t BlocksPerRow() const { return pitch / blockWidth; }
     std::size_t Offset(std::uint32_t x, std::uint32_t y) const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> RectUnits(std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1, std::uint64_t unitBytes) const;
     void Detile(std::span<const std::byte> source, std::span<std::byte> destination) const;
     void Tile(std::span<const std::byte> source, std::span<std::byte> destination) const;
 

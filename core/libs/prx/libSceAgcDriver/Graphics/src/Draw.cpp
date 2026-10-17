@@ -1345,6 +1345,70 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     return inputs;
 }
 
+std::shared_ptr<const TargetRefresh::Scope> targetRefreshScope(const ColorTarget& color, const State& state, TargetRefresh::Lookup& kind) {
+    kind = TargetRefresh::Lookup::Unsupported;
+    if (color.samples > 1 || color.mipCount > 1 || color.mip != 0 || color.mipTail || color.depth > 1 || color.layers > 1 || color.arrayLastSlice != 0 || color.arraySlice != 0 || color.depthSlice != 0 || color.tileMode == ColorTileMode::Linear) return nullptr;
+    const auto& rect = state.scissor;
+    const std::int64_t left = std::max<std::int64_t>(0, rect.offset.x);
+    const std::int64_t top = std::max<std::int64_t>(0, rect.offset.y);
+    const std::int64_t right = std::min<std::int64_t>(color.extent.width, static_cast<std::int64_t>(rect.offset.x) + rect.extent.width);
+    const std::int64_t bottom = std::min<std::int64_t>(color.extent.height, static_cast<std::int64_t>(rect.offset.y) + rect.extent.height);
+    if (right <= left || bottom <= top) return nullptr;
+    if (left == 0 && top == 0 && right == color.extent.width && bottom == color.extent.height) {
+        kind = TargetRefresh::Lookup::FullScissor;
+        return nullptr;
+    }
+    struct Entry {
+        std::array<std::uint64_t, 9> key{};
+        TargetRefresh::Lookup kind = TargetRefresh::Lookup::Unsupported;
+        std::shared_ptr<const TargetRefresh::Scope> scope;
+    };
+    static std::mutex cacheMutex;
+    static std::array<Entry, 8> cache;
+    static std::size_t next = 0;
+    const std::array<std::uint64_t, 9> key{color.address, color.extent.width, color.extent.height, static_cast<std::uint64_t>(color.tileMode), color.elementBytes, static_cast<std::uint64_t>(left), static_cast<std::uint64_t>(top), static_cast<std::uint64_t>(right), static_cast<std::uint64_t>(bottom)};
+    {
+        const std::lock_guard lock(cacheMutex);
+        for (const auto& entry : cache) {
+            if (entry.key == key && entry.scope != nullptr) {
+                kind = entry.kind;
+                return entry.kind == TargetRefresh::Lookup::Scoped ? entry.scope : nullptr;
+            }
+        }
+    }
+    auto scope = std::make_shared<TargetRefresh::Scope>();
+    try {
+        const ColorTargetLayout layout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        const auto units = layout.RectUnits(static_cast<std::uint32_t>(left), static_cast<std::uint32_t>(top), static_cast<std::uint32_t>(right), static_cast<std::uint32_t>(bottom), 65536);
+        std::uint64_t bytes = 0;
+        for (const auto& [begin, end] : units) {
+            scope->ranges.emplace_back(color.address + begin, color.address + end);
+            bytes += end - begin;
+            scope->pages += (end - begin + 4095) / 4096;
+        }
+        scope->address = color.address;
+        scope->bytes = layout.Bytes();
+        kind = units.empty() ? TargetRefresh::Lookup::Unsupported : bytes * 4 > layout.Bytes() * 3 ? TargetRefresh::Lookup::Wide : TargetRefresh::Lookup::Scoped;
+        if (kind == TargetRefresh::Lookup::Scoped && TargetRefresh::Verify()) {
+            for (std::int64_t row = 0; row < 3; ++row) {
+                for (std::int64_t column = 0; column < 3; ++column) {
+                    const auto x = static_cast<std::uint32_t>(left + (right - 1 - left) * column / 2);
+                    const auto y = static_cast<std::uint32_t>(top + (bottom - 1 - top) * row / 2);
+                    TargetRefresh::NoteMappingCheck(scope->Holds(color.address + layout.Offset(x, y) / 65536 * 65536));
+                }
+            }
+        }
+    } catch (const std::exception&) {
+        kind = TargetRefresh::Lookup::Unsupported;
+    }
+    const std::lock_guard lock(cacheMutex);
+    Entry& slot = cache[next++ % cache.size()];
+    slot.key = key;
+    slot.kind = kind;
+    slot.scope = scope;
+    return kind == TargetRefresh::Lookup::Scoped ? std::shared_ptr<const TargetRefresh::Scope>(scope) : nullptr;
+}
+
 // The resident-target proof of one attachment (StorageTexture::Refresh: FlushPending, CollectWrites
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
@@ -1354,7 +1418,15 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
-        resident = lookup();
+        if (TargetRefresh::Enabled()) {
+            auto kind = TargetRefresh::Lookup::Whole;
+            const auto scope = targetRefreshScope(color, state, kind);
+            TargetRefresh::NoteLookup(kind);
+            const TargetRefresh::Guard guard(scope.get());
+            resident = lookup();
+        } else {
+            resident = lookup();
+        }
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         static std::mutex reportMutex;

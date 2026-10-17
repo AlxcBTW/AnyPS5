@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -20,6 +21,21 @@ void reject(TAction action) {
     try { action(); }
     catch (const std::runtime_error&) { return; }
     throw std::runtime_error("expected color layout rejection");
+}
+
+void checkRectUnits(const ColorTargetLayout& layout, std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1) {
+    const auto units = layout.RectUnits(x0, y0, x1, y1, 65536);
+    for (std::size_t index = 0; index < units.size(); ++index) {
+        const auto [begin, end] = units[index];
+        Require(begin % 65536 == 0 && begin < end && end <= layout.Bytes() && (end % 65536 == 0 || end == layout.Bytes()), "a rectangle's units are not whole units of the surface");
+        Require(index == 0 || begin > units[index - 1].second, "a rectangle's units are not ascending and disjoint");
+    }
+    for (std::uint32_t y = y0; y < y1; ++y) {
+        for (std::uint32_t x = x0; x < x1; ++x) {
+            const auto unit = layout.Offset(x, y) / 65536 * 65536;
+            Require(std::any_of(units.begin(), units.end(), [&](const auto& range) { return unit >= range.first && unit < range.second; }), "a texel of the rectangle lies outside the rectangle's units");
+        }
+    }
 }
 
 }
@@ -263,4 +279,29 @@ void RunColorTargetLayoutTests() {
     readback.fill(std::byte{0});
     ReadColorTarget(target, readback);
     Require(readback == pixels && guest[0] == std::byte{0x6b}, "display XOR guest color transfer lost pixels or wrote the untagged block origin");
+    for (const auto mode : {ColorTileMode::RenderTarget, ColorTileMode::D64KBX, ColorTileMode::Z64KBX, ColorTileMode::Standard64KB, ColorTileMode::Standard4KB, ColorTileMode::S4KBX, ColorTileMode::D4KBX}) {
+        for (const std::uint32_t bpe : {2u, 4u, 8u}) {
+            std::optional<ColorTargetLayout> built;
+            try { built.emplace(1000, 700, mode, bpe); }
+            catch (const std::runtime_error&) { continue; }
+            const auto& layout = *built;
+            checkRectUnits(layout, 0, 0, 1, 1);
+            checkRectUnits(layout, 3, 5, 40, 17);
+            checkRectUnits(layout, 333, 175, 667, 350);
+            checkRectUnits(layout, 0, 699, 1000, 700);
+            checkRectUnits(layout, 999, 0, 1000, 700);
+            checkRectUnits(layout, 0, 0, 1000, 700);
+            const auto whole = layout.RectUnits(0, 0, 1000, 700, 65536);
+            Require(whole.size() == 1 && whole[0].first == 0 && whole[0].second == layout.Bytes(), "the whole surface's units are not the whole surface");
+            const auto texel = layout.RectUnits(500, 300, 501, 301, 65536);
+            Require(!texel.empty() && texel[0].second - texel[0].first <= std::max<std::uint64_t>(layout.Alignment(), 65536) * 2 && texel[0].second - texel[0].first < layout.Bytes(), "one texel took more units than its block can reach");
+        }
+    }
+    const ColorTargetLayout rows(1000, 700, ColorTileMode::Linear);
+    Require(rows.RectUnits(0, 0, 10, 10, 65536).empty(), "a linear surface named block units");
+    const ColorTargetLayout small(300, 300, ColorTileMode::RenderTarget);
+    reject([&] { small.RectUnits(5, 5, 5, 6, 65536); });
+    reject([&] { small.RectUnits(0, 0, 301, 1, 65536); });
+    const auto corner = small.RectUnits(0, 0, 1, 1, 65536);
+    Require(corner.size() == 1 && corner[0].first == 0 && corner[0].second == 65536, "a corner texel of a 64 KiB render target is not its first unit");
 }
