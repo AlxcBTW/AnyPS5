@@ -40,3 +40,9 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Depth clear, cases in reverse order
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          build/tests/agc_driver_depth_clear_hle_tests reverse
