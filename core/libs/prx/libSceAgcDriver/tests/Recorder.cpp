@@ -7467,6 +7467,77 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
 }
 
+void proofEpochTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    if (!device.NullDescriptors()) {
+        std::cout << "nullDescriptor unavailable: proof epoch not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+    void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "write watching unavailable: proof epoch not tested\n";
+        return;
+    }
+    const auto& base = device.GetContext();
+    struct Release {
+        const Context& context;
+        void* block;
+        ~Release() {
+            ClearCachedTextures(context.device);
+            ReleaseWatched(block, bytes);
+            ShaderResources::SetProofEpochMode(-1);
+        }
+    } release{base, block};
+    StorageTexture::BumpPendingSerial();
+    std::memset(block, 0x33, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.nullDescriptors = true;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
+    binding.count = 1;
+    binding.imageSamplers = {0};
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>((address >> 40) & 0xffu) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    for (const int mode : {1, 2}) {
+        ShaderResources::SetProofEpochMode(mode);
+        const auto name = mode == 1 ? std::string("on") : std::string("verify");
+        const auto before = ShaderResources::ProofEpochCounts();
+        std::array<bool, 4> proved{};
+        std::array<ShaderResources::ProofReport, 4> reports{};
+        {
+            ShaderResources resources(context, compute);
+            Require(resources.Reusable(), "a set sampling watched guest memory is not reusable (proof epoch " + name + ")");
+            for (std::size_t use = 0; use < 3; ++use) proved[use] = resources.Revalidate(compute, &reports[use]);
+            const auto reused = ShaderResources::ProofEpochCounts();
+            for (std::size_t use = 0; use < 3; ++use) Require(proved[use], "an unchanged watched texture failed its proof on use " + std::to_string(use + 1) + " (proof epoch " + name + ")");
+            Require(reused.asked - before.asked == 3, "the epoch counted another number of proofs asked (proof epoch " + name + ")");
+            if (reports[0].path == ShaderResources::ProofPath::Fast) Require(reused.skipped - before.skipped == 2, "an unchanged watched template was not skipped on its later uses (proof epoch " + name + ")");
+            std::memset(block, 0x5a, 16);
+            proved[3] = resources.Revalidate(compute, &reports[3]);
+            const auto stored = ShaderResources::ProofEpochCounts();
+            Require(stored.skipped == reused.skipped, "a proof was skipped over memory a CPU store changed (proof epoch " + name + ")");
+            Require(stored.disagreements == 0, "the epoch skipped a proof that would have failed (proof epoch " + name + ")");
+            Require(!proved[3] || reports[3].path != ShaderResources::ProofPath::Fast, "a texture over a CPU store passed the fast proof (proof epoch " + name + ")");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+        }
+        ClearCachedTextures(base.device);
+    }
+}
+
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -9268,6 +9339,7 @@ int main(int argc, char** argv) {
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         depthSurfaceProofTests(device, recorder);
+        proofEpochTests(device, recorder);
         multisampleGuestAccessTests(device, recorder);
         tiledResolveTests(device, recorder);
         fmaskDecompressMsaaTests(device, recorder);
