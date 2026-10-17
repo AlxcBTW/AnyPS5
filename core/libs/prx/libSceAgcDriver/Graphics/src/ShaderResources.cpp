@@ -2817,6 +2817,10 @@ void countRevalCall(std::size_t path, std::chrono::steady_clock::time_point star
     stats.nanoseconds[path].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
     auto last = stats.lastReport.load();
+    if (last == 0) {
+        stats.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
     if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     const auto millis = [](const std::atomic<std::uint64_t>& value) { return static_cast<double>(value.load(std::memory_order_relaxed)) / 1e6; };
