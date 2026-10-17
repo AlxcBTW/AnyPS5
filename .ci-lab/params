@@ -1,0 +1,5 @@
+name=barrier-batch
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-barrier-batch-c6fdafc467-171239
