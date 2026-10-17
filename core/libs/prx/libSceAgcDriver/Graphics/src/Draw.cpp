@@ -740,6 +740,7 @@ bool MovableBuffers() {
 }
 
 ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DrawKey);
     ResourceCache::Key key{0xffffffffu};
     const auto append64 = [&](std::uint64_t value) {
         key.push_back(static_cast<std::uint32_t>(value));
@@ -767,6 +768,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
 // would have failed its build fails its hit.
 void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::AliasCheck);
     const auto overlap = [](std::uint64_t first, std::uint64_t firstSize, std::uint64_t second, std::uint64_t secondSize) { return first < second + secondSize && second < first + firstSize; };
     for (const auto& shader : shaders) {
         for (const auto& binding : shader.program->bindings) {
@@ -1344,6 +1346,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::TargetRefresh);
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
@@ -1415,7 +1418,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             }
         } else {
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-            found = SharedResourceCache().Find(resolved.contentKey);
+            { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::CacheFind); found = SharedResourceCache().Find(resolved.contentKey); }
         }
         if (auto cached = std::move(found)) {
             const bool valid = cached->Revalidate(shaders);
@@ -1440,7 +1443,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::ResBuild); resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots); }
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -1634,6 +1637,7 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::uint32_t> slices, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::KeepDraw);
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -2089,7 +2093,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr);
+    auto inputs = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DrawInputs); return prepareDrawInputs(context, state, draw, shaders, outcome, timer, nullptr); }();
     if (inputs.nothing) return;
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
@@ -2136,7 +2140,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
-        RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RetireDepth); RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes()); }
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         timer.phase(PhaseSetup);
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
@@ -2205,7 +2209,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         binding.target = std::make_unique<RenderTarget>(context, color, state.blends.at(color.exportIndex).blendEnable != 0);
         targetViews.push_back(binding.target->View());
     }
-    if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth));
+    { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DepthView); if (state.depth) targetViews.push_back(DepthSurfaceView(context, *state.depth)); }
     timer.phase(PhasePrepare);
     const bool recordDraws = RecordDraws();
     auto* recorder = Recorder::Active();
@@ -2339,7 +2343,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::CacheInsert); SharedResourceCache().Insert(contentKey, resources); }
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -2351,7 +2355,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         if (binding.multisampled) Require(std::find(resources->MultisampleSources().begin(), resources->MultisampleSources().end(), binding.color.surfaceAddress) == resources->MultisampleSources().end(), "sampling a multisampled color target the draw renders to is not implemented");
     }
     if (!lean && !resolved.moved.empty()) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::ResBuild); resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots); }
         resolved.moved.clear();
     }
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
@@ -2382,7 +2386,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
-    auto pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    auto pipeline = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::PipelineLookup); return stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second; }();
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     std::vector<std::shared_ptr<StorageTexture>> owners;
@@ -2393,7 +2397,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         owners.push_back(binding.resident);
         persistent.push_back(binding.multisampled ? 1u : 0u);
     }
-    auto framebuffer = pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent);
+    auto framebuffer = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::Framebuffer); return pipeline->AcquireFramebuffer(targetViews, owners, state.renderExtent, state.renderLayers, persistent); }();
     timer.phase(PhasePipeline);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline created");
     if (lean) {
@@ -2420,6 +2424,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RecipeMake);
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -2728,7 +2733,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
-    auto inputs = prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe);
+    auto inputs = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DrawInputs); return prepareDrawInputs(context, state, draw, shaders, outcome, timer, &recipe); }();
     if (inputs.nothing) {
         result.recorded = true;
         return result;
@@ -2755,7 +2760,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
-        const auto depthView = DepthSurfaceView(context, *state.depth);
+        const auto depthView = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DepthView); return DepthSurfaceView(context, *state.depth); }();
         timer.phase(PhaseReadTarget);
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -42,6 +43,7 @@ void Driver::appendWrittenRanges(const ShaderRecompiler::RecompileResult& compil
 }
 
 void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, const ShaderRecompiler::RecompileResult& compiled) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::NoteWriters);
     std::lock_guard lock(writtenBuffersMutex);
     const auto serial = ++writtenBufferSerial;
     forEachWrittenBuffer(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool atomic) {
@@ -83,6 +85,7 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
 }
 
 void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::NoteWriters);
     for (const auto& stage : stages) {
         forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { noteForeignWriter(begin, end, queue); });
     }

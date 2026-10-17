@@ -980,6 +980,7 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool written) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::StorageLookup);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     RequireNoMultisampleTarget(viewed.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a storage image access");
     if (auto depth = DepthSurfaceStorage(context, words, viewed, mip)) return depth;
@@ -2937,6 +2938,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 }
 
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::PendingCpuWrites);
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -2966,6 +2968,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::Revalidate);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3072,7 +3075,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    bool fast = !noFast && [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RevalFast); return fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted); }();
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3084,10 +3087,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
             refreshed = overlapping;
-            fallback = refreshOwnObjects(shaders, refreshed);
+            fallback = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RevalOwn); return refreshOwnObjects(shaders, refreshed); }();
         }
         if (fallback == OwnRefreshFallback::Count) {
-            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+            fast = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RevalFast); return fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted); }();
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;
         }
@@ -3099,7 +3102,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
-        if (!fullWalk()) {
+        if (![&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RevalWalk); return fullWalk(); }()) {
             const auto failure = [&] {
                 switch (reason) {
                     case FastFail::Pending: return ProofFailure::Pending;
@@ -4694,6 +4697,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::MovedBuffers);
     std::vector<MovedBuffer> moved;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
     for (const auto& shader : shaders) {
@@ -4748,6 +4752,7 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DrawBindings);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
@@ -4799,7 +4804,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
-        auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp);
+        auto buffer = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::SnapshotFind); return recorder.UnwrittenDrawSnapshot(begin, bytes, stamp); }();
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -4809,6 +4814,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         if (buffer == nullptr) {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::SnapshotMake);
             const auto generation = GuestMemory::CollectWrites(begin, bytes);
             buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
             if (buffer == nullptr) {
@@ -4843,12 +4849,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
     if (!descriptions[0].empty() || splitSets) {
-        result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DescAlloc); result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0)); }
         result->layout = _layout;
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
     if (!descriptions[1].empty() || splitSets) {
-        result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DescAlloc); result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1)); }
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
@@ -4873,7 +4879,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
-    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DescWrite); context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr); }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;

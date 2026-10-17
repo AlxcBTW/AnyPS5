@@ -133,6 +133,7 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
 }
 
 bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::Labels);
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

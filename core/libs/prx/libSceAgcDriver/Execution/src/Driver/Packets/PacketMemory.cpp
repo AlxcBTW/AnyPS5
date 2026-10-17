@@ -450,6 +450,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::SubmitDue);
     if (localDevice == nullptr) return;
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();

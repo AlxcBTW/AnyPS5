@@ -229,6 +229,72 @@ private:
     bool active = false;
     HoldSpanKind previous = HoldSpanKind::Count;
 };
+#define APS5_HOLD_SUBS(X) \
+    X(Labels, "labels-for-packet") \
+    X(NoteWriters, "note-writers") \
+    X(AttachRecipe, "attach-recipe") \
+    X(SubmitDue, "submit-due") \
+    X(DispatchSetup, "dispatch-setup") \
+    X(DispatchFind, "dispatch-find") \
+    X(DispatchComplete, "dispatch-complete") \
+    X(DispatchBuild, "dispatch-build") \
+    X(DispatchInsert, "dispatch-insert") \
+    X(DispatchPipeline, "dispatch-pipeline") \
+    X(DispatchDecide, "dispatch-decide") \
+    X(DispatchRecipeMake, "dispatch-recipe-make") \
+    X(DispatchRecipeHit, "dispatch-recipe-hit") \
+    X(DrawInputs, "draw-inputs") \
+    X(RetireDepth, "retire-depth") \
+    X(TargetRefresh, "target-refresh") \
+    X(DepthView, "depth-view") \
+    X(DrawKey, "draw-key") \
+    X(CacheFind, "cache-find") \
+    X(Revalidate, "revalidate-self") \
+    X(RevalPrelude, "reval-pending-cpu-writes") \
+    X(RevalFast, "reval-fast") \
+    X(RevalOwn, "reval-own-refresh") \
+    X(RevalWalk, "reval-full-walk") \
+    X(MovedBuffers, "moved-buffers") \
+    X(AliasCheck, "alias-check") \
+    X(ResBuild, "resources-build") \
+    X(CacheInsert, "cache-insert") \
+    X(PipelineLookup, "pipeline-lookup") \
+    X(Framebuffer, "framebuffer") \
+    X(RecipeMake, "draw-recipe-make") \
+    X(RecipeProve, "recipe-prove") \
+    X(KeepDraw, "keep-draw") \
+    X(DrawBindings, "draw-bindings-self") \
+    X(SnapshotFind, "snapshot-find") \
+    X(SnapshotMake, "snapshot-make") \
+    X(DescAlloc, "descriptor-alloc") \
+    X(DescWrite, "descriptor-write") \
+    X(StorageLookup, "storage-lookup") \
+    X(StorageRefresh, "storage-refresh-self") \
+    X(RefreshProved, "refresh-proved") \
+    X(PendingCpuWrites, "pending-cpu-writes") \
+    X(FlushPending, "flush-pending") \
+    X(CollectWrites, "collect-writes") \
+    X(UnchangedSince, "unchanged-since") \
+    X(ChangedBlocks, "changed-blocks") \
+    X(DccKeyScan, "dcc-key-scan") \
+    X(FlushHook, "flush-hook")
+enum class HoldSub : std::uint8_t {
+#define APS5_HOLD_SUB_ENUM(name, text) name,
+    APS5_HOLD_SUBS(APS5_HOLD_SUB_ENUM)
+#undef APS5_HOLD_SUB_ENUM
+    Count
+};
+class HoldSubSpan {
+public:
+    explicit HoldSubSpan(HoldSub sub);
+    ~HoldSubSpan();
+    HoldSubSpan(const HoldSubSpan&) = delete;
+    HoldSubSpan& operator=(const HoldSubSpan&) = delete;
+
+private:
+    bool active = false;
+    HoldSub previous = HoldSub::Count;
+};
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();

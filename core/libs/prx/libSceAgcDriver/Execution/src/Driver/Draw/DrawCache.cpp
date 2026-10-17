@@ -215,6 +215,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
 }
 
 void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::AttachRecipe);
     std::shared_ptr<DrawEntry> entry;
     {
         std::lock_guard cacheLock(drawCacheMutex);

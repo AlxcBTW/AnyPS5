@@ -1250,6 +1250,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::CollectWrites);
     return collectWrites(address, bytes, true);
 }
 
@@ -1471,6 +1472,7 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
 }
 
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UnchangedSince);
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -1782,6 +1784,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 }
 
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::ChangedBlocks);
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
@@ -2043,6 +2046,10 @@ struct HoldThreadState {
     std::chrono::steady_clock::time_point lap;
     HoldSpanKind current = HoldSpanKind::Count;
     std::int64_t lastReleaseNs = 0;
+    std::chrono::steady_clock::time_point subLap;
+    HoldSub sub = HoldSub::Count;
+    std::uint64_t spanTotalNs = 0;
+    std::uint64_t spanAtSubLap = 0;
 };
 
 HoldThreadState& HoldThread() {
@@ -2058,8 +2065,36 @@ void ChargeLap(HoldThreadState& state, std::chrono::steady_clock::time_point now
     if (state.current != HoldSpanKind::Count) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now - state.lap).count();
         HoldCounters()[HoldCell() + 2 + static_cast<std::size_t>(state.current)].fetch_add(static_cast<std::uint64_t>(ns), std::memory_order_relaxed);
+        state.spanTotalNs += static_cast<std::uint64_t>(ns);
     }
     state.lap = now;
+}
+
+constexpr std::size_t HoldSubCount = static_cast<std::size_t>(HoldSub::Count);
+constexpr std::size_t HoldSubStride = 3;
+constexpr std::size_t HoldSubCells = HolderColumns * HoldSites * HoldSubCount * HoldSubStride;
+constexpr const char* HoldSubNames[HoldSubCount] = {
+#define APS5_HOLD_SUB_NAME(name, text) text,
+    APS5_HOLD_SUBS(APS5_HOLD_SUB_NAME)
+#undef APS5_HOLD_SUB_NAME
+};
+
+std::array<std::atomic<std::uint64_t>, HoldSubCells>& HoldSubCounters() {
+    static std::array<std::atomic<std::uint64_t>, HoldSubCells> cells{};
+    return cells;
+}
+
+void ChargeSub(HoldThreadState& state, std::chrono::steady_clock::time_point now) {
+    if (state.sub != HoldSub::Count) {
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - state.subLap).count());
+        const auto inside = state.current != HoldSpanKind::Count ? ns : std::min(ns, state.spanTotalNs - state.spanAtSubLap);
+        const auto base = (HoldCell() / HoldStride) * HoldSubCount * HoldSubStride + static_cast<std::size_t>(state.sub) * HoldSubStride;
+        auto& cells = HoldSubCounters();
+        cells[base].fetch_add(ns - inside, std::memory_order_relaxed);
+        cells[base + 1].fetch_add(inside, std::memory_order_relaxed);
+    }
+    state.subLap = now;
+    state.spanAtSubLap = state.spanTotalNs;
 }
 
 void HoldProfileAcquired() {
@@ -2124,6 +2159,47 @@ void ReportHoldProfile(std::chrono::steady_clock::time_point now, bool print) {
     previous = current;
 }
 
+void ReportHoldSubs(std::chrono::steady_clock::time_point now, bool print) {
+    static std::array<std::uint64_t, HoldCells> previousHolds{};
+    static std::array<std::uint64_t, HoldSubCells> previousSubs{};
+    static std::chrono::steady_clock::time_point last = now;
+    const auto interval = std::chrono::duration<double>(now - last).count();
+    last = now;
+    auto& holdCells = HoldCounters();
+    auto& subCells = HoldSubCounters();
+    std::array<std::uint64_t, HoldCells> holds{};
+    std::array<std::uint64_t, HoldSubCells> subs{};
+    for (std::size_t i = 0; i < HoldCells; ++i) holds[i] = holdCells[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < HoldSubCells; ++i) subs[i] = subCells[i].load(std::memory_order_relaxed);
+    for (std::size_t column = 0; column < HolderColumns && print; ++column) {
+        for (std::size_t site = 0; site < HoldSites; ++site) {
+            const auto cell = column * HoldSites + site;
+            const auto base = cell * HoldStride;
+            const auto count = holds[base] - previousHolds[base];
+            if (count == 0) continue;
+            const double heldMs = static_cast<double>(holds[base + 1] - previousHolds[base + 1]) / 1e6;
+            double spansMs = 0;
+            for (std::size_t k = 0; k < HoldKinds; ++k) spansMs += static_cast<double>(holds[base + 2 + k] - previousHolds[base + 2 + k]) / 1e6;
+            const auto subBase = cell * HoldSubCount * HoldSubStride;
+            double outMs = 0;
+            std::string names;
+            char item[96];
+            for (std::size_t s = 0; s < HoldSubCount; ++s) {
+                const auto at = subBase + s * HoldSubStride;
+                const double out = static_cast<double>(subs[at] - previousSubs[at]) / 1e6;
+                const double in = static_cast<double>(subs[at + 1] - previousSubs[at + 1]) / 1e6;
+                outMs += out;
+                std::snprintf(item, sizeof(item), " %s=%.2f/%.2f/%llu", HoldSubNames[s], out, in, static_cast<unsigned long long>(subs[at + 2] - previousSubs[at + 2]));
+                names += item;
+            }
+            char holder[24];
+            AgcDriver::ProfilePrint_nid_no_patch("[holdprof2] %s %s (%.0f s) holds=%llu held_ms=%.1f spans_ms=%.1f subs_out_ms=%.1f rest_ms=%.1f |%s\n", HolderName(column, holder, sizeof(holder)), site == HoldUnlockedSite ? "unlocked" : GpuLockSiteNames[site], interval, static_cast<unsigned long long>(count), heldMs, spansMs, outMs, std::max(0.0, heldMs - spansMs - outMs), names.c_str());
+        }
+    }
+    previousHolds = holds;
+    previousSubs = subs;
+}
+
 // Every outermost release checks the clock; the one that finds the interval over prints.
 void MaybeReportHoldProfile() {
     static std::atomic<std::int64_t> next{0};
@@ -2140,6 +2216,7 @@ void MaybeReportHoldProfile() {
     if (!next.compare_exchange_strong(due, nowNs + intervalNs, std::memory_order_acq_rel)) return;
     // The first call (due == 0) only sets the baseline: counts before it belong to start-up.
     ReportHoldProfile(now, due != 0);
+    ReportHoldSubs(now, due != 0);
 }
 
 }
@@ -2170,6 +2247,24 @@ HoldSpan::~HoldSpan() {
     auto& state = HoldThread();
     ChargeLap(state, std::chrono::steady_clock::now());
     state.current = previous;
+}
+
+HoldSubSpan::HoldSubSpan(HoldSub sub) {
+    if (!HoldProfiled()) return;
+    active = true;
+    auto& state = HoldThread();
+    ChargeSub(state, std::chrono::steady_clock::now());
+    previous = state.sub;
+    state.sub = sub;
+    const auto base = (HoldCell() / HoldStride) * HoldSubCount * HoldSubStride + static_cast<std::size_t>(sub) * HoldSubStride;
+    HoldSubCounters()[base + 2].fetch_add(1, std::memory_order_relaxed);
+}
+
+HoldSubSpan::~HoldSubSpan() {
+    if (!active) return;
+    auto& state = HoldThread();
+    ChargeSub(state, std::chrono::steady_clock::now());
+    state.sub = previous;
 }
 
 void GpuMutexType::acquired() {
@@ -2405,6 +2500,7 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::FlushHook);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 

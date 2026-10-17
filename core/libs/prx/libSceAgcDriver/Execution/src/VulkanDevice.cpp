@@ -4348,6 +4348,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::DispatchIndirect(const ShaderRecompi
 }
 
 void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchDecide);
     auto& recorder = *state->recorder;
     auto& timer = *record.timer;
     const auto& context = *record.context;
@@ -4678,6 +4679,8 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
+    std::optional<GuestMemory::HoldSubSpan> setupSub;
+    setupSub.emplace(GuestMemory::HoldSub::DispatchSetup);
     startJournalReplay();
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
@@ -4704,6 +4707,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         std::lock_guard pipelines(state->computePipelinesMutex);
         if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) objects = found->second;
     }
+    setupSub.reset();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& d = Dispatches();
     // This call's phases (indexed by DispatchPhase), formatted only for a slow call or a new
@@ -4741,6 +4745,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // The resource cache insert evicts the oldest entry, destroying its ShaderResources here when the
     // cache was the last owner: timed apart from the build.
     const auto insert = [&] {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchInsert);
         const auto insertStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         // The displaced entries go to the open batch: their destruction (descriptor sets, pooled
         // buffers, texture references) then runs on the release thread once the batch completed,
@@ -4762,7 +4767,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // (an address-based build also runs its stage A here, under the mutex: 'A locked').
         const auto before = profile ? resources->Timing() : Graphics::ShaderResources::BuildTiming{};
         const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        resources->Complete();
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchComplete); resources->Complete(); }
         require(prepared->describedLayoutKey.empty() || std::ranges::equal(resources->SetLayouts().mainKey, prepared->describedLayoutKey), "the set layout described for the dispatch's pipeline differs from its build");
         if (profile) {
             const auto completeWall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - completeStart).count();
@@ -4793,8 +4798,11 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // object it found: revalidated as a map hit would be (an entry replaced meanwhile is left
         // alone by the pointer-conditional Remove). APS5_NO_PREPARED_FIND=1 looks the key up again.
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
+        std::optional<GuestMemory::HoldSubSpan> findSub;
+        findSub.emplace(GuestMemory::HoldSub::DispatchFind);
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
+        findSub.reset();
         if (cached != nullptr) {
             if (cached->Revalidate(shaders[0])) {
                 resources = std::move(cached);
@@ -4814,7 +4822,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (resources == nullptr) {
         const auto buildStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0);
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchBuild); resources = std::make_shared<Graphics::ShaderResources>(context, shaders[0], snapshots, false, prepared != nullptr ? prepared->dispatchThreads : 0); }
         if (profile) timer.add(PhaseResourcesFullBuild, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - buildStart).count());
         if (cacheable) {
             ++d.cacheMisses;
@@ -4851,7 +4859,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             require(described.layouts.main == resources->Layout() && !described.layouts.split, "the set layout described from the compute shader differs from the dispatch's");
         }
         const auto layouts = resources->SetLayouts();
-        objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress);
+        { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchPipeline); objects = computePipeline(context, shader, layouts.main, layouts.mainKey, pushStages, programAddress); }
         timing.Mark("pipeline_create");
         timer.phase(PhasePipeline);
     }
@@ -4915,6 +4923,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
     if (recipeOut != nullptr && DispatchRecipes() && cacheable && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchRecipeMake);
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
         recipe->templateRef = resources;
@@ -4936,6 +4945,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
 }
 
 RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::uint64_t programAddress, const std::shared_ptr<RecipeHit>& hit, IndirectOutcome& outcome, const std::shared_ptr<PreparedDispatch>& verify, bool refreshByWords) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DispatchRecipeHit);
     state->recorder->BoundKeptBytes();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.DispatchRecipe");

@@ -1772,11 +1772,12 @@ bool UntrackedBypass::Active() {
 }
 
 bool StorageTexture::Refresh() {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::StorageRefresh);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    if ([&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RefreshProved); return refreshProved(); }()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
@@ -1857,7 +1858,7 @@ bool StorageTexture::Refresh() {
             }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        keys = ProvedKeys();
+        keys = [&] { const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::DccKeyScan); return ProvedKeys(); }();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
@@ -3439,6 +3440,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::FlushPending);
     if (published != nullptr) *published = false;
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
