@@ -1,0 +1,5 @@
+name=pr-main-f8b
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr-main-f8b-f8b22edfb7-104236
