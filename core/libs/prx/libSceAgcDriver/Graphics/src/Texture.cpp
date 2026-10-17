@@ -1866,6 +1866,175 @@ bool UntrackedBypass::Active() {
     return untrackedBypass;
 }
 
+namespace TargetRefresh {
+namespace {
+
+thread_local const Scope* activeScope = nullptr;
+thread_local bool inLookup = false;
+
+struct Counters {
+    std::atomic<std::uint64_t> lookups{0}, scoped{0}, fullScissor{0}, unsupported{0}, wide{0};
+    std::atomic<std::uint64_t> refreshes{0}, proved{0}, collects{0}, wholeCollects{0}, pagesCollected{0}, pagesBefore{0}, fallbacks{0};
+    std::atomic<std::uint64_t> dccScans{0}, dccRescans{0};
+    std::atomic<std::uint64_t> verified{0}, deferred{0}, missedInside{0}, onlyNarrow{0}, verifySkipped{0};
+    std::atomic<std::uint64_t> mappingChecks{0}, mappingViolations{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+Counters& Count() {
+    static Counters counters;
+    return counters;
+}
+
+void report() {
+    auto& c = Count();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load();
+    if (last == 0) {
+        c.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !c.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto lookups = take(c.lookups), scoped = take(c.scoped), fullScissor = take(c.fullScissor), unsupported = take(c.unsupported), wide = take(c.wide);
+    const auto refreshes = take(c.refreshes), proved = take(c.proved), collects = take(c.collects), wholeCollects = take(c.wholeCollects);
+    const auto pagesCollected = take(c.pagesCollected), pagesBefore = take(c.pagesBefore), fallbacks = take(c.fallbacks);
+    const auto dccScans = take(c.dccScans), dccRescans = take(c.dccRescans);
+    const auto verified = take(c.verified), deferred = take(c.deferred), missed = take(c.missedInside), onlyNarrow = take(c.onlyNarrow), skipped = take(c.verifySkipped);
+    const auto checks = take(c.mappingChecks), violations = take(c.mappingViolations);
+    AgcDriver::ProfilePrint_nid_no_patch("[targetrefresh] %s (10 s): %llu target lookups (%llu scoped to the scissor, %llu full-scissor, %llu unsupported layout, %llu scissor too wide); %llu scoped refreshes: %llu skipped by stamp, %llu narrow collects run, %llu fell back to the whole surface; %llu whole-surface collects run; pages collected %llu, pages the whole surface would have been %llu, pages not collected %lld; DCC key scans %llu (%llu read the keys again); verify: %llu compared, %llu units deferred outside the scissor, %llu MISSED inside it, %llu only the narrow collect saw, %llu not comparable; mapping checks %llu, %llu OUTSIDE the scope\n",
+        Verify() ? "verify" : "on", lookups, scoped, fullScissor, unsupported, wide, refreshes, proved, collects, fallbacks, wholeCollects, pagesCollected, pagesBefore, static_cast<long long>(pagesBefore) - static_cast<long long>(pagesCollected), dccScans, dccRescans, verified, deferred, missed, onlyNarrow, skipped, checks, violations);
+}
+
+}
+
+bool Enabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_LAB_TARGET_REFRESH");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool Verify() {
+    static const bool verify = [] {
+        const char* text = std::getenv("APS5_LAB_TARGET_REFRESH");
+        return text != nullptr && std::strcmp(text, "verify") == 0;
+    }();
+    return verify;
+}
+
+bool Scope::Holds(std::uint64_t unitBegin) const {
+    const auto next = std::upper_bound(ranges.begin(), ranges.end(), unitBegin, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.first; });
+    return next != ranges.begin() && unitBegin < std::prev(next)->second;
+}
+
+Guard::Guard(const Scope* scope) : previous(activeScope), previousInLookup(inLookup) {
+    activeScope = scope;
+    inLookup = true;
+}
+
+Guard::~Guard() {
+    activeScope = previous;
+    inLookup = previousInLookup;
+}
+
+const Scope* Guard::Active() {
+    return activeScope;
+}
+
+bool Guard::InLookup() {
+    return inLookup;
+}
+
+void NoteLookup(Lookup kind) {
+    auto& c = Count();
+    c.lookups.fetch_add(1, std::memory_order_relaxed);
+    switch (kind) {
+        case Lookup::Scoped: c.scoped.fetch_add(1, std::memory_order_relaxed); break;
+        case Lookup::FullScissor: c.fullScissor.fetch_add(1, std::memory_order_relaxed); break;
+        case Lookup::Unsupported: c.unsupported.fetch_add(1, std::memory_order_relaxed); break;
+        case Lookup::Wide: c.wide.fetch_add(1, std::memory_order_relaxed); break;
+        case Lookup::Whole: break;
+    }
+    thread_local std::uint32_t calls = 0;
+    if ((++calls & 255u) == 0) report();
+}
+
+void NoteMappingCheck(bool held) {
+    auto& c = Count();
+    c.mappingChecks.fetch_add(1, std::memory_order_relaxed);
+    if (!held) c.mappingViolations.fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
+const TargetRefresh::Scope* StorageTexture::targetScope() const {
+    const auto* scope = TargetRefresh::Guard::Active();
+    if (scope == nullptr || scope->address != descriptor.baseAddress || scope->bytes != guestBytes || !blockUnits || trackedLayerBytes != 65536 || scope->ranges.empty()) return nullptr;
+    return scope;
+}
+
+std::uint64_t StorageTexture::collectSurface(std::uint64_t compared) {
+    const auto base = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (!TargetRefresh::Enabled()) return GuestMemory::CollectWrites(base, bytes);
+    auto& counters = TargetRefresh::Count();
+    const auto* scope = targetScope();
+    if (scope == nullptr) {
+        if (TargetRefresh::Guard::InLookup()) counters.wholeCollects.fetch_add(1, std::memory_order_relaxed);
+        return GuestMemory::CollectWrites(base, bytes);
+    }
+    counters.refreshes.fetch_add(1, std::memory_order_relaxed);
+    counters.pagesBefore.fetch_add((bytes + 4095) / 4096, std::memory_order_relaxed);
+    const auto narrow = [&] {
+        std::uint64_t latest = 0;
+        for (const auto& [begin, end] : scope->ranges) {
+            counters.collects.fetch_add(1, std::memory_order_relaxed);
+            latest = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+            if (latest == 0) return std::uint64_t{0};
+        }
+        return latest;
+    };
+    if (!TargetRefresh::Verify()) {
+        const auto latest = narrow();
+        if (latest == 0) {
+            counters.fallbacks.fetch_add(1, std::memory_order_relaxed);
+            counters.wholeCollects.fetch_add(1, std::memory_order_relaxed);
+            return GuestMemory::CollectWrites(base, bytes);
+        }
+        counters.pagesCollected.fetch_add(scope->pages, std::memory_order_relaxed);
+        return latest;
+    }
+    std::vector<std::uint64_t> generations;
+    blockGenerations(generations);
+    if (compared != 0) std::fill(generations.begin(), generations.end(), compared);
+    std::vector<std::uint8_t> afterNarrow(generations.size()), afterWhole(generations.size());
+    const bool narrowed = narrow() != 0 && GuestMemory::ChangedBlocks(base, bytes, generations, afterNarrow);
+    const auto whole = GuestMemory::CollectWrites(base, bytes);
+    counters.wholeCollects.fetch_add(1, std::memory_order_relaxed);
+    if (!narrowed || whole == 0 || !GuestMemory::ChangedBlocks(base, bytes, generations, afterWhole)) {
+        counters.verifySkipped.fetch_add(1, std::memory_order_relaxed);
+        return whole;
+    }
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    const auto spanBegin = base & ~std::uint64_t{65535};
+    for (std::size_t unit = 0; unit < generations.size(); ++unit) {
+        if (afterWhole[unit] != 0 && afterNarrow[unit] == 0) {
+            if (scope->Holds(spanBegin + unit * 65536u)) {
+                counters.missedInside.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<std::uint32_t> printed{0};
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[targetrefresh] APS5_LAB_TARGET_REFRESH=verify: unit %zu of 0x%llx+0x%llx changed inside the scissor's units and the narrow collect did not see it\n", unit, static_cast<unsigned long long>(base), static_cast<unsigned long long>(guestBytes));
+            } else {
+                counters.deferred.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (afterNarrow[unit] != 0 && afterWhole[unit] == 0) {
+            counters.onlyNarrow.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return whole;
+}
+
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
     const auto lever = RefreshLeverMode();
@@ -1877,6 +2046,7 @@ bool StorageTexture::Refresh() {
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     if (refreshProved()) {
+        if (TargetRefresh::Enabled() && targetScope() != nullptr) TargetRefresh::Count().proved.fetch_add(1, std::memory_order_relaxed);
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
@@ -1941,7 +2111,7 @@ bool StorageTexture::Refresh() {
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
-    const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    const auto current = collectSurface(0);
     // Per tracked layer: changed since its generation (a keys change makes every layer stale).
     std::vector<bool> changed;
     // Per 64 KiB block of the surface (blockGenerations): stamped since its layer's generation, and
@@ -1982,7 +2152,14 @@ bool StorageTexture::Refresh() {
             }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        keys = ProvedKeys();
+        if (TargetRefresh::Enabled() && TargetRefresh::Guard::InLookup() && descriptor.dccAddress != 0) {
+            const auto scansBefore = KeyProofCounts().scanned;
+            keys = ProvedKeys();
+            TargetRefresh::Count().dccScans.fetch_add(1, std::memory_order_relaxed);
+            if (KeyProofCounts().scanned != scansBefore) TargetRefresh::Count().dccRescans.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            keys = ProvedKeys();
+        }
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
         // Same keys, block units, no alias and no stamp since the generation: nothing below can change the answer
         // "unchanged" (no unit changed, no compare, no borrow), so the per-unit state is not even built.
@@ -2372,7 +2549,7 @@ bool StorageTexture::refreshProved() {
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (collectSurface(generation) == 0) return false;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
