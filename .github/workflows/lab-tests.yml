@@ -40,3 +40,27 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Order forward 1
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests
+      - name: Order forward 2
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests
+      - name: Order groups
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests groups
+      - name: Order modes
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests modes
+      - name: Order groups and modes
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests groups modes
+      - name: Order groups and modes again
+        if: always()
+        env: {ANYPS5_REQUIRE_VULKAN: 1, GALLIUM_OVERRIDE_CPU_CAPS: avx}
+        run: build/tests/agc_driver_depth_clear_hle_tests groups modes
