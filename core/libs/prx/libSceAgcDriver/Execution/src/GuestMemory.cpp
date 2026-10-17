@@ -2084,6 +2084,18 @@ std::array<std::atomic<std::uint64_t>, HoldSubCells>& HoldSubCounters() {
     return cells;
 }
 
+constexpr std::size_t HoldCountCount = static_cast<std::size_t>(HoldCount::Count);
+constexpr const char* HoldCountNames[HoldCountCount] = {
+#define APS5_HOLD_COUNT_NAME(name, text) text,
+    APS5_HOLD_COUNTS(APS5_HOLD_COUNT_NAME)
+#undef APS5_HOLD_COUNT_NAME
+};
+
+std::array<std::atomic<std::uint64_t>, HolderColumns * HoldCountCount>& HoldCountCounters() {
+    static std::array<std::atomic<std::uint64_t>, HolderColumns * HoldCountCount> cells{};
+    return cells;
+}
+
 void ChargeSub(HoldThreadState& state, std::chrono::steady_clock::time_point now) {
     if (state.sub != HoldSub::Count) {
         const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - state.subLap).count());
@@ -2198,6 +2210,24 @@ void ReportHoldSubs(std::chrono::steady_clock::time_point now, bool print) {
     }
     previousHolds = holds;
     previousSubs = subs;
+    static std::array<std::uint64_t, HolderColumns * HoldCountCount> previousCounts{};
+    auto& countCells = HoldCountCounters();
+    for (std::size_t column = 0; column < HolderColumns && print; ++column) {
+        std::string names;
+        std::uint64_t any = 0;
+        char item[96];
+        for (std::size_t c = 0; c < HoldCountCount; ++c) {
+            const auto at = column * HoldCountCount + c;
+            const auto value = countCells[at].load(std::memory_order_relaxed) - previousCounts[at];
+            any += value;
+            std::snprintf(item, sizeof(item), " %s=%llu", HoldCountNames[c], static_cast<unsigned long long>(value));
+            names += item;
+        }
+        if (any == 0) continue;
+        char holder[24];
+        AgcDriver::ProfilePrint_nid_no_patch("[holdprof3] %s (%.0f s) counts |%s\n", HolderName(column, holder, sizeof(holder)), interval, names.c_str());
+    }
+    for (std::size_t i = 0; i < HolderColumns * HoldCountCount; ++i) previousCounts[i] = countCells[i].load(std::memory_order_relaxed);
 }
 
 // Every outermost release checks the clock; the one that finds the interval over prints.
@@ -2247,6 +2277,11 @@ HoldSpan::~HoldSpan() {
     auto& state = HoldThread();
     ChargeLap(state, std::chrono::steady_clock::now());
     state.current = previous;
+}
+
+void NoteHoldCount(HoldCount count, std::uint64_t amount) {
+    if (!HoldProfiled()) return;
+    HoldCountCounters()[HoldColumn() * HoldCountCount + static_cast<std::size_t>(count)].fetch_add(amount, std::memory_order_relaxed);
 }
 
 HoldSubSpan::HoldSubSpan(HoldSub sub) {

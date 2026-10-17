@@ -1773,6 +1773,7 @@ bool UntrackedBypass::Active() {
 
 bool StorageTexture::Refresh() {
     const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::StorageRefresh);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::RefreshCalls);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -1799,6 +1800,8 @@ bool StorageTexture::Refresh() {
     // generation, no results of this image's own there) or dead to its own write-back (tracked and
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
+    std::optional<GuestMemory::HoldSubSpan> aliasSpan;
+    aliasSpan.emplace(GuestMemory::HoldSub::RfAlias);
     auto alias = pendingAlias();
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
     if (alias != nullptr) {
@@ -1812,6 +1815,8 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    aliasSpan.reset();
+    if (alias != nullptr) GuestMemory::NoteHoldCount(GuestMemory::HoldCount::AliasFound);
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -1838,11 +1843,13 @@ bool StorageTexture::Refresh() {
     DccKeys keys = uploadedKeys;
     {
         const auto equalsOriginal = [&] {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfEquals);
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
         const auto scanBlocks = [&] {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfScan);
             blockGenerations(generations);
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
@@ -1915,8 +1922,12 @@ bool StorageTexture::Refresh() {
         }
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
-        direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfHostImport);
+            direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        }
         if (alias != nullptr && direct) {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfBorrowScan);
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
             // its image: every one of them, since its write-back would have stamped them all. Units
@@ -1940,6 +1951,8 @@ bool StorageTexture::Refresh() {
         }
     }
     if (unchanged) {
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfUnchangedTail);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::RefreshUnchanged);
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
@@ -1947,6 +1960,7 @@ bool StorageTexture::Refresh() {
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::RefreshChanged);
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
@@ -2024,14 +2038,22 @@ bool StorageTexture::Refresh() {
     }
     if (anyStored) {
         const auto previous = std::exchange(flushReason, "refresh");
-        writeBackLayers(stored);
+        {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfWriteBack);
+            writeBackLayers(stored);
+        }
         flushReason = previous;
     } else if (dropped) {
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfReconcile);
         reconcilePending();
     }
     if (anyBorrowed) {
         uploadReason = "alias";
-        borrowUnits(*alias, borrowed);
+        {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfBorrow);
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::Borrows);
+            borrowUnits(*alias, borrowed);
+        }
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) layerGeneration[unit] = current;
         }
@@ -2039,6 +2061,7 @@ bool StorageTexture::Refresh() {
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::RfUpload);
         upload(&changed);
     } else {
         uploadedKeys = keys;
@@ -2255,6 +2278,9 @@ constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::optional<GuestMemory::HoldSubSpan> preludeSpan;
+    preludeSpan.emplace(GuestMemory::HoldSub::UpPrelude);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::Uploads);
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
@@ -2265,12 +2291,15 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    preludeSpan.reset();
     const auto stampLayers = [&](bool selectedOnly) {
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpStamp);
         const bool whole = !selectedOnly || layers == nullptr;
         if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::BaselineBytes, guestBytes);
         }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
@@ -2286,6 +2315,9 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     VkClearColorValue clearValue{};
     if (IsDccClear(uploadedKeys) && ClearColorFor(storageFormat, uploadedKeys, clearValue)) {
         // A fast-cleared surface is cleared on the GPU; its texel memory is neither read nor filled.
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpClearRecord);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadClears);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadClearBytes, guestBytes);
         // The clear is recorded into the open batch like a direct upload (the image kept by it): a
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
@@ -2294,6 +2326,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
         } else {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpCapture);
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::CaptureBytes, guestBytes);
             captureGuestBytes(nullptr);
         }
         forgetBorrowed(0, trackedLayers);
@@ -2347,9 +2381,12 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             layerOriginal.assign(trackedLayers, false);
             cancelStoredSaves();
         } else {
+            const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpCapture);
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::CaptureBytes, guestBytes);
             captureGuestBytes(layers);
         }
         stampLayers(true);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadDirect);
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
         // layout yet); a partial one always does.
@@ -2364,7 +2401,13 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 forgetBorrowed(0, trackedLayers);
                 runs.emplace_back(0, guestBytes);
             }
-            const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
+            std::uint64_t uploadedBytes = 0;
+            {
+                const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpWindows);
+                uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
+            }
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadWindowsCount);
+            GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadDirectBytes, uploadedBytes);
             countStorageUpload(1, uploadedBytes);
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
@@ -2375,6 +2418,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
         }
+        const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpDetileRecord);
         // Units another image's results shadow reach the import before the detile reads it in place.
         PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
         forgetBorrowed(0, trackedLayers);
@@ -2384,6 +2428,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 if ((*layers)[layer]) uploadedBytes += trackedLayerBytes;
             }
         }
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadDirectBytes, uploadedBytes);
         const bool direct = singlePass();
         auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         detiler.BeginBatch();
@@ -2469,6 +2514,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
     }
+    const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::UpPlain);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::UploadPlain);
     layerOriginal.assign(trackedLayers, true);
     cancelStoredSaves();
     forgetBorrowed(0, trackedLayers);
@@ -4749,6 +4796,9 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    std::optional<GuestMemory::HoldSubSpan> decideSpan;
+    decideSpan.emplace(GuestMemory::HoldSub::WbDecide);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::WriteBacks);
     const StoringScope storingScope(this);
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4927,6 +4977,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         advanceAdjacent(adjacent, now, firstBlock, lastBlock);
         if (!shadowed.empty()) markShadowed(now);
     };
+    decideSpan.reset();
+    for (const auto& [from, to] : keep) GuestMemory::NoteHoldCount(GuestMemory::HoldCount::WriteBackBytes, to - from);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::WriteBackKept, keep.size());
     if (keep.empty()) {
         // Every selected block was written by the CPU since the layer's generation: nothing to
         // store, the keys stay as they are, and the image is stale there (re-uploaded at its next
@@ -4946,7 +4999,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (const auto& [from, to] : keep) GuestWriteRing::Record(GuestWriteRing::Kind::StorageWriteBack, from, to - from, descriptor.baseAddress);
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
-            const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            std::uint64_t storedBytes = 0;
+            {
+                const GuestMemory::HoldSubSpan holdSub(GuestMemory::HoldSub::WbWindows);
+                storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            }
+            const GuestMemory::HoldSubSpan settleSpan(GuestMemory::HoldSub::WbSettle);
             if (decided != 0 && !imported.empty()) {
                 if (auto* windowRecorder = Recorder::Active()) windowRecorder->OnRetire([imported, decided, base = descriptor.baseAddress] { GuestMemory::CheckStoreWindow(imported, decided, false, base); });
             }

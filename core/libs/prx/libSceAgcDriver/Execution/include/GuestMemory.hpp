@@ -277,13 +277,59 @@ private:
     X(UnchangedSince, "unchanged-since") \
     X(ChangedBlocks, "changed-blocks") \
     X(DccKeyScan, "dcc-key-scan") \
-    X(FlushHook, "flush-hook")
+    X(FlushHook, "flush-hook") \
+    X(RfAlias, "rf-alias") \
+    X(RfHostImport, "rf-host-import") \
+    X(RfScan, "rf-scan-blocks") \
+    X(RfEquals, "rf-equals-original") \
+    X(RfBorrowScan, "rf-borrow-scan") \
+    X(RfUnchangedTail, "rf-unchanged-tail") \
+    X(RfWriteBack, "rf-writeback-total") \
+    X(WbDecide, "wb-decide") \
+    X(WbWindows, "wb-windows") \
+    X(WbSettle, "wb-settle") \
+    X(RfReconcile, "rf-reconcile") \
+    X(RfBorrow, "rf-borrow") \
+    X(RfUpload, "rf-upload-total") \
+    X(UpPrelude, "up-prelude") \
+    X(UpCapture, "up-capture-guest") \
+    X(UpStamp, "up-stamp-layers") \
+    X(UpClearRecord, "up-clear-record") \
+    X(UpWindows, "up-windows") \
+    X(UpDetileRecord, "up-detile-record") \
+    X(UpPlain, "up-plain")
 enum class HoldSub : std::uint8_t {
 #define APS5_HOLD_SUB_ENUM(name, text) name,
     APS5_HOLD_SUBS(APS5_HOLD_SUB_ENUM)
 #undef APS5_HOLD_SUB_ENUM
     Count
 };
+#define APS5_HOLD_COUNTS(X) \
+    X(RefreshCalls, "refresh-calls") \
+    X(RefreshUnchanged, "refresh-unchanged") \
+    X(RefreshChanged, "refresh-changed") \
+    X(WriteBacks, "writebacks") \
+    X(WriteBackBytes, "writeback-bytes") \
+    X(WriteBackKept, "writeback-kept-ranges") \
+    X(Uploads, "uploads") \
+    X(UploadClears, "upload-clears") \
+    X(UploadClearBytes, "upload-clear-bytes") \
+    X(UploadDirect, "upload-direct") \
+    X(UploadDirectBytes, "upload-direct-bytes") \
+    X(UploadWindowsCount, "upload-windows") \
+    X(UploadPlain, "upload-plain") \
+    X(CaptureBytes, "capture-guest-bytes") \
+    X(BaselineBytes, "baseline-copy-bytes") \
+    X(Borrows, "borrows") \
+    X(BorrowBytes, "borrow-bytes") \
+    X(AliasFound, "alias-found")
+enum class HoldCount : std::uint8_t {
+#define APS5_HOLD_COUNT_ENUM(name, text) name,
+    APS5_HOLD_COUNTS(APS5_HOLD_COUNT_ENUM)
+#undef APS5_HOLD_COUNT_ENUM
+    Count
+};
+void NoteHoldCount(HoldCount count, std::uint64_t amount = 1);
 class HoldSubSpan {
 public:
     explicit HoldSubSpan(HoldSub sub);
