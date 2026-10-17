@@ -400,8 +400,8 @@ bool TranslationContext::vCvtNormF16(const RdnaInstruction& inst, bool signedVal
 }
 
 bool TranslationContext::vCvtPknormF16(const RdnaInstruction& inst, bool signedValue) {
-    const IrU32 low = normF16(readF16Bits(sourceAt(inst, 0u)), signedValue);
-    const IrU32 high = normF16(readF16Bits(sourceAt(inst, 1u)), signedValue);
+    const IrU32 low = normF16(flushF16Input(readF16Bits(sourceAt(inst, 0u))), signedValue);
+    const IrU32 high = normF16(flushF16Input(readF16Bits(sourceAt(inst, 1u))), signedValue);
     const IrU32 result(ir.BitwiseOr(low.Value(), ir.ShiftLeftLogical(high.Value(), ir.Constant(16u))));
     writeOperand(inst.destination, &result.Value());
     return true;
@@ -745,10 +745,7 @@ bool TranslationContext::vLdexpF32(const RdnaInstruction& inst) {
     if (roundMode == 1u) overflowBits = &ir.Select(*positive, ir.Constant(0x7f800000u), ir.Constant(0xff7fffffu));
     else if (roundMode == 2u) overflowBits = &ir.Select(*positive, ir.Constant(0x7f7fffffu), ir.Constant(0xff800000u));
     else if (roundMode == 3u) overflowBits = &ir.BitwiseOr(sign.Value(), ir.Constant(0x7f7fffffu));
-    if (denorm32 == 1u || denorm32 == 2u) {
-        throw std::runtime_error("f32 denormal mode " + std::to_string(denorm32) + " at pc " + std::to_string(inst.programCounter) + " is not implemented");
-    }
-    if (denorm32 == 3u) {
+    if (denorm32 != 0u) {
         const IrU32 mantissa(ir.BitwiseAnd(bits.Value(), ir.Constant(0x007fffffu)));
         const IrU1 isSubnormal(ir.IEqual(exponent.Value(), ir.Constant(0u)));
         const IrU32 sig(ir.Select(isSubnormal.Value(), mantissa.Value(), ir.BitwiseOr(mantissa.Value(), ir.Constant(0x00800000u))));
@@ -773,9 +770,9 @@ bool TranslationContext::vLdexpF32(const RdnaInstruction& inst) {
         const IrU32 magnitude(roundMode == 3u ? unrounded : IrU32(ir.Select(*roundUp, ir.IAdd(unrounded.Value(), ir.Constant(1u)), unrounded.Value())));
         const IrU32 subResult(ir.BitwiseOr(sign.Value(), magnitude.Value()));
         IrU32 result(ir.Select(ir.Emit(IrOpcode::SGreaterThanEqual32, IrType::U1, {&expNorm.Value(), &ir.Constant(255u)}), *overflowBits, normResult.Value()));
-        result = IrU32(ir.Select(ir.Emit(IrOpcode::SLessThanEqual32, IrType::U1, {&expNorm.Value(), &ir.Constant(0u)}), subResult.Value(), result.Value()));
-        const IrU1 zero(ir.IEqual(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0u)));
-        result = IrU32(ir.Select(zero.Value(), bits.Value(), result.Value()));
+        result = IrU32(ir.Select(ir.Emit(IrOpcode::SLessThanEqual32, IrType::U1, {&expNorm.Value(), &ir.Constant(0u)}), (denorm32 & 2u) != 0u ? subResult.Value() : sign.Value(), result.Value()));
+        const IrU1 zero((denorm32 & 1u) != 0u ? ir.IEqual(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0u)) : ir.IEqual(exponent.Value(), ir.Constant(0u)));
+        result = IrU32(ir.Select(zero.Value(), sign.Value(), result.Value()));
         const IrU1 nan(ir.UGreaterThan(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)));
         result = IrU32(ir.Select(ir.IEqual(exponent.Value(), ir.Constant(0xffu)), ir.Select(nan.Value(), quietNan32(bits).Value(), bits.Value()), result.Value()));
         writeOperand(inst.destination, &ir.BitCastF32(result.Value()));

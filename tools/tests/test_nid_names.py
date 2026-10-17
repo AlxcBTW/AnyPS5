@@ -1,6 +1,8 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import tempfile
 import sys
 import unittest
@@ -202,6 +204,31 @@ class SourceCollectionTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8")
         return path
+
+    def cli(self, *arguments):
+        tools = self.root / "tools"
+        tools.mkdir(exist_ok=True)
+        tool = tools / "nid_names.py"
+        tool.write_bytes(Path(nid_names.__file__).read_bytes())
+        return subprocess.run([sys.executable, str(tool), *map(str, arguments)],
+                              env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+                              capture_output=True, timeout=10)
+
+    def test_report_preserves_unicode_paths_with_legacy_stdout(self):
+        self.write_source('APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);\n', "\u8cc7\u6599.cpp")
+        database = self.root / "aerolib.csv"
+        database.write_bytes(b"")
+        result = self.cli("--db", database)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn("core/libs/prx/libSceExample/\u8cc7\u6599.cpp", result.stdout.decode("utf-8"))
+
+    def test_error_preserves_unicode_paths_with_legacy_stderr(self):
+        database = self.root / "\u8cc7\u6599"
+        database.mkdir()
+        result = self.cli("--db", database)
+        self.assertEqual(result.returncode, 2, result.stderr.decode("utf-8", errors="replace"))
+        self.assertIn("\u8cc7\u6599", result.stderr.decode("utf-8"))
+        self.assertNotIn(b"Traceback", result.stderr)
 
     def test_comments_and_literals_do_not_create_export_records(self):
         self.write_source('''// APS5_EXPORT("AAAAAAAAAAA", exampleUnknown00);

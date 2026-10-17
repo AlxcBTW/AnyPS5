@@ -29,15 +29,6 @@
 #include <string>
 #include <vector>
 
-// A compute template that stores to a plane through a storage image must not outlive the depth surface
-// that owns the plane's memory. Templates are served from stamps (Revalidate's fast proof, the moved-buffer
-// path on top of it), and no stamp tells that a depth surface appeared over the image after the build:
-// the lookup would then hand out the plane's colour mirror, copied in from the depth image, and the
-// stale image would be copied over the whole depth image after the dispatch (DepthSurfaceStoreBack).
-// A program that overwrites the plane in full cannot tell, a program that stores to part of it can: the
-// first row of the plane takes a read-only buffer, every other texel must stay what the depth image holds.
-// The plane is only stored to (a program that also loads from it gets a sampled binding, which the
-// depth surface changes anyway). The planes are read back by programs compiled anew (no template).
 
 #ifndef _WIN32
 namespace AgcDriver {
@@ -66,28 +57,25 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 constexpr std::size_t Piece = 65536;
 
-// out[tid] = in[tid] + 1; plane(tid, 0) = in[tid]. User data: s[0:3] the output V#, s[4:11] the plane's T#,
-// s[16:19] the input V#.
 alignas(256) constexpr std::array<std::uint32_t, 13> RowCode{
-    0x7e3c0300u,                // v_mov_b32 v30, v0
-    0x7e3e0280u,                // v_mov_b32 v31, 0
-    0x34060082u,                // v_lshlrev_b32 v3, 2, v0
-    0xe0301000u, 0x80040b03u,   // buffer_load_dword v11, v3, s[16:19], 0 offen
-    0xbf8c3f70u,                // s_waitcnt vmcnt(0)
-    0x4a181681u,                // v_add_nc_u32 v12, 1, v11
-    0xe0701000u, 0x80000c03u,   // buffer_store_dword v12, v3, s[0:3], 0 offen
-    0xf0201108u, 0x00010b1eu,   // image_store v11, v[30:31], s[4:11]
+    0x7e3c0300u,
+    0x7e3e0280u,
+    0x34060082u,
+    0xe0301000u, 0x80040b03u,
+    0xbf8c3f70u,
+    0x4a181681u,
+    0xe0701000u, 0x80000c03u,
+    0xf0201108u, 0x00010b1eu,
     0xbf810000u, 0xbf810000u,
 };
 
-// out[tid] = bits(plane(tid, s12)). User data: s[0:3] the output V#, s[4:11] the plane's T#, s12 the row.
 alignas(256) constexpr std::array<std::uint32_t, 10> ProbeCode{
-    0x7e3c0300u,                // v_mov_b32 v30, v0
-    0x7e3e020cu,                // v_mov_b32 v31, s12
-    0xf0001108u, 0x00010a1eu,   // image_load v10, v[30:31], s[4:11]
-    0x34060082u,                // v_lshlrev_b32 v3, 2, v0
-    0xbf8c3f70u,                // s_waitcnt vmcnt(0)
-    0xe0701000u, 0x80000a03u,   // buffer_store_dword v10, v3, s[0:3], 0 offen
+    0x7e3c0300u,
+    0x7e3e020cu,
+    0xf0001108u, 0x00010a1eu,
+    0x34060082u,
+    0xbf8c3f70u,
+    0xe0701000u, 0x80000a03u,
     0xbf810000u, 0xbf810000u,
 };
 
@@ -152,7 +140,6 @@ private:
     std::uint8_t* block = nullptr;
 };
 
-// The watched block: the planes first, then the read-only inputs (at three different alignments) and the output.
 struct Buffers {
     explicit Buffers(const GuestBlock& block) : block(block) {}
     std::uint32_t* InputA() const { return reinterpret_cast<std::uint32_t*>(block.PieceAt(4)); }
@@ -205,7 +192,6 @@ ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::
     return ShaderRecompiler::Recompile(request);
 }
 
-// Compiled once per plane: a fresh compile has a fresh variant id, so only the runs of one result can share a template.
 ShaderRecompiler::RecompileResult RowProgram(AgcDriver::VulkanDevice& device, const void* plane, const std::uint32_t* input, const std::uint32_t* output) {
     std::vector<std::uint32_t> userData(20, 0u);
     const auto out = BufferDescriptor(output, Bytes);
@@ -261,7 +247,6 @@ void FillPlane(std::uint8_t* plane, float value) {
     std::fill(words, words + Piece / sizeof(std::uint32_t), std::bit_cast<std::uint32_t>(value));
 }
 
-// The depth surface over a plane: every texel becomes `depth` (the harness' triangle is at z = 0.5 of the viewport's depth range).
 void DrawDepth(const Env& env, const void* plane, float depth) {
     const Surface surface{reinterpret_cast<std::uintptr_t>(plane), 0, 0, false, VK_FORMAT_D32_SFLOAT};
     const float low = depth <= 0.5f ? 0.0f : 2.0f * depth - 1.0f;
@@ -269,7 +254,6 @@ void DrawDepth(const Env& env, const void* plane, float depth) {
     Require(Draw(env.device, env.shaders, surface, {.depthWrite = true, .depthCompare = VK_COMPARE_OP_ALWAYS, .minDepth = low, .maxDepth = high}) == Covered, "dispatch move depth: the depth producer did not cover the surface");
 }
 
-// What the plane holds: the first row (the lanes' texels) and every other texel, as the program leaves them.
 struct PlaneModel {
     std::array<std::uint32_t, Threads> row0{};
     std::uint32_t rest = 0;
@@ -338,8 +322,6 @@ void Print(const char* what, const MoveSteps& step) {
     std::printf("dispatch move depth: %s: checked %llu, exact %llu, moved %llu, refused %llu\n", what, static_cast<unsigned long long>(step.checked), static_cast<unsigned long long>(step.exact), static_cast<unsigned long long>(step.moved), static_cast<unsigned long long>(step.refused));
 }
 
-// The first dispatch over a range of guest memory is not served by a template whose input moved onto it (the
-// object built then did not see the range imported), so every range the scenarios use is dispatched over once.
 void Warm(const Env& env, std::uint8_t* plane) {
     FillPlane(plane, 0.5f);
     PlaneModel model;
@@ -350,7 +332,6 @@ void Warm(const Env& env, std::uint8_t* plane) {
     Step(env, program, model, env.buffers.InputC(), "warm-up: the third input");
 }
 
-// No depth surface anywhere near the plane: the template serves the repeats (the positive control).
 bool Control(const Env& env, std::uint8_t* plane) {
     FillPlane(plane, 0.5f);
     PlaneModel model;
@@ -377,8 +358,6 @@ bool Control(const Env& env, std::uint8_t* plane) {
     return true;
 }
 
-// The depth surface exists before the first dispatch: the template holds the plane's colour mirror, which the
-// lookup copies in from the depth image every time.
 void Mirror(const Env& env, std::uint8_t* plane, const char* where) {
     const std::string at = std::string(where) + ", the mirror: ";
     FillPlane(plane, 0.5f);
@@ -401,8 +380,6 @@ void Mirror(const Env& env, std::uint8_t* plane, const char* where) {
     Print((at + "repeats and redraws").c_str(), Since(start));
 }
 
-// The depth surface appears after the template was built over a plain storage image of the memory: the repeat must
-// not be served from that image. `moved` selects an input that moved, else the very input of the first dispatch.
 void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved, bool templates) {
     const std::string at = std::string(where) + (moved ? ", a surface appears, input moved: " : ", a surface appears, exact repeat: ");
     FillPlane(plane, 0.125f);
@@ -426,7 +403,6 @@ void Appears(const Env& env, std::uint8_t* plane, const char* where, bool moved,
     Verify(env, plane, model, at + "after the last dispatch");
 }
 
-// One pass takes the planes [10 * pass, 10 * pass + 3] of the watched block and [3 * pass, 3 * pass + 2] of the other.
 bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwatched, std::size_t pass) {
     const auto inWatch = pass * 10;
     const auto outside = pass * 3;
@@ -449,13 +425,6 @@ bool RunTests(const Env& env, const GuestBlock& watched, const GuestBlock& unwat
 
 int main() {
     try {
-#ifdef _WIN32
-        _putenv_s("APS5_LAB_DISPATCH_MOVE", "1");
-        _putenv_s("APS5_LAB_FAST_PROOF", "2");
-#else
-        setenv("APS5_LAB_DISPATCH_MOVE", "1", 1);
-        setenv("APS5_LAB_FAST_PROOF", "2", 1);
-#endif
         const GuestBlock watched(20, true);
         const GuestBlock unwatched(6, false);
         const auto device = OpenVulkanTestDevice();
@@ -465,7 +434,6 @@ int main() {
         const Env env{*device, shaders, buffers};
         bool templates = true;
 #ifndef _WIN32
-        // Imported surfaces left under the write watch or not: the proof from stamps and the proof of memory outside the watch.
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
         struct Restore {

@@ -995,6 +995,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             for (auto& resource : resources) recorder->Keep(std::move(resource));
         }
     }
+    if (!evicted.empty()) {
+        auto& sampled = Textures();
+        std::lock_guard lock(sampled.mutex);
+        dropUncachedViews(sampled);
+    }
     return texture;
 }
 
@@ -2579,9 +2584,6 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        // A depth surface registered over the image's memory is the lookup's to answer, not this image's: cachedStorageTexture
-        // hands out the plane's colour mirror (DepthSurfaceStorage), copied in from the depth image anew for every use, and a
-        // written image retires the surfaces it lands on. No stamp says whether one appeared after the build, so the walk decides.
         if (DepthSurfaceOverlaps(context.device, address, bytes)) {
             depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);

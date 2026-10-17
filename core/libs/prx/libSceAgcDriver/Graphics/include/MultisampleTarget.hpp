@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace AgcDriver::Graphics {
@@ -49,6 +50,8 @@ private:
 };
 
 std::uint64_t MultisampledColorBytes(const ColorTarget& target);
+std::size_t MultisampledDccBytes(const ColorTarget& target);
+VkClearColorValue MultisampledDccClear(const ColorTarget& target, std::span<const std::byte> dcc, std::span<const std::byte> cmask);
 bool MultisampledFillClearColor(const ColorTarget& target, std::uint32_t fill, VkClearColorValue& clear);
 bool TakeMultisampledClear(MultisampledCmask& cmask, MultisampledColorFill& colorFill, const ColorTarget& use, VkClearColorValue& clear);
 VkImageView MultisampleTargetView(const Context& context, const ColorTarget& target);

@@ -2938,8 +2938,9 @@ void multisampleTests() {
     expectFailure([&] { DecodeState(queue); }, "without a CMASK address");
     queue = multisampled();
     queue.context[0x31c] |= 0x10000000u;
-    expectFailure([&] { DecodeState(queue); }, "DCC over a multisampled color target is unsupported");
-    expectFailure([&] { DecodeColorBuffer(queue.context, 0); }, "DCC over a multisampled color target is unsupported");
+    queue.context[0x325] = 0;
+    expectFailure([&] { DecodeState(queue); }, "multisampled DCC targets require pipe-aligned single-layer SW_64KB_R_X");
+    expectFailure([&] { DecodeColorBuffer(queue.context, 0); }, "multisampled DCC targets require pipe-aligned single-layer SW_64KB_R_X");
     queue = multisampled();
     queue.context[0x31c] |= 0x2000;
     setCmaskAddress(queue);
@@ -2984,7 +2985,8 @@ void multisampleTests() {
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "different formats or extents");
     queue = rasterizedResolve;
     queue.context[0x31c] |= 0x10000000u;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "DCC over a multisampled color target is unsupported");
+    queue.context[0x325] = 0;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "multisampled DCC targets require pipe-aligned single-layer SW_64KB_R_X");
     queue = multisampled();
     queue.context[0x0] = 0;
     queue.context[0x202] = 0xcc0030;
@@ -3001,13 +3003,15 @@ void multisampleTests() {
     queue.context[0x202] = 0xcc0020;
     expectFailure([&] { DecodeColorMetadataPass(queue); }, "multisampled color target");
     queue.context[0x31c] |= 0x10000000u;
-    expectFailure([&] { DecodeColorMetadataPass(queue); }, "DCC over a multisampled color target is unsupported");
+    queue.context[0x325] = 0;
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "multisampled DCC targets require pipe-aligned single-layer SW_64KB_R_X");
     queue = multisampled();
     queue.context[0x2f8] = 0;
     queue.context[0x0] = 0;
     queue.context[0x202] = 0x00cc0050;
     queue.context[0x31c] = 0x1002e028;
     queue.context[0x31d] = 0x00012000;
+    queue.context[0x31e] = 0x00100038u;
     queue.context[0x325] = 0x2000;
     queue.context[0x323] = 0x3f800000;
     queue.context[0x324] = 0x3f800000;
@@ -3015,6 +3019,9 @@ void multisampleTests() {
     auto fmaskPass = DecodeColorMetadataPass(queue);
     Require(fmaskPass.has_value() && fmaskPass->mode == ColorMetadataPass::Mode::FmaskDecompress && fmaskPass->targets.size() == 1 && fmaskPass->targets[0].samples == 4 && fmaskPass->targets[0].cmaskAddress == cmaskAddress && fmaskPass->targets[0].dccAddress != 0, "an FMASK decompress of a 4x multisampled target with CMASK and DCC did not decode");
     Require(fmaskPass->targets[0].clearWords[0] == 0x3f800000 && fmaskPass->targets[0].clearWords[1] == 0x3f800000, "fast clear words changed");
+    Require(fmaskPass->targets[0].dccControl == 0x00100038u, "FMASK decompress lost its DCC control");
+    queue.context[0x31e] |= 0x80u;
+    Require(DecodeColorMetadataPass(queue)->targets[0].dccControl == 0x001000b8u, "FMASK decompress hid an unsupported DCC control from the importer");
     queue = makeState();
     queue.context[0x0] = 0;
     queue.context[0x202] = 0x00cc0050;
@@ -3124,6 +3131,46 @@ void multisampleTests() {
     pending.NoteFill(0x40000000, 0xff0000, 0);
     clearedCmask.NoteFill(0x50000000, 0x1000, 0);
     Require(TakeMultisampledClear(clearedCmask, pending, halfFloat, clear) && clear.float32[0] == 1.0f && !TakeMultisampledClear(clearedCmask, pending, halfFloat, clear), "a pending CMASK clear and a whole fill did not clear once to the CMASK clear color");
+}
+
+void multisampleDccStateTests() {
+    static std::array<std::byte, 131072> color{};
+    const auto address = (reinterpret_cast<std::uintptr_t>(color.data()) + 65535u) & ~std::uintptr_t{65535u};
+    for (const auto log2 : {1u, 2u, 3u}) {
+        auto queue = makeState();
+        queue.context[0x318] = static_cast<std::uint32_t>(address >> 8u);
+        queue.context[0x390] = static_cast<std::uint32_t>(address >> 40u);
+        queue.context[0x31c] |= 0x10000000u;
+        queue.context[0x31d] = (log2 << 12u) | (log2 << 15u);
+        queue.context[0x31e] = 0x00100038u;
+        queue.context[0x325] = 0x1234u;
+        queue.context[0x3b8] = 0x4dc6c000u;
+        queue.context[0x2f8] = (log2 << 20u) | log2;
+        for (std::uint32_t pixel = 0; pixel < 4; ++pixel) {
+            queue.context[0x2fe + pixel * 4u] = 0;
+            queue.context[0x2ff + pixel * 4u] = 0;
+        }
+        queue.context[0x292] = 3;
+        queue.context[0x1b3] = queue.context[0x1b4] = 2;
+        const auto state = AgcDriver::Graphics::DecodeState(queue);
+        Require(state.colors.size() == 1 && state.colors.front().samples == (1u << log2) && state.colors.front().dccAddress == 0x123400u && state.colors.front().dccPipeAligned, "normal-render multisampled DCC state did not decode");
+        Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "normal-render multisampled DCC state failed the draw precheck");
+        auto changed = queue;
+        changed.context[0x31e] |= 0x80u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "color transforms or lossy");
+        changed = queue;
+        changed.context[0x3b8] &= ~0x40000000u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "pipe-aligned single-layer");
+        changed = queue;
+        changed.context[0x325] = 0;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "pipe-aligned single-layer");
+        changed = queue;
+        changed.context[0x3b8] |= 1u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "pipe-aligned single-layer");
+        changed = queue;
+        changed.context[0x3b0] |= 1u << 28u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(changed); }, "multisampled color mips");
+    }
 }
 
 void clipDistanceTests() {
@@ -7916,6 +7963,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--covered-centroid-state") {
             multisampleTests();
             std::cout << "Covered-centroid and multisample state checks passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--multisample-dcc-state") {
+            multisampleDccStateTests();
+            std::cout << "Multisampled DCC state checks passed\n";
             return 0;
         }
         {

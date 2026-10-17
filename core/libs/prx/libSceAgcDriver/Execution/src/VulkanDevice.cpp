@@ -3716,17 +3716,14 @@ bool TemplateDataRefresh() {
     return enabled;
 }
 
-// APS5_LAB_DISPATCH_MOVE=1: the content key of a compute stage leaves the base address and size
-// of its read-only guest buffers out (as a draw's does, ShaderResources::ContentKey), and a hit
-// whose such buffers moved binds snapshots of their new ranges (ShaderResources::MovedDispatchBuffers).
 bool DispatchMove() {
-    static const bool enabled = std::getenv("APS5_LAB_DISPATCH_MOVE") != nullptr && TemplateDataRefresh();
+    static const bool enabled = std::getenv("APS5_NO_DISPATCH_MOVE") == nullptr && TemplateDataRefresh();
     return enabled;
 }
 
 std::size_t DispatchMoveBytes() {
     static const std::size_t bytes = [] {
-        const char* text = std::getenv("APS5_LAB_DISPMOVE_MAX_KIB");
+        const char* text = std::getenv("APS5_DISPMOVE_MAX_KIB");
         return static_cast<std::size_t>(text != nullptr ? std::strtoull(text, nullptr, 10) : 1024ull) * 1024u;
     }();
     return bytes;
@@ -4167,8 +4164,6 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
-    // The descriptor set that binds snapshots of the read-only buffers that moved since the
-    // template was built (APS5_LAB_DISPATCH_MOVE); null: the template's own set.
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings{};
 };
 

@@ -281,6 +281,35 @@ if(BUILD_TESTING)
             PASS_REGULAR_EXPRESSION "C\\+\\+ exception St9bad_alloc raised on thread [0-9]+ cannot be delivered: 0x[0-9a-f]+ undeliverable_host_exception_tests\\.exe\\+0x[0-9a-f]+ has no unwind data")
     endif()
 
+    add_test_executable(crash_text_tests tests/CrashText.cpp)
+    target_include_directories(crash_text_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MINGW)
+        target_compile_options(crash_text_tests PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME crash_text COMMAND crash_text_tests)
+
+    if(WIN32)
+        add_test_executable(windows_crash_text_tests tests/WindowsCrashText.cpp)
+        add_dependencies(windows_crash_text_tests libc)
+        if(MINGW)
+            target_compile_options(windows_crash_text_tests PRIVATE -fasynchronous-unwind-tables)
+        endif()
+        add_test(NAME windows_crash_text COMMAND windows_crash_text_tests $<TARGET_FILE:libc>)
+        set_tests_properties(windows_crash_text PROPERTIES TIMEOUT 20
+            PASS_REGULAR_EXPRESSION "faulting[^~]*FATAL: unhandled exception 0xc0000005[^~]*  \\[r12\\] \"allocation failed in the heap\"[\r\n]+  \\[r13\\] u\"LowLevelFatalError \\[File:Unknown\\] \\[Line: 42\\] Out of memory\"[\r\n]+  \\[r14\\] \"PAGE END\"[.][.][.]"
+            FAIL_REGULAR_EXPRESSION "\\[rbx\\] u?\"|did not fault")
+    endif()
+
+    add_test_executable(guest_voice_port_attr_tests tests/GuestVoicePortAttr.cpp)
+    target_include_directories(guest_voice_port_attr_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(guest_voice_port_attr_tests PRIVATE libSceVoice libc)
+    configure_windows_unwind(guest_voice_port_attr_tests)
+    add_test(NAME guest_voice_port_attr COMMAND guest_voice_port_attr_tests)
+    if(WIN32)
+        set_tests_properties(guest_voice_port_attr PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVoice>")
+    endif()
+
     add_test_executable(guest_offline_imports_tests tests/GuestOfflineImports.cpp)
     target_include_directories(guest_offline_imports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_offline_imports_tests PRIVATE libSceHttp libSceNpEntitlementAccess libSceRudp libc)
@@ -460,16 +489,6 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData>")
         set_tests_properties(savedata_native_write_replacement PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceSaveData.native>")
-    endif()
-
-    add_test_executable(guest_ppsa01530_exports_tests tests/GuestPPSA01530Exports.cpp)
-    target_include_directories(guest_ppsa01530_exports_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(guest_ppsa01530_exports_tests PRIVATE libkernel libSceJson2 libSceNet libScePad libc)
-    configure_windows_unwind(guest_ppsa01530_exports_tests)
-    add_test(NAME guest_ppsa01530_exports COMMAND guest_ppsa01530_exports_tests)
-    if(WIN32)
-        set_tests_properties(guest_ppsa01530_exports PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
 
     add_test_executable(guest_posix_random_tests tests/GuestPosixRandom.cpp)

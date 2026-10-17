@@ -185,9 +185,6 @@ public:
         std::uint64_t created, underGpuMutex;
     };
     static ComputePipelineCreation ComputePipelineCounts();
-    // APS5_LAB_DISPATCH_MOVE: the template hits checked for moved read-only buffers, those that had
-    // every one where it was built, those served with snapshots of moved ones, those refused (a
-    // fresh build followed), and the cached objects stage A dropped before the dispatch's own check.
     struct DispatchMoveCount {
         std::uint64_t checked, exact, moved, refused, filtered;
     };

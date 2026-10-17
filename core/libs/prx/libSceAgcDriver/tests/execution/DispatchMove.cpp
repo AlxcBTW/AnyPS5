@@ -250,11 +250,6 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
 
 int main() {
     try {
-#ifdef _WIN32
-        _putenv_s("APS5_LAB_DISPATCH_MOVE", "1");
-#else
-        setenv("APS5_LAB_DISPATCH_MOVE", "1", 1);
-#endif
         GuestBlock guest;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
