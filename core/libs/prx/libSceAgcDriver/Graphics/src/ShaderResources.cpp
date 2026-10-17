@@ -2610,6 +2610,95 @@ bool EpochRevalidate() {
     return enabled;
 }
 
+std::atomic<int> proofEpochOverride{-1};
+
+int ProofEpochMode() {
+    if (const auto forced = proofEpochOverride.load(std::memory_order_relaxed); forced >= 0) return forced;
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_LAB_PROOF_EPOCH");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return 0;
+        return std::strcmp(text, "verify") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+
+enum class EpochRefusal : std::size_t { NoToken, Pending, Collect, Image, Stamp, Depth, Evicted, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(EpochRefusal::Count)> EpochRefusalNames{"no token", "pending serial", "collect", "image state", "write stamp", "depth surface", "evicted image"};
+
+enum class EpochIneligible : std::size_t { DepthTexture, OutsideWatch, KeyScan, ForeignKeys, UnstableKeys, Accepted, OwnRefreshed, OutsideProof, PendingMoved, FullWalk, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(EpochIneligible::Count)> EpochIneligibleNames{"depth texture", "outside the write watch", "key scan", "foreign keys", "unstable keys", "accepted overlap", "own-object refresh", "outside proof", "pending serial moved", "full walk"};
+
+struct ProofEpochCounters {
+    std::atomic<std::uint64_t> asked{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::uint64_t> proofsRun{0};
+    std::atomic<std::uint64_t> fullWalks{0};
+    std::atomic<std::uint64_t> tokens{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> disagreements{0};
+    std::atomic<std::uint64_t> missed{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochRefusal::Count)> refusals{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(EpochIneligible::Count)> ineligible{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+ProofEpochCounters& EpochCounters() {
+    static ProofEpochCounters counters;
+    return counters;
+}
+
+void reportProofEpoch() {
+    auto& counters = EpochCounters();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load();
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    std::string moves;
+    for (std::size_t i = 0; i < counters.refusals.size(); ++i) moves += std::string(" ") + EpochRefusalNames[i] + " " + std::to_string(load(counters.refusals[i]));
+    std::string none;
+    for (std::size_t i = 0; i < counters.ineligible.size(); ++i) none += std::string(" ") + EpochIneligibleNames[i] + " " + std::to_string(load(counters.ineligible[i]));
+    AgcDriver::ProfilePrint_nid_no_patch("[proofepoch] mode %s: proofs asked %llu, skipped by epoch %llu, proofs run %llu, full walks %llu, tokens made %llu; epoch moves (skip refused) by cause:%s; no token made because:%s; verify: checked %llu, disagreeing %llu, refused but the proof passed %llu\n", ProofEpochMode() == 2 ? "verify" : "on", load(counters.asked), load(counters.skipped), load(counters.proofsRun), load(counters.fullWalks), load(counters.tokens), moves.c_str(), none.c_str(), load(counters.verified), load(counters.disagreements), load(counters.missed));
+}
+
+struct EpochTrace {
+    bool ok = true;
+    bool complete = false;
+    EpochIneligible why = EpochIneligible::DepthTexture;
+    std::uint64_t stamps = 0;
+    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    std::vector<const StorageTexture*> images;
+    std::vector<std::pair<std::uint64_t, std::size_t>> storageSurfaces;
+
+    void reset() {
+        ok = true;
+        complete = false;
+        ranges.clear();
+        images.clear();
+        storageSurfaces.clear();
+    }
+
+    void refuse(EpochIneligible reason) {
+        if (!ok) return;
+        ok = false;
+        why = reason;
+    }
+
+    void range(std::uint64_t address, std::size_t bytes) {
+        if (bytes == 0) return;
+        const std::pair<std::uint64_t, std::size_t> entry{address, bytes};
+        if (std::find(ranges.begin(), ranges.end(), entry) == ranges.end()) ranges.push_back(entry);
+    }
+
+    void keys(std::uint64_t dccAddress, std::uint64_t surfaceBytes) {
+        if (dccAddress != 0) range(dccAddress, DccKeyBytes(surfaceBytes));
+    }
+};
+
+EpochTrace& ProofEpochTrace() {
+    thread_local EpochTrace* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
 }
 
 // Turns the lookups' records into this object's per-texture validation records (see
@@ -2660,6 +2749,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     if (validatedTextures.size() != textures.size()) return fail(FastFail::NoRecord);
     const bool unchanged = pendingSerialSeen != 0 && pendingSerialSeen == serialBefore;
     const bool keyProofs = KeyFastPath();
+    EpochTrace* trace = nullptr;
+    if (ProofEpochMode() != 0) {
+        trace = &ProofEpochTrace();
+        trace->reset();
+        trace->stamps = GuestMemory::TrackerGeneration();
+        if (!keyProofs) trace->refuse(EpochIneligible::KeyScan);
+    }
     thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
     auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
     thread_local std::vector<StorageTexture::PendingQuery>* pendingSlot = nullptr;
@@ -2685,14 +2781,17 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!surface.valid) return fail(FastFail::NoRecord);
         if (surface.depth) {
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth);
+            if (trace != nullptr) trace->refuse(EpochIneligible::DepthTexture);
             continue;
         }
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (trace != nullptr) trace->range(address, bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         const auto* source = surface.source;
         bool outside = false;
         if (surface.collected == 0) {
+            if (trace != nullptr) trace->refuse(EpochIneligible::OutsideWatch);
             const auto level = FastProofLevel();
             if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
                 // A depth surface registered over the memory is the lookup's to return (DepthSurfaceTexture).
@@ -2731,6 +2830,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             const auto keys = surface.resource.dccAddress == 0 ? DccKeys::Uncompressed : SameKeySurface(source, surface.resource, surface.bytes) ? sourceKeys : ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof());
             if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress && (keys != DccKeys::Uncompressed || !StorageImageServesKeys(*source, surface.resource.dccAddress))) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
+            if (trace != nullptr) {
+                trace->keys(own.dccAddress, source->GuestBytes());
+                if (own.dccAddress != 0 && source->UploadedKeys() != DccKeys::Uncompressed && source->KeyProof().generation == 0) trace->refuse(EpochIneligible::UnstableKeys);
+                if (surface.resource.dccAddress != 0 && surface.resource.dccAddress != own.dccAddress) {
+                    trace->refuse(EpochIneligible::ForeignKeys);
+                } else if (surface.resource.dccAddress != 0 && !SameKeySurface(source, surface.resource, surface.bytes)) {
+                    trace->keys(surface.resource.dccAddress, surface.bytes);
+                    if (textures[i]->KeyProof().generation == 0) trace->refuse(EpochIneligible::UnstableKeys);
+                }
+            }
             // A view of a fast-cleared surface stays one only while its image still has results
             // pending over it (cachedTexture's hit rule), unless the image's own descriptor names
             // the surface's metadata (the lookup views the cleared image then). The identity is
@@ -2744,6 +2853,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             const auto keys = surface.resource.dccAddress != 0 ? ProvedClearKeys(surface.resource, surface.bytes, textures[i]->KeyProof()) : DccKeys::Uncompressed;
             if (keys != surface.keys) return fail(FastFail::Keys);
             scannedKeys[i] = keys;
+            if (trace != nullptr && surface.resource.dccAddress != 0) {
+                trace->keys(surface.resource.dccAddress, surface.bytes);
+                if (textures[i]->KeyProof().generation == 0) trace->refuse(EpochIneligible::UnstableKeys);
+            }
             if (!unchanged) query(address, address + bytes, nullptr, nullptr, {i, false, false});
             if (surface.resource.dccAddress != 0) countKeysProven(false);
         }
@@ -2757,6 +2870,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
+        if (trace != nullptr && storageTextures[i] != nullptr && storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress) trace->refuse(EpochIneligible::ForeignKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
         const auto* image = storageTextures[i].get();
         if (image == nullptr) return fail(FastFail::NoRecord);
@@ -2768,7 +2882,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             return fail(FastFail::Depth);
         }
         bool outside = false;
+        if (trace != nullptr) {
+            trace->range(address, bytes);
+            trace->storageSurfaces.emplace_back(address, bytes);
+        }
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            if (trace != nullptr) trace->refuse(EpochIneligible::OutsideWatch);
             if (FastProofLevel() < 2) {
                 countOutside(2, 2);
                 return fail(FastFail::Collect);
@@ -2786,6 +2905,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             // byte-compare fallback; the image's generation is left where it is.
             if (!keyProofs || image->ProvedKeys() != image->UploadedKeys()) return fail(FastFail::StorageKeys);
             countKeysProven(true);
+            if (trace != nullptr) {
+                trace->keys(own.dccAddress, image->GuestBytes());
+                if (image->UploadedKeys() != DccKeys::Uncompressed && image->KeyProof().generation == 0) trace->refuse(EpochIneligible::UnstableKeys);
+            }
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
@@ -2833,6 +2956,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         auto& surface = validatedTextures[i];
         if (surface.source == nullptr && surface.collected != 0) surface.generation = surface.collected;
         surface.keys = scannedKeys[i];
+    }
+    if (trace != nullptr) {
+        trace->images.assign(images.begin(), images.end());
+        trace->complete = trace->ok && fastProofsOutside == 0 && !accepted;
     }
     return true;
 }
@@ -3123,7 +3250,42 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    const int epochMode = noFast || !EpochRevalidate() ? 0 : ProofEpochMode();
+    bool epochSkipped = false;
+    std::size_t refusal = static_cast<std::size_t>(EpochRefusal::NoToken);
+    if (epochMode != 0) {
+        auto& epoch = EpochCounters();
+        epoch.asked.fetch_add(1, std::memory_order_relaxed);
+        epochSkipped = proofEpoch.valid && proofEpochSkip(serialBefore, refusal);
+        proofEpoch.valid = false;
+        ProofEpochTrace().complete = false;
+        if (epochSkipped) epoch.skipped.fetch_add(1, std::memory_order_relaxed);
+        else epoch.refusals[refusal].fetch_add(1, std::memory_order_relaxed);
+    }
+    const bool epochServed = epochSkipped && epochMode == 1;
+    bool fast = epochServed;
+    if (epochServed) {
+        overlapping.clear();
+        fastProofsOutside = 0;
+    } else {
+        fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+        if (epochMode != 0) {
+            auto& epoch = EpochCounters();
+            epoch.proofsRun.fetch_add(1, std::memory_order_relaxed);
+            if (epochSkipped) {
+                epoch.verified.fetch_add(1, std::memory_order_relaxed);
+                if (!fast) {
+                    const auto count = epoch.disagreements.fetch_add(1, std::memory_order_relaxed);
+                    if (count < 20) {
+                        std::fprintf(stderr, "[proofepoch] APS5_LAB_PROOF_EPOCH=verify: a skipped proof would have failed (%s)\n", reason == FastFail::Count ? "none" : FastFailNames[static_cast<std::size_t>(reason)]);
+                        std::fflush(stderr);
+                    }
+                }
+            } else if (fast && refusal != static_cast<std::size_t>(EpochRefusal::NoToken)) {
+                epoch.missed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3150,6 +3312,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
+        if (epochMode != 0) EpochCounters().fullWalks.fetch_add(1, std::memory_order_relaxed);
         if (!fullWalk()) {
             const auto failure = [&] {
                 switch (reason) {
@@ -3265,7 +3428,78 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
     }
+    if (epochMode != 0) {
+        auto& epoch = EpochCounters();
+        auto& trace = ProofEpochTrace();
+        if (epochServed) {
+            proofEpoch.valid = true;
+        } else {
+            std::optional<EpochIneligible> why;
+            if (!fast) why = EpochIneligible::FullWalk;
+            else if (ownedPath) why = EpochIneligible::OwnRefreshed;
+            else if (accepted) why = EpochIneligible::Accepted;
+            else if (viaOutside) why = EpochIneligible::OutsideProof;
+            else if (!trace.complete) why = trace.ok ? EpochIneligible::OutsideProof : trace.why;
+            else if (pendingSerialSeen == 0) why = EpochIneligible::PendingMoved;
+            if (why.has_value()) {
+                epoch.ineligible[static_cast<std::size_t>(*why)].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                proofEpoch.stamps = trace.stamps;
+                proofEpoch.ranges.assign(trace.ranges.begin(), trace.ranges.end());
+                proofEpoch.storageSurfaces.assign(trace.storageSurfaces.begin(), trace.storageSurfaces.end());
+                proofEpoch.images.clear();
+                for (const auto* image : trace.images) {
+                    if (std::none_of(proofEpoch.images.begin(), proofEpoch.images.end(), [&](const auto& held) { return held.image == image; })) proofEpoch.images.push_back({image, image->Generation(), image->UploadedKeys(), image->FilledKeys()});
+                }
+                proofEpoch.valid = true;
+                epoch.tokens.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        reportProofEpoch();
+    }
     return finish(fast, true);
+}
+
+bool ShaderResources::proofEpochSkip(std::uint64_t serialBefore, std::size_t& refusal) {
+    const auto refuse = [&refusal](EpochRefusal why) {
+        refusal = static_cast<std::size_t>(why);
+        return false;
+    };
+    if (validatedTextures.size() != textures.size()) return refuse(EpochRefusal::NoToken);
+    if (pendingSerialSeen == 0 || pendingSerialSeen != serialBefore) return refuse(EpochRefusal::Pending);
+    for (const auto& [address, bytes] : proofEpoch.ranges) {
+        if (GuestMemory::CollectWrites(address, bytes) == 0) return refuse(EpochRefusal::Collect);
+    }
+    for (const auto& held : proofEpoch.images) {
+        if (held.image->Generation() != held.generation || held.image->UploadedKeys() != held.uploaded || held.image->FilledKeys() != held.filled) return refuse(EpochRefusal::Image);
+    }
+    thread_local std::vector<GuestMemory::UnchangedQuery>* queriesSlot = nullptr;
+    auto& queries = ShaderRecompiler::ThreadOwned(queriesSlot);
+    queries.clear();
+    for (const auto& [address, bytes] : proofEpoch.ranges) queries.push_back({address, bytes, proofEpoch.stamps});
+    if (!GuestMemory::UnchangedSinceAll(queries)) return refuse(EpochRefusal::Stamp);
+    for (const auto& [address, bytes] : proofEpoch.storageSurfaces) {
+        if (DepthSurfaceOverlaps(context.device, address, bytes)) return refuse(EpochRefusal::Depth);
+    }
+    thread_local std::vector<const StorageTexture*>* imagesSlot = nullptr;
+    auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
+    images.clear();
+    for (const auto& held : proofEpoch.images) {
+        if (!held.image->Cached()) return refuse(EpochRefusal::Evicted);
+        images.push_back(held.image);
+    }
+    if (!StorageImagesCached(context, images)) return refuse(EpochRefusal::Evicted);
+    for (const auto* image : images) image->NoteProved();
+    return true;
+}
+
+ShaderResources::ProofEpochStats ShaderResources::ProofEpochCounts() {
+    const auto& counters = EpochCounters();
+    return {counters.asked.load(), counters.skipped.load(), counters.proofsRun.load(), counters.fullWalks.load(), counters.verified.load(), counters.disagreements.load()};
+}
+
+void ShaderResources::SetProofEpochMode(int mode) {
+    proofEpochOverride.store(mode, std::memory_order_relaxed);
 }
 
 namespace {
