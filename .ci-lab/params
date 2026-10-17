@@ -1,0 +1,5 @@
+name=waitdefer3
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-waitdefer3-9c4f42a402-87788
