@@ -324,7 +324,19 @@ enum class HoldSub : std::uint8_t {
     X(BaselineBytes, "baseline-copy-bytes") \
     X(Borrows, "borrows") \
     X(BorrowBytes, "borrow-bytes") \
-    X(AliasFound, "alias-found")
+    X(AliasFound, "alias-found") \
+    X(ProofNone, "proof-fail-no-proof") \
+    X(ProofStale, "proof-fail-stale-or-unheld") \
+    X(ProofNoEpoch, "proof-fail-no-collect-epoch") \
+    X(ProofKeysMoved, "proof-fail-dcc-keys-moved") \
+    X(ProofWritten, "proof-fail-written-since") \
+    X(ProofPending, "proof-fail-other-pending") \
+    X(ProofOk, "proof-ok") \
+    X(TakeAliased, "take-skip-aliased") \
+    X(TakeNoGeneration, "take-skip-no-generation") \
+    X(TakeKeys, "take-skip-keys") \
+    X(TakePending, "take-skip-other-pending") \
+    X(TakeOk, "take-ok")
 enum class HoldCount : std::uint8_t {
 #define APS5_HOLD_COUNT_ENUM(name, text) name,
     APS5_HOLD_COUNTS(APS5_HOLD_COUNT_ENUM)

@@ -2100,34 +2100,41 @@ bool StorageTexture::otherPendingOverlaps() const {
 }
 
 bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto fail = [](GuestMemory::HoldCount reason) {
+        GuestMemory::NoteHoldCount(reason);
+        return false;
+    };
+    if (refreshProof.generation == 0) return fail(GuestMemory::HoldCount::ProofNone);
+    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return fail(GuestMemory::HoldCount::ProofStale);
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return fail(GuestMemory::HoldCount::ProofNoEpoch);
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys) return fail(GuestMemory::HoldCount::ProofKeysMoved);
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return fail(GuestMemory::HoldCount::ProofNoEpoch);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return fail(GuestMemory::HoldCount::ProofWritten);
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) return fail(GuestMemory::HoldCount::ProofPending);
         refreshProof.pendingSerial = serial;
     }
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::ProofOk);
     return true;
 }
 
 void StorageTexture::takeRefreshProof(bool aliased) {
     refreshProof = {};
-    if (aliased || generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return;
+    if (aliased) return GuestMemory::NoteHoldCount(GuestMemory::HoldCount::TakeAliased);
+    if (generation == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return GuestMemory::NoteHoldCount(GuestMemory::HoldCount::TakeNoGeneration);
+    if (descriptor.dccAddress != 0 && (keyProof.generation == 0 || keyProof.keys != uploadedKeys)) return GuestMemory::NoteHoldCount(GuestMemory::HoldCount::TakeKeys);
     const auto serial = PendingSerial();
-    if (otherPendingOverlaps()) return;
+    if (otherPendingOverlaps()) return GuestMemory::NoteHoldCount(GuestMemory::HoldCount::TakePending);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::TakeOk);
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
 }
 
