@@ -3732,8 +3732,6 @@ std::size_t DispatchMoveBytes() {
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
-// A refused move builds fresh under the exact key (movable false: the read-only buffers' addresses
-// are part of it), so the template under the movable key, which serves another address, stays.
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device, bool movable = true) {
     auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), movable && DispatchMove());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
@@ -3766,7 +3764,6 @@ struct PreparedDispatch {
     std::shared_ptr<Graphics::ShaderResources> resources;
     std::shared_ptr<Graphics::ShaderResources> cached;
     ResourceCache::Key key;
-    // `key` is the exact key: the movable template was refused for this dispatch and is left alone.
     bool exact = false;
     // APS5_PROFILE_DRAW: stage A's time, added to the [dispatch] phase totals by the dispatch, and
     // the prepare's parts for the driver's 'prepare:' rows (PreparePhase order).
@@ -3969,8 +3966,6 @@ constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderRe
 
 struct DispatchMoveCounters {
     std::atomic<std::uint64_t> checked{0}, exact{0}, moved{0}, buffers{0}, bytes{0};
-    // After a refusal: built fresh, of those inserted beside the movable template (which stays),
-    // and served by an exact entry built earlier.
     std::atomic<std::uint64_t> rebuilt{0}, kept{0}, served{0};
     std::array<std::atomic<std::uint64_t>, 5> sizes{};
     std::array<std::atomic<std::uint64_t>, MoveRefusals> refused{};
@@ -4317,8 +4312,6 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
             Graphics::ShaderResources::MoveProof proof;
             if (!cached->MovedDispatchBuffers(compute, nullptr, DispatchMoveBytes(), proof).has_value()) {
                 DispatchMoves().filtered[static_cast<std::size_t>(proof.refusal)].fetch_add(1, std::memory_order_relaxed);
-                // The movable template serves another address and stays: this dispatch is served
-                // by (or builds) the entry under the exact key.
                 prepared->key = DispatchContentKey(compute, context.device, false);
                 prepared->exact = true;
                 cached = state->resourceCache.Find(prepared->key);
@@ -4789,6 +4782,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
     bool fromCache = false;
+    bool refusedMove = false;
     double revalidateMs = 0;
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> overlay;
     // The batches the pre-sync (PrepareDispatch) waited for are reaped first: their completions
@@ -4810,7 +4804,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // The image lookups of this call by outcome (stage B, a Revalidate or a locked build), for the
     // [indirect] line: reset here, read after the resources phase.
     if (profile && arguments != 0) Graphics::ThreadLookupOutcomes() = {};
-    // A fresh build after a refused move goes under the exact key, beside the movable template.
     const auto noteRefusalBuild = [](bool inserted) {
         auto& moves = DispatchMoves();
         moves.rebuilt.fetch_add(1, std::memory_order_relaxed);
@@ -4873,7 +4866,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         // alone by the pointer-conditional Remove). APS5_NO_PREPARED_FIND=1 looks the key up again.
         static const bool preparedFind = std::getenv("APS5_NO_PREPARED_FIND") == nullptr;
         const bool exactEntry = prepared != nullptr && prepared->exact;
-        bool refusedMove = false;
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
@@ -4905,9 +4897,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
                     }
                 }
                 if (!usable) {
-                    // Refused: the movable template stays for the address it serves. An exact entry
-                    // of this dispatch's own is used when one exists; else the fresh build below
-                    // is inserted under the exact key.
                     contentKey = DispatchContentKey(shaders[0], context.device, false);
                     refusedMove = true;
                     cached = state->resourceCache.Find(contentKey);

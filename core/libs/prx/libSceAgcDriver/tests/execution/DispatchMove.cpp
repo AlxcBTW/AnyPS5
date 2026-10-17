@@ -241,8 +241,6 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
         Require(refused.rebuilt == 2 && refused.kept == 2 && refused.served == 0, "dispatch move: the two refusals were not two rebuilds inserted beside the template");
     }
 
-    // The template of the input at A survives the refusals: A is an exact hit, not a rebuild and
-    // not a move from a build made for another address.
     const auto afterRefusals = AgcDriver::VulkanDevice::DispatchMoveCounts();
     Reset(guest.OutputO());
     Run(device, compiled, guest.InputA(), Bytes, guest.OutputO(), true);
@@ -251,7 +249,6 @@ bool RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
     Print("the input back after the refusals", back);
     if (templates) Require(back.checked == 1 && back.exact == 1 && back.moved == 0 && back.refused == 0 && back.rebuilt == 0, "dispatch move: the input back at the template's address was not an exact hit after the refusals");
 
-    // A and a refused B alternating: B is served by the entry its first refusal built, A stays exact.
     for (int round = 0; round < 2; ++round) {
         const auto alternating = AgcDriver::VulkanDevice::DispatchMoveCounts();
         Reset(guest.OutputO());
