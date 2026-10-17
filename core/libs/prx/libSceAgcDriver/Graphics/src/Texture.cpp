@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -1145,6 +1146,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayers = blockUnits ? static_cast<std::uint32_t>((guestBytes + 65535) / 65536) : layered && LayerTrackingEnabled() ? geometry.layers : 1u;
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
+        uploadHash.assign(trackedLayers, {});
         layerPending.assign(trackedLayers, false);
         layerOriginal.assign(trackedLayers, true);
         savedTicket.assign(trackedLayers, 0);
@@ -2052,7 +2054,10 @@ bool StorageTexture::Refresh() {
         uploadReason = "alias";
         borrowUnits(*alias, borrowed);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-            if (borrowed[unit]) layerGeneration[unit] = current;
+            if (borrowed[unit]) {
+                layerGeneration[unit] = current;
+                forgetUploadHash(unit, 1);
+            }
         }
         refreshGeneration();
     }
@@ -2208,7 +2213,34 @@ bool StorageTexture::keepWrittenSince(std::uint32_t unit) {
     return true;
 }
 
+constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
+
+std::array<std::uint64_t, 2> StorageTexture::unitContentHash(std::uint32_t unit, bool flushGpuWrites) const {
+    constexpr std::size_t chunkBytes = 65536;
+    static thread_local std::vector<std::byte> chunk(chunkBytes);
+    std::array<std::uint64_t, 2> hash{0x5eed7e0d00000001ull, 0x5eed7e0d00000002ull};
+    const auto begin = layerBegin(unit);
+    const auto bytes = static_cast<std::size_t>(layerBytes(unit));
+    for (std::size_t at = 0; at < bytes; at += chunkBytes) {
+        const auto part = std::span<std::byte>(chunk).first(std::min(chunkBytes, bytes - at));
+        if (flushGpuWrites) GuestMemory::ReadCommitted(begin + at, part);
+        else GuestMemory::ReadCommittedUnsynced(begin + at, part);
+        hash[0] = ShaderRecompiler::HashBytes(part, hash[0]);
+        hash[1] = ShaderRecompiler::HashBytes(part, hash[1]);
+    }
+    if (hash[0] == 0 && hash[1] == 0) hash[0] = 1;
+    return hash;
+}
+
+void StorageTexture::forgetUploadHash(std::uint32_t first, std::uint32_t count) {
+    for (auto unit = first; unit < first + count && unit < uploadHash.size(); ++unit) uploadHash[unit] = {};
+}
+
 bool StorageTexture::guestMatchesUpload(std::uint32_t unit) const {
+    if (guestBytes > GenerationBaselineBytes) {
+        const std::array<std::uint64_t, 2> none{};
+        return uploadHash.size() == trackedLayers && uploadHash[unit] != none && unitContentHash(unit, false) == uploadHash[unit];
+    }
     if (generationBaseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
     return GuestMemory::EqualsCommittedUnsynced(layerBegin(unit), std::span<const std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(unit))));
@@ -2275,8 +2307,6 @@ bool StorageTexture::UntrackedUnchanged() const {
     return (stamp[3] & 1u) == 0 && comparedGuestBytes == stamp;
 }
 
-constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
-
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -2292,7 +2322,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
+        const bool settled = guestBytesSettled();
+        const bool hashUnits = guestBytes > GenerationBaselineBytes && settled;
+        if (!hashUnits) uploadHash.assign(trackedLayers, {});
+        if (guestBytes > GenerationBaselineBytes || !settled) generationBaseline.clear();
         else if (whole) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
@@ -2300,6 +2333,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
+            if (hashUnits) uploadHash[layer] = unitContentHash(layer, true);
             if (whole || generationBaseline.size() != guestBytes) continue;
             const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
             GuestMemory::ReadCommitted(layerBegin(layer), std::span<std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
@@ -3369,7 +3403,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     reportPendingSave();
-    const auto baselineKept = [&](std::uint32_t) { return generationBaseline.size() == guestBytes; };
+    const auto baselineKept = [&](std::uint32_t unit) { return guestBytes > GenerationBaselineBytes ? uploadHash.size() == trackedLayers && uploadHash[unit] != std::array<std::uint64_t, 2>{} : generationBaseline.size() == guestBytes; };
     std::vector<bool> unsaved(trackedLayers, false);
     bool anyUnsaved = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
@@ -4278,6 +4312,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     filledKeys = DccKeys::Uncompressed;
     keyProof = {};
     forgetBorrowed(0, trackedLayers);
+    forgetUploadHash(0, trackedLayers);
     layerGeneration.assign(trackedLayers, GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
     refreshGeneration();
     ++version;
@@ -4969,7 +5004,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         if (!advances && adjacent.empty() && shadowed.empty()) return;
         const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-            if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
+            if (layers[layer] && !skippedLayer[layer]) {
+                layerGeneration[layer] = now;
+                forgetUploadHash(layer, 1);
+            }
         }
         refreshGeneration();
         advanceAdjacent(adjacent, now, firstBlock, lastBlock);
