@@ -606,6 +606,43 @@ bool JoinWawCheck() {
     return check;
 }
 
+constexpr std::size_t BatchSlots = 4;
+constexpr const char* BatchSlotNames[BatchSlots] = {"label-run", "staging-in", "staging-out", "storage-writeback"};
+int BarrierBatchModeValue() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_LAB_BARRIER_BATCH");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return 0;
+        return std::strcmp(text, "verify") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+int BatchSlot(Recorder::CommandClass which) {
+    switch (which) {
+    case Recorder::CommandClass::LabelRun: return 0;
+    case Recorder::CommandClass::StagingIn: return 1;
+    case Recorder::CommandClass::StagingOut: return 2;
+    case Recorder::CommandClass::StorageWriteBack: return 3;
+    default: return -1;
+    }
+}
+std::atomic<std::int64_t> batchRecorded[BatchSlots]{};
+std::atomic<std::uint64_t> batchSaved[BatchSlots]{};
+std::atomic<std::uint64_t> batchCovered{0}, batchMerged{0}, batchWaveStores{0}, batchWaveGroups{0};
+std::atomic<std::uint64_t> batchViolations{0};
+std::mutex batchLedgerMutex;
+BarrierLedger& batchLedger() {
+    static auto* ledger = new BarrierLedger();
+    return *ledger;
+}
+std::uint64_t batchStrictShown = 0, batchChainShown = 0;
+std::uint64_t HandleBits(VkBuffer buffer) {
+    static_assert(sizeof(VkBuffer) == sizeof(std::uint64_t));
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &buffer, sizeof(bits));
+    return bits;
+}
+constexpr BarrierMask PassEndMask{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+
 // APS5_NO_SEPARATE_QUEUED_LABELS=1: a queued label enters the recorded table and replaces a
 // recorded entry of its dword, as before (see NoteQueuedLabel).
 bool SeparateQueuedLabels() {
@@ -1664,6 +1701,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         // A label says the work before it is done: the queued key stores (results of that work)
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
+        const bool passEndRecorded = open->renderPass.open && !open->renderPass.afterPass;
         if (open->renderPass.open) endOpenRenderPass();
         const auto commands = open->commands;
         run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
@@ -1674,9 +1712,18 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         }
         // At Submit every result of the batch reaches the host before the stores (the title's
         // pollers read results after the label); in place, later work sees the stores as well.
-        if (atSubmit) recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
-        else recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         std::uint32_t barriers = 2;
+        if (atSubmit) {
+            recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        } else {
+            const BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+            if (BarrierBatchOn() && passEndRecorded && Covers(PassEndMask, leading)) {
+                NoteBatched(CommandClass::LabelRun, "label-run leading after pass end", std::span(&leading, 1), PassEndMask, 1);
+                barriers = 1;
+            } else {
+                recordBarrier(commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+            }
+        }
         std::uint64_t storedBytes = 0;
         const auto update = function(cmdUpdateBuffer, "vkCmdUpdateBuffer");
         std::vector<QueuedWrite> writes;
@@ -1692,7 +1739,40 @@ bool Recorder::closeStoreRun(bool atSubmit) {
                 ++barriers;
                 run.recorded.clear();
             }
-            for (std::size_t i = first; i < end; ++i) {
+            if (BarrierBatchOn()) {
+                std::vector<std::uint32_t> members;
+                std::vector<StoreSpan> spans;
+                for (std::size_t i = first; i < end; ++i) {
+                    if (stores[i].dumpTarget != 0) continue;
+                    members.push_back(static_cast<std::uint32_t>(i));
+                    spans.push_back({HandleBits(stores[i].buffer), stores[i].offset, stores[i].offset + stores[i].bytes.size()});
+                }
+                const auto plan = PlanStoreWaves(spans);
+                const auto sequential = CountSequentialBarriers(spans);
+                if (BarrierBatchMode() == 2) {
+                    std::string what;
+                    if (VerifyStoreWaves(spans, plan, &what) != 0) NoteBatchViolation("label-run store waves", what.c_str());
+                }
+                std::uint32_t waveBegin = 0;
+                for (std::size_t wave = 0; wave < plan.waveEnds.size(); ++wave) {
+                    if (wave != 0) {
+                        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                        ++barriers;
+                        storeWawBarriers.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    for (auto k = waveBegin; k < plan.waveEnds[wave]; ++k) {
+                        const auto& store = stores[members[plan.order[k]]];
+                        update(commands, store.buffer, store.offset, store.bytes.size(), store.bytes.data());
+                        run.recorded.emplace_back(store.buffer, store.offset, store.offset + store.bytes.size());
+                        storedBytes += store.bytes.size();
+                    }
+                    waveBegin = plan.waveEnds[wave];
+                }
+                const auto waveBarriers = plan.waveEnds.empty() ? 0u : static_cast<std::uint32_t>(plan.waveEnds.size() - 1);
+                batchWaveGroups.fetch_add(1, std::memory_order_relaxed);
+                batchWaveStores.fetch_add(spans.size(), std::memory_order_relaxed);
+                if (sequential > waveBarriers) NoteSaved(CommandClass::LabelRun, sequential - waveBarriers);
+            } else for (std::size_t i = first; i < end; ++i) {
                 const auto& store = stores[i];
                 if (store.dumpTarget != 0) continue;
                 const VkDeviceSize storeEnd = store.offset + store.bytes.size();
@@ -1794,6 +1874,36 @@ bool DrawOrGpuProfiled() {
     return profiled;
 }
 
+void reportBarrierBatch() {
+    if (!Recorder::BarrierBatchOn()) return;
+    static auto lastReport = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string classes;
+    std::uint64_t before = 0, after = 0;
+    for (std::size_t i = 0; i < BatchSlots; ++i) {
+        const auto recorded = static_cast<std::uint64_t>(std::max<std::int64_t>(batchRecorded[i].exchange(0, std::memory_order_relaxed), 0));
+        const auto saved = batchSaved[i].exchange(0, std::memory_order_relaxed);
+        before += recorded + saved;
+        after += recorded;
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu/%llu", BatchSlotNames[i], static_cast<unsigned long long>(recorded + saved), static_cast<unsigned long long>(recorded));
+        classes += text;
+    }
+    std::uint64_t strict = 0, chain = 0;
+    if (Recorder::BarrierBatchMode() == 2) {
+        std::lock_guard lock(batchLedgerMutex);
+        strict = batchLedger().Strict() - batchStrictShown;
+        chain = batchLedger().Chain() - batchChainShown;
+        batchStrictShown += strict;
+        batchChainShown += chain;
+    }
+    char verify[160] = "";
+    if (Recorder::BarrierBatchMode() == 2) std::snprintf(verify, sizeof(verify), "; verify: %llu strict, %llu chain, %llu violations (cumulative)", static_cast<unsigned long long>(strict), static_cast<unsigned long long>(chain), static_cast<unsigned long long>(batchViolations.load(std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[barrierbatch] before/after (10 s) %llu/%llu by class:%s; left out: %llu behind a covering trailing barrier, %llu merged or dominated, %llu store groups in %llu stores%s\n", static_cast<unsigned long long>(before), static_cast<unsigned long long>(after), classes.c_str(), static_cast<unsigned long long>(batchCovered.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(batchMerged.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(batchWaveGroups.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(batchWaveStores.exchange(0, std::memory_order_relaxed)), verify);
+}
+
 void reportBarriers() {
     if (!DrawOrGpuProfiled()) return;
     static auto lastReport = std::chrono::steady_clock::now();
@@ -1850,7 +1960,65 @@ bool Recorder::BatchStampsEnabled() {
     return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured();
 }
 
+int Recorder::BarrierBatchMode() {
+    return BarrierBatchModeValue();
+}
+
+void Recorder::NoteBatchViolation(const char* site, const char* what) {
+    const auto number = batchViolations.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (number <= 20) std::fprintf(stderr, "[barrierbatch] VIOLATION %llu: %s: %s\n", static_cast<unsigned long long>(number), site, what);
+}
+
+void Recorder::NoteSaved(CommandClass which, std::uint32_t saved, bool counted) {
+    const auto slot = BatchSlot(which);
+    if (slot < 0 || saved == 0) return;
+    batchSaved[slot].fetch_add(saved, std::memory_order_relaxed);
+    if (counted) batchRecorded[slot].fetch_sub(static_cast<std::int64_t>(saved), std::memory_order_relaxed);
+}
+
+void Recorder::NoteBatched(CommandClass which, const char* site, std::span<const BarrierMask> replaced, const BarrierMask& emitted, std::uint32_t saved) {
+    NoteSaved(which, saved);
+    batchMerged.fetch_add(1, std::memory_order_relaxed);
+    if (BarrierBatchMode() != 2) return;
+    std::string what;
+    std::uint32_t violations = 0;
+    {
+        std::lock_guard lock(batchLedgerMutex);
+        auto& ledger = batchLedger();
+        for (const auto& mask : replaced) ledger.NoteOld(site, mask);
+        ledger.NoteEmitted(emitted);
+        violations = ledger.Settle(&what);
+    }
+    if (violations != 0) NoteBatchViolation(site, what.c_str());
+}
+
+bool Recorder::ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered, const char* site, bool counted) {
+    if (!BarrierBatchOn() || !MergeBarriers()) return false;
+    constexpr VkAccessFlags shaderAndTransfer = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    const VkAccessFlags needed = shaderAndTransfer | wanted.dstAccess;
+    if ((covered & needed) != needed || (wanted.dstStage & VK_PIPELINE_STAGE_HOST_BIT) != 0) return false;
+    NoteSaved(which, 1, counted);
+    batchCovered.fetch_add(1, std::memory_order_relaxed);
+    if (BarrierBatchMode() == 2) {
+        std::string what;
+        std::uint32_t violations = 0;
+        {
+            std::lock_guard lock(batchLedgerMutex);
+            auto& ledger = batchLedger();
+            ledger.NoteOld(site, wanted);
+            ledger.NoteChain(covered);
+            violations = ledger.Settle(&what);
+        }
+        if (violations != 0) NoteBatchViolation(site, what.c_str());
+    }
+    return true;
+}
+
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
+    if (BarrierBatchOn()) {
+        const auto slot = BatchSlot(which);
+        if (slot >= 0) batchRecorded[slot].fetch_add(static_cast<std::int64_t>(count), std::memory_order_relaxed);
+    }
     if (!DrawOrGpuProfiled()) return;
     classBarriers[static_cast<std::size_t>(which)].fetch_add(count, std::memory_order_relaxed);
 }
@@ -3346,6 +3514,7 @@ void Recorder::Submit() {
     }
     EndGpuTiming(open->batchTiming);
     if (!GpuTimingEnabled()) reportBarriers();
+    reportBarrierBatch();
     if (FlipReadCheck()) {
         // A CPU write into a noted read after this collect (and so possibly before the GPU read
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).

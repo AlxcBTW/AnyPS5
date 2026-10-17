@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include <unordered_map>
@@ -503,6 +504,12 @@ public:
     };
     static bool BarrierValidate();
     void NoteAccess(CommandClass which, const Access& access);
+    static int BarrierBatchMode();
+    static bool BarrierBatchOn() { return BarrierBatchMode() != 0; }
+    bool ElideCovered(CommandClass which, const BarrierMask& wanted, VkAccessFlags covered, const char* site, bool counted = false);
+    static void NoteBatched(CommandClass which, const char* site, std::span<const BarrierMask> replaced, const BarrierMask& emitted, std::uint32_t saved);
+    static void NoteSaved(CommandClass which, std::uint32_t saved, bool counted = false);
+    static void NoteBatchViolation(const char* site, const char* what);
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);

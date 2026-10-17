@@ -3668,14 +3668,29 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.image = image;
     toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    if (!direct) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
-    if (!seeds.empty() || !padding.copies.empty() || !holeCopies.empty()) {
+    const bool seeded = !seeds.empty() || !padding.copies.empty() || !holeCopies.empty();
+    constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    const bool seedCovered = recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers();
+    bool seedRecorded = false;
+    if (!direct) {
+        if (seeded && !seedCovered && recorder != nullptr && Recorder::BarrierBatchOn()) {
+            const VkMemoryBarrier seedMemory{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess};
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &seedMemory, 0, nullptr, 1, &toSource);
+            const BarrierMask replaced[2] = {
+                {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, toSource.srcAccessMask, toSource.dstAccessMask},
+                {VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, seedMemory.srcAccessMask, seedMemory.dstAccessMask}};
+            Recorder::NoteBatched(Recorder::CommandClass::StorageWriteBack, "write-back image barrier and seed barrier", replaced, Merge(replaced[0], replaced[1]), 1);
+            seedRecorded = true;
+        } else {
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        }
+    }
+    if (seeded) {
         // The seeded units' import bytes (every earlier writer of them, host stores included)
         // precede the seed copies; the previous command's trailing barrier may have covered that.
-        constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        if (recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
+        if (seedCovered) {
             Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
-        } else {
+        } else if (!seedRecorded) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
             Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack);
         }
@@ -3696,7 +3711,10 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         toRead.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
         toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         toRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toRead);
+        const BarrierMask ready{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, importReady.srcAccessMask | toRead.srcAccessMask, importReady.dstAccessMask | toRead.dstAccessMask};
+        if (seeded || recorder == nullptr || !recorder->ElideCovered(Recorder::CommandClass::StorageWriteBack, ready, covered, "write-back leading", true)) {
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toRead);
+        }
         for (std::size_t i = 0; i < windows.size(); ++i) {
             const auto& window = windows[i];
             auto retile = window.window;
