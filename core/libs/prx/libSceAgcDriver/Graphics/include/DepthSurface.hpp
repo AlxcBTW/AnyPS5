@@ -114,6 +114,23 @@ DepthClearStatistics DepthClearCounts();
 // xored into the value the check expects (a check that cannot fail proves nothing).
 void SetDepthClearModeForTest(int mode, std::uint32_t perturb = 0);
 
+enum class ClearKernelPlan : std::uint8_t { None, Skip, Verify };
+struct ClearKernelStatistics {
+    std::uint64_t planned = 0;
+    std::uint64_t taken = 0;
+    std::uint64_t bytesCleared = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t differingClears = 0;
+    std::uint64_t differingTexels = 0;
+    std::array<std::uint64_t, 8> declined{};
+};
+bool ClearKernelActive();
+ClearKernelPlan PlanClearKernel(const Context& context, VkImage mirror);
+void RecordClearKernel(const Context& context, VkCommandBuffer commands, VkImage mirror);
+void RecordClearKernelVerify(const Context& context, VkCommandBuffer commands, VkImage mirror);
+ClearKernelStatistics ClearKernelCounts();
+void SetClearKernelModeForTest(int mode, std::uint32_t perturb = 0);
+
 }
 
 #endif

@@ -386,6 +386,13 @@ void AwaitCompletions(AgcDriver::VulkanDevice& device, TDone done) {
     }
 }
 
+struct ClearKernelMode {
+    explicit ClearKernelMode(int mode, std::uint32_t perturb = 0) { Graphics::SetClearKernelModeForTest(mode, perturb); }
+    ~ClearKernelMode() { Graphics::SetClearKernelModeForTest(-1); }
+    ClearKernelMode(const ClearKernelMode&) = delete;
+    ClearKernelMode& operator=(const ClearKernelMode&) = delete;
+};
+
 // A 16-bit plane, which the title's shadow atlases are: an R16 unorm view cleared to a colour of 0 and 1 (0.5 is 32767.5 in
 // 16 bits, no value to take), and an R16 uint view with the depth swizzle cleared to raw 0xffff and 0 (0x4000 is declined). Verify
 // mode compares every texel of the mirror and of the depth image with the raw value.
@@ -584,6 +591,69 @@ int main() {
         for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
         run("store-back without Storage()", [&] { WithoutStorageCase(*device, shaders); });
         for (const int mode : {0, 1, 2}) run(mode == 0 ? "16-bit plane, switch off" : mode == 1 ? "16-bit plane, lever" : "16-bit plane, verify", [&] { SixteenBitCase(*device, shaders, mode); });
+        run("clear kernel off", [&] {
+            const auto before = Graphics::ClearKernelCounts();
+            ClearSequence(*device, shaders, 1);
+            const auto after = Graphics::ClearKernelCounts();
+            Require(after.planned == before.planned && after.taken == before.taken, "the clear kernel's mirror clear counted with its switch off");
+        });
+
+        run("clear kernel, mirror cleared", [&] {
+            const ClearKernelMode kernelMode(1);
+            const auto before = Graphics::ClearKernelCounts();
+            const auto on = ClearSequence(*device, shaders, 1);
+            const auto after = Graphics::ClearKernelCounts();
+            Require(on.clears == 4u, "the depth clears were " + std::to_string(on.clears) + ", expected 4");
+            Require(after.taken - before.taken == 4u, "the dispatch was left out " + std::to_string(after.taken - before.taken) + " times, expected 4 (1.0, 0.25, 0.5, 0.125)");
+            Require(after.bytesCleared - before.bytesCleared == 4u * Width * Height * sizeof(float), "the mirror clears add up to " + std::to_string(after.bytesCleared - before.bytesCleared) + " bytes");
+            Require(after.declined[0] - before.declined[0] >= 1u, "the clear of half the plane was not declined for its coverage");
+        });
+
+        run("clear kernel, verify", [&] {
+            const ClearKernelMode kernelMode(2);
+            const auto before = Graphics::ClearKernelCounts();
+            ClearSequence(*device, shaders, 1);
+            AwaitCompletions(*device, [&] { return Graphics::ClearKernelCounts().verified >= before.verified + 4u; });
+            const auto after = Graphics::ClearKernelCounts();
+            Require(after.taken == before.taken, "verify mode left a dispatch out");
+            Require(after.verified - before.verified == 4u, "verify mode checked " + std::to_string(after.verified - before.verified) + " clears, expected 4");
+            Require(after.differingClears == before.differingClears && after.differingTexels == before.differingTexels, "the clear stored other values than the kernel in " + std::to_string(after.differingTexels - before.differingTexels) + " texels");
+        });
+
+        run("clear kernel, verify perturbed", [&] {
+            const ClearKernelMode kernelMode(2, 1u);
+            const auto before = Graphics::ClearKernelCounts();
+            ClearSequence(*device, shaders, 1);
+            AwaitCompletions(*device, [&] { return Graphics::ClearKernelCounts().verified >= before.verified + 4u; });
+            const auto after = Graphics::ClearKernelCounts();
+            Require(after.differingClears - before.differingClears == 4u, "a perturbed clear differed in " + std::to_string(after.differingClears - before.differingClears) + " of 4 clears");
+            Require(after.differingTexels - before.differingTexels == 4u * Width * Height, "a perturbed clear differed in " + std::to_string(after.differingTexels - before.differingTexels) + " texels, expected " + std::to_string(4u * Width * Height));
+        });
+
+        run("clear kernel, integer view", [&] {
+            const ClearKernelMode kernelMode(1);
+            const auto before = Graphics::ClearKernelCounts();
+            IntegerViewCase(*device, shaders, 1);
+            Require(Graphics::ClearKernelCounts().taken - before.taken == 1u, "the integer view's dispatch was not left out");
+        });
+
+        for (const int kernel : {1, 2}) run(kernel == 1 ? "clear kernel, 16-bit plane" : "clear kernel, 16-bit plane verify", [&] {
+            const ClearKernelMode kernelMode(kernel);
+            const auto before = Graphics::ClearKernelCounts();
+            const auto depthBefore = Graphics::DepthClearCounts();
+            SixteenBitCase(*device, shaders, 1);
+            const auto clears = Graphics::DepthClearCounts().clears - depthBefore.clears;
+            if (kernel == 2) AwaitCompletions(*device, [&] { return Graphics::ClearKernelCounts().verified >= before.verified + clears; });
+            const auto after = Graphics::ClearKernelCounts();
+            if (kernel == 1) {
+                Require(after.taken - before.taken == clears, "the 16-bit plane's dispatches left out: " + std::to_string(after.taken - before.taken) + ", depth clears: " + std::to_string(clears));
+                Require(after.bytesCleared - before.bytesCleared == clears * Width * Height * sizeof(std::uint16_t), "the 16-bit mirror clears add up to " + std::to_string(after.bytesCleared - before.bytesCleared) + " bytes");
+            } else {
+                Require(after.taken == before.taken, "verify mode left a dispatch out");
+                Require(after.verified - before.verified == clears && after.differingClears == before.differingClears, "verify mode checked " + std::to_string(after.verified - before.verified) + " of " + std::to_string(clears) + " clears, differing " + std::to_string(after.differingClears - before.differingClears));
+            }
+        });
+
         for (const int mode : {0, 1}) run(mode == 0 ? "depth and stencil, switch off" : "depth and stencil, lever", [&] { StencilCase(*device, shaders, mode); });
         for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
         Graphics::SetDepthClearModeForTest(-1);

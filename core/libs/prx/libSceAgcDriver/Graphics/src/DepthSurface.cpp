@@ -128,6 +128,23 @@ DepthSamplingState prepareDepthSampling(const Context& context, const DepthTarge
 std::atomic<int> depthClearModeForced{-1};
 std::atomic<std::uint32_t> depthClearPerturb{0};
 
+std::atomic<int> clearKernelModeForced{-1};
+std::atomic<std::uint32_t> clearKernelPerturb{0};
+
+int clearKernelEnvironmentMode() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_LAB_CLEAR_KERNEL");
+        if (text == nullptr || text[0] == '\0' || text[0] == '0') return 0;
+        return std::strcmp(text, "verify") == 0 ? 2 : 1;
+    }();
+    return mode;
+}
+
+int clearKernelMode() {
+    const int forced = clearKernelModeForced.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced : clearKernelEnvironmentMode();
+}
+
 int depthClearMode() {
     const int forced = depthClearModeForced.load(std::memory_order_relaxed);
     if (forced >= 0) return forced;
@@ -135,7 +152,8 @@ int depthClearMode() {
         const char* verify = std::getenv("APS5_LAB_DEPTH_CLEAR_VERIFY");
         if (verify != nullptr && verify[0] != '\0' && verify[0] != '0') return 2;
         const char* lever = std::getenv("APS5_LAB_DEPTH_CLEAR_HLE");
-        return lever != nullptr && lever[0] != '\0' && lever[0] != '0' ? 1 : 0;
+        if (lever != nullptr && lever[0] != '\0' && lever[0] != '0') return 1;
+        return clearKernelEnvironmentMode() != 0 ? 1 : 0;
     }();
     return mode;
 }
@@ -165,8 +183,37 @@ DepthClearCounters& depthClearCounters() {
     return counters;
 }
 
-// The clear the calling thread's dispatch is recorded under (DepthPlaneClear), if any.
+enum ClearKernelDecline : std::size_t { ClearDeclineCoverage, ClearDeclineView, ClearDeclineFormat, ClearDeclineCount };
+static_assert(ClearDeclineCount <= 8, "ClearKernelStatistics::declined holds eight reasons");
+
+struct ClearKernelCounters {
+    std::atomic<std::uint64_t> planned{0};
+    std::atomic<std::uint64_t> taken{0};
+    std::atomic<std::uint64_t> bytesCleared{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> differingClears{0};
+    std::atomic<std::uint64_t> differingTexels{0};
+    std::atomic<std::uint64_t> printed{0};
+    std::array<std::atomic<std::uint64_t>, 8> declined{};
+};
+
+ClearKernelCounters& clearKernelCounters() {
+    static ClearKernelCounters counters;
+    return counters;
+}
+
 thread_local DepthPlaneOverwrite* currentOverwrite = nullptr;
+
+void printClearKernelCounters() {
+    const auto& c = clearKernelCounters();
+    const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    char line[768];
+    std::snprintf(line, sizeof(line), "[clearkernel] mode %d: clear dispatches over depth planes %llu, planned %llu, taken %llu (%.0f MiB cleared by vkCmdClearColorImage instead of the kernel's stores), dispatched anyway %llu; declined: coverage %llu view %llu format %llu; verified %llu, differing clears %llu, differing texels %llu\n",
+        clearKernelMode(), static_cast<unsigned long long>(depthClearCounters().taken.load(std::memory_order_relaxed)), count(c.planned), count(c.taken), static_cast<double>(c.bytesCleared.load(std::memory_order_relaxed)) / 1048576.0,
+        count(c.planned) - count(c.taken), count(c.declined[ClearDeclineCoverage]), count(c.declined[ClearDeclineView]), count(c.declined[ClearDeclineFormat]),
+        count(c.verified), count(c.differingClears), count(c.differingTexels));
+    std::fputs(line, stderr);
+}
 
 void printDepthClearCounters() {
     static std::mutex mutex;
@@ -184,6 +231,7 @@ void printDepthClearCounters() {
         count(c.declined[DeclineLayers]), count(c.declined[DeclineFormat]), count(c.declined[DeclineValue]), count(c.declined[DeclineColor]), count(c.declined[DeclinePending]), count(c.declined[DeclineCoverage]), count(c.declined[DeclineSize]),
         count(c.verified), count(c.violations));
     std::fputs(line, stderr);
+    if (clearKernelMode() != 0) printClearKernelCounters();
 }
 
 // What the kernel stores into every texel, as the plane holds it: the 16 or 32 bits of the texel and the depth that
@@ -712,6 +760,110 @@ public:
             }
             const auto verified = ++counters.verified;
             if (verified <= 4u || verified % 64u == 0u) std::fprintf(stderr, "[depthclear] verified plane 0x%llx %ux%u: all %zu texels of the mirror and of the depth image hold %08x (%llu checked)\n", static_cast<unsigned long long>(plane), width, height, texels, expected, static_cast<unsigned long long>(verified));
+        });
+    }
+
+    bool ClearKernelValue(const StorageTexture& mirror, const DepthPlaneOverwrite& overwrite, std::uint32_t perturb, VkClearColorValue& clear) const {
+        const std::uint32_t raw = overwrite.raw ^ perturb;
+        std::array<std::uint32_t, 4> pattern;
+        pattern.fill(overwrite.bits == 16u ? (raw & 0xffffu) * 0x10001u : raw);
+        clear = {};
+        return ClearColorForTexel(mirror.StorageFormat(), overwrite.bits / 8u, pattern, clear);
+    }
+
+    bool OwnsMirror(VkImage mirrorImage) const {
+        return depthPlane.storage != nullptr && depthPlane.storage->Image() == mirrorImage;
+    }
+
+    ClearKernelPlan PlanClearKernelFor(VkImage mirrorImage) {
+        auto* overwrite = currentOverwrite;
+        if (overwrite == nullptr || depthPlane.storage == nullptr || depthPlane.storage->Image() != mirrorImage) return ClearKernelPlan::None;
+        auto& counters = clearKernelCounters();
+        const auto decline = [&](ClearKernelDecline why) {
+            ++counters.declined[why];
+            return ClearKernelPlan::None;
+        };
+        if (!OverwritesWholePlane(*overwrite)) return decline(ClearDeclineCoverage);
+        const auto& described = depthPlane.storage->Descriptor();
+        const auto& view = overwrite->view;
+        if (described.baseAddress != view.baseAddress || described.format != view.format || described.tileMode != view.tileMode || described.dimension != view.dimension || described.width != target.extent.width || described.height != target.extent.height) return decline(ClearDeclineView);
+        VkClearColorValue clear;
+        if (!ClearKernelValue(*depthPlane.storage, *overwrite, 0u, clear)) return decline(ClearDeclineFormat);
+        ++counters.planned;
+        if (clearKernelMode() < 2) return ClearKernelPlan::Skip;
+        static std::atomic<std::uint64_t> seen{0};
+        static const std::uint64_t every = [] {
+            const char* text = std::getenv("APS5_LAB_CLEAR_KERNEL_VERIFY_EVERY");
+            const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+            return value != 0ull ? value : 8ull;
+        }();
+        const auto index = seen.fetch_add(1, std::memory_order_relaxed);
+        return index < 16u || index % every == 0u ? ClearKernelPlan::Verify : ClearKernelPlan::None;
+    }
+
+    void RecordClearKernelOn(VkCommandBuffer commands) {
+        auto* overwrite = currentOverwrite;
+        Require(overwrite != nullptr && depthPlane.storage != nullptr, "the clear kernel's mirror clear needs the clear it was planned under");
+        VkClearColorValue clear;
+        Require(ClearKernelValue(*depthPlane.storage, *overwrite, 0u, clear), "the clear kernel's colour has no exact clear value in the mirror's format");
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, depthPlane.storage->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        auto& counters = clearKernelCounters();
+        ++counters.taken;
+        counters.bytesCleared += static_cast<std::uint64_t>(target.extent.width) * target.extent.height * (overwrite->bits / 8u);
+    }
+
+    void RecordClearKernelVerifyOn(VkCommandBuffer commands) {
+        auto* overwrite = currentOverwrite;
+        auto* recorder = RecorderFor(context);
+        Require(overwrite != nullptr && depthPlane.storage != nullptr && recorder != nullptr, "the clear kernel's check needs the clear it was planned under and the recorder of the surface's device");
+        const auto mirror = depthPlane.storage;
+        VkClearColorValue clear;
+        Require(ClearKernelValue(*mirror, *overwrite, clearKernelPerturb.load(std::memory_order_relaxed), clear), "the clear kernel's colour has no exact clear value in the mirror's format");
+        const std::uint32_t texelBytes = overwrite->bits / 8u;
+        const std::size_t texels = static_cast<std::size_t>(target.extent.width) * target.extent.height;
+        auto fromKernel = std::make_shared<Buffer>(context, texels * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        auto fromClear = std::make_shared<Buffer>(context, texels * texelBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        recorder->Keep(mirror);
+        const VkBufferImageCopy region{0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {target.extent.width, target.extent.height, 1}};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        const auto copyToBuffer = context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
+        const auto copyToImage = context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        copyToBuffer(commands, mirror->Image(), VK_IMAGE_LAYOUT_GENERAL, fromKernel->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, mirror->Image(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        copyToBuffer(commands, mirror->Image(), VK_IMAGE_LAYOUT_GENERAL, fromClear->Handle(), 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        copyToImage(commands, fromKernel->Handle(), mirror->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::Copy, 5);
+        const auto plane = target.address;
+        const auto width = target.extent.width;
+        recorder->OnComplete([fromKernel, fromClear, texelBytes, texels, plane, width] {
+            fromKernel->Invalidate();
+            fromClear->Invalidate();
+            const auto scan = [&](const auto* kernel, const auto* cleared) {
+                std::uint64_t different = 0;
+                for (std::size_t texel = 0; texel < texels; ++texel) {
+                    if (kernel[texel] == cleared[texel]) continue;
+                    if (clearKernelCounters().printed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[clearkernel] DIFFERENCE plane 0x%llx texel %zu (x %zu, y %zu): the kernel stored %08x, the clear stores %08x\n", static_cast<unsigned long long>(plane), texel, texel % width, texel / width, static_cast<unsigned>(kernel[texel]), static_cast<unsigned>(cleared[texel]));
+                    ++different;
+                }
+                return different;
+            };
+            const auto kernelBytes = fromKernel->Bytes();
+            const auto clearedBytes = fromClear->Bytes();
+            const std::uint64_t different = texelBytes == 2u ? scan(reinterpret_cast<const std::uint16_t*>(kernelBytes.data()), reinterpret_cast<const std::uint16_t*>(clearedBytes.data())) : scan(reinterpret_cast<const std::uint32_t*>(kernelBytes.data()), reinterpret_cast<const std::uint32_t*>(clearedBytes.data()));
+            auto& counters = clearKernelCounters();
+            const auto verified = ++counters.verified;
+            if (different != 0) {
+                ++counters.differingClears;
+                counters.differingTexels += different;
+                return;
+            }
+            if (verified <= 4u || verified % 64u == 0u) std::fprintf(stderr, "[clearkernel] verified plane 0x%llx: the clear stores what the kernel stored in all %zu texels (%llu checked)\n", static_cast<unsigned long long>(plane), texels, static_cast<unsigned long long>(verified));
         });
     }
 
@@ -1654,6 +1806,58 @@ DepthClearStatistics DepthClearCounts() {
 void SetDepthClearModeForTest(int mode, std::uint32_t perturb) {
     depthClearModeForced.store(mode, std::memory_order_relaxed);
     depthClearPerturb.store(perturb, std::memory_order_relaxed);
+}
+
+bool ClearKernelActive() {
+    return currentOverwrite != nullptr && clearKernelMode() != 0;
+}
+
+ClearKernelPlan PlanClearKernel(const Context& context, VkImage mirror) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->context.device != context.device || surface->retired) continue;
+        const auto plan = surface->PlanClearKernelFor(mirror);
+        if (plan != ClearKernelPlan::None) return plan;
+    }
+    return ClearKernelPlan::None;
+}
+
+void RecordClearKernel(const Context& context, VkCommandBuffer commands, VkImage mirror) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->context.device != context.device || surface->retired || !surface->OwnsMirror(mirror)) continue;
+        surface->RecordClearKernelOn(commands);
+        return;
+    }
+    throw std::runtime_error("the clear kernel's mirror belongs to no depth surface any more");
+}
+
+void RecordClearKernelVerify(const Context& context, VkCommandBuffer commands, VkImage mirror) {
+    std::lock_guard lock(surfacesMutex());
+    for (const auto& surface : surfaces()) {
+        if (!surface->active->load(std::memory_order_acquire) || surface->context.device != context.device || surface->retired || !surface->OwnsMirror(mirror)) continue;
+        surface->RecordClearKernelVerifyOn(commands);
+        return;
+    }
+    throw std::runtime_error("the clear kernel's mirror belongs to no depth surface any more");
+}
+
+ClearKernelStatistics ClearKernelCounts() {
+    const auto& counters = clearKernelCounters();
+    ClearKernelStatistics statistics;
+    statistics.planned = counters.planned.load();
+    statistics.taken = counters.taken.load();
+    statistics.bytesCleared = counters.bytesCleared.load();
+    statistics.verified = counters.verified.load();
+    statistics.differingClears = counters.differingClears.load();
+    statistics.differingTexels = counters.differingTexels.load();
+    for (std::size_t reason = 0; reason < statistics.declined.size(); ++reason) statistics.declined[reason] = counters.declined[reason].load();
+    return statistics;
+}
+
+void SetClearKernelModeForTest(int mode, std::uint32_t perturb) {
+    clearKernelModeForced.store(mode, std::memory_order_relaxed);
+    clearKernelPerturb.store(perturb, std::memory_order_relaxed);
 }
 
 std::size_t HtileDepthClearBytes_nid_no_patch(std::span<const std::uint32_t> code, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments) {
