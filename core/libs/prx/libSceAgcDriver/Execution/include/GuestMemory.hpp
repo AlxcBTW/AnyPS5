@@ -336,7 +336,9 @@ enum class HoldSub : std::uint8_t {
     X(TakeNoGeneration, "take-skip-no-generation") \
     X(TakeKeys, "take-skip-keys") \
     X(TakePending, "take-skip-other-pending") \
-    X(TakeOk, "take-ok")
+    X(TakeOk, "take-ok") \
+    X(PendingScans, "pending-registry-scans") \
+    X(PendingScanned, "pending-registry-entries-scanned")
 enum class HoldCount : std::uint8_t {
 #define APS5_HOLD_COUNT_ENUM(name, text) name,
     APS5_HOLD_COUNTS(APS5_HOLD_COUNT_ENUM)
