@@ -2188,6 +2188,12 @@ bool StorageTexture::keepWrittenSince(std::uint32_t unit) {
     return true;
 }
 
+bool StorageTexture::guestMatchesUpload(std::uint32_t unit) const {
+    if (generationBaseline.size() != guestBytes) return false;
+    const auto offset = static_cast<std::size_t>(layerBegin(unit) - descriptor.baseAddress);
+    return GuestMemory::EqualsCommittedUnsynced(layerBegin(unit), std::span<const std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(unit))));
+}
+
 bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) const {
     for (auto layer = (address - descriptor.baseAddress) / trackedLayerBytes; layer < trackedLayers && layer * trackedLayerBytes < address - descriptor.baseAddress + bytes; ++layer) {
         if (!layerOriginal[static_cast<std::size_t>(layer)]) return false;
@@ -3346,7 +3352,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     bool anyUnsaved = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
         const bool noBaseline = !layerPending[layer] && !layerOriginal[layer];
-        unsaved[layer] = noBaseline && (layerGeneration[layer] == 0 || savedTicket[layer] == 0);
+        unsaved[layer] = noBaseline && (layerGeneration[layer] == 0 || (savedTicket[layer] == 0 && (GuestMemory::Watched(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer))) || guestMatchesUpload(layer))));
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved, true);
