@@ -2654,9 +2654,11 @@ const HostImport* HostImportForCached(const Context& context, std::uint64_t addr
             outcome = HostImportLookup::Hit;
             return cache.import;
         }
-        if (state.epoch != cache.epoch) outcome = HostImportLookup::EpochMoved;
     }
+    const bool remembered = cache.import != nullptr && cache.address == address && cache.bytes == bytes;
+    const auto rememberedEpoch = cache.epoch;
     const auto* entry = hostImportLocked(context, state, address, bytes);
+    if (remembered && state.epoch != rememberedEpoch) outcome = HostImportLookup::EpochMoved;
     if (entry != nullptr && !importsStale(context, state)) cache = {entry, address, bytes, state.epoch, state.inserts};
     else cache = {};
     return entry;
