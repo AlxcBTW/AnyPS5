@@ -4080,10 +4080,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         std::cout << "host imports unavailable: results pending after a block left the watch not tested\n";
         return false;
     }
-    constexpr std::uint32_t side = 256;
     constexpr std::size_t unit = 65536;
-    constexpr std::size_t surfaceBytes = side * side * 4;
-    static_assert(surfaceBytes == 4 * unit);
     const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
     const auto decided = PrepareImportWatch(base);
     SetImportWatch(base, ImportWatch::Watch);
@@ -4093,9 +4090,14 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         ~Restore() { SetImportWatch(context, decided); }
     } restore{base, decided};
     enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite };
+    for (const std::uint32_t side : {256u, 1024u})
     for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite}) {
+        const std::size_t surfaceBytes = static_cast<std::size_t>(side) * side * 4;
+        const std::size_t units = surfaceBytes / unit;
+        const std::size_t lastUnit = units - 1;
+        const bool large = side > 256;
         const bool unwatchedWrite = write == Write::UnwatchedFullClear || write == Write::UnwatchedPartialWrite;
-        const std::string what = write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : "a CPU write into the unwatched block before results that cover part of it";
+        const std::string what = std::string(large ? "1024x1024, " : "") + (write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : "a CPU write into the unwatched block before results that cover part of it");
         void* block = AllocateWatched(surfaceBytes, unit);
         if (block == nullptr) {
             std::cout << "no write watching: results pending after a block left the watch not tested\n";
@@ -4112,6 +4114,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             const Context& context;
             void* block;
             std::uint64_t address;
+            std::size_t surfaceBytes;
             ~Unregister() {
                 {
                     GuestAllocations::Mutation mutation;
@@ -4120,7 +4123,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 HostImportFor(context, address, surfaceBytes);
                 ReleaseWatched(block, surfaceBytes);
             }
-        } unregister{base, block, address};
+        } unregister{base, block, address, surfaceBytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
         TextureDetiler detiler(base);
         auto context = base;
@@ -4156,7 +4159,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 recorder.Sync();
             };
             const auto writePage = [&] {
-                for (std::size_t i = 0; i < 4096; ++i) memory[2 * unit + i] = pattern(i);
+                for (std::size_t i = 0; i < 4096; ++i) memory[(units - 2) * unit + i] = pattern(i);
             };
             const bool onPath = AgcDriver::GuestMemory::Watched(address, surfaceBytes) && HostImportFor(context, address, surfaceBytes) != nullptr;
 #ifdef _WIN32
@@ -4168,12 +4171,12 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             Require(onPath, "(p) " + what + ": the image is not on the path under test");
 #endif
             Require(!image->GuestSnapshotValid(), "(p) " + what + ": the upload left saved guest bytes while its memory was watched");
-            AgcDriver::GuestMemory::Unwatch(address + 3 * unit, unit);
-            Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes) && AgcDriver::GuestMemory::Watched(address, 3 * unit), "(p) " + what + ": the last block did not leave the watch alone");
+            AgcDriver::GuestMemory::Unwatch(address + lastUnit * unit, unit);
+            Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes) && AgcDriver::GuestMemory::Watched(address, lastUnit * unit), "(p) " + what + ": the last block did not leave the watch alone");
             const auto cpuUnit = [](std::size_t i) { return i % 4 == 0 ? static_cast<std::uint8_t>(0x11) : static_cast<std::uint8_t>(i * 131u + 7u); };
             if (write == Write::BeforePending) writePage();
             if (unwatchedWrite) {
-                for (std::size_t i = 0; i < unit; ++i) memory[3 * unit + i] = cpuUnit(i);
+                for (std::size_t i = 0; i < unit; ++i) memory[lastUnit * unit + i] = cpuUnit(i);
             }
             if (write == Write::UnwatchedPartialWrite) {
                 constexpr std::uint32_t patch = 16;
@@ -4223,15 +4226,16 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 }
                 throw;
             }
+            if (large && write == Write::UnwatchedPartialWrite) Require(refused, "(p) " + what + ": stored over an unwatched unit the CPU wrote, which the upload hash does not match");
             if (unwatchedWrite) {
                 if (refused) {
                     std::cout << "(p) " + what + ": refused rather than stored\n";
-                    for (std::size_t i = 0; i < unit; ++i) Require(memory[3 * unit + i] == cpuUnit(i), "(p) " + what + ": the refused write-back changed the CPU's bytes");
+                    for (std::size_t i = 0; i < unit; ++i) Require(memory[lastUnit * unit + i] == cpuUnit(i), "(p) " + what + ": the refused write-back changed the CPU's bytes");
                     recorder.Sync();
                     continue;
                 }
                 std::vector<std::byte> storedUnit(unit);
-                AgcDriver::GuestMemory::Read(address + 3 * unit, storedUnit);
+                AgcDriver::GuestMemory::Read(address + lastUnit * unit, storedUnit);
                 std::size_t greens = 0;
                 for (std::size_t at = 0; at < unit; at += 4) {
                     const bool green = std::to_integer<std::uint8_t>(storedUnit[at]) == 0 && std::to_integer<std::uint8_t>(storedUnit[at + 1]) == 255 && std::to_integer<std::uint8_t>(storedUnit[at + 2]) == 0 && std::to_integer<std::uint8_t>(storedUnit[at + 3]) == 255;
@@ -4242,9 +4246,9 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 }
                 if (write == Write::UnwatchedFullClear) Require(greens == unit / 4, "(p) " + what + ": " + std::to_string(greens) + " of " + std::to_string(unit / 4) + " words took the GPU result");
                 else Require(greens == 16 * 16, "(p) " + what + ": " + std::to_string(greens) + " words took the GPU result, want 256");
-                std::vector<std::byte> rest(3 * unit);
+                std::vector<std::byte> rest(lastUnit * unit);
                 AgcDriver::GuestMemory::Read(address, rest);
-                for (std::size_t at = 0; at < 3 * unit; at += 4) {
+                for (std::size_t at = 0; at < lastUnit * unit; at += 4) {
                     const bool green = std::to_integer<std::uint8_t>(rest[at]) == 0 && std::to_integer<std::uint8_t>(rest[at + 1]) == 255 && std::to_integer<std::uint8_t>(rest[at + 2]) == 0 && std::to_integer<std::uint8_t>(rest[at + 3]) == 255;
                     if (write == Write::UnwatchedFullClear) Require(green, "(p) " + what + ": the watched units did not take the GPU result at +0x" + std::to_string(at));
                     else Require(std::to_integer<std::uint8_t>(rest[at]) == 0x5a, "(p) " + what + ": the watched units changed where the GPU wrote nothing, at +0x" + std::to_string(at));
@@ -4261,8 +4265,8 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 }
                 return true;
             };
-            std::string units;
-            for (std::size_t u = 0; u < 4; ++u) {
+            std::string unitSummary;
+            for (std::size_t u = 0; u < units; ++u) {
                 std::size_t greens = 0, untouched = 0, other = 0, rawGreens = 0;
                 for (std::size_t at = u * unit; at < (u + 1) * unit; at += 4) {
                     if (isGreen(at)) ++greens;
@@ -4270,14 +4274,14 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                     else ++other;
                     if (memory[at] == green[0] && memory[at + 1] == green[1] && memory[at + 2] == green[2] && memory[at + 3] == green[3]) ++rawGreens;
                 }
-                units += " unit " + std::to_string(u) + ": " + std::to_string(greens) + " green words, " + std::to_string(untouched) + " untouched, " + std::to_string(other) + " other, " + std::to_string(rawGreens) + " green in the raw memory;";
+                unitSummary += " unit " + std::to_string(u) + ": " + std::to_string(greens) + " green words, " + std::to_string(untouched) + " untouched, " + std::to_string(other) + " other, " + std::to_string(rawGreens) + " green in the raw memory;";
             }
             for (std::size_t at = 0; at < surfaceBytes; at += 4) {
-                if (write != Write::None && at >= 2 * unit && at < 3 * unit) continue;
-                Require(isGreen(at), "(p) " + what + ": GPU results were not stored at +0x" + std::to_string(at) + ";" + units);
+                if (write != Write::None && at >= (units - 2) * unit && at < lastUnit * unit) continue;
+                Require(isGreen(at), "(p) " + what + ": GPU results were not stored at +0x" + std::to_string(at) + ";" + unitSummary);
             }
             if (write != Write::None) {
-                for (std::size_t i = 0; i < 4096; ++i) Require(std::to_integer<std::uint8_t>(read[2 * unit + i]) == pattern(i), "(p) " + what + ": the GPU results overwrote the CPU's bytes;" + units);
+                for (std::size_t i = 0; i < 4096; ++i) Require(std::to_integer<std::uint8_t>(read[(units - 2) * unit + i]) == pattern(i), "(p) " + what + ": the GPU results overwrote the CPU's bytes;" + unitSummary);
             }
         }
         recorder.Sync();
