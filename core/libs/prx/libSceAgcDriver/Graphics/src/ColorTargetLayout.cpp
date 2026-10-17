@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -181,6 +182,29 @@ std::size_t ColorTargetLayout::offset(std::uint32_t x, std::uint32_t y) const {
 std::size_t ColorTargetLayout::Offset(std::uint32_t x, std::uint32_t y) const {
     require(x < width && y < height, "AGC graphics: color surface coordinate out of range");
     return offset(x, y);
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> ColorTargetLayout::RectUnits(std::uint32_t x0, std::uint32_t y0, std::uint32_t x1, std::uint32_t y1, std::uint64_t unitBytes) const {
+    require(x0 < x1 && y0 < y1 && x1 <= width && y1 <= height && std::has_single_bit(unitBytes), "AGC graphics: color surface rectangle out of range");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    if (mode == ColorTileMode::Linear) return spans;
+    const std::uint64_t reach = std::max<std::uint64_t>(Alignment(), unitBytes);
+    const auto perRow = static_cast<std::uint64_t>(pitch / blockWidth);
+    for (std::uint64_t by = y0 / blockHeight; by <= (y1 - 1u) / blockHeight; ++by) {
+        for (std::uint64_t bx = x0 / blockWidth; bx <= (x1 - 1u) / blockWidth; ++bx) {
+            const auto begin = (by * perRow + bx) * Alignment();
+            if (begin >= bytes) continue;
+            spans.emplace_back(begin & ~(unitBytes - 1u), std::min<std::uint64_t>((begin + reach + unitBytes - 1u) & ~(unitBytes - 1u), (bytes + unitBytes - 1u) & ~(unitBytes - 1u)));
+        }
+    }
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& [begin, end] : spans) {
+        if (!merged.empty() && begin <= merged.back().second) merged.back().second = std::max(merged.back().second, end);
+        else merged.emplace_back(begin, end);
+    }
+    for (auto& range : merged) range.second = std::min<std::uint64_t>(range.second, bytes);
+    return merged;
 }
 
 void ColorTargetLayout::Detile(std::span<const std::byte> source, std::span<std::byte> destination) const {
