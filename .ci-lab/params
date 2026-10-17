@@ -1,0 +1,5 @@
+name=clear-kernel
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-clear-kernel-924e2474ca-156077
