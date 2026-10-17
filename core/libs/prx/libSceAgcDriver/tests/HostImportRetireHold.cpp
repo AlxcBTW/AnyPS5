@@ -359,6 +359,32 @@ void BusyRetireOutlivesALaterBatch() {
     Expect(!Live(retired), "the dropped import outlived every batch of its hold");
 }
 
+void CachedLookupMatchesTheFullLookup() {
+    Heap heap;
+    ActiveRecorder active;
+    const auto context = mockContext();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    HostImportLookupCache cache;
+    HostImportLookup outcome = HostImportLookup::Hit;
+    const auto* first = HostImportForCached(context, heap.Address(), 4096, cache, outcome);
+    Expect(first != nullptr && outcome == HostImportLookup::Miss, "the first cached lookup did not take the full path");
+    if (first == nullptr) return;
+    Expect(HostImportFor(context, heap.Address(), 4096) == first, "the full lookup answered another import than the cached one");
+    const auto before = first->lastUse;
+    const auto* again = HostImportForCached(context, heap.Address(), 4096, cache, outcome);
+    Expect(again == first && outcome == HostImportLookup::Hit, "a repeat lookup did not hit the cache");
+    const auto cachedUse = first->lastUse;
+    static_cast<void>(HostImportFor(context, heap.Address(), 4096));
+    Expect(cachedUse - before == first->lastUse - cachedUse, "a cached hit and a full lookup stamp the last use differently");
+    Expect(HostImportForCached(context, heap.Address(), 8192, cache, outcome) == HostImportFor(context, heap.Address(), 8192) && outcome == HostImportLookup::Miss, "another range was answered from the cache");
+    cache = {};
+    static_cast<void>(HostImportForCached(context, heap.Address(), 4096, cache, outcome));
+    heap.Grow();
+    const auto* grown = HostImportForCached(context, heap.Address(), 4096, cache, outcome);
+    Expect(outcome == HostImportLookup::EpochMoved && grown == HostImportFor(context, heap.Address(), 4096) && grown != first && grown->bytes == 2 * RangeBytes, "a dropped import was still answered from the cache");
+    Expect(HostImportForCached(context, heap.Address(), 4096, cache, outcome) == grown && outcome == HostImportLookup::Hit, "the cache did not refill after the epoch moved");
+}
+
 }
 
 int main() {
@@ -372,6 +398,7 @@ int main() {
         WindowPromotionOutlivesTheHold();
         IdleRetireOutlivesTheHold();
         BusyRetireOutlivesALaterBatch();
+        CachedLookupMatchesTheFullLookup();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
