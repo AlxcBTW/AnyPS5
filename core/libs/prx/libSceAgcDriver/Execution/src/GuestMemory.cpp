@@ -2368,6 +2368,122 @@ void NoteLockedGpuWait(double ms) {
     stats.lockedGpuWaitMs += ms;
 }
 
+namespace {
+
+bool WindowFlag(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr && *text != 0 && std::strcmp(text, "0") != 0;
+}
+
+constexpr std::size_t MutexWindowEvents = static_cast<std::size_t>(MutexWindowEvent::Count);
+
+struct MutexWindowTotals {
+    std::array<std::atomic<std::uint64_t>, MutexWindowEvents> events{};
+    std::atomic<std::uint64_t> unlockedNs{0};
+    std::atomic<std::uint64_t> relockWaitNs{0};
+    std::atomic<std::uint64_t> disagreementsSinceStart{0};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+MutexWindowTotals& WindowTotals() {
+    static MutexWindowTotals totals;
+    return totals;
+}
+
+thread_local int windowFences = 0;
+
+}
+
+bool MutexWindowEnabled() {
+    static const bool enabled = WindowFlag("APS5_LAB_MUTEX_WINDOW") || WindowFlag("APS5_LAB_MUTEX_WINDOW_VERIFY");
+    return enabled;
+}
+
+bool MutexWindowVerify() {
+    static const bool verify = WindowFlag("APS5_LAB_MUTEX_WINDOW_VERIFY");
+    return verify;
+}
+
+void NoteMutexWindow(MutexWindowEvent event) {
+    auto& totals = WindowTotals();
+    totals.events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+    if (event == MutexWindowEvent::VerifyDisagree) totals.disagreementsSinceStart.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t MutexWindowDisagreements() {
+    return WindowTotals().disagreementsSinceStart.load(std::memory_order_relaxed);
+}
+
+void ReportMutexWindow() {
+    auto& totals = WindowTotals();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = totals.reportedAt.load(std::memory_order_relaxed);
+    if (last == 0) {
+        totals.reportedAt.compare_exchange_strong(last, now);
+        return;
+    }
+    static const std::int64_t intervalNs = [] {
+        const char* text = std::getenv("APS5_LAB_MUTEX_WINDOW_SECONDS");
+        const double seconds = text != nullptr ? std::atof(text) : 0.0;
+        return seconds > 0.0 ? static_cast<std::int64_t>(seconds * 1e9) : std::int64_t{10000000000};
+    }();
+    if (now - last < intervalNs || !totals.reportedAt.compare_exchange_strong(last, now)) return;
+    std::array<unsigned long long, MutexWindowEvents> e{};
+    for (std::size_t i = 0; i < MutexWindowEvents; ++i) e[i] = totals.events[i].exchange(0, std::memory_order_relaxed);
+    const auto unlockedMs = static_cast<double>(totals.unlockedNs.exchange(0, std::memory_order_relaxed)) / 1e6;
+    const auto relockMs = static_cast<double>(totals.relockWaitNs.exchange(0, std::memory_order_relaxed)) / 1e6;
+    const auto at = [&](MutexWindowEvent event) { return e[static_cast<std::size_t>(event)]; };
+    using E = MutexWindowEvent;
+    AgcDriver::ProfilePrint_nid_no_patch("[mutexwindow] (10 s, mode %s): attempts %llu, windows opened %llu, unlocked %.1f ms (relock wait %.1f ms), applied %llu; refused: depth %llu, completion %llu, alias %llu, untracked %llu, leaf-lock %llu, key-writers %llu, writes %llu, other %llu; bailed in the window: changed %llu, untracked %llu, keys %llu, key-writers %llu, exception %llu; recheck passes %llu, failures: fields %llu, cpu-writes %llu, pending %llu, key-writers %llu, stamps %llu, keys %llu, writes %llu; fall-throughs to the full locked path %llu; verify: compared %llu, window conservative %llu, hard disagreements %llu (%llu since start)\n",
+                              MutexWindowVerify() ? "verify" : "on", at(E::Attempt), at(E::Opened), unlockedMs, relockMs, at(E::Applied), at(E::RefusedDepth), at(E::RefusedCompletion), at(E::RefusedAlias), at(E::RefusedUntracked), at(E::RefusedFence), at(E::RefusedKeyWriters), at(E::RefusedWrites), at(E::RefusedOther),
+                              at(E::BailChanged), at(E::BailUntracked), at(E::BailKeys), at(E::BailKeyWriters), at(E::BailException), at(E::RecheckPassed), at(E::FailFields), at(E::FailCpuWrites), at(E::FailPending), at(E::FailKeyWriters), at(E::FailStamps), at(E::FailKeys), at(E::FailWrites),
+                              at(E::FallThrough), at(E::VerifyCompared), at(E::VerifyConservative), at(E::VerifyDisagree), static_cast<unsigned long long>(totals.disagreementsSinceStart.load(std::memory_order_relaxed)));
+}
+
+MutexWindowFence::MutexWindowFence() {
+    ++windowFences;
+}
+
+MutexWindowFence::~MutexWindowFence() {
+    --windowFences;
+}
+
+bool MutexWindowFence::Held() {
+    return windowFences != 0;
+}
+
+GpuMutexWindow::GpuMutexWindow() {
+    if (MutexWindowFence::Held()) {
+        NoteMutexWindow(MutexWindowEvent::RefusedFence);
+        return;
+    }
+    auto& mutex = GpuMutex();
+    if (mutex.DepthOnThisThread() != 1) {
+        NoteMutexWindow(MutexWindowEvent::RefusedDepth);
+        return;
+    }
+    site = static_cast<GpuLockSite>(LockStats().holdSite);
+    start = std::chrono::steady_clock::now();
+    mutex.unlock();
+    open = true;
+    NoteMutexWindow(MutexWindowEvent::Opened);
+}
+
+void GpuMutexWindow::Close() {
+    if (!open) return;
+    open = false;
+    const auto released = std::chrono::steady_clock::now();
+    TagGpuLockSite(site);
+    GpuMutex().lock();
+    auto& totals = WindowTotals();
+    totals.unlockedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(released - start).count()), std::memory_order_relaxed);
+    totals.relockWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - released).count()), std::memory_order_relaxed);
+}
+
+GpuMutexWindow::~GpuMutexWindow() {
+    Close();
+}
+
 std::uint64_t ThreadCollectedBytes() {
     if (!MemoryProfiled()) return 0;
     return CounterFor(CounterCollect).bytes.load(std::memory_order_relaxed);
