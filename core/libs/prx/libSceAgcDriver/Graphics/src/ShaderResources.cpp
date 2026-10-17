@@ -784,6 +784,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto untracked = source == nullptr && generation == 0 && !committed.has_value() && *keys == DccKeys::Uncompressed ? untrackedKey(address, bytes) : std::array<std::uint64_t, 4>{};
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    const auto viewServes = [&](const CachedTexture& entry) { return !stagedFlushed && (source == nullptr || source == entry.source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*entry.source, resource.dccAddress); };
+    {
+        std::shared_ptr<StorageTexture> stale;
+        {
+            std::lock_guard lock(cache.mutex);
+            dropUncachedViews(cache);
+            if (const auto it = findTexture(cache, key); it != cache.entries.end() && it->source != nullptr && viewServes(*it) && !GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) stale = it->source;
+        }
+        if (stale != nullptr) stale->Refresh();
+    }
     std::lock_guard lock(cache.mutex);
     const CacheHold held(sampledCacheHeld);
     dropUncachedViews(cache);
@@ -792,8 +802,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
-            if (!stagedFlushed && (source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
-                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+            if (viewServes(*it)) {
+                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) {
+                    it->source->Refresh();
+                }
                 if (it->texture->IsDepthCopy()) it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -1025,6 +1037,18 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     auto& cache = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
+    std::shared_ptr<StorageTexture> refreshed;
+    {
+        std::shared_ptr<StorageTexture> found;
+        {
+            std::lock_guard lock(cache.mutex);
+            if (const auto it = findStorage(cache, key); it != cache.entries.end() && !MetadataMoved(*it->texture, resource)) found = it->texture;
+        }
+        if (found != nullptr) {
+            found->Refresh();
+            refreshed = std::move(found);
+        }
+    }
     {
         std::lock_guard lock(cache.mutex);
         const CacheHold held(storageCacheHeld);
@@ -1039,7 +1063,9 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             it = cache.entries.end();
         }
         if (it != cache.entries.end()) {
-            it->texture->Refresh();
+            if (it->texture != refreshed) {
+                it->texture->Refresh();
+            }
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
             texture = it->texture;
             counters.storageHits.fetch_add(1, std::memory_order_relaxed);
