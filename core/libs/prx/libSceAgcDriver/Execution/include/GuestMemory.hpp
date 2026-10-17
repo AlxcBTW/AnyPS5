@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -230,6 +231,65 @@ public:
 private:
     bool active = false;
     HoldSpanKind previous = HoldSpanKind::Count;
+};
+
+bool MutexWindowEnabled();
+bool MutexWindowVerify();
+enum class MutexWindowEvent : std::uint8_t {
+    Attempt = 0,
+    Opened,
+    Applied,
+    RefusedDepth,
+    RefusedCompletion,
+    RefusedAlias,
+    RefusedUntracked,
+    RefusedFence,
+    RefusedKeyWriters,
+    RefusedWrites,
+    RefusedOther,
+    BailChanged,
+    BailUntracked,
+    BailKeys,
+    BailKeyWriters,
+    BailException,
+    RecheckPassed,
+    FailFields,
+    FailCpuWrites,
+    FailPending,
+    FailKeyWriters,
+    FailStamps,
+    FailKeys,
+    FailWrites,
+    FallThrough,
+    VerifyCompared,
+    VerifyConservative,
+    VerifyDisagree,
+    Count
+};
+void NoteMutexWindow(MutexWindowEvent event);
+void ReportMutexWindow();
+std::uint64_t MutexWindowDisagreements();
+class MutexWindowFence {
+public:
+    MutexWindowFence();
+    ~MutexWindowFence();
+    MutexWindowFence(const MutexWindowFence&) = delete;
+    MutexWindowFence& operator=(const MutexWindowFence&) = delete;
+    static bool Held();
+};
+class GpuMutexWindow {
+public:
+    GpuMutexWindow();
+    ~GpuMutexWindow();
+    GpuMutexWindow(const GpuMutexWindow&) = delete;
+    GpuMutexWindow& operator=(const GpuMutexWindow&) = delete;
+    bool Open() const { return open; }
+    void Close();
+
+private:
+    bool open = false;
+    GpuLockSite site = GpuLockSite::Other;
+    std::chrono::steady_clock::time_point start;
 };
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
