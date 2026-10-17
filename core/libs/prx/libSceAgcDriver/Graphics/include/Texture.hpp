@@ -27,6 +27,9 @@ class Buffer;
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
+namespace TargetRefresh {
+struct Scope;
+}
 struct HostImport;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
@@ -470,6 +473,8 @@ private:
     enum class WindowOutcome : std::uint8_t { Refused, Declined, WouldApply, Applied };
     WindowOutcome refreshWindow(bool aliasFree, bool nested, bool& flushed);
     const HostImport* refreshImportLookup(int importMode);
+    std::uint64_t collectSurface(std::uint64_t compared);
+    const TargetRefresh::Scope* targetScope() const;
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
@@ -650,6 +655,39 @@ struct LookupOutcomes {
     std::array<double, Count> ms{};
 };
 LookupOutcomes& ThreadLookupOutcomes();
+
+namespace TargetRefresh {
+
+bool Enabled();
+bool Verify();
+
+struct Scope {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t pages = 0;
+    bool Holds(std::uint64_t unitBegin) const;
+};
+
+class Guard {
+public:
+    explicit Guard(const Scope* scope);
+    ~Guard();
+    Guard(const Guard&) = delete;
+    Guard& operator=(const Guard&) = delete;
+    static const Scope* Active();
+    static bool InLookup();
+
+private:
+    const Scope* previous;
+    bool previousInLookup;
+};
+
+enum class Lookup { Whole, Scoped, FullScissor, Unsupported, Wide };
+void NoteLookup(Lookup kind);
+void NoteMappingCheck(bool held);
+
+}
 
 // APS5_VERIFY_PROOFS: while an object of this class lives on a thread, that thread's lookups do not
 // trust the write-watch hint for memory outside the write watch (the snapshot keep rule of
