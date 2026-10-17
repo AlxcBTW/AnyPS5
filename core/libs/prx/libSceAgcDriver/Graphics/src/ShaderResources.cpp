@@ -2727,6 +2727,65 @@ bool RevalReasonsEnabled() {
     return enabled;
 }
 
+// APS5_LAB_REVAL_LEVER: the two parts of the lever that keeps Revalidate off the full walk.
+//   outside:   a snapshot of a fast-cleared surface (DCC keys other than uncompressed and single clear) over memory
+//              outside the write watch is proved by its keys alone, as cachedTexture's hit rule decides it without
+//              looking at the memory (the stage-A record path does the same);
+//   selective: a proof that failed on one element only because that element's memory moved outside the write watch
+//              (a snapshot's untracked key, a view's image, a storage image) repeats that element's lookup alone, in
+//              the walk's own code, and runs the proof again; another object from the lookup leaves the call to the
+//              full walk.
+// =1 both parts, =outside, =selective, =verify both parts plus the full walk beside every proof they made.
+struct RevalLeverMode {
+    bool outside = false;
+    bool selective = false;
+    bool verify = false;
+};
+
+const RevalLeverMode& RevalLever() {
+    static const RevalLeverMode mode = [] {
+        RevalLeverMode parsed;
+        const char* text = std::getenv("APS5_LAB_REVAL_LEVER");
+        if (text == nullptr || *text == '\0' || std::strcmp(text, "0") == 0) return parsed;
+        if (std::strcmp(text, "outside") == 0) {
+            parsed.outside = true;
+        } else if (std::strcmp(text, "selective") == 0) {
+            parsed.selective = true;
+        } else {
+            parsed.outside = true;
+            parsed.selective = true;
+            parsed.verify = std::strcmp(text, "verify") == 0;
+        }
+        return parsed;
+    }();
+    return mode;
+}
+
+struct RevalFailAt {
+    std::uint8_t kind = 0;
+    std::size_t index = 0;
+};
+
+// The element the last fastRevalidate stopped at: kind 1 a sampled texture, 2 a storage image, 0 none.
+thread_local RevalFailAt lastRevalFailAt;
+thread_local std::uint32_t leverOutsideRun = 0;
+
+struct RevalLeverStats {
+    std::atomic<std::uint64_t> outsideProofs{0};
+    std::atomic<std::uint64_t> calls{0};
+    std::array<std::atomic<std::uint64_t>, 3> tried{};
+    std::array<std::atomic<std::uint64_t>, 3> succeeded{};
+    std::array<std::atomic<std::uint64_t>, 3> otherObject{};
+    std::array<std::atomic<std::uint64_t>, 3> rerunFailed{};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> disagreed{0};
+};
+
+RevalLeverStats& RevalLeverCounts() {
+    static RevalLeverStats stats;
+    return stats;
+}
+
 struct RevalReasonStats {
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalFine::Count)> walks{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RevalFine::Count)> walkNanoseconds{};
@@ -2766,6 +2825,10 @@ void countRevalCall(std::size_t path, std::chrono::steady_clock::time_point star
         char text[160];
         std::snprintf(text, sizeof(text), " %s %llu/%.1f ms/%llu failed;", RevalFineNames[i], load(stats.walks[i]), millis(stats.walkNanoseconds[i]), load(stats.walkFailed[i]));
         reasons += text;
+    }
+    if (RevalLever().outside || RevalLever().selective) {
+        auto& lever = RevalLeverCounts();
+        AgcDriver::ProfilePrint_nid_no_patch("[reval-lever] mode %s%s%s: %llu fast proofs rested on a compressed-key snapshot outside the write watch; one-element lookups (snapshot/view/storage) tried %llu/%llu/%llu, proof held after them %llu/%llu/%llu, lookup found another object %llu/%llu/%llu, proof failed again %llu/%llu/%llu; verified %llu, disagreeing %llu\n", RevalLever().outside ? "outside" : "", RevalLever().selective ? " selective" : "", RevalLever().verify ? " verify" : "", load(lever.outsideProofs), load(lever.tried[0]), load(lever.tried[1]), load(lever.tried[2]), load(lever.succeeded[0]), load(lever.succeeded[1]), load(lever.succeeded[2]), load(lever.otherObject[0]), load(lever.otherObject[1]), load(lever.otherObject[2]), load(lever.rerunFailed[0]), load(lever.rerunFailed[1]), load(lever.rerunFailed[2]), load(lever.verified), load(lever.disagreed));
     }
     AgcDriver::ProfilePrint_nid_no_patch("[reval-reasons] cumulative: fast %llu (%.1f ms), own-refresh %llu (%.1f ms), full walk %llu (%.1f ms), failed %llu (%.1f ms); full walks by reason (count/walk time/walk found another object):%s\n", load(stats.calls[0]), millis(stats.nanoseconds[0]), load(stats.calls[1]), millis(stats.nanoseconds[1]), load(stats.calls[2]), millis(stats.nanoseconds[2]), load(stats.calls[3]), millis(stats.nanoseconds[3]), reasons.c_str());
 }
@@ -2820,6 +2883,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     overlapping.clear();
     accepted = false;
     fastProofsOutside = 0;
+    leverOutsideRun = 0;
+    lastRevalFailAt = {};
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto fail = [&reason](FastFail why, RevalFine fine) {
         reason = why;
@@ -2859,6 +2924,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     };
     for (std::size_t i = 0; i < textures.size(); ++i) {
         auto& surface = validatedTextures[i];
+        lastRevalFailAt = {1, i};
         if (!surface.valid) return fail(FastFail::NoRecord, RevalFine::NoRecordInvalid);
         if (surface.depth) {
             if (!DepthSurfaceHolds(context, surface.resource, textures[i].get())) return fail(FastFail::Depth, RevalFine::DepthHolds);
@@ -2874,7 +2940,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (surface.collected == 0) {
             if (trace != nullptr) trace->refuse(EpochIneligible::OutsideWatch);
             const auto level = FastProofLevel();
-            if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
+            if (RevalLever().outside && source == nullptr && surface.keys != DccKeys::Uncompressed && surface.keys != DccKeys::ClearSingle) {
+                // cachedTexture's hit rule for these keys never looks at the memory: the entry holds while the keys are the same.
+                if (DepthSurfaceAt(address)) return fail(FastFail::Depth, RevalFine::SnapOutsideDepthAt);
+                outside = true;
+                ++leverOutsideRun;
+                RevalLeverCounts().outsideProofs.fetch_add(1, std::memory_order_relaxed);
+            } else if (level >= 1 && source == nullptr && surface.untracked[0] != 0 && surface.keys == DccKeys::Uncompressed) {
                 // A depth surface registered over the memory is the lookup's to return (DepthSurfaceTexture).
                 if (DepthSurfaceAt(address)) return fail(FastFail::Depth, RevalFine::SnapOutsideDepthAt);
                 const bool held = untrackedKey(address, bytes) == surface.untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
@@ -2955,6 +3027,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        lastRevalFailAt = {2, i};
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys, RevalFine::StorageElementKeys);
         if (trace != nullptr && storageTextures[i] != nullptr && storageKeys[i] != 0 && storageKeys[i] != storageTextures[i]->Descriptor().dccAddress) trace->refuse(EpochIneligible::ForeignKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -3001,6 +3074,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!outside) queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
     }
+    lastRevalFailAt = {};
     if (!pending.empty()) {
         if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView, RevalFine::ClearedViewScan);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
@@ -3234,7 +3308,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool reasons = RevalReasonsEnabled();
+    const bool reasons = RevalReasonsEnabled() || RevalLever().outside || RevalLever().selective;
     const auto reasonsStart = reasons ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
     for (const auto& range : describedRanges) {
@@ -3261,7 +3335,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
     // by stage, binding by binding, so the walk repeats that order.
-    const auto fullWalk = [&] {
+    const auto fullWalk = [&](int only = 0, std::size_t target = 0) {
         lookupLog().clear();
         std::size_t textureIndex = 0;
         std::size_t storageIndex = 0;
@@ -3274,9 +3348,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     for (std::uint32_t element = 0; element < binding.count; ++element) {
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                         if (IsNullTextureResource(words)) continue;
+                        if (only != 0 && !(only == 1 && textureIndex == target)) {
+                            ++textureIndex;
+                            continue;
+                        }
                         const auto resource = DecodeTextureResource(words);
                         const VkComponentMapping components = ViewComponents(resource);
                         if (textureIndex >= textures.size() || cachedTexture(context, words, resource, components, 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element)) != textures[textureIndex]) return false;
+                        if (only == 1) return true;
                         ++textureIndex;
                     }
                 } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
@@ -3284,15 +3363,21 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
                         if (IsNullTextureResource(words)) continue;
                         if (storageIndex >= storageTextures.size()) return false;
+                        if (only != 0 && !(only == 2 && storageIndex == target)) {
+                            ++storageIndex;
+                            continue;
+                        }
                         std::shared_ptr<StorageTexture> expected;
                         if (SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[storageIndex - 1];
                         else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[storageIndex], 0, storageWritten[storageIndex]);
                         if (expected != storageTextures[storageIndex]) return false;
+                        if (only == 2) return true;
                         ++storageIndex;
                     }
                 }
             }
         }
+        if (only != 0) return false;
         for (const auto& table : tableStages) {
             if (table.elementTextures.empty()) continue;
             const auto* images = tableImages(shaders, table.stage);
@@ -3397,10 +3482,76 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
         if (fallback != OwnRefreshFallback::Count && fallback != OwnRefreshFallback::Rerun) lastRevalFine = static_cast<RevalFine>(static_cast<std::size_t>(RevalFine::PendingT1Disabled) + static_cast<std::size_t>(fallback));
     }
+    bool selectiveDone = false;
+    if (!fast && !noFast && RevalLever().selective && EpochRevalidate()) {
+        // One element's memory moved outside the write watch and nothing else failed: the lookup of that element alone
+        // (the walk's own code) brings its object current or names another; the proof then runs again. Every element is
+        // looked up at most once, so a proof that keeps failing at the same element ends in the full walk.
+        auto& lever = RevalLeverCounts();
+        std::array<std::pair<std::uint8_t, std::size_t>, 4> tried{};
+        for (std::size_t round = 0; round < tried.size() && !fast; ++round) {
+            const auto at = lastRevalFailAt;
+            const auto fine = lastRevalFine;
+            const bool moved = (at.kind == 1 && (fine == RevalFine::SnapOutsideKeyMoved || fine == RevalFine::ViewOutsideMoved)) || (at.kind == 2 && fine == RevalFine::StorageOutsideMoved);
+            if (!moved || std::find(tried.begin(), tried.begin() + static_cast<std::ptrdiff_t>(round), std::make_pair(at.kind, at.index)) != tried.begin() + static_cast<std::ptrdiff_t>(round)) break;
+            tried[round] = {at.kind, at.index};
+            const std::size_t slot = at.kind == 2 ? 2u : fine == RevalFine::ViewOutsideMoved ? 1u : 0u;
+            lever.tried[slot].fetch_add(1, std::memory_order_relaxed);
+            if (!fullWalk(at.kind, at.index)) {
+                lever.otherObject[slot].fetch_add(1, std::memory_order_relaxed);
+                lookupLog().clear();
+                break;
+            }
+            if (at.kind == 1) {
+                const auto& log = lookupLog();
+                const auto found = std::find_if(log.rbegin(), log.rend(), [&](const LookupRecord& entry) { return entry.object == textures[at.index].get(); });
+                if (found == log.rend()) {
+                    lever.otherObject[slot].fetch_add(1, std::memory_order_relaxed);
+                    lookupLog().clear();
+                    break;
+                }
+                validatedTextures[at.index] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true, found->untracked};
+            }
+            lookupLog().clear();
+            fast = fastRevalidate(StorageTexture::PendingSerial(), refreshed, reason, overlapping, accepted);
+            (fast ? lever.succeeded : lever.rerunFailed)[slot].fetch_add(1, std::memory_order_relaxed);
+            if (fast) selectiveDone = true;
+        }
+    }
     ownedPath = ownRefreshed;
     const bool viaOutside = fast && fastProofsOutside != 0;
     if (viaOutside && profile) Revalidations().fastViaOutside.fetch_add(1, std::memory_order_relaxed);
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    if (fast && RevalLever().verify && (selectiveDone || leverOutsideRun != 0)) {
+        // The full walk beside a proof the lever made: it must find every object in place and current (no other object, no
+        // upload). Over memory outside the write watch it compares bytes instead of trusting the hint (UntrackedBypass).
+        thread_local std::vector<std::pair<const StorageTexture*, std::uint64_t>>* leverVersionsSlot = nullptr;
+        auto& versions = ShaderRecompiler::ThreadOwned(leverVersionsSlot);
+        versions.clear();
+        for (const auto& surface : validatedTextures) {
+            if (surface.source != nullptr) versions.emplace_back(surface.source, surface.source->Version());
+        }
+        for (const auto& image : storageTextures) versions.emplace_back(image.get(), image->Version());
+        const auto staleBefore = TextureCounts().staleReplaced.load(std::memory_order_relaxed);
+        const bool same = [&] {
+            std::optional<UntrackedBypass> bypass;
+            if (fastProofsOutside != 0) bypass.emplace();
+            return fullWalk();
+        }();
+        const bool staleSeen = TextureCounts().staleReplaced.load(std::memory_order_relaxed) != staleBefore;
+        const auto moved = std::find_if(versions.begin(), versions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; });
+        auto& lever = RevalLeverCounts();
+        lever.verified.fetch_add(1, std::memory_order_relaxed);
+        if (!same || moved != versions.end()) {
+            lever.disagreed.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<std::uint32_t> printed{0};
+            if (printed.fetch_add(1, std::memory_order_relaxed) < 20) {
+                std::fprintf(stderr, "[reval-lever] verify: the lever's proof disagrees with the full walk (%s; %s%s)\n", !same ? (staleSeen ? "a cache entry was replaced because the bytes differ" : "another object, no entry replaced") : "an upload", selectiveDone ? "after one-element lookups" : "", leverOutsideRun != 0 ? " with a compressed-key snapshot proved outside the write watch" : "");
+                std::fflush(stderr);
+            }
+            if (!same) return finish(false, false, ProofFailure::Other);
+        }
+    }
     if (!fast) {
         countFullWalk(reason);
         if (epochMode != 0) EpochCounters().fullWalks.fetch_add(1, std::memory_order_relaxed);
