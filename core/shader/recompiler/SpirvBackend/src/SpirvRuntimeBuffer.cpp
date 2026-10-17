@@ -7,6 +7,8 @@
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 #include <string>
 #include <vector>
@@ -169,7 +171,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
-    return EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, access, last), [&] {
+    const auto body = [&] {
         const auto load = [&](std::uint32_t word) {
             const auto value = state.module.AllocateId();
             const auto pointer = EmitMemoryElementPointer(state, access, word);
@@ -188,7 +190,13 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
             value = Binary(state, spv::OpShiftRightLogical, TypeU32(state), value, subwordShift);
         }
         return EmitAndConstant(state, value, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
-    });
+    };
+    static const bool skipBounds = [] {
+        const bool on = std::getenv("APS5_LAB_SKIP_BOUNDS") != nullptr && *std::getenv("APS5_LAB_SKIP_BOUNDS") == '1';
+        if (on) std::fprintf(stderr, "[lab] APS5_LAB_SKIP_BOUNDS=1: direct buffer loads omit the descriptor-range check and rely on device robustBufferAccess for out-of-range words (stores, atomics and BDA keep their checks). Ablation, NOT exact: out-of-range reads may return values other than zero.\n");
+        return on;
+    }();
+    return skipBounds ? body() : EmitValueOrZeroIfCondition(state, EmitMemoryElementInBounds(state, access, last), body);
 }
 
 std::uint32_t byteBuffers(SpirvEmitterState& state) {
