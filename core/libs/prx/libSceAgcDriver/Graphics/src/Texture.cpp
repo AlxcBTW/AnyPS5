@@ -2095,6 +2095,8 @@ std::uint64_t StorageTexture::SlabRetiles() {
 bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::PendingScans);
+    GuestMemory::NoteHoldCount(GuestMemory::HoldCount::PendingScanned, pending.textures.size() + pending.flushing.size());
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
@@ -4660,6 +4662,8 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::PendingScans);
+        GuestMemory::NoteHoldCount(GuestMemory::HoldCount::PendingScanned, pending.textures.size());
         for (auto* texture : pending.textures) {
             if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
