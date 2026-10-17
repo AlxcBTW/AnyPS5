@@ -4373,7 +4373,7 @@ void dispatchMoveTests() {
         auto written = relocated;
         written.bindings[0].bufferWritten[1] = true;
         refuses(written, 0, Refusal::Written, "a moved buffer the dispatch writes was served");
-        refuses(moveTo(1, guestMovedSecond.data(), 20000), 0, Refusal::Limit, "a moved buffer over the storage buffer range was served");
+        refuses(moveTo(1, guestMovedSecond.data(), 20000), 0, Refusal::Written, "a moved buffer over the storage buffer range that no registered allocation holds was served");
         refuses(relocated, 16, Refusal::Limit, "a moved buffer over the byte budget was served");
         refuses(moveTo(1, reinterpret_cast<const void*>(std::uintptr_t{0x10}), 24), 0, Refusal::Inaccessible, "a moved buffer over unmapped memory was served");
         refuses(moveTo(1, guestThird.data(), 8), 0, Refusal::Overlap, "a moved buffer over the dispatch's own written range was served");
@@ -4430,6 +4430,9 @@ void dispatchMoveTests() {
         Require(moved.has_value() && moved->size() == 1 && moved->front().size == 4096, "another oversized size over the same allocation end listed another range");
         proveAgainst(oversized, vsharp(tail, 4096), proof, moved);
         Require(moved.has_value() && moved->size() == 1 && moved->front().address == address(tail) && moved->front().size == 4096, "a V# that now fits the range limit was not listed at its own size");
+
+        proveAgainst(oversized, vsharp(block, 0xffffffffu), proof, moved);
+        Require(!moved.has_value() && proof.refusal == Refusal::Limit, "a moved V# the allocation holds past the range limit was served");
 
         const auto overhang = readOnly(strided(tail, 24, 342));
         proveAgainst(overhang, strided(tail, 24, 342), proof, moved);
