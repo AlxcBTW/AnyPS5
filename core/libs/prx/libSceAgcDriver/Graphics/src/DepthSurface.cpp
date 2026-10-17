@@ -316,6 +316,8 @@ std::optional<DepthPlaneOverwrite> decodeOverwrite(const StorageImageClear& clea
             break;
         }
     }
+    overwrite.colorAddress = base;
+    overwrite.colorBits = c0;
     overwrite.width = clear.width;
     overwrite.height = clear.height;
     return overwrite;
@@ -672,6 +674,13 @@ public:
         const auto& described = mirror.Descriptor();
         const auto& view = overwrite->view;
         if (described.baseAddress != view.baseAddress || described.format != view.format || described.tileMode != view.tileMode || described.dimension != view.dimension) return false;
+        std::uint32_t current = 0;
+        try {
+            GuestMemory::Read(overwrite->colorAddress, std::as_writable_bytes(std::span(&current, 1)), 4);
+        } catch (...) {
+            return false;
+        }
+        if (current != overwrite->colorBits) return false;
         auto* recorder = RecorderFor(context);
         Require(recorder != nullptr, "depth surface storage clears need the recorder of the surface's device");
         const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;

@@ -74,6 +74,8 @@ struct DepthPlaneOverwrite {
     std::uint32_t width = 0;
     std::uint32_t height = 0;
     std::uint32_t raw = 0;
+    std::uint64_t colorAddress = 0;
+    std::uint32_t colorBits = 0;
     float depth = 0.0f;
     // The mirror whose copy-in was left out for this dispatch (set by DepthSurface::Storage, consumed by its StoreBack).
     const void* mirror = nullptr;
