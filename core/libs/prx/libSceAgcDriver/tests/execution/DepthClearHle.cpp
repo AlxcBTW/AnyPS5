@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -98,12 +99,26 @@ std::vector<std::uint32_t> Pm4Packet(std::uint32_t opcode, std::initializer_list
     return words;
 }
 
+Graphics::Recorder* testRecorder = nullptr;
+Graphics::Recorder* driverRecorder = nullptr;
+
+void UseTestDevice(AgcDriver::VulkanDevice& device) {
+    testRecorder = AgcDriver::VulkanDeviceTestAccess::ContextOf(device).recorder;
+    Require(testRecorder != nullptr, "depth clear: the test device has no recorder");
+    testRecorder->Activate();
+}
+
 void Submit(std::vector<std::vector<std::uint32_t>> packets) {
     std::vector<std::uint32_t> words;
     for (const auto& packet : packets) words.insert(words.end(), packet.begin(), packet.end());
     Packet dcb{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    if (driverRecorder != nullptr) driverRecorder->Activate();
     Require(sceAgcDriverSubmitDcb(&dcb) == 0, "depth clear: DCB submission failed");
     AgcDriverWaitIdle_nid_postfix();
+    if (driverRecorder == nullptr) {
+        driverRecorder = Graphics::Recorder::Active();
+        Require(driverRecorder != nullptr && driverRecorder != testRecorder, "depth clear: the driver's device did not activate its own recorder");
+    }
 }
 
 std::array<std::uint32_t, 8> TextureDescriptor(std::uint64_t address, std::uint32_t format, std::uint32_t tile = TileLinear, std::uint32_t type = Type2DArray) {
@@ -284,6 +299,7 @@ void RequireDepthTexels(AgcDriver::VulkanDevice& device, const GuestBlock& plane
 }
 
 Graphics::DepthClearStatistics ClearSequence(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "mode " + std::to_string(mode) + ": ";
@@ -341,6 +357,7 @@ Graphics::DepthClearStatistics ClearSequence(AgcDriver::VulkanDevice& device, co
 }
 
 void IntegerViewCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "integer view, mode " + std::to_string(mode) + ": ";
@@ -362,6 +379,7 @@ void IntegerViewCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, in
 }
 
 void DriverMatchCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "driver submit, mode " + std::to_string(mode) + ": ";
@@ -379,6 +397,7 @@ void DriverMatchCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, in
 }
 
 void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "16-bit plane, mode " + std::to_string(mode) + ": ";
@@ -443,6 +462,7 @@ void SixteenBitCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int
 }
 
 void StencilCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "depth and stencil, mode " + std::to_string(mode) + ": ";
@@ -464,9 +484,8 @@ void StencilCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mo
     else Require(difference.clears == 1u, label + "the clear was not taken (" + std::to_string(difference.clears) + " clears, " + std::to_string(Declined(difference)) + " declined)");
 }
 
-}
-
 void PlaneFillCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int mode) {
+    UseTestDevice(device);
     Graphics::SetDepthPlaneClearForTest(mode != 0);
     const auto before = Graphics::DepthClearCounts();
     const std::string label = "plane fill, mode " + std::to_string(mode) + ": ";
@@ -499,7 +518,10 @@ void PlaneFillCase(AgcDriver::VulkanDevice& device, const Shaders& shaders, int 
     else Require(difference.clears == 2u, label + "the lever took " + std::to_string(difference.clears) + " clears, expected 2");
 }
 
-int main() {
+}
+
+int main(int argc, char** argv) {
+    const bool reverse = argc > 1 && std::string(argv[1]) == "reverse";
     int failures = 0;
     const auto run = [&](const char* name, auto&& body) {
         try {
@@ -532,11 +554,23 @@ int main() {
 
         Graphics::SetDepthPlaneClearForTest(true);
 
-        for (const int mode : {0, 1}) run(mode == 0 ? "plane fill, switch off" : "plane fill, lever", [&] { PlaneFillCase(*device, shaders, mode); });
-        for (const int mode : {0, 1}) run(mode == 0 ? "integer view, switch off" : "integer view, lever", [&] { IntegerViewCase(*device, shaders, mode); });
-        for (const int mode : {0, 1}) run(mode == 0 ? "16-bit plane, switch off" : "16-bit plane, lever", [&] { SixteenBitCase(*device, shaders, mode); });
-        for (const int mode : {0, 1}) run(mode == 0 ? "depth and stencil, switch off" : "depth and stencil, lever", [&] { StencilCase(*device, shaders, mode); });
-        for (const int mode : {0, 1}) run(mode == 0 ? "driver submit, switch off" : "driver submit, lever", [&] { DriverMatchCase(*device, shaders, mode); });
+        using Case = void (*)(AgcDriver::VulkanDevice&, const Shaders&, int);
+        struct Group {
+            const char* off;
+            const char* lever;
+            Case body;
+        };
+        std::vector<Group> groups{
+            {"integer view, switch off", "integer view, lever", IntegerViewCase},
+            {"16-bit plane, switch off", "16-bit plane, lever", SixteenBitCase},
+            {"depth and stencil, switch off", "depth and stencil, lever", StencilCase},
+            {"plane fill, switch off", "plane fill, lever", PlaneFillCase},
+            {"driver submit, switch off", "driver submit, lever", DriverMatchCase},
+        };
+        if (reverse) std::reverse(groups.begin(), groups.end());
+        for (const auto& group : groups) {
+            for (const int mode : reverse ? std::array<int, 2>{1, 0} : std::array<int, 2>{0, 1}) run(mode == 0 ? group.off : group.lever, [&] { group.body(*device, shaders, mode); });
+        }
         Graphics::SetDepthPlaneClearForTest(true);
         LibcRunShutdown_nid_postfix();
     } catch (const std::exception& error) {
