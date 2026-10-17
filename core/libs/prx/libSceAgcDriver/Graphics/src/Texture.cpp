@@ -115,8 +115,7 @@ void reportPendingSave() {
     if (nowMs - last < 10000 || !pendingSaveReported.compare_exchange_strong(last, nowMs)) return;
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto watched = take(pendingSaveWatched), matched = take(pendingSaveMatched), changed = take(pendingSaveChanged), noBaseline = take(pendingSaveNoBaseline), avoided = take(pendingSaveAvoided), occurred = take(pendingSaveOccurred);
-    AgcDriver::ProfilePrint_nid_no_patch("[pendingsave] units captured because still watched %llu, captured because the baseline matched %llu; refusals kept because changed %llu, because no baseline %llu; unwatched-span stores past the Require(!unsavedOutsideWatch) %llu, Require hits %llu (10 s)
-", watched, matched, changed, noBaseline, avoided, occurred);
+    AgcDriver::ProfilePrint_nid_no_patch("[pendingsave] units captured because still watched %llu, captured because the baseline matched %llu; refusals kept because changed %llu, because no baseline %llu; unwatched-span stores past the Require(!unsavedOutsideWatch) %llu, Require hits %llu (10 s)\n", watched, matched, changed, noBaseline, avoided, occurred);
 }
 
 struct StorageTraffic {
