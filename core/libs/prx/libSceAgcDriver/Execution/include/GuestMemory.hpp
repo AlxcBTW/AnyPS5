@@ -279,6 +279,8 @@ private:
     X(DccKeyScan, "dcc-key-scan") \
     X(FlushHook, "flush-hook") \
     X(RfAlias, "rf-alias") \
+    X(RfLoops, "rf-decide-loops") \
+    X(RfStoredLoops, "rf-stored-loops") \
     X(RfHostImport, "rf-host-import") \
     X(RfScan, "rf-scan-blocks") \
     X(RfEquals, "rf-equals-original") \
