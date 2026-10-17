@@ -385,7 +385,7 @@ private:
     // The bytes of a buffer element a build binds: the V# size cut to the mapped end when it exceeds the
     // descriptor range limit, and a stride overhang at the last guest page cut to the allocation end;
     // 0 for an empty element. addGuestBuffer and the move proof both take the range from here.
-    std::uint64_t guestBufferBytes(const ShaderRecompiler::ShaderBufferResource& descriptor) const;
+    std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
