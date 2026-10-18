@@ -1,0 +1,5 @@
+name=pr-measure
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-pr-measure-4dacb85d5c-249996
