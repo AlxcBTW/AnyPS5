@@ -270,6 +270,7 @@ struct SpirvTarget {
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
     bool robustBufferAccess2 = false;
+    bool exactRobustLoads = false;
 };
 
 struct BindingLayout {

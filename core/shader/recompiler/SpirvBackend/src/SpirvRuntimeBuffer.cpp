@@ -7,6 +7,7 @@
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <utility>
@@ -162,6 +163,13 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
+void countRobust2Load(bool withoutRangeCheck) {
+    static std::atomic<std::uint32_t> without{0};
+    static std::atomic<std::uint32_t> with{0};
+    const auto count = (withoutRangeCheck ? without : with).fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if ((count & (count - 1u)) == 0u) std::fprintf(stderr, "[lab] APS5_LAB_ROBUST2 loads compiled: %u without the descriptor-range check, %u with it (printed at powers of two of either count)\n", without.load(std::memory_order_relaxed), with.load(std::memory_order_relaxed));
+}
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
@@ -176,8 +184,11 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
         if (on) std::fprintf(stderr, "[lab] APS5_LAB_SKIP_BOUNDS=1: direct buffer loads omit the descriptor-range check and rely on device robustBufferAccess for out-of-range words (stores, atomics and BDA keep their checks). Ablation, NOT exact: out-of-range reads may return values other than zero.\n");
         return on;
     }();
-    const auto bounds = skipBounds ? 0u : EmitMemoryElementInBounds(state, access, last);
-    const auto inBounds = skipBounds ? 0u : (enable != 0u ? both(state, enable, bounds) : bounds);
+    const bool exact = state.exactRobustLoads && !skipBounds && LoadsSelectable(state, access);
+    static const bool robust2Requested = std::getenv("APS5_LAB_ROBUST2") != nullptr && *std::getenv("APS5_LAB_ROBUST2") == '1';
+    if (robust2Requested && !skipBounds) countRobust2Load(exact);
+    const auto bounds = skipBounds || exact ? 0u : EmitMemoryElementInBounds(state, access, last);
+    const auto inBounds = skipBounds || exact ? 0u : (enable != 0u ? both(state, enable, bounds) : bounds);
     const auto load = [&](std::uint32_t word) {
         const auto value = state.module.AllocateId();
         const auto pointer = EmitMemoryElementPointer(state, access, word);
@@ -195,6 +206,18 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
         return EmitAndConstant(state, value, bits == 32u ? 0xffffffffu : (1u << bits) - 1u);
     };
     const auto highShift = Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 32u), shift);
+    if (exact) {
+        auto guard = enable;
+        if (access.kind != ResourceKind::ScalarBuffer) {
+            const auto nextFits = Binary(state, spv::OpLogicalOr, TypeBool(state), Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), EmitMemoryElementInBounds(state, access, next));
+            guard = guard != 0u ? both(state, guard, nextFits) : nextFits;
+        }
+        const auto lowIndex = guard != 0u ? GuardedElementIndex(state, access, guard, index) : index;
+        const auto highIndex = Select(state, TypeU32(state), guard != 0u ? both(state, guard, unaligned) : unaligned, next, lowIndex);
+        const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
+        const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
+        return combine(low, high);
+    }
     if (skipBounds) {
         const auto unguarded = [&] {
             const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(index), shift);
