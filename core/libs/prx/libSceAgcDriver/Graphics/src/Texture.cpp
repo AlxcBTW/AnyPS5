@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/IndirectPublish.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestWriteRing.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -3971,6 +3972,7 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    const IndirectPublish::FlushScope probe(reason, address, bytes);
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -4001,6 +4003,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         if (!flush.empty()) BumpPendingSerial();
     }
+    IndirectPublish::NoteImagesStored(flush.size());
     if (flush.empty()) {
         // Units shadowed over the range (another image's results retiled into the import's unit
         // shadow, or an earlier flush's) still reach the import as the scope asks.
@@ -4176,6 +4179,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 }
 
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason) {
+    const IndirectPublish::FlushScope probe(reason, address, bytes);
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
