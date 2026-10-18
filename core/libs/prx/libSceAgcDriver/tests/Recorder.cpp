@@ -8770,7 +8770,7 @@ void clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
     constexpr std::array<std::uint8_t, 8> green{0, 0, 0x00, 0x3c, 0, 0, 0x00, 0x3c};
     constexpr std::array<std::uint8_t, 8> cleared{};
-    enum class Order { Superseded, ReadFirst, Rewritten };
+    enum class Order { Superseded, ReadFirst, Rewritten, CpuStore };
     struct Outcome {
         std::vector<std::byte> bytes;
         std::vector<std::byte> imageB;
@@ -8778,7 +8778,7 @@ void clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         std::uint64_t superseded = 0;
     };
     const auto run = [&](bool on, Order order) {
-        const std::string where = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : ", A written again after the hand-over") + (on ? ", on" : ", off");
+        const std::string where = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : ", a CPU store before B wrote") + (on ? ", on" : ", off");
         StorageTexture::SetClearHandOver(on);
         recorder.Sync();
         std::memset(memory, 0x55, surfaceA);
@@ -8811,6 +8811,9 @@ void clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
                 imageB->Refresh();
                 Require(filled(readImage(imageB, 128, 128, 8), cleared), where + ": B refreshed again does not hold its keys' clear");
             }
+            if (order == Order::CpuStore) {
+                std::memset(memory + 65536, 0x77, 65536);
+            }
             draw(imageB, {{0.0f, 1.0f, 0.0f, 1.0f}});
             Require(StorageTexture::FlushPending(address, bytes, nullptr, "clear-key hand-over test", PublishScope::Whole), where + ": nothing was pending at the end");
             recorder.Submit();
@@ -8824,12 +8827,12 @@ void clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         recorder.Sync();
         return outcome;
     };
-    for (const auto order : {Order::Superseded, Order::ReadFirst, Order::Rewritten}) {
-        const std::string name = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : ", A written again after the hand-over");
+    for (const auto order : {Order::Superseded, Order::ReadFirst, Order::Rewritten, Order::CpuStore}) {
+        const std::string name = what + (order == Order::Superseded ? ", A never read again" : order == Order::ReadFirst ? ", A read before B wrote" : order == Order::Rewritten ? ", A written again after the hand-over" : ", a CPU store before B wrote");
         const auto off = run(false, order);
         const auto on = run(true, order);
         const auto& lastA = order == Order::Rewritten ? blue : red;
-        Require(filled(std::span(off.bytes).first(2 * 65536), green), name + ": B's results did not reach guest memory with the hand-over off");
+        if (order != Order::CpuStore) Require(filled(std::span(off.bytes).first(2 * 65536), green), name + ": B's results did not reach guest memory with the hand-over off");
         Require(filled(std::span(off.bytes).subspan(2 * 65536), lastA), name + ": A's results did not reach guest memory with the hand-over off");
         Require(on.imageB == off.imageB, name + ": B held other texels with the hand-over on than off");
         Require(on.bytes == off.bytes, name + ": the hand-over left other guest bytes than the old order");

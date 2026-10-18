@@ -2107,6 +2107,8 @@ bool StorageTexture::Refresh() {
         }
     };
     // No publish: the upload below reads the stored units from the unit shadow itself.
+    handedOver.clear();
+    handedUnits.clear();
     const auto handOverKeys = alias == nullptr ? clearHandOver() : std::nullopt;
     const bool flushed = (!handOverKeys.has_value() && FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None)) || windowFlushed;
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
@@ -5210,19 +5212,23 @@ void StorageTexture::supersedeHandedOver(std::uint32_t first, std::uint32_t coun
         ++entry;
     }
     if (first == 0 && count >= trackedLayers) handedOver.clear();
-    bool moved = false;
-    for (std::uint32_t unit = first; unit < first + count && unit < handedUnits.size(); ++unit) {
-        if (!handedUnits[unit]) continue;
-        if (!moved) {
-            const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-            for (std::uint32_t moving = unit; moving < first + count && moving < handedUnits.size(); ++moving) {
-                if (handedUnits[moving]) layerGeneration[moving] = current;
-            }
+    if (std::any_of(handedUnits.begin() + first, handedUnits.begin() + std::min<std::size_t>(first + count, handedUnits.size()), [](bool handed) { return handed; })) {
+        const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        std::vector<std::uint64_t> generations;
+        blockGenerations(generations);
+        std::vector<std::uint8_t> stamped(generations.size(), 0);
+        std::vector<std::uint8_t> cpu(generations.size(), 0);
+        const bool tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stamped, cpu);
+        bool moved = false;
+        for (std::uint32_t unit = first; unit < first + count && unit < handedUnits.size(); ++unit) {
+            if (!handedUnits[unit]) continue;
+            handedUnits[unit] = false;
+            if (!tracked || unit >= cpu.size() || cpu[unit] != 0) continue;
+            layerGeneration[unit] = current;
             moved = true;
         }
-        handedUnits[unit] = false;
+        if (moved) refreshGeneration();
     }
-    if (moved) refreshGeneration();
     if (std::none_of(handedUnits.begin(), handedUnits.end(), [](bool handed) { return handed; })) handedUnits.clear();
 }
 
