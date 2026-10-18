@@ -32,6 +32,7 @@ void ClearCachedTextures(VkDevice device);
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
+std::uint64_t StorageTextureRoom(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t sampledBytes, std::uint64_t storageBytes);
 std::uint64_t NextStorageBudget(std::uint64_t current, std::uint64_t floor, std::uint64_t cap, std::uint64_t reportedBudget, std::uint64_t usage, std::uint64_t evictions);
 std::uint64_t StorageBudgetCap(std::uint64_t heapBytes, std::uint64_t reportedBudget, std::uint64_t usage, std::uint64_t cacheBytes, std::uint64_t sampledRemaining, std::uint64_t floor);
 std::uint64_t SampledCacheHeadroom(std::uint64_t sampledBudget, std::uint64_t sampled, std::uint64_t sampledPeak);
