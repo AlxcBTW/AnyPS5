@@ -40,3 +40,23 @@ jobs:
         run: |
           pattern=$(cat .ci-lab/tests)
           ctest --test-dir build --output-on-failure --timeout 120 --parallel 2 -R "$pattern"
+      - name: Install gdb
+        if: always()
+        run: sudo apt-get install -y --no-install-recommends gdb
+      - name: Order loops
+        if: always()
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          for variant in "" "groups" "modes" "groups modes"; do
+            fails=0
+            for i in $(seq 1 15); do
+              if ! gdb -batch -ex run -ex bt --args build/tests/agc_driver_depth_clear_hle_tests $variant > loop.out 2>&1 || grep -q "SIGSEGV\|^[a-z0-9 ,-]*: AGC graphics" loop.out; then
+                fails=$((fails+1))
+                echo "=== variant [$variant] iteration $i failed"
+                grep -vE "write-watch|VulkanDevice\]|\[gpu\]|HostCpu|ShaderRegistry|StorageTexture|Texture.cpp" loop.out | tail -40
+              fi
+            done
+            echo "=== variant [$variant]: $fails of 15 failed"
+          done
