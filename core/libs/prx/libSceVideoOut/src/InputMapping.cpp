@@ -281,9 +281,9 @@ void loadInputFile(Pad::InputConfiguration& configuration, const std::filesystem
             auto binding = parseBinding(*action, source);
             const auto normalizedAction = upper(action->name);
             if (overriddenActions.insert(normalizedAction).second) {
-                std::erase_if(bindings, [action](const InputBinding& existing) { return matchesAction(existing, *action); });
+                std::erase_if(bindings, [action](const Pad::InputBinding& existing) { return matchesAction(existing, *action); });
             }
-            const bool duplicate = std::any_of(bindings.begin(), bindings.end(), [&binding](const InputBinding& existing) {
+            const bool duplicate = std::any_of(bindings.begin(), bindings.end(), [&binding](const Pad::InputBinding& existing) {
                 return existing.key == binding.key && existing.mouseButton == binding.mouseButton &&
                     existing.control == binding.control && existing.button == binding.button &&
                     existing.wheelDirection == binding.wheelDirection;
