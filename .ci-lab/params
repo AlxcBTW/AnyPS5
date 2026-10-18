@@ -1,0 +1,5 @@
+name=robust2
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-robust2-d48c1f5c2c-218879
