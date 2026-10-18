@@ -1,0 +1,5 @@
+name=indirect-publish
+build_type=Release
+g1=off
+cmake=
+artifact=lab-libs-indirect-publish-2dada4eae5-215451
