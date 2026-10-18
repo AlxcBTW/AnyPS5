@@ -11,6 +11,7 @@
 #include <fstream>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -112,6 +113,40 @@ static bool ChflagsThrows(const std::filesystem::path& path, std::uint64_t flags
         return std::strstr(error.what(), names) != nullptr;
     }
     return false;
+}
+
+static std::string CaptureStderr(const std::function<void()>& action) {
+    std::FILE* capture = std::tmpfile();
+    Require(capture != nullptr);
+    std::fflush(stderr);
+#ifdef _WIN32
+    const int stream = ::_fileno(stderr);
+    const int saved = ::_dup(stream);
+    Require(saved >= 0 && ::_dup2(::_fileno(capture), stream) == 0);
+#else
+    const int stream = ::fileno(stderr);
+    const int saved = ::dup(stream);
+    Require(saved >= 0 && ::dup2(::fileno(capture), stream) >= 0);
+#endif
+    action();
+    std::fflush(stderr);
+#ifdef _WIN32
+    Require(::_dup2(saved, stream) == 0);
+    ::_close(saved);
+#else
+    Require(::dup2(saved, stream) >= 0);
+    ::close(saved);
+#endif
+    Require(std::fseek(capture, 0, SEEK_SET) == 0);
+    std::string output;
+    char buffer[512];
+    for (;;) {
+        const auto bytes = std::fread(buffer, 1, sizeof(buffer), capture);
+        output.append(buffer, bytes);
+        if (bytes != sizeof(buffer)) break;
+    }
+    std::fclose(capture);
+    return output;
 }
 
 static void TestParentTraversal() {
@@ -219,6 +254,13 @@ static void TestRelinkedModuleNames() {
     Require(sceKernelStat(original.c_str(), &status) == static_cast<int>(0x80020002u));
     Require(sceKernelCheckReachability(original.c_str()) == static_cast<int>(0x80020002u));
     Require(sceKernelOpen(original.c_str(), 0, 0) == static_cast<int>(0x80020002u));
+    const auto missing = (root / "missing-content.pak").string();
+    int openResult = 0;
+    const auto openLog = CaptureStderr([&] { openResult = sceKernelOpen(missing.c_str(), 0, 0); });
+    Require(openResult == static_cast<int>(0x80020002u));
+    Require(openLog.find("path=" + missing) != std::string::npos);
+    Require(openLog.find("resolvedPath=") != std::string::npos && openLog.find("missing-content.pak") != std::string::npos);
+    Require(openLog.find("result=0x80020002") != std::string::npos);
     { std::ofstream file(relinked); file << "relinked"; }
     Require(sceKernelStat(original.c_str(), &status) == 0 && status.st_size == 8);
     Require(stat_nid_postfix(original.c_str(), &status) == 0 && status.st_size == 8);
@@ -775,27 +817,25 @@ int main() {
         Require(stat_nid_postfix(fileLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0100000);
         Require(followed.st_ino == status.st_ino && linkStatus.st_ino != status.st_ino && linkStatus.st_dev == status.st_dev);
         Require(stat_nid_postfix(directoryLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0040000);
-        const auto checkUnsupportedLink = [](const std::filesystem::path& link) {
-            FileStat untouched;
-            std::memset(&untouched, 0x5a, sizeof(untouched));
-            constexpr int sentinelError = 123;
-            *__error_nid_postfix() = sentinelError;
-            bool rejected = false;
-            try {
-                lstat_nid_postfix(link.string().c_str(), &untouched);
-            } catch (const std::runtime_error& error) {
-                rejected = std::strcmp(error.what(), "lstat of a Windows reparse point other than a relative symbolic link not implemented") == 0;
-            }
-            const bool errorUnchanged = *__error_nid_postfix() == sentinelError;
-            const auto* bytes = reinterpret_cast<const unsigned char*>(&untouched);
-            const bool statusUnchanged = std::all_of(bytes, bytes + sizeof(untouched), [](unsigned char value) { return value == 0x5a; });
-            return rejected && errorUnchanged && statusUnchanged;
-        };
         Require(stat_nid_postfix(fileLink.string().c_str(), &status) == 0 && status.st_size == 5);
-        Require(checkUnsupportedLink(absoluteLink));
+        FileStat absoluteStatus{};
+        Require(lstat_nid_postfix(absoluteLink.string().c_str(), &absoluteStatus) == 0);
+        Require((absoluteStatus.st_mode & 0170000) == 0120000 && absoluteStatus.st_size > 0 && absoluteStatus.st_nlink == 1);
+        Require(stat_nid_postfix(absoluteLink.string().c_str(), &followed) == 0 && followed.st_ino == status.st_ino);
         Require(std::filesystem::remove(fileLink) && std::filesystem::remove(directoryLink) && DeleteFileW(danglingLink.c_str()) != 0 &&
             std::filesystem::remove(absoluteLink) && std::filesystem::remove(targetDirectory));
     }
+    const auto junctionTarget = root / "junction-target";
+    const auto junction = root / "junction";
+    Require(std::filesystem::create_directory(junctionTarget));
+    const auto junctionCommand = L"cmd /c mklink /J \"" + junction.wstring() + L"\" \"" + junctionTarget.wstring() + L"\"";
+    Require(_wsystem(junctionCommand.c_str()) == 0);
+    FileStat junctionStatus{};
+    Require(lstat_nid_postfix(junction.string().c_str(), &junctionStatus) == 0);
+    Require((junctionStatus.st_mode & 0170000) == 0120000 && junctionStatus.st_size > 0);
+    FileStat junctionFollowed{};
+    Require(stat_nid_postfix(junction.string().c_str(), &junctionFollowed) == 0 && (junctionFollowed.st_mode & 0170000) == 0040000);
+    Require(std::filesystem::remove(junction) && std::filesystem::remove(junctionTarget));
 #endif
     FileStat identity{};
     FileStat byDescriptor{};
