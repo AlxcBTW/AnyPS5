@@ -8649,6 +8649,7 @@ void clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     constexpr std::size_t surfaceB = 128 * 128 * 8;
     constexpr std::size_t keyCount = surfaceB / 256;
     constexpr std::size_t bytes = surfaceA + 65536;
+    static_assert(surfaceB <= surfaceA && keyCount <= bytes - surfaceA, "B lies over the first units of A, and B's DCC keys follow A inside the block");
     const auto decided = PrepareImportWatch(base);
 #ifndef _WIN32
     if (watched && decided == ImportWatch::Unwatch) {
