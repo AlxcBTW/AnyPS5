@@ -271,10 +271,9 @@ void ReportStackWords(std::uint64_t rsp) {
     const auto stackHigh = reinterpret_cast<std::uint64_t>(tib->StackBase);
     const auto first = rsp & ~std::uint64_t{7};
     Report("  stack words from rsp 0x%016llx (APS5_CRASH_STACK_BYTES):\n", static_cast<unsigned long long>(rsp));
-    const auto limit = std::min(first + bytes, stackHigh);
     std::uint64_t end = first;
     std::uint64_t readablePage = 0;
-    for (std::uint64_t at = first; at < limit; at += 32) {
+    for (std::uint64_t at = first; at < first + bytes; at += 32) {
         std::uint64_t words[4] = {};
         int count = 0;
         for (; count < 4; ++count) {
@@ -287,14 +286,14 @@ void ReportStackWords(std::uint64_t rsp) {
             words[count] = *reinterpret_cast<const std::uint64_t*>(slot);
         }
         if (count == 0) break;
-        static char text[192];
+        char text[192];
         int used = std::snprintf(text, sizeof(text), "    +0x%04llx:", static_cast<unsigned long long>(at - first));
         for (int k = 0; k < count && used > 0 && used < static_cast<int>(sizeof(text)); ++k) used += std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " %016llx", static_cast<unsigned long long>(words[k]));
         Report("%s\n", text);
         end = at + static_cast<std::uint64_t>(count) * 8;
         if (count < 4) break;
     }
-    static std::uint64_t seen[256];
+    std::uint64_t seen[256];
     std::size_t seenCount = 0;
     Report("  data at stack words that point outside the stack (8 words each):\n");
     for (std::uint64_t slot = first; slot + 8 <= end && seenCount < std::size(seen); slot += 8) {
@@ -430,7 +429,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     }
     ReportStackCandidates(context->Rsp, 16, 0x2000);
     ReportStackWords(context->Rsp);
-    if (context->Rip == 0 ||!IsExecutable(context->Rip)) {
+    if (context->Rip == 0|| !IsExecutable(context->Rip)) {
         // A jump into nothing usually follows a return through a clobbered frame; the frames that just
         // returned are still below rsp.
         Report("  recently popped return address candidates:\n");
