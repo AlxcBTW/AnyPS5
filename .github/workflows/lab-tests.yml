@@ -43,20 +43,27 @@ jobs:
       - name: Install gdb
         if: always()
         run: sudo apt-get install -y --no-install-recommends gdb
-      - name: Order loops
+      - name: Order loops plain
         if: always()
         env:
           ANYPS5_REQUIRE_VULKAN: 1
           GALLIUM_OVERRIDE_CPU_CAPS: avx
         run: |
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%p
+          ulimit -c unlimited
           for variant in "" "groups" "modes" "groups modes"; do
             fails=0
-            for i in $(seq 1 15); do
-              if ! gdb -batch -ex run -ex bt --args build/tests/agc_driver_depth_clear_hle_tests $variant > loop.out 2>&1 || grep -q "SIGSEGV\|^[a-z0-9 ,-]*: AGC graphics" loop.out; then
+            for i in $(seq 1 20); do
+              status=0
+              build/tests/agc_driver_depth_clear_hle_tests $variant > loop.out 2>&1 || status=$?
+              if [ $status -ne 0 ]; then
                 fails=$((fails+1))
-                echo "=== variant [$variant] iteration $i failed"
-                grep -vE "write-watch|VulkanDevice\]|\[gpu\]|HostCpu|ShaderRegistry|StorageTexture|Texture.cpp" loop.out | tail -40
+                echo "=== variant [$variant] iteration $i exit $status"
+                grep -vE "write-watch|VulkanDevice\]|\[gpu\]|HostCpu|ShaderRegistry|StorageTexture|Texture.cpp" loop.out | tail -8
+                for core in /tmp/core.*; do
+                  [ -e "$core" ] && sudo gdb -batch -ex bt build/tests/agc_driver_depth_clear_hle_tests "$core" 2>&1 | grep -E "^#" | head -25 && sudo rm -f "$core"
+                done
               fi
             done
-            echo "=== variant [$variant]: $fails of 15 failed"
+            echo "=== variant [$variant]: $fails of 20 failed"
           done
