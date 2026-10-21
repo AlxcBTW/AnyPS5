@@ -24,6 +24,11 @@ struct StreamManipulator {
     std::int32_t argument;
 };
 StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width);
+struct StreamManipulatorV2 {
+    void* (APS5_VABI* function)(void*, std::int64_t);
+    std::int64_t argument;
+};
+StreamManipulatorV2 APS5_VABI _ZNSt8__sce_v24setwEx_nid_postfix(std::int64_t width);
 void APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(GuestLocale::IosBase* self);
 const short* APS5_VABI _Getpctype_nid_postfix();
 const short* APS5_VABI _Getptolower_nid_postfix();
@@ -177,6 +182,52 @@ static void CheckStreamWidth() {
     RequireException([&] { manipulator.function(nullptr, manipulator.argument); });
 }
 
+static void CheckStreamWidthV2() {
+    struct GuardedStream {
+        std::uint64_t before = 0x12345678;
+        std::array<std::uint64_t, 8> stream{};
+        std::uint64_t after = 0x87654321;
+    } object;
+    object.stream.fill(0x1111111111111111);
+    const auto width = [&] { return object.stream[5]; };
+    const auto untouched = [&] {
+        for (std::size_t index = 0; index < object.stream.size(); ++index)
+            if (index != 5 && object.stream[index] != 0x1111111111111111) return false;
+        return object.before == 0x12345678 && object.after == 0x87654321;
+    };
+
+    const auto manipulator = _ZNSt8__sce_v24setwEx_nid_postfix(12);
+    Require(manipulator.argument == 12 && manipulator.function != nullptr);
+    Require(manipulator.function(object.stream.data(), manipulator.argument) == object.stream.data());
+    Require(width() == 12 && untouched());
+
+    const std::int64_t wide = static_cast<std::int64_t>(INT_MAX) + 5;
+    const auto large = _ZNSt8__sce_v24setwEx_nid_postfix(wide);
+    Require(large.argument == wide);
+    large.function(object.stream.data(), large.argument);
+    Require(width() == 0x80000004 && untouched());
+
+    const std::int64_t huge = 0x123456789abcdef0;
+    const auto highest = _ZNSt8__sce_v24setwEx_nid_postfix(huge);
+    highest.function(object.stream.data(), highest.argument);
+    Require(width() == 0x123456789abcdef0 && untouched());
+
+    const auto negative = _ZNSt8__sce_v24setwEx_nid_postfix(-1);
+    negative.function(object.stream.data(), negative.argument);
+    Require(width() == ~std::uint64_t{} && untouched());
+
+    const auto reset = _ZNSt8__sce_v24setwEx_nid_postfix(0);
+    reset.function(object.stream.data(), reset.argument);
+    Require(width() == 0 && untouched());
+    RequireException([&] { manipulator.function(nullptr, manipulator.argument); });
+
+    GuestLocale::IosBase legacy{};
+    legacy.width = 7;
+    const auto narrow = _ZSt4setwi_nid_postfix(12);
+    narrow.function(&legacy, narrow.argument);
+    Require(legacy.width == 12);
+}
+
 static void CheckStandardStreams() {
     struct GuardedStream {
         std::uint64_t before = 0x12345678;
@@ -247,6 +298,7 @@ int main() {
     CheckCharacterConversions();
     CheckStreamDestruction();
     CheckStreamWidth();
+    CheckStreamWidthV2();
     CheckStandardStreams();
     CheckWideCaseTranslation();
     _Locksyslock_nid_postfix();

@@ -334,6 +334,23 @@ StreamManipulator APS5_VABI _ZSt4setwi_nid_postfix(std::int32_t width) {
     return {&SetStreamWidth, width};
 }
 
+void* APS5_VABI SetStreamWidthV2(void* stream, std::int64_t width) {
+    if (stream == nullptr) throw std::invalid_argument("setw: null stream");
+    std::memcpy(static_cast<std::byte*>(stream) + 0x28, &width, sizeof(width));
+    return stream;
+}
+
+struct StreamManipulatorV2 {
+    void* (APS5_VABI* function)(void*, std::int64_t);
+    std::int64_t argument;
+};
+
+static_assert(sizeof(StreamManipulatorV2) == 0x10);
+
+StreamManipulatorV2 APS5_VABI _ZNSt8__sce_v24setwEx_nid_postfix(std::int64_t width) {
+    return {&SetStreamWidthV2, width};
+}
+
 void APS5_VABI _ZNSt8ios_base7_AddstdEPS__nid_postfix(GuestLocale::IosBase* self) {
     if (self == nullptr) throw std::invalid_argument("ios_base _Addstd: null stream");
     std::lock_guard lock(g_standardStreamMutex);
