@@ -2599,8 +2599,6 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     return true;
 }
 
-constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
-
 std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units) const {
     if (descriptor.dimension != TextureDimension::k2DArray || descriptor.mipCount != 1 || descriptor.dccAddress != 0 || IsBlockCompressed(descriptor.format) || geometry.thick || arrayLayers <= 1 || geometry.imageLayers != arrayLayers || trackedLayerBytes == 0 || units.size() != trackedLayers) return {};
     std::vector<bool> selected(arrayLayers, false);
