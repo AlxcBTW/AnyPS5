@@ -87,6 +87,9 @@ struct PthreadSyncForwards_nid_no_patch {
     int (APS5_VABI* detach)(void*);
     int (APS5_VABI* join)(void*, void**);
     void (APS5_VABI* yield)();
+    int (APS5_VABI* create)(void**, const void*, void* (APS5_VABI*)(void*), void*, const char*);
+    int (APS5_VABI* condTimedwait)(void**, void**, unsigned int);
+    int (APS5_VABI* getAffinity)(void*, std::uint64_t*);
 };
 extern "C" void RegisterPthreadSyncForwards_nid_no_patch(const PthreadSyncForwards_nid_no_patch* forwards);
 

@@ -5,6 +5,7 @@
 #endif
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -662,6 +663,59 @@ void APS5_VABI _ZNSt8__sce_v211_Thrd_yieldEv_nid_postfix() {
 
 void* APS5_VABI _ZNSt8__sce_v28_Thrd_idEv_nid_postfix() {
     return _Thrd_current_nid_postfix();
+}
+
+std::int64_t APS5_VABI _Xtime_get_ticks_nid_postfix();
+
+constexpr int KernelTimedout = static_cast<int>(0x8002003c);
+constexpr int KernelNotPermitted = static_cast<int>(0x80020001);
+
+static unsigned int MicrosecondsUntil(const Xtime& deadline) {
+    constexpr std::int64_t microsPerSecond = 1000000;
+    constexpr std::int64_t longestWaitSeconds = 4294;
+    std::int64_t seconds = deadline.sec;
+    std::int64_t nanos = deadline.nsec;
+    std::int64_t carry = nanos / nanosPerSecond;
+    nanos -= carry * nanosPerSecond;
+    if (nanos < 0) {
+        nanos += nanosPerSecond;
+        --carry;
+    }
+    if (carry > 0 && seconds > std::numeric_limits<std::int64_t>::max() - carry) return std::numeric_limits<unsigned int>::max();
+    if (carry < 0 && seconds < std::numeric_limits<std::int64_t>::min() - carry) return 0;
+    seconds += carry;
+    const std::int64_t now = _Xtime_get_ticks_nid_postfix();
+    seconds -= now / microsPerSecond;
+    nanos -= (now % microsPerSecond) * 1000;
+    if (nanos < 0) {
+        nanos += nanosPerSecond;
+        --seconds;
+    }
+    if (seconds < 0 || (seconds == 0 && nanos == 0)) return 0;
+    if (seconds > longestWaitSeconds) return std::numeric_limits<unsigned int>::max();
+    return static_cast<unsigned int>(seconds * microsPerSecond + (nanos + 999) / 1000);
+}
+
+int APS5_VABI _ZNSt8__sce_v211_Thrd_startEPP7pthreadPFPvS3_ES3__nid_postfix(void** thread, void* (APS5_VABI* function)(void*), void* argument) {
+    return PthreadSync(__func__).create(thread, nullptr, function, argument, "Thr") == 0 ? threadSuccess : threadError;
+}
+
+int APS5_VABI _ZNSt8__sce_v226_Thrd_hardware_concurrencyEv_nid_postfix() {
+    static const int processors = [] {
+        const auto& sync = PthreadSync("_Thrd_hardware_concurrency");
+        std::uint64_t mask = 0;
+        if (sync.getAffinity(ThreadForwards("_Thrd_hardware_concurrency").self(), &mask) != 0) return 0;
+        return static_cast<int>(std::popcount(mask));
+    }();
+    return processors;
+}
+
+int APS5_VABI _ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(void** condition, void** mutex, const Xtime* deadline) {
+    const auto& sync = PthreadSync(__func__);
+    const int result = sync.condTimedwait(condition, mutex, MicrosecondsUntil(*deadline));
+    if (result == 0) return threadSuccess;
+    if (result == KernelTimedout) return threadTimedout;
+    return threadError | (result == KernelNotPermitted ? 1 : 0);
 }
 
 }
