@@ -1,5 +1,6 @@
 #include "prx/libc/include/FileStream.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -200,6 +201,8 @@ int main() {
     Require(Contents(violations).empty(), "a rejected call writes nothing");
     Require(fprintf_s_nid_postfix(&violations, "%s", "") == 0, "fprintf_s of an empty string");
     violations.Close();
+    errno = 0;
+    Require(fprintf_s_nid_postfix(&violations, "x") == -1 && errno == 9, "fprintf_s on a closed stream sets EBADF");
     Require(PrintSecureOutput("vprintf_s: %d\n", 42) == 14, "vprintf_s counts the bytes written to standard output");
     Require(PrintSecureOutput("%n", &number) == -1 && PrintSecureOutput(static_cast<const char*>(nullptr)) == -1, "vprintf_s violations");
 
@@ -215,6 +218,8 @@ int main() {
     Require(fwprintf_s_nid_postfix(nullptr, u"x") == -1 && PrintWideSecure(nullptr, u"x") == -1, "wide secure forms reject a null stream");
     wideChecked.Close();
     wideList.Close();
+    errno = 0;
+    Require(fwprintf_s_nid_postfix(&wideList, u"x") == -1 && errno == 9, "fwprintf_s on a closed stream sets EBADF");
     Require(wprintf_s_nid_postfix(u"wprintf_s %d\n", 5) == 12, "wprintf_s counts wide characters");
     Require(PrintWideSecureOutput(u"vwprintf_s %d\n", 6) == 13, "vwprintf_s counts wide characters");
     Require(wprintf_s_nid_postfix(u"%n", &widePosition) == -1 && PrintWideSecureOutput(static_cast<const char16_t*>(nullptr)) == -1, "wide standard output violations");
@@ -235,6 +240,8 @@ int main() {
     Require(sscanf_s_nid_postfix("abcdef", "%s", siblingSmall, 4u) == 0 && siblingSmall[0] == '\0', "sscanf_s reference for an undersized buffer");
     Require(fscanf_s_nid_postfix(sizedInput, "%s", tooSmall, 4u) == 0 && tooSmall[0] == '\0', "fscanf_s rejects an undersized buffer like sscanf_s");
     sizedInput->Close();
+    errno = 0;
+    Require(fscanf_s_nid_postfix(sizedInput, "%d", &number) == EOF && errno == 9, "fscanf_s on a closed stream sets EBADF");
     delete sizedInput;
 
     FileStream* tailInput = SeededStream("x 3.5 7");
