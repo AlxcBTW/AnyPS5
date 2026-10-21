@@ -9,6 +9,7 @@
 
 extern "C" {
 FileStream* APS5_VABI _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(const char*, int, int);
+FileStream* APS5_VABI _ZNSt8__sce_v27_FiopenEPKcii_nid_postfix(const char*, int, int);
 FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
 int APS5_VABI fopen_s_nid_postfix(FileStream**, const char*, const char*);
 int APS5_VABI fclose_nid_postfix(FileStream*);
@@ -27,6 +28,12 @@ constexpr int In = 0x01, Out = 0x02, Ate = 0x04, App = 0x08, Trunc = 0x10, Nocre
     Binary = 0x80;
 constexpr int GuestEinval = 22;
 constexpr int GuestEnoent = 2;
+
+constexpr int V2Binary = 0x20, V2Nocreate = 0x40, V2Noreplace = 0x80;
+
+static FileStream* OpenV2(const char* name, int mode) {
+    return _ZNSt8__sce_v27_FiopenEPKcii_nid_postfix(name, mode, 0x1b6);
+}
 
 static FileStream* Open(const char* name, int mode) {
     return _ZSt7_FiopenPKcNSt5_IosbIiE9_OpenmodeEi_nid_postfix(name, mode, 0x1b6);
@@ -151,6 +158,83 @@ int main() {
     stream = Open(file, In | 0x100 | 0x8000);
     Require(stream != nullptr && std::fgetc(stream->GetHandle()) == 'k');
     fclose_nid_postfix(stream);
+
+    const char* versioned = "guest_fiopen_dir/v2";
+    for (int mode : {0, Ate, Trunc, V2Binary, V2Nocreate | Trunc, V2Noreplace, In | Trunc, In | V2Noreplace,
+            In | V2Binary | V2Noreplace, In | 0x100, In | 0x8000, -1, Out | 0x100}) {
+        Require(OpenV2(versioned, mode) == nullptr);
+        Require(!Exists(versioned));
+    }
+    for (int mode : {In, In | Ate, In | V2Binary, In | Out, V2Nocreate, V2Nocreate | Ate, Out | V2Nocreate,
+            Out | V2Nocreate | V2Binary}) {
+        Require(OpenV2(versioned, mode) == nullptr);
+        Require(!Exists(versioned));
+    }
+    Write(OpenV2(versioned, Out | V2Binary), "abc");
+    Require(Contents(versioned) == "abc");
+    Require(OpenV2(versioned, Out | V2Noreplace) == nullptr);
+    Require(OpenV2(versioned, In | Out | V2Binary | V2Noreplace | Trunc) == nullptr);
+    Require(OpenV2(versioned, Out | App | V2Noreplace) == nullptr);
+    Require(OpenV2(versioned, Out | App | V2Noreplace | Ate) == nullptr);
+    Require(OpenV2(versioned, In | 0x100) == nullptr);
+    Require(OpenV2(versioned, In | 0x8000) == nullptr);
+    Require(OpenV2(versioned, -1) == nullptr);
+    Require(Contents(versioned) == "abc");
+
+    Write(OpenV2(versioned, App), "d");
+    Require(Contents(versioned) == "abcd");
+    Write(OpenV2(versioned, Out | App | V2Binary), "e");
+    Require(Contents(versioned) == "abcde");
+    Write(OpenV2(versioned, In | App), "f");
+    Require(Contents(versioned) == "abcdef");
+
+    stream = OpenV2(versioned, In | Ate);
+    Require(stream != nullptr && ftello_nid_postfix(stream) == 6);
+    fclose_nid_postfix(stream);
+    stream = OpenV2(versioned, In | V2Binary);
+    Require(stream != nullptr && ftello_nid_postfix(stream) == 0);
+    fclose_nid_postfix(stream);
+    stream = OpenV2(versioned, V2Nocreate | Ate);
+    Require(stream != nullptr && ftello_nid_postfix(stream) == 6);
+    fclose_nid_postfix(stream);
+
+    Write(OpenV2(versioned, Out | V2Nocreate), "X");
+    Require(Contents(versioned) == "Xbcdef");
+    Write(OpenV2(versioned, In | Out), "Y");
+    Require(Contents(versioned) == "Ybcdef");
+    stream = OpenV2(versioned, Out | V2Nocreate | V2Binary | Ate);
+    Require(stream != nullptr && ftello_nid_postfix(stream) == 6);
+    Write(stream, "g");
+    Require(Contents(versioned) == "Ybcdefg");
+
+    Write(OpenV2(versioned, Out | Trunc), "h");
+    Require(Contents(versioned) == "h");
+    Write(OpenV2(versioned, In | Out | Trunc | V2Binary), "ij");
+    Require(Contents(versioned) == "ij");
+    Write(OpenV2(versioned, Out), "k");
+    Require(Contents(versioned) == "k");
+
+    const char* created = "guest_fiopen_dir/v2created";
+    Write(OpenV2(created, Out | V2Noreplace), "new");
+    Require(Contents(created) == "new");
+    std::filesystem::remove(dir / "v2created");
+    Write(OpenV2(created, In | Out | Trunc | V2Noreplace), "plus");
+    Require(Contents(created) == "plus");
+    std::filesystem::remove(dir / "v2created");
+    Write(OpenV2(created, Out | V2Binary | V2Noreplace), "bin");
+    Require(Contents(created) == "bin");
+    Require(OpenV2(created, Out | Trunc | V2Binary | V2Noreplace) == nullptr);
+    Require(Contents(created) == "bin");
+    std::filesystem::remove(dir / "v2created");
+    Write(OpenV2(created, Out | Trunc | V2Binary | V2Noreplace), "x");
+    Require(Contents(created) == "x");
+    Require(OpenV2(created, In | Out | Trunc | V2Binary | V2Noreplace) == nullptr);
+    std::filesystem::remove(dir / "v2created");
+    Write(OpenV2(created, Out | App), "app");
+    Require(Contents(created) == "app");
+    std::filesystem::remove(dir / "v2created");
+    Write(OpenV2(created, Out | Trunc | V2Nocreate), "made");
+    Require(Contents(created) == "made");
 
 #ifndef _WIN32
     auto* full = std::fopen("/dev/full", "wb");
