@@ -40,8 +40,7 @@ static_assert(offsetof(Bn, neg) == 16);
 
 static void Require(bool value, int line = __builtin_LINE()) {
     if (value) return;
-    std::fprintf(stderr, "check failed at line %d
-", line);
+    std::fprintf(stderr, "check failed at line %d\n", line);
     std::abort();
 }
 
