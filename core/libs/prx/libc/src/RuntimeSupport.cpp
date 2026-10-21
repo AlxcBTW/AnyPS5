@@ -132,6 +132,10 @@ unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {
     return value;
 }
 
+unsigned int APS5_VABI _ZNSt8__sce_v214_Random_deviceEv_nid_postfix() {
+    return _ZSt14_Random_devicev_nid_postfix();
+}
+
 [[noreturn]] void APS5_VABI _ZSt14_Throw_C_errori_nid_postfix(int code) {
     throw std::runtime_error("_Throw_C_error: C11 thread error " + std::to_string(code));
 }

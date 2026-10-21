@@ -37,6 +37,7 @@ __int128 APS5_VABI __modti3_nid_postfix(__int128 dividend, __int128 divisor);
 SonyLconv* APS5_VABI localeconv_nid_postfix(void);
 int APS5_VABI sceAmprFpclassifyd(double value);
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix();
+unsigned int APS5_VABI _ZNSt8__sce_v214_Random_deviceEv_nid_postfix();
 }
 
 #define Require(condition) do { if (!(condition)) { std::fprintf(stderr, "guest_crt: line %d: %s\n", __LINE__, #condition); std::abort(); } } while (0)
@@ -238,4 +239,9 @@ int main() {
     bool randomChanged = false;
     for (int draw = 0; draw < 8; ++draw) randomChanged |= _ZSt14_Random_devicev_nid_postfix() != firstRandom;
     Require(randomChanged);
+
+    const unsigned int firstVersioned = _ZNSt8__sce_v214_Random_deviceEv_nid_postfix();
+    bool versionedChanged = false;
+    for (int draw = 0; draw < 64; ++draw) versionedChanged |= _ZNSt8__sce_v214_Random_deviceEv_nid_postfix() != firstVersioned;
+    Require(versionedChanged);
 }
