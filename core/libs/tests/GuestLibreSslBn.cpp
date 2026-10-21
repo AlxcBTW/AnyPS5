@@ -1,9 +1,11 @@
+#include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <source_location>
 #include <string>
 
 struct Bn {
@@ -65,7 +67,13 @@ static std::string Hex(const Bn* value) {
     return value->neg ? "-" + text : text;
 }
 
+static void InitializeHeap() {
+    void* const api[10] {};
+    ApplicationHeapRegister_nid_no_patch(api);
+}
+
 int main() {
+    InitializeHeap();
     Bn* fresh = BN_new_nid_postfix();
     Require(fresh && fresh->top == 0 && fresh->neg == 0 && BN_num_bits_nid_postfix(fresh) == 0);
     BN_free_nid_postfix(fresh);
