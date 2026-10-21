@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 
+from signal_run import run_without_core_dump
 from test_linux_load_alignment import PT_SCE_VERSION
 
 PT_NULL = 0
@@ -104,7 +105,10 @@ def main():
             assert after == (*before[:3], before[3] + shift, before[4] + shift, *before[5:]), (before, after)
         assert min(header[3] for header in fixed_headers if header[0] == PT_LOAD) == BASE, "image does not start at the base"
 
-        for (tag, value), (fixed_tag, fixed_value) in zip(dynamic_tags(plain), dynamic_tags(fixed), strict=True):
+        plain_dynamic = dynamic_tags(plain)
+        fixed_dynamic = dynamic_tags(fixed)
+        assert len(plain_dynamic) == len(fixed_dynamic), (len(plain_dynamic), len(fixed_dynamic))
+        for (tag, value), (fixed_tag, fixed_value) in zip(plain_dynamic, fixed_dynamic):
             assert tag == fixed_tag and fixed_value == value + (BASE if tag in ADDRESS_TAGS else 0), (tag, value, fixed_value)
 
         plain_relocations = relocations(plain)
@@ -141,10 +145,10 @@ def main():
 
         if sys.platform.startswith("linux") and platform.machine() in ("x86_64", "AMD64"):
             fixed_path.chmod(0o755)
-            executed = subprocess.run([str(fixed_path)], capture_output=True, timeout=20)
+            executed = run_without_core_dump([str(fixed_path)], capture_output=True, timeout=20)
             assert executed.returncode == -signal.SIGTRAP, ("the image did not run at the base with its relocation applied", executed.returncode)
             relocated_fixed_path.chmod(0o755)
-            executed = subprocess.run([str(relocated_fixed_path)], capture_output=True, timeout=20)
+            executed = run_without_core_dump([str(relocated_fixed_path)], capture_output=True, timeout=20)
             assert executed.returncode == -signal.SIGTRAP, ("the relocated-table image did not run at the base with its relocation applied", executed.returncode)
 
         for name, image, base, error in (

@@ -9,7 +9,7 @@
 #include "Common.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include <atomic>
-#include <chrono>
+#include <mutex>
 #include <cstring>
 #include <thread>
 
@@ -21,12 +21,19 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadRename(Pthread thread, const char* name);
 int APS5_VABI scePthreadGetname(Pthread thread, char* name);
 Pthread APS5_VABI scePthreadSelf();
+int APS5_VABI scePthreadEqual(Pthread thread1, Pthread thread2);
+int APS5_VABI scePthreadOnce(int32_t* once, void (APS5_VABI* init)(void));
+int APS5_VABI scePthreadKeyCreate(PthreadKey* key, pthread_key_destructor_func_t destructor);
+int APS5_VABI scePthreadKeyDelete(PthreadKey key);
+void* APS5_VABI scePthreadGetspecific(PthreadKey key);
+int APS5_VABI scePthreadSetspecific(PthreadKey key, void* value);
 int APS5_VABI scePthreadCancel(Pthread thread);
 int APS5_VABI scePthreadSetcancelstate(int state, int* old_state);
 int APS5_VABI scePthreadSetcanceltype(int type, int* old_type);
 void APS5_VABI scePthreadTestcancel();
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio);
 int APS5_VABI scePthreadGetprio(Pthread thread, int* prio);
+void APS5_VABI scePthreadYield();
 }
 
 static constexpr int GUEST_SCHED_FIFO = 1;
@@ -61,11 +68,10 @@ int APS5_VABI cpuset_getaffinity_nid_postfix(int level, int which, std::int64_t 
     if (size < sizeof(KernelCpumask) || size > MaximumSize) return fail(GuestErange);
     if (!mask) return fail(GuestEfault);
     auto* self = scePthreadSelf();
+    KernelCpumask affinity = 0;
     if (which == WhichThread) {
-        if (id != -1 && id != static_cast<std::int64_t>(self->tid)) {
-            if (LiveGuestThreadExists(id)) NotImplemented_nid_no_patch("cpuset_getaffinity other than the calling thread or process");
-            return fail(GuestEsrch);
-        }
+        const auto tid = id == -1 ? self->tid : id;
+        if (!GetLiveGuestThreadAffinity_nid_no_patch(tid, affinity)) return fail(GuestEsrch);
     } else if (which == WhichProcess) {
         if (id != -1 && id != getpid_nid_postfix()) return fail(GuestEsrch);
     } else if (which >= 3 && which <= 6) {
@@ -75,9 +81,7 @@ int APS5_VABI cpuset_getaffinity_nid_postfix(int level, int which, std::int64_t 
     }
     if (level < 1 || level > 3) return fail(GuestEinval);
     if (level != LevelWhich) NotImplemented_nid_no_patch("cpuset_getaffinity other than the calling thread or process");
-    KernelCpumask affinity = 0;
-    if (which == WhichThread) scePthreadGetaffinity(self, &affinity);
-    else affinity = LiveGuestThreadsAffinity();
+    if (which == WhichProcess) affinity = LiveGuestThreadsAffinity();
     std::memset(mask, 0, size);
     std::memcpy(mask, &affinity, sizeof(affinity));
     return 0;
@@ -99,10 +103,7 @@ int APS5_VABI cpuset_setaffinity_nid_postfix(int level, int which, std::int64_t 
     }
     auto* self = scePthreadSelf();
     if (which == WhichThread) {
-        if (id != -1 && id != static_cast<std::int64_t>(self->tid)) {
-            if (LiveGuestThreadExists(id)) NotImplemented_nid_no_patch("cpuset_setaffinity other than the calling thread or process");
-            return fail(GuestEsrch);
-        }
+        if (id != -1 && id != self->tid && !LiveGuestThreadExists(id)) return fail(GuestEsrch);
     } else if (which == WhichProcess) {
         if (id != -1 && id != getpid_nid_postfix()) return fail(GuestEsrch);
     } else if (which >= 3 && which <= 6) {
@@ -116,8 +117,10 @@ int APS5_VABI cpuset_setaffinity_nid_postfix(int level, int which, std::int64_t 
     std::memcpy(&requested, bytes, sizeof(requested));
     const KernelCpumask affinity = requested & sceKernelGetAvailableCpumask();
     if (affinity == 0) return fail(GuestEdeadlk);
-    if (which == WhichThread) scePthreadSetaffinity(self, affinity);
-    else SetLiveGuestThreadsAffinity(affinity);
+    if (which == WhichThread) {
+        const auto tid = id == -1 ? self->tid : id;
+        if (!SetLiveGuestThreadAffinity_nid_no_patch(tid, affinity)) return fail(GuestEsrch);
+    } else SetLiveGuestThreadsAffinity(affinity);
     return 0;
 }
 
@@ -198,6 +201,15 @@ int APS5_VABI pthread_getschedparam_nid_postfix(Pthread thread, int* policy, Ker
     return PosixThread::ToErrno(scePthreadGetschedparam(thread, policy, param));
 }
 
+int APS5_VABI pthread_getprio_nid_postfix(Pthread thread) {
+    const auto lock = LockLiveGuestThread(thread);
+    if (!lock.owns_lock()) {
+        *__error_nid_postfix() = PosixThread::GUEST_ESRCH;
+        return -1;
+    }
+    return thread->priority.load(std::memory_order_relaxed);
+}
+
 int APS5_VABI pthread_getaffinity_np_nid_postfix(Pthread thread, std::size_t cpusetSize, void* cpuset) {
     if (!thread) return PosixThread::GUEST_EINVAL;
     if (cpusetSize != GUEST_CPUSET_BYTES) return GUEST_ERANGE;
@@ -227,6 +239,28 @@ int APS5_VABI pthread_setaffinity_np_nid_postfix(Pthread thread, std::size_t cpu
 
 int APS5_VABI pthread_join_nid_postfix(Pthread thread, void** value) {
     return PosixThread::ToErrno(scePthreadJoin(thread, value));
+}
+
+namespace {
+struct RegisterPthreadOnLoad {
+    RegisterPthreadOnLoad() {
+        RegisterPthreadCreate_nid_no_patch(reinterpret_cast<PthreadCreateFn_nid_no_patch>(pthread_create_nid_postfix));
+        RegisterPthreadJoin_nid_no_patch(reinterpret_cast<PthreadJoinFn_nid_no_patch>(pthread_join_nid_postfix));
+        RegisterPthreadDetach_nid_no_patch(reinterpret_cast<PthreadDetachFn_nid_no_patch>(pthread_detach_nid_postfix));
+        static const ThreadForwards_nid_no_patch forwards{
+            reinterpret_cast<decltype(forwards.once)>(scePthreadOnce),
+            reinterpret_cast<decltype(forwards.keyCreate)>(scePthreadKeyCreate),
+            scePthreadKeyDelete,
+            scePthreadGetspecific,
+            scePthreadSetspecific,
+            reinterpret_cast<decltype(forwards.equal)>(scePthreadEqual),
+            reinterpret_cast<decltype(forwards.self)>(scePthreadSelf),
+            scePthreadExit,
+        };
+        RegisterThreadForwards_nid_no_patch(&forwards);
+    }
+};
+const RegisterPthreadOnLoad gRegisterPthread;
 }
 
 int APS5_VABI pthread_rename_np_nid_postfix(Pthread thread, const char* name) {
@@ -270,7 +304,7 @@ int APS5_VABI pthread_getcpuclockid_nid_postfix(Pthread thread, int* clockId) {
 }
 
 int APS5_VABI sched_yield_nid_postfix(void) {
-    std::this_thread::yield();
+    scePthreadYield();
     return 0;
 }
 
@@ -300,12 +334,20 @@ void APS5_VABI pthread_testcancel_nid_postfix(void) {
 }
 
 void APS5_VABI pthread_yield_nid_postfix(void) {
-    std::this_thread::yield();
+    scePthreadYield();
 }
 
 unsigned int APS5_VABI sleep_nid_postfix(unsigned int seconds) {
     ThreadCancel::Check();
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    {
+        const auto deadline = TimedWait::DeadlineNanos(static_cast<std::uint64_t>(seconds) * 1000000ULL);
+        std::mutex mutex;
+        TimedWait::Condition condition;
+        std::unique_lock lock(mutex);
+        while (!ThreadCancel::Requested()) {
+            if (!ThreadCancel::Wait(condition, lock, deadline)) break;
+        }
+    }
     ThreadCancel::Check();
     return 0;
 }
