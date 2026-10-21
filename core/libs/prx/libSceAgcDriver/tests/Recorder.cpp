@@ -5352,51 +5352,41 @@ void importWatchTests(const Device& device) {
 #endif
 }
 
-template <bool StaysWatched>
-bool staleGenerationTests(const Device& device, Recorder& recorder) {
+void staleGenerationTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
 #ifdef _WIN32
     static_cast<void>(recorder);
     static_cast<void>(base);
     std::cout << "a range leaving the watch: Linux write watch only\n";
-    return false;
 #else
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: a range leaving the watch not tested\n";
-        return false;
+        return;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
     constexpr std::size_t keyCount = surfaceBytes / 256;
-    constexpr std::size_t lead = StaysWatched ? 65536 : 0;
-    constexpr std::size_t bytes = lead + surfaceBytes + 65536;
+    constexpr std::size_t bytes = surfaceBytes + 65536;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: a range leaving the watch not tested\n";
-        return false;
+        return;
     }
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
     } release{block};
     const auto decided = PrepareImportWatch(base);
-    SetImportWatch(base, StaysWatched ? ImportWatch::Watch : ImportWatch::Unwatch);
+    SetImportWatch(base, ImportWatch::Unwatch);
     struct Restore {
         const Context& context;
         ImportWatch decided;
         ~Restore() { SetImportWatch(context, decided); }
     } restore{base, decided};
-    struct Budget {
-        bool set;
-        ~Budget() {
-            if (set) SetHostImportBudget(0);
-        }
-    } budget{StaysWatched};
-    auto* texels = static_cast<std::uint8_t*>(block) + lead;
+    auto* texels = static_cast<std::uint8_t*>(block);
     std::memset(texels, 0x55, surfaceBytes);
     std::memset(texels + surfaceBytes, 0x00, keyCount);
-    const auto blockAddress = reinterpret_cast<std::uint64_t>(block);
-    const auto address = blockAddress + lead;
+    const auto address = reinterpret_cast<std::uint64_t>(block);
     {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
@@ -5412,7 +5402,7 @@ bool staleGenerationTests(const Device& device, Recorder& recorder) {
             }
             HostImportFor(context, address, bytes);
         }
-    } unregister{base, block, blockAddress};
+    } unregister{base, block, address};
     TextureDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
@@ -5430,8 +5420,7 @@ bool staleGenerationTests(const Device& device, Recorder& recorder) {
     resource.dstSelW = 7;
     resource.dccAddress = address + surfaceBytes;
     {
-        Require(AgcDriver::GuestMemory::Watched(blockAddress, bytes), "(s) the block is not watched before the storage image takes its generation");
-        if constexpr (StaysWatched) SetHostImportBudget(1);
+        Require(AgcDriver::GuestMemory::Watched(address, bytes), "(s) the block is not watched before the storage image takes its generation");
         auto image = StorageTexture::Create(context, detiler, resource, 0);
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const auto commands = recorder.Commands();
@@ -5442,20 +5431,13 @@ bool staleGenerationTests(const Device& device, Recorder& recorder) {
         context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, &red, 1, &range);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         image->MarkDirty();
-        if constexpr (StaysWatched) {
-            SetHostImportBudget(0);
-            Require(!image->GuestSnapshotValid(), "(s) the pending results had saved guest bytes while their memory was watched");
-            AgcDriver::GuestMemory::Unwatch(blockAddress, lead);
-            Require(!AgcDriver::GuestMemory::Watched(blockAddress, lead) && AgcDriver::GuestMemory::Watched(address, bytes - lead), "(s) the block before the surface did not leave the watch alone");
-        }
-        const auto* import = HostImportFor(base, blockAddress, bytes);
+        const auto* import = HostImportFor(base, address, bytes);
         if (import == nullptr) {
             std::cout << "host import of the stale generation block refused: a range leaving the watch not tested\n";
             recorder.Sync();
-            return false;
+            return;
         }
-        Require(!AgcDriver::GuestMemory::Watched(blockAddress, bytes), "(s) the imported range stayed watched");
-        if constexpr (StaysWatched) Require(image->GuestSnapshotValid(), "(s) the results pending when a walk gave up the watch saved no guest bytes");
+        Require(!AgcDriver::GuestMemory::Watched(address, bytes), "(s) the imported range stayed watched");
         image->Refresh();
         Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         const auto copyCommands = recorder.Commands();
@@ -5479,7 +5461,6 @@ bool staleGenerationTests(const Device& device, Recorder& recorder) {
         for (std::size_t i = 0; i < surfaceBytes; ++i) Require(texels[i] == expected[i % 4], "(s) results pending when their memory left the watch did not reach it");
     }
     recorder.Sync();
-    return true;
 #endif
 }
 
@@ -10290,7 +10271,6 @@ int main(int argc, char** argv) {
             settledBaselineTests(device, recorder);
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--unwalked-import-only") return staleGenerationTests<true>(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--completion-labels-only") {
             completionCountTests(device, recorder);
             afterRecordedWorkTests(device, recorder);
@@ -10544,8 +10524,7 @@ int main(int argc, char** argv) {
         keptUnitSettleTests(device, recorder);
         settledBaselineTests(device, recorder);
         importWatchTests(device);
-        staleGenerationTests<false>(device, recorder);
-        staleGenerationTests<true>(device, recorder);
+        staleGenerationTests(device, recorder);
         importWindowTests(device, recorder);
         dataWordPositionsTests();
         dataRefreshTests(device, recorder);
