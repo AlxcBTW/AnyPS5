@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -37,7 +38,12 @@ static_assert(sizeof(Bn) == 24);
 static_assert(offsetof(Bn, top) == 8);
 static_assert(offsetof(Bn, neg) == 16);
 
-static void Require(bool value) { if (!value) std::abort(); }
+static void Require(bool value, int line = __builtin_LINE()) {
+    if (value) return;
+    std::fprintf(stderr, "check failed at line %d
+", line);
+    std::abort();
+}
 
 static Bn* FromHex(const char* text) {
     Bn* value = nullptr;
@@ -116,7 +122,7 @@ int main() {
         std::memset(out, 0xEE, sizeof(out));
         Require(BN_bn2bin_nid_postfix(value, out) == 9);
         Require(std::memcmp(out, bytes + 2, 9) == 0 && out[9] == 0xEE);
-        Require(BN_bin2bn_nid_postfix(bytes, 3, value) == value && Hex(value) == "102" && value->top == 1);
+        Require(BN_bin2bn_nid_postfix(bytes, 4, value) == value && Hex(value) == "102" && value->top == 1);
         const unsigned char zeros[] = {0, 0, 0};
         Require(BN_bin2bn_nid_postfix(zeros, 3, value) == value && value->top == 0);
         std::memset(out, 0xEE, sizeof(out));
