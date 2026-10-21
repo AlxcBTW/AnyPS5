@@ -3435,7 +3435,6 @@ const HostImport* HostImportForCached(const Context& context, std::uint64_t addr
 #endif
     if (cache.import != nullptr && cache.address == address && cache.bytes == bytes && cache.epoch == state.epoch && cache.inserts == state.inserts && !importsStale(context, state)) {
         cache.import->lastUse = ++state.useCounter;
-        cache.import->lastUse = ++state.useCounter;
         return cache.import;
     }
     const auto* entry = hostImportSettled(context, state, address, bytes, ImportRequester::Access);
