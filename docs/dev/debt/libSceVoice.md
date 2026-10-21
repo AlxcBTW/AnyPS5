@@ -1,0 +1,26 @@
+# libSceVoice technical debt
+
+### Functional
+
+- [Voice resource and port state](../../../core/libs/prx/libSceVoice/Export.cpp): resource information is eight bytes containing four 16-bit limits selected by initialization mode. Reset, pause and resume use confirmed initialization, range and missing-port errors; repeated pause/resume succeed. GetPortInfo preserves unused output fields and reports native frame sizes, but still reports a constant ready state and does not reproduce stopped-state or snapshot-slot errors. The host has no buffered voice processing or device reset backend, so reset only covers empty software ports and pause flags currently affect no audio. Initialization validates native modes and version 100, but still lacks event callback delivery and backend creation. Port creation enforces recovered format and resource limits, but does not allocate device or codec backends.
+- [sceVoiceEnableChat and sceVoiceDisableChat](../../../core/libs/prx/libSceVoice/Export.cpp): zero-argument signatures and the not-initialized error are confirmed. Initialized calls throw because the required audio chat backend is not implemented; they no longer report success for a local flag change.
+
+### Unknown function info
+
+- [sceVoiceInit, sceVoiceStart, sceVoiceCreatePort, sceVoiceGetPortInfo](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - a second `sceVoiceInit` returns 0x804E0802, and Start, CreatePort and GetPortInfo return 0x804E0801 before checking any argument while the library is not initialized, as [prosper](https://github.com/mattias800/prosper/blob/ed42e499888d5a86792c3e1b2df3aebd8ca1a681/prosper/src/hle/audio/hle_audio.cpp#L4697-L4713) reads them from the shipped module. The other port and lifecycle calls still throw when the library is not initialized, since prosper gives no module address for them. Whether `sceVoiceInit` checks a null param before its state is unknown, so a null param still throws first, and that `sceVoiceEnd` returns the library to the not-initialized state is assumed. Closes when: the other entry points are read from the module or measured on a PS5
+- [sceVoicePausePortAll, sceVoiceResumePortAll](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - not measured on a PS5: both return 0x804E0801 while the library is not initialized and 0 otherwise, as in [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/c1b26558352b863f80142256e4df38585aa7d727/src/core/libraries/voice/voice.cpp#L356-L437); prosper reads the same code for `sceVoiceStart`, and the PS3 calls in [RPCS3](https://github.com/RPCS3/rpcs3/blob/be69c054eeac57e2e671697a463473d37fe5a7b2/rpcs3/Emu/Cell/Modules/cellVoice.cpp#L462-L543) make the same check. Like `sceVoicePausePort` they change nothing that is reported: [VitaSDK](https://github.com/vitasdk/vita-headers/blob/ae5808f3105c42fa3373ba4ab64ab54e2e3ca848/include/psp2/voice.h#L540-L557) documents that pausing every port keeps the buffered data and the reported state, and nothing here processes port data
+- [sceVoiceInitHQ](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceGetMemorySize](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceDeviceInCustomerData](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceQAEnableRecording](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceVADAdjustment](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceVADPVTAdjustment](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceVADSetVersion](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceSetMuteFlagAll](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceSetBitRate](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceUpdatePort](../../../core/libs/prx/libSceVoice/Export.cpp) (libSceVoice) - unknown signature
+- [sceVoiceGetPortAttr](../../../core/libs/prx/libSceVoice/Export.cpp): native initialization, port-range, pointer, attribute-size and port-type validation is implemented. Supported device attributes throw because the host has no device state or voice-activity processing. The former constant-zero voice-activity fallback is removed; failed calls leave output untouched.
+
+- [sceVoiceSetThreadsParams](../../../core/libs/prx/libSceVoice/Export.cpp): the 48-byte mode/priority/affinity layout and initialization, null, started-state and mode validation are recovered. Mode 1 throws because worker scheduling is not implemented; mode 0 is the native no-op. The 32-byte event callback union is recovered, but callback delivery and device-state byte semantics remain unimplemented.
+
+- [sceVoiceStart, sceVoiceStop and sceVoiceEnd](../../../core/libs/prx/libSceVoice/Export.cpp) validate initialization, container presence and native mode-dependent memory sizes, but do not partition guest working memory or run the audio workers. Start/stop currently change software state only; backend failures and active-stream shutdown are not reproduced.
