@@ -2182,7 +2182,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = handOverKeys.has_value() ? *handOverKeys : ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
-        const bool quickCandidate = RefreshLookupsEnabled() && alias == nullptr && keys == uploadedKeys && blockUnits;
+        const bool quickCandidate = RefreshLookupsEnabled() && alias == nullptr && !scoped && !compared && keys == uploadedKeys && blockUnits;
         const bool quick = quickCandidate && GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation);
         if (!quick) changed.assign(trackedLayers, false);
         if (keys != uploadedKeys) {
