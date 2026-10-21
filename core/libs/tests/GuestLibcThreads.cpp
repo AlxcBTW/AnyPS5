@@ -73,7 +73,6 @@ void* APS5_VABI _ZNSt8__sce_v28_Thrd_idEv_nid_postfix();
 int APS5_VABI _ZNSt8__sce_v211_Thrd_startEPP7pthreadPFPvS3_ES3__nid_postfix(void** thread, void* (APS5_VABI* function)(void*), void* argument);
 int APS5_VABI _ZNSt8__sce_v226_Thrd_hardware_concurrencyEv_nid_postfix();
 int APS5_VABI _ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(void** condition, void** mutex, const void* deadline);
-std::int64_t APS5_VABI _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
 std::int64_t APS5_VABI _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
 int APS5_VABI scePthreadCreate(void** thread, const void* attr, void* (APS5_VABI* entry)(void*), void* argument, const char* name);
 int APS5_VABI scePthreadMutexUnlock(void** mutex);
@@ -547,24 +546,18 @@ static void VersionedConditionTimedWait() {
 }
 
 static void VersionedClocks() {
-    std::int64_t previousTicks = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
-    std::int64_t previousNow = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
+    std::int64_t previous = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
     for (int sample = 0; sample < 1000; ++sample) {
-        const std::int64_t ticks = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
         const std::int64_t now = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
-        Require(ticks >= previousTicks && now >= previousNow);
-        previousTicks = ticks;
-        previousNow = now;
+        Require(now >= previous);
+        previous = now;
     }
-    const std::int64_t ticksBefore = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
-    const std::int64_t nowBefore = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
+    const std::int64_t before = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    const std::int64_t ticksDelta = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix() - ticksBefore;
-    const std::int64_t nowDelta = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix() - nowBefore;
-    Require(ticksDelta >= 9000 && ticksDelta < 500000);
-    Require(nowDelta >= 9000 && nowDelta < 500000);
+    const std::int64_t delta = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix() - before;
+    Require(delta >= 9000 && delta < 500000);
     const std::int64_t wall = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    const std::int64_t difference = wall - _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+    const std::int64_t difference = wall - _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
     Require(difference > -1000000 && difference < 1000000);
 }
 

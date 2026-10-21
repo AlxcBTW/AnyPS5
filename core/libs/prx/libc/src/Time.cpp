@@ -568,10 +568,6 @@ int64_t APS5_VABI _Xtime_get_ticks_nid_postfix() {
 #endif
 }
 
-int64_t APS5_VABI _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix() {
-    return _Xtime_get_ticks_nid_postfix();
-}
-
 int64_t APS5_VABI _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix() {
     return _Xtime_get_ticks_nid_postfix();
 }
