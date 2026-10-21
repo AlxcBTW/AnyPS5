@@ -70,6 +70,11 @@ int APS5_VABI _ZNSt8__sce_v212_Thrd_detachEP7pthread_nid_postfix(void* thread);
 int APS5_VABI _ZNSt8__sce_v210_Thrd_joinEP7pthreadPi_nid_postfix(void* thread, int* code);
 void APS5_VABI _ZNSt8__sce_v211_Thrd_yieldEv_nid_postfix();
 void* APS5_VABI _ZNSt8__sce_v28_Thrd_idEv_nid_postfix();
+int APS5_VABI _ZNSt8__sce_v211_Thrd_startEPP7pthreadPFPvS3_ES3__nid_postfix(void** thread, void* (APS5_VABI* function)(void*), void* argument);
+int APS5_VABI _ZNSt8__sce_v226_Thrd_hardware_concurrencyEv_nid_postfix();
+int APS5_VABI _ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(void** condition, void** mutex, const void* deadline);
+std::int64_t APS5_VABI _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+std::int64_t APS5_VABI _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
 int APS5_VABI scePthreadCreate(void** thread, const void* attr, void* (APS5_VABI* entry)(void*), void* argument, const char* name);
 int APS5_VABI scePthreadMutexUnlock(void** mutex);
 int APS5_VABI scePthreadCondWait(void** condition, void** mutex);
@@ -465,9 +470,110 @@ static void VersionedSync() {
     Require(_ZNSt8__sce_v28_Thrd_idEv_nid_postfix() != nullptr);
 }
 
+constexpr int timedOut = 2;
+
+struct Deadline {
+    std::int64_t sec;
+    std::int64_t nsec;
+};
+
+static Deadline DeadlineAfter(std::chrono::nanoseconds offset) {
+    const auto target = std::chrono::system_clock::now().time_since_epoch() + offset;
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(target);
+    return Deadline{seconds.count(), std::chrono::duration_cast<std::chrono::nanoseconds>(target - seconds).count()};
+}
+
+struct StartRecord {
+    std::atomic<void*> argument{nullptr};
+};
+
+static void* APS5_VABI StartWorker(void* argument) {
+    static_cast<StartRecord*>(argument)->argument.store(argument);
+    return reinterpret_cast<void*>(std::intptr_t{7});
+}
+
+struct SignalShared {
+    void* mutex = nullptr;
+    void* condition = nullptr;
+};
+
+static void* APS5_VABI SignalWorker(void* argument) {
+    auto* shared = static_cast<SignalShared*>(argument);
+    Require(_ZNSt8__sce_v29_Mtx_lockEPP13pthread_mutex_nid_postfix(&shared->mutex) == success);
+    Require(_ZNSt8__sce_v211_Cnd_signalEPP12pthread_cond_nid_postfix(&shared->condition) == success);
+    Require(_ZNSt8__sce_v211_Mtx_unlockEPP13pthread_mutex_nid_postfix(&shared->mutex) == success);
+    return nullptr;
+}
+
+static void VersionedThreadStart() {
+    StartRecord record;
+    void* thread = nullptr;
+    Require(_ZNSt8__sce_v211_Thrd_startEPP7pthreadPFPvS3_ES3__nid_postfix(&thread, StartWorker, &record) == success && thread != nullptr);
+    int code = 0;
+    Require(_ZNSt8__sce_v210_Thrd_joinEP7pthreadPi_nid_postfix(thread, &code) == success && code == 7);
+    Require(record.argument.load() == &record);
+    Require(_ZNSt8__sce_v226_Thrd_hardware_concurrencyEv_nid_postfix() >= 1);
+    Require(_ZNSt8__sce_v226_Thrd_hardware_concurrencyEv_nid_postfix() <= 64);
+}
+
+static void VersionedConditionTimedWait() {
+    SignalShared shared;
+    Require(_ZNSt8__sce_v29_Mtx_initEPP13pthread_mutexi_nid_postfix(&shared.mutex, plain) == success);
+    Require(_ZNSt8__sce_v29_Cnd_initEPP12pthread_cond_nid_postfix(&shared.condition) == success);
+    Require(_ZNSt8__sce_v29_Mtx_lockEPP13pthread_mutex_nid_postfix(&shared.mutex) == success);
+
+    const auto start = std::chrono::steady_clock::now();
+    const Deadline soon = DeadlineAfter(std::chrono::milliseconds(50));
+    Require(_ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(&shared.condition, &shared.mutex, &soon) == timedOut);
+    const auto waited = std::chrono::steady_clock::now() - start;
+    Require(waited >= std::chrono::milliseconds(45) && waited < std::chrono::seconds(2));
+
+    const auto pastStart = std::chrono::steady_clock::now();
+    const Deadline past = DeadlineAfter(-std::chrono::seconds(1));
+    Require(_ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(&shared.condition, &shared.mutex, &past) == timedOut);
+    Require(std::chrono::steady_clock::now() - pastStart < std::chrono::milliseconds(500));
+
+    void* thread = nullptr;
+    Require(scePthreadCreate(&thread, nullptr, SignalWorker, &shared, "signal") == 0);
+    const auto signalStart = std::chrono::steady_clock::now();
+    const Deadline later = DeadlineAfter(std::chrono::seconds(10));
+    Require(_ZNSt8__sce_v214_Cnd_timedwaitEPP12pthread_condPP13pthread_mutexPK8timespec_nid_postfix(&shared.condition, &shared.mutex, &later) == success);
+    Require(std::chrono::steady_clock::now() - signalStart < std::chrono::seconds(5));
+    Require(_ZNSt8__sce_v211_Mtx_unlockEPP13pthread_mutex_nid_postfix(&shared.mutex) == success);
+    int code = 0;
+    Require(_ZNSt8__sce_v210_Thrd_joinEP7pthreadPi_nid_postfix(thread, &code) == success);
+    Require(_ZNSt8__sce_v212_Cnd_destroyEPP12pthread_cond_nid_postfix(&shared.condition) == success);
+    Require(_ZNSt8__sce_v212_Mtx_destroyEPP13pthread_mutex_nid_postfix(&shared.mutex) == success);
+}
+
+static void VersionedClocks() {
+    std::int64_t previousTicks = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+    std::int64_t previousNow = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
+    for (int sample = 0; sample < 1000; ++sample) {
+        const std::int64_t ticks = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+        const std::int64_t now = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
+        Require(ticks >= previousTicks && now >= previousNow);
+        previousTicks = ticks;
+        previousNow = now;
+    }
+    const std::int64_t ticksBefore = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+    const std::int64_t nowBefore = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const std::int64_t ticksDelta = _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix() - ticksBefore;
+    const std::int64_t nowDelta = _ZNSt8__sce_v26chrono12steady_clock13now_v1_compatEv_nid_postfix() - nowBefore;
+    Require(ticksDelta >= 9000 && ticksDelta < 500000);
+    Require(nowDelta >= 9000 && nowDelta < 500000);
+    const std::int64_t wall = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::int64_t difference = wall - _ZNSt8__sce_v216_Xtime_get_ticksEv_nid_postfix();
+    Require(difference > -1000000 && difference < 1000000);
+}
+
 int main() {
     KernelKeys();
     VersionedSync();
+    VersionedThreadStart();
+    VersionedConditionTimedWait();
+    VersionedClocks();
     ForwardedCalls();
     MutexBasics();
     RecursiveMutex();
