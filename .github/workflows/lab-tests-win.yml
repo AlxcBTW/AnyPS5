@@ -1,0 +1,61 @@
+# Lab-only (fork AlxcBTW/AnyPS5, never proposed upstream): builds the write tracking tests on a Windows runner and runs them.
+name: Lab tests windows
+
+on:
+  push:
+    branches: ['ci/test/**']
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: github.repository == 'AlxcBTW/AnyPS5'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      GUEST_MEMORY: core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Point the WinLibs CMake at the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+      - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: lab-tests-windows
+          max-size: 2G
+          evict-old-files: job
+      - name: Fetch FFmpeg prebuilts
+        run: |
+          sha=$(git -C 3rdparty/ffmpeg-core rev-parse --short=12 HEAD)
+          mkdir -p build/externals
+          curl -sSfL --retry 8 --retry-all-errors --retry-delay 5 -o "build/externals/$sha-ffmpeg-mingw-x64.zip" \
+            "https://github.com/KytyPS5/ext-ffmpeg-core/releases/download/$sha/ffmpeg-mingw-x64.zip"
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build --target agc_write_tracking_tests agc_write_watch_coverage_tests agc_driver_recorder_tests --parallel 4
+      - name: Test
+        run: ctest --test-dir build -V --timeout 120 -R '^(agc_write_tracking|agc_write_watch_coverage|agc_import_watch)$'
