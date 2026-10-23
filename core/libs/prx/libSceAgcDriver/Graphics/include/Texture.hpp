@@ -395,9 +395,10 @@ private:
     std::vector<bool> cpuUploadLayers(const std::vector<bool>& units) const;
     void captureGuestBytes(const std::vector<bool>* layers, bool keepWritten = false);
     bool keepWrittenSince(std::uint32_t unit);
-    bool guestMatchesUpload(std::uint32_t unit) const;
-    std::array<std::uint64_t, 2> unitContentHash(std::uint32_t unit, bool flushGpuWrites) const;
-    void forgetUploadHash(std::uint32_t first, std::uint32_t count);
+    bool guestMatchesBaseline(std::uint32_t unit) const;
+    std::array<std::uint64_t, 2> unitContentHash(std::uint32_t unit) const;
+    void hashBeforeUnwatch(std::uint64_t address, std::size_t bytes);
+    void forgetUnwatchHash(std::uint32_t first, std::uint32_t count);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
@@ -580,7 +581,11 @@ private:
     mutable std::array<ComparedRange, 4> comparedRanges{};
     mutable std::uint32_t nextComparedRange = 0;
     std::vector<std::byte> generationBaseline;
-    std::vector<std::array<std::uint64_t, 2>> uploadHash;
+    struct UnwatchHash {
+        std::array<std::uint64_t, 2> hash{};
+        std::uint64_t generation = 0;
+    };
+    std::vector<UnwatchHash> unwatchHash;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;

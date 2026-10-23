@@ -1524,6 +1524,9 @@ namespace {
 
 std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
 
+thread_local bool unwatchWritesProven = true;
+std::atomic<int> importWalkFailureForTest{0};
+
 void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
     const auto hook = unwatchHook.load(std::memory_order_acquire);
     if (hook == nullptr) return;
@@ -1542,6 +1545,16 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
+void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
+    struct Unproven {
+        Unproven() { unwatchWritesProven = false; }
+        ~Unproven() { unwatchWritesProven = true; }
+        Unproven(const Unproven&) = delete;
+        Unproven& operator=(const Unproven&) = delete;
+    } unproven;
+    beforeUnwatch(address, bytes);
+}
+
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
 #ifdef _WIN32
@@ -1556,6 +1569,14 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 
 void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
     unwatchHook.store(hook, std::memory_order_release);
+}
+
+bool UnwatchWritesProven() {
+    return unwatchWritesProven;
+}
+
+void SetImportWalkFailureForTest(int walk) {
+    importWalkFailureForTest.store(walk, std::memory_order_release);
 }
 
 #ifdef _WIN32
@@ -1648,12 +1669,27 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
             hashes[static_cast<std::size_t>((cursor - first) / page)] = HashPage(reinterpret_cast<const std::byte*>(cursor));
         }
     }
-    std::erase_if(spans, [&](const auto& span) { return !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true); });
+    const auto failWalk = importWalkFailureForTest.load(std::memory_order_acquire);
+    const auto leave = [&](std::uint64_t begin, std::uint64_t end) {
+        lock.unlock();
+        beforeUnwatchUnproven(begin, static_cast<std::size_t>(end - begin));
+        lock.lock();
+    };
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> leaving;
+    std::erase_if(spans, [&](const auto& span) {
+        if (failWalk != 1 && walkWrites(tracker, span.first, span.second, StampKind::Cpu, true)) return false;
+        leaving.push_back(span);
+        return true;
+    });
+    for (const auto& [begin, end] : leaving) leave(begin, end);
     if (!runImport()) return false;
     const WindowCopy window{first, hashes};
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
-        if (!walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) continue;
+        if (failWalk == 2 || !walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) {
+            leave(begin, end);
+            continue;
+        }
         if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
         unwatchedFrom = end;
     }
@@ -1790,7 +1826,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
 #endif
         if (!collected) {
             lock.unlock();
-            beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            beforeUnwatchUnproven(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             lock.lock();
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
