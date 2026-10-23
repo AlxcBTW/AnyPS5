@@ -1,7 +1,37 @@
 #include <cstdint>
+#include <algorithm>
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceGnmDriverForNeoMode/include/InitSequences.hpp"
+
+namespace {
+
+constexpr std::uint32_t InitPacketWords = 0x100;
+
+template <std::size_t Words>
+int WriteHardwareState(std::uint32_t* cmdbuf, std::uint32_t size, const std::array<std::uint32_t, Words>& state) {
+    if (size < InitPacketWords) return 0;
+    auto* at = std::copy(GnmNeo::ClearState.begin(), GnmNeo::ClearState.end(), cmdbuf);
+    at = std::copy(state.begin(), state.end(), at);
+    const auto padding = static_cast<std::uint32_t>(cmdbuf + InitPacketWords - at - 1);
+    at[0] = 0xc0001000u | ((padding - 1) << 16);
+    at[1] = 0;
+    return InitPacketWords;
+}
+
+template <std::size_t Words>
+int WriteContextState(std::uint32_t* cmdbuf, std::uint32_t size, std::uint32_t packetWords, const std::array<std::uint32_t, Words>& state) {
+    if (size != packetWords) return 0;
+    std::copy(state.begin(), state.end(), cmdbuf);
+    return static_cast<int>(packetWords);
+}
+
+constexpr int Failure = static_cast<int>(0x8EEE00FFu);
+constexpr int NoInterface = static_cast<int>(0x80000000u);
+constexpr int ValidationNotEnabled = static_cast<int>(0x80D13FFFu);
+
+} // namespace
 
 extern "C" {
 
@@ -26,13 +56,11 @@ int APS5_VABI sceGnmCreateWorkloadStream(void) {
 }
 
 int APS5_VABI sceGnmDebugModuleReset(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmDebugReset(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmDestroyWorkloadStream(void) {
@@ -110,29 +138,24 @@ int APS5_VABI sceGnmDrawIndirectMulti(void) {
     return 0;
 }
 
-int APS5_VABI sceGnmDrawInitDefaultHardwareState(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceGnmDrawInitDefaultHardwareState(std::uint32_t* cmdbuf, std::uint32_t size) {
+    return WriteHardwareState(cmdbuf, size, GnmNeo::HardwareState);
 }
 
-int APS5_VABI sceGnmDrawInitDefaultHardwareState200(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceGnmDrawInitDefaultHardwareState200(std::uint32_t* cmdbuf, std::uint32_t size) {
+    return WriteHardwareState(cmdbuf, size, GnmNeo::HardwareState200);
 }
 
-int APS5_VABI sceGnmDrawInitDefaultHardwareState350(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceGnmDrawInitDefaultHardwareState350(std::uint32_t* cmdbuf, std::uint32_t size) {
+    return WriteHardwareState(cmdbuf, size, GnmNeo::HardwareState350);
 }
 
-int APS5_VABI sceGnmDrawInitToDefaultContextState(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceGnmDrawInitToDefaultContextState(std::uint32_t* cmdbuf, std::uint32_t size) {
+    return WriteContextState(cmdbuf, size, 0x20, GnmNeo::ContextState);
 }
 
-int APS5_VABI sceGnmDrawInitToDefaultContextState400(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+int APS5_VABI sceGnmDrawInitToDefaultContextState400(std::uint32_t* cmdbuf, std::uint32_t size) {
+    return WriteContextState(cmdbuf, size, 0x100, GnmNeo::ContextState400);
 }
 
 int APS5_VABI sceGnmDrawInitToDefaultContextStateInternalCommand(void) {
@@ -151,28 +174,23 @@ int APS5_VABI sceGnmDrawOpaqueAuto(void) {
 }
 
 int APS5_VABI sceGnmDriverInternalRetrieveGnmInterface(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return NoInterface;
 }
 
 int APS5_VABI sceGnmDriverInternalRetrieveGnmInterfaceForGpuDebugger(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return NoInterface;
 }
 
 int APS5_VABI sceGnmDriverInternalRetrieveGnmInterfaceForReplay(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return NoInterface;
 }
 
 int APS5_VABI sceGnmDriverInternalRetrieveGnmInterfaceForResourceRegistration(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return NoInterface;
 }
 
 int APS5_VABI sceGnmDriverInternalRetrieveGnmInterfaceForValidation(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return NoInterface;
 }
 
 int APS5_VABI sceGnmDriverInternalVirtualQuery(void) {
@@ -181,7 +199,6 @@ int APS5_VABI sceGnmDriverInternalVirtualQuery(void) {
 }
 
 int APS5_VABI sceGnmDriverTraceInProgress(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
@@ -191,13 +208,11 @@ int APS5_VABI sceGnmEndWorkload(void) {
 }
 
 int APS5_VABI sceGnmFindResources(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmFindResourcesPublic(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetCoredumpAddress(void) {
@@ -216,8 +231,7 @@ int APS5_VABI sceGnmGetCoredumpProtectionFaultTimestamp(void) {
 }
 
 int APS5_VABI sceGnmGetDbgGcHandle(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return -1;
 }
 
 int APS5_VABI sceGnmGetGpuBlockStatus(void) {
@@ -251,13 +265,11 @@ int APS5_VABI sceGnmGetOffChipTessellationBufferSize(void) {
 }
 
 int APS5_VABI sceGnmGetOwnerName(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetPhysicalCounterFromVirtualized(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetProtectionFaultTimeStamp(void) {
@@ -266,33 +278,27 @@ int APS5_VABI sceGnmGetProtectionFaultTimeStamp(void) {
 }
 
 int APS5_VABI sceGnmGetResourceBaseAddressAndSizeInBytes(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetResourceName(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetResourceRegistrationBuffers(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetResourceShaderGuid(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetResourceType(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetResourceUserData(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmGetShaderProgramBaseAddress(void) {
@@ -356,8 +362,7 @@ int APS5_VABI sceGnmPaHeartbeat(void) {
 }
 
 int APS5_VABI sceGnmQueryResourceRegistrationUserMemoryRequirements(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmRaiseUserExceptionEvent(void) {
@@ -366,8 +371,7 @@ int APS5_VABI sceGnmRaiseUserExceptionEvent(void) {
 }
 
 int APS5_VABI sceGnmRegisterGdsResource(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmRegisterGnmLiveCallbackConfig(void) {
@@ -376,18 +380,15 @@ int APS5_VABI sceGnmRegisterGnmLiveCallbackConfig(void) {
 }
 
 int APS5_VABI sceGnmRegisterOwner(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmRegisterOwnerForSystem(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmRegisterResource(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmRequestFlipAndSubmitDoneForWorkload(void) {
@@ -401,43 +402,35 @@ int APS5_VABI sceGnmResetVgtControl(void) {
 }
 
 int APS5_VABI sceGnmSdmaClose(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaConstFill(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaCopyLinear(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaCopyTiled(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaCopyWindow(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaFlush(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaGetMinCmdSize(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSdmaOpen(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSetCsShaderWithModifier(void) {
@@ -461,23 +454,19 @@ int APS5_VABI sceGnmSetPsShader350(void) {
 }
 
 int APS5_VABI sceGnmSetResourceRegistrationUserMemory(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSetResourceUserData(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSetSpiEnableSqCounters(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSetSpiEnableSqCountersForUnitInstance(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmSetVgtControl(void) {
@@ -506,18 +495,15 @@ int APS5_VABI sceGnmSubmitCommandBuffersForWorkload(void) {
 }
 
 int APS5_VABI sceGnmUnregisterAllResourcesForOwner(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmUnregisterOwnerAndResources(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmUnregisterResource(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return Failure;
 }
 
 int APS5_VABI sceGnmUpdateGsShader(void) {
@@ -546,33 +532,27 @@ int APS5_VABI sceGnmUpdateVsShader(void) {
 }
 
 int APS5_VABI sceGnmValidateDisableDiagnostics(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateDisableDiagnostics2(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateDispatchCommandBuffers(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateDrawCommandBuffers(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateGetDiagnosticInfo(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateGetDiagnostics(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidateGetVersion(void) {
@@ -581,18 +561,15 @@ int APS5_VABI sceGnmValidateGetVersion(void) {
 }
 
 int APS5_VABI sceGnmValidateOnSubmitEnabled(void) {
-    NotImplemented_nid_no_patch(__func__);
     return 0;
 }
 
 int APS5_VABI sceGnmValidateResetState(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 int APS5_VABI sceGnmValidationRegisterMemoryCheckCallback(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
+    return ValidationNotEnabled;
 }
 
 }

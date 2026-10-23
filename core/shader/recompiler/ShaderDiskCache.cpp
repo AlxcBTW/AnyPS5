@@ -1,4 +1,5 @@
 #include "ShaderDiskCache.hpp"
+#include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "CacheKey.hpp"
 #include "ShaderCachePack.hpp"
 #include "ShaderCacheDirectory.hpp"
@@ -86,7 +87,7 @@ namespace ShaderRecompiler::ShaderDiskCache {
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
 static_assert(sizeof(CompiledShaderArtifact) == 280, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 528, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 544, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 656, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
@@ -138,7 +139,7 @@ constexpr std::size_t fieldCount() {
     }
 }
 
-static_assert(fieldCount<ShaderInfo>() == 23, "ShaderInfo changed: update the info encoder");
+static_assert(fieldCount<ShaderInfo>() == 24, "ShaderInfo changed: update the info encoder");
 static_assert(fieldCount<BufferResource>() == 12, "BufferResource changed: update the info encoder");
 static_assert(fieldCount<ImageResource>() == 41, "ImageResource changed: update the info encoder");
 static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: update the info encoder");
@@ -503,10 +504,12 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(parameter.custom);
         out.Value(parameter.flatP10);
         out.Value(parameter.vertexOrder);
+        out.Value(parameter.flatP20);
     });
     writer.Value(result.barycentricEmulation.active);
     writer.Value(result.barycentricEmulation.smooth);
     writer.Value(result.barycentricEmulation.linear);
+    writer.Value(result.barycentricEmulation.smoothOffset);
     writer.Value(result.meshBarycentrics.has_value());
     if (result.meshBarycentrics) {
         writer.Value(result.meshBarycentrics->emulation.active);
@@ -561,10 +564,12 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(parameter.custom);
         in.Value(parameter.flatP10);
         in.Value(parameter.vertexOrder);
+        in.Value(parameter.flatP20);
     });
     reader.Value(result.barycentricEmulation.active);
     reader.Value(result.barycentricEmulation.smooth);
     reader.Value(result.barycentricEmulation.linear);
+    reader.Value(result.barycentricEmulation.smoothOffset);
     bool hasMeshBarycentrics = false;
     reader.Value(hasMeshBarycentrics);
     result.meshBarycentrics.reset();
@@ -798,6 +803,7 @@ void encodeShaderInfo(Writer& writer, const ShaderInfo& info) {
     writer.Value(info.dispatchThreadLimit);
     writer.Value(info.rasterPrimitive);
     writer.Value(info.layerExported);
+    writer.Value(info.smoothOffsetBarycentrics);
 }
 
 void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
@@ -905,6 +911,7 @@ void decodeShaderInfo(Reader& reader, ShaderInfo& info) {
     reader.Value(info.dispatchThreadLimit);
     reader.Value(info.rasterPrimitive);
     reader.Value(info.layerExported);
+    reader.Value(info.smoothOffsetBarycentrics);
 }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
@@ -1780,6 +1787,7 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     writer.Value(FileMagic);
     writer.Value(FormatVersion);
     writer.Value(SourceVersion());
+    writer.Value(static_cast<std::uint8_t>(GcnGuestShaders()));
     thread_local std::vector<std::uint64_t>* memoryKeySlot = nullptr;
     auto& memoryKey = ThreadOwned(memoryKeySlot);
     RecompileCacheKey::Build(request, memoryKey);
@@ -1800,6 +1808,7 @@ void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSiz
     writer.Value(FileMagic);
     writer.Value(FormatVersion);
     writer.Value(SourceVersion());
+    writer.Value(static_cast<std::uint8_t>(GcnGuestShaders()));
     writer.Value(PlanEntryKind);
     thread_local std::vector<std::uint64_t>* memoryKeySlot = nullptr;
     auto& memoryKey = ThreadOwned(memoryKeySlot);
