@@ -67,6 +67,8 @@ int APS5_VABI sceRtcSetCurrentTick(const RtcTick*);
 int APS5_VABI sceRtcSetCurrentNetworkTick(const RtcTick*);
 int APS5_VABI sceRtcSetCurrentAdNetworkTick(const RtcTick*);
 int APS5_VABI sceRtcSetCurrentDebugNetworkTick(const RtcTick*);
+int APS5_VABI sceRtcInit(void);
+int APS5_VABI sceRtcEnd(void);
 }
 
 static void Require(bool value) { if (!value) std::abort(); }
@@ -438,6 +440,8 @@ int main() {
         const char* name;
         std::int64_t minutes;
     } additionalZones[] = {
+        {"LIGT", 600}, {"AWSST", 540}, {"CETDST", 120},
+        {"DNT", 60}, {"NOR", 60}, {"SET", 60}, {"NFT", -150},
         {"SWT", 60}, {"MEZ", 60}, {"WETDST", 60}, {"METDST", 120}, {"EETDST", 180},
         {"AESST", 660}, {"ACSST", 630}, {"CAST", 570}, {"CADT", 630}, {"SAST", 570}, {"SADT", 630}, {"WST", 480}, {"WDT", 540},
     };
@@ -461,6 +465,20 @@ int main() {
         tick.tick = untouched;
         Require(sceRtcParseDateTime(&tick, text) == 0);
         Require(tick.tick == at(2000, 3, 1, 8, 9, 10) - static_cast<std::uint64_t>(zone.minutes * 60000000));
+    }
+
+    const struct {
+        const char* name;
+        std::int64_t minutes;
+    } secondLetterZones[] = {
+        {"MT", 0}, {"mt", 510}, {"IT", 0}, {"it", 210},
+        {"BT", 0}, {"bt", 180}, {"NT", 0}, {"nt", -660},
+    };
+    for (const auto& zone : secondLetterZones) {
+        char text[80];
+        std::snprintf(text, sizeof(text), "Thu, 29 Feb 2024 12:34:56 %s", zone.name);
+        Require(sceRtcParseDateTime(&tick, text) == 0);
+        Require(tick.tick == leapDayTick - 789000ull - static_cast<std::uint64_t>(zone.minutes * 60000000));
     }
 
     RtcTick source{leapDayTick};
@@ -891,4 +909,6 @@ int main() {
         Require(sceRtcGetCurrentDebugNetworkTick(&current) == 0 && current.tick >= debugClock.tick && current.tick < debugClock.tick + 1000000);
         Require(sceRtcGetCurrentRawNetworkTick(&current) == 0 && current.tick > unixEpochTick);
     }
+    Require(sceRtcInit() == 0);
+    Require(sceRtcEnd() == 0);
 }

@@ -1,12 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <mutex>
 #include <array>
 #include <chrono>
@@ -152,13 +154,13 @@ struct MemoryCounters {
 };
 
 struct MemoryProfile {
-    std::mutex threadsMutex;
+    AgcDriver::Mutex threadsMutex;
     std::vector<const MemoryCounters*> threads;
     MemoryCounters retired;
     MemoryCounters shared;
     std::atomic<std::int64_t> lastReport{0};
     // Sampled callers of Read and Write (module offsets), to name what touches guest memory most.
-    std::mutex callersMutex;
+    AgcDriver::Mutex callersMutex;
     std::array<std::pair<unsigned long long, std::uint64_t>, 16> callers{};
     std::array<std::pair<unsigned long long, std::uint64_t>, 16> writeCallers{};
 };
@@ -222,19 +224,19 @@ void CountCaller(std::array<std::pair<unsigned long long, std::uint64_t>, 16>& c
     }
 }
 
-// Attribution tags (see the header): the packet a queue worker executes and the read site the
-// driver code named. Plain thread-locals; a store per packet costs nothing measurable.
-thread_local PacketTag currentPacket{NoPacket, 0xffffffffu};
-thread_local ReadSite currentReadSite = ReadSite::Unknown;
+struct CurrentPacketSlot {};
+struct CurrentReadSiteSlot {};
+constexpr std::uint64_t NoPacketBits = NoPacket | (std::uint64_t{0xffffffffu} << 32u);
 // Sampled reads by site (every 256th Read/ReadCommitted, like the callers), for the [guestmem] line.
 std::atomic<std::uint64_t> readSiteSamples[static_cast<std::size_t>(ReadSite::Count)] = {};
 
 void SetCurrentPacket(std::uint32_t opcode, std::uint32_t queue) {
-    currentPacket = {opcode, queue};
+    HostThreadSlot<std::uint64_t, CurrentPacketSlot>::Set((opcode | (std::uint64_t{queue} << 32u)) ^ NoPacketBits);
 }
 
 PacketTag CurrentPacket() {
-    return currentPacket;
+    const auto bits = HostThreadSlot<std::uint64_t, CurrentPacketSlot>::Get() ^ NoPacketBits;
+    return {static_cast<std::uint32_t>(bits), static_cast<std::uint32_t>(bits >> 32u)};
 }
 
 const char* ReadSiteName(ReadSite site) {
@@ -244,11 +246,13 @@ const char* ReadSiteName(ReadSite site) {
 }
 
 ReadSite SetReadSite(ReadSite site) {
-    return std::exchange(currentReadSite, site);
+    const auto previous = HostThreadSlot<ReadSite, CurrentReadSiteSlot>::Get();
+    HostThreadSlot<ReadSite, CurrentReadSiteSlot>::Set(site);
+    return previous;
 }
 
 ReadSite CurrentReadSite() {
-    return currentReadSite;
+    return HostThreadSlot<ReadSite, CurrentReadSiteSlot>::Get();
 }
 
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip) {
@@ -289,7 +293,7 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 void CountReadCaller(const void* returnAddress) {
     thread_local std::uint32_t sampled = 0;
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).
-    if ((sampled + 1) % 256 == 0) readSiteSamples[static_cast<std::size_t>(currentReadSite)].fetch_add(256, std::memory_order_relaxed);
+    if ((sampled + 1) % 256 == 0) readSiteSamples[static_cast<std::size_t>(CurrentReadSite())].fetch_add(256, std::memory_order_relaxed);
     CountCaller(Profile().callers, sampled, 256, returnAddress);
 }
 
@@ -848,7 +852,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 #endif
 
 struct WriteTracker {
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     bool initialized = false;
     bool watched = false;
     static constexpr std::size_t CoarseBlocks = 64;
@@ -971,8 +975,10 @@ struct WriteTracker {
     struct DriverPieces {
         std::uint32_t whole = 0;
         std::uint32_t dropped = 0;
-        std::uint32_t next = 0;
         std::array<DriverPiece, 4> pieces{};
+        std::uint32_t possibleWhole = 0;
+        std::uint32_t possibleDropped = 0;
+        std::array<DriverPiece, 4> possiblePieces{};
 
         bool covers(std::uint32_t begin, std::uint32_t end, std::uint64_t generation) const {
             if (generation == 0 || begin >= end || dropped > generation) return false;
@@ -1025,7 +1031,7 @@ struct WriteTracker {
 #endif
     }
 
-    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+    void stampWatchedPart(std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, bool complete) {
 #ifdef _WIN32
         address = std::max<std::uint64_t>(address, base);
         end = std::min<std::uint64_t>(end, base + size);
@@ -1039,24 +1045,45 @@ struct WriteTracker {
             const auto stop = std::min<std::uint64_t>(end, blockBegin(block) + WriteBlockBytes);
             if (!blockPartWatched(first, stop)) continue;
             stamp(block, stampGeneration, StampKind::Driver);
-            noteDriverStore(block, address, end, stampGeneration);
+            noteDriverStore(block, address, end, stampGeneration, complete);
         }
     }
 
-    void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration) {
+    void noteDriverStore(std::uint64_t block, std::uint64_t address, std::uint64_t end, std::uint32_t stampGeneration, bool complete) {
         const auto begin = blockBegin(block);
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
         if (from == 0 && to == WriteBlockBytes) {
             auto& entry = driverPieces[block];
-            entry = DriverPieces{};
-            entry.whole = stampGeneration;
+            if (complete) {
+                entry = DriverPieces{};
+                entry.whole = stampGeneration;
+            } else {
+                entry.possibleWhole = stampGeneration;
+                entry.possibleDropped = 0;
+                entry.possiblePieces = {};
+            }
             return;
         }
         auto& entry = driverPieces[block];
-        auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
-        entry.dropped = std::max(entry.dropped, slot.generation);
-        slot = {stampGeneration, from, to};
+        auto& pieces = complete ? entry.pieces : entry.possiblePieces;
+        auto& dropped = complete ? entry.dropped : entry.possibleDropped;
+        DriverPiece* contained = nullptr;
+        for (auto& piece : pieces) {
+            if (piece.generation == 0 || piece.begin < from || piece.end > to) continue;
+            if (contained == nullptr) contained = &piece;
+            else piece = {};
+        }
+        if (contained != nullptr) {
+            *contained = {stampGeneration, from, to};
+            return;
+        }
+        auto* oldest = &pieces.front();
+        for (auto& piece : pieces) {
+            if (piece.generation < oldest->generation) oldest = &piece;
+        }
+        dropped = std::max(dropped, oldest->generation);
+        *oldest = {stampGeneration, from, to};
     }
 
     Leaf& leafFor(std::uint64_t block) {
@@ -1167,8 +1194,11 @@ struct WriteTracker {
                 continue;
             }
             const auto& entry = found->second;
-            if (entry.whole > generation || entry.dropped > generation) return true;
+            if (entry.whole > generation || entry.dropped > generation || entry.possibleWhole > generation || entry.possibleDropped > generation) return true;
             for (const auto& piece : entry.pieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) return true;
+            }
+            for (const auto& piece : entry.possiblePieces) {
                 if (piece.generation > generation && piece.begin < to && from < piece.end) return true;
             }
         }
@@ -1199,7 +1229,7 @@ WriteTracker& Tracker() {
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
-std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
+std::unique_lock<AgcDriver::Mutex> lockTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return std::unique_lock(tracker.mutex);
     std::unique_lock lock(tracker.mutex, std::try_to_lock);
@@ -1234,11 +1264,11 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // thread that never bumped is given a new epoch for every collect: its walks are never reused (the
 // presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
-thread_local std::uint64_t threadCollectEpoch = 0;
+struct CollectEpochSlot {};
 std::atomic<std::uint64_t> lastBumpedEpoch{0};
 
 std::uint64_t currentCollectEpoch() {
-    if (threadCollectEpoch != 0) return threadCollectEpoch;
+    if (const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get(); epoch != 0) return epoch;
     return nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
@@ -1255,7 +1285,15 @@ struct ThreadCollectMemo {
     std::array<WriteTracker::Memo, 64> entries{};
     std::size_t next = 0;
 };
-thread_local ThreadCollectMemo threadCollectMemo;
+ThreadCollectMemo& threadCollectMemo() {
+    struct Slot {};
+    auto* memo = HostThreadSlot<ThreadCollectMemo*, Slot>::Get();
+    if (memo == nullptr) {
+        ShaderRecompiler::ThreadOwned(memo);
+        HostThreadSlot<ThreadCollectMemo*, Slot>::Set(memo);
+    }
+    return *memo;
+}
 
 struct EpochCollectMap {
     std::uint64_t epoch = 0;
@@ -1376,7 +1414,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
-        for (const auto& entry : threadCollectMemo.entries) {
+        for (const auto& entry : threadCollectMemo().entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
@@ -1400,7 +1438,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const TimedAccess timed(CounterCollect, bytes);
 #ifndef _WIN32
-    if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
+    if (useMemo && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0 && bytes <= WriteBlockBytes) {
         const auto begin = first & ~(WriteBlockBytes - 1);
         const auto end = (stop + WriteBlockBytes - 1) & ~(WriteBlockBytes - 1);
         if (end > begin && tracker.covers(begin, end - begin)) {
@@ -1415,7 +1453,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
         else {
-            threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial, mapping};
+            auto& memo = threadCollectMemo();
+            memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
@@ -1436,14 +1475,15 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 }
 
 void BumpCollectEpoch() {
-    threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
-    while (last < threadCollectEpoch && !lastBumpedEpoch.compare_exchange_weak(last, threadCollectEpoch, std::memory_order_release, std::memory_order_relaxed)) {}
+    while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t ThreadCollectEpoch() {
-    return collectMemoEnabled() ? threadCollectEpoch : 0;
+    return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
 
 std::uint64_t UnwatchSerial() {
@@ -1452,15 +1492,32 @@ std::uint64_t UnwatchSerial() {
 
 void AdoptLatestCollectEpoch() {
     const auto latest = lastBumpedEpoch.load(std::memory_order_acquire);
-    if (latest > threadCollectEpoch) threadCollectEpoch = latest;
+    if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
 }
 
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<std::uint64_t> proofSerial{1};
+thread_local bool proofThread = false;
+}
+
+std::uint64_t ProofSerial() {
+    return proofSerial.load(std::memory_order_acquire);
+}
+
+void BreakProofs() {
+    proofSerial.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void MarkProofThread() {
+    proofThread = true;
+}
+
 std::uint64_t CollectEpoch() {
-    return collectMemoEnabled() ? threadCollectEpoch : 0;
+    return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
 
 namespace {
@@ -1666,17 +1723,18 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);
-            if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation);
+            if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation, true);
             return 0;
         }
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
             tracker.stamp(block, tracker.generation, StampKind::Driver);
-            tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation);
+            tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation, true);
         }
         return tracker.generation;
     };
@@ -1709,7 +1767,8 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
-std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
+    BreakProofs();
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -1717,7 +1776,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
-        if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation);
+        if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
         return 0;
     }
     {
@@ -1725,11 +1784,11 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
         StampRuns runs{tracker, StampKind::Fresh};
 #ifdef _WIN32
-        const bool complete = collectWindowsWrites(runs, blockFirst, blockStop, false);
+        const bool collected = collectWindowsWrites(runs, blockFirst, blockStop, false);
 #else
-        const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
+        const bool collected = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
-        if (!complete) {
+        if (!collected) {
             lock.unlock();
             beforeUnwatch(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             lock.lock();
@@ -1743,9 +1802,17 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     const auto last = tracker.blockOf(address + bytes - 1);
     for (auto block = first; block <= last; ++block) {
         tracker.stamp(block, tracker.generation, StampKind::Driver);
-        tracker.noteDriverStore(block, address, address + bytes, tracker.generation);
+        tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
     return tracker.generation;
+}
+
+std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    return markWritten(address, bytes, true);
+}
+
+std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes) {
+    return markWritten(address, bytes, false);
 }
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
@@ -2053,24 +2120,29 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 }
 
-// The owner token is a thread-local's address: unique per live thread and free to read.
 namespace {
-const void* ThreadToken() {
-    thread_local char token;
-    return &token;
-}
-
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+void GpuMutexType::enter() {
+    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+}
+
+bool GpuMutexType::tryEnter() {
+    return HeldByThisThread() || mutex.try_lock();
+}
+
 void GpuMutexType::acquired() {
-    owner.store(ThreadToken(), std::memory_order_relaxed);
-    if (++depth == 1) gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+    owner.store(CurrentThreadToken(), std::memory_order_relaxed);
+    if (++depth == 1) {
+        gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        if (!proofThread) BreakProofs();
+    }
 }
 
 bool GpuMutexType::try_lock() {
     if (!GpuLockProfiled()) {
-        if (!mutex.try_lock()) return false;
+        if (!tryEnter()) return false;
         acquired();
         return true;
     }
@@ -2079,7 +2151,7 @@ bool GpuMutexType::try_lock() {
     auto& stats = LockStats();
     const auto tagged = std::exchange(stats.nextSite, GpuLockSite::Other);
     ++stats.tries;
-    if (!mutex.try_lock()) {
+    if (!tryEnter()) {
         ++stats.triesFailed;
         return false;
     }
@@ -2106,8 +2178,8 @@ void GpuMutexType::unlock() {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
+        mutex.unlock();
     }
-    mutex.unlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
     if (outermost) {
@@ -2116,7 +2188,7 @@ void GpuMutexType::unlock() {
 }
 
 bool GpuMutexType::HeldByThisThread() const {
-    return owner.load(std::memory_order_relaxed) == ThreadToken();
+    return owner.load(std::memory_order_relaxed) == CurrentThreadToken();
 }
 
 std::uint32_t GpuMutexType::DepthOnThisThread() const {
@@ -2135,10 +2207,10 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
-            LockSpinning(mutex, HandoffSpinWindow());
+            enter();
         } else {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
-            if (!mutex.try_lock()) {
+            if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
                 LockSpinning(mutex, HandoffSpinWindow());
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
@@ -2153,7 +2225,7 @@ void GpuMutexType::lock() {
     ++stats.siteAcquisitions[site];
     // An uncontended (or recursive) acquisition costs no clock reads for the wait; only a wait is
     // timed. The hold timer (outermost acquisitions only) starts once the mutex is held.
-    if (!mutex.try_lock()) {
+    if (!tryEnter()) {
         const bool holders = GpuHoldProfiled();
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
@@ -2420,6 +2492,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    BreakProofs();
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).

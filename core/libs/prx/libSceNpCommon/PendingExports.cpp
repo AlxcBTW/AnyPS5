@@ -115,27 +115,7 @@ int APS5_VABI sceNpCloseSema(void) {
     return 0;
 }
 
-int APS5_VABI sceNpCmpNpIdInOrder(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpCmpOnlineId(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpCondDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpCondInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpCondSignal(void) {
+int APS5_VABI sceNpCmpNpId(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -146,11 +126,6 @@ int APS5_VABI sceNpCondSignalAll(void) {
 }
 
 int APS5_VABI sceNpCondSignalTo(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpCondTimedwait(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -210,11 +185,6 @@ int APS5_VABI sceNpGetNavSdkVersion(void) {
     return 0;
 }
 
-int APS5_VABI sceNpGetPlatformType(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceNpGetProcessId(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -225,17 +195,7 @@ int APS5_VABI sceNpGetRandom(void) {
     return 0;
 }
 
-int APS5_VABI sceNpGetSdkVersion(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceNpGetSdkVersionUInt(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpGetSystemClockUsec(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -310,11 +270,6 @@ int APS5_VABI sceNpIntIsOnlineIdString(void) {
     return 0;
 }
 
-int APS5_VABI sceNpIntIsValidOnlineId(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceNpIntSetPlatformType(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -331,11 +286,6 @@ int APS5_VABI sceNpIpc2ClientInit(void) {
 }
 
 int APS5_VABI sceNpIpc2ClientTerm(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpJoinThread(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -400,31 +350,6 @@ int APS5_VABI sceNpLwCondWait(void) {
     return 0;
 }
 
-int APS5_VABI sceNpLwMutexDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpLwMutexInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpLwMutexLock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpLwMutexTryLock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpLwMutexUnlock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI sceNpMemoryHeapDestroy(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -441,31 +366,6 @@ int APS5_VABI sceNpMemoryHeapGetAllocatorEx(void) {
 }
 
 int APS5_VABI sceNpMemoryHeapInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpMutexDestroy(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpMutexInit(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpMutexLock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpMutexTryLock(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI sceNpMutexUnlock(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
