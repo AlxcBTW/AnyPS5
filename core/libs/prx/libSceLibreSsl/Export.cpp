@@ -1,3 +1,4 @@
+#include "prx/libSceLibreSsl/include/Api.hpp"
 #include <cinttypes>
 #include <cstdio>
 #include <cstddef>
@@ -18,46 +19,6 @@ constexpr std::size_t DesScheduleBytes = 128;
 extern "C" {
 
 APS5_DUMMY_FUN
-int APS5_VABI AES_cbc_encrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_cfb128_encrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_ctr128_encrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_decrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_ecb_encrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_encrypt_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_set_decrypt_key_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI AES_set_encrypt_key_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI ASN1_INTEGER_get_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -283,16 +244,6 @@ int APS5_VABI CRYPTO_cleanup_all_ex_data_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI CRYPTO_free_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI CRYPTO_malloc_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI CRYPTO_num_locks_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -304,11 +255,6 @@ int APS5_VABI CRYPTO_set_add_lock_callback_nid_postfix(void) {
 }
 
 int APS5_VABI CRYPTO_set_locking_callback_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI CRYPTO_set_mem_functions_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
@@ -1013,31 +959,6 @@ int APS5_VABI PKCS12_free_nid_postfix(void) {
 }
 
 int APS5_VABI PKCS12_parse_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI RAND_add_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI RAND_bytes_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI RAND_file_name_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI RAND_load_file_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
-int APS5_VABI RAND_status_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
 }
