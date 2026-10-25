@@ -1774,6 +1774,53 @@ void CheckImportWalkUnwatchHooks() {
     Require(importHookCalls.size() == 1 && importHookCalls.front().watched && importHookCalls.front().proven, "Unwatch did not run the unwatch hook once, while watched, with its CPU writes proven");
 }
 
+std::uint64_t collectDuringHookAddress = 0;
+std::size_t collectDuringHookBytes = 0;
+std::size_t collectDuringHookCalls = 0;
+
+void CollectDuringHook(std::uint64_t, std::size_t) {
+    if (collectDuringHookCalls++ == 0) static_cast<void>(CollectWritesUncached(collectDuringHookAddress, collectDuringHookBytes));
+}
+
+void CheckImportWalkHookKeepsLaterWindows() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    Unwatch(base + Block, Block);
+    const auto synced = CollectWritesUncached(base + 2 * Block, 2 * Block);
+    Require(synced != 0 && CollectWritesUncached(base, Block) != 0, "the blocks around the unwatched one are not collected");
+    struct Reset {
+        ~Reset() {
+            SetImportWalkFailureForTest(0);
+            SetUnwatchHook(nullptr);
+        }
+    } reset;
+    collectDuringHookAddress = base + 2 * Block;
+    collectDuringHookBytes = 2 * Block;
+    collectDuringHookCalls = 0;
+    SetUnwatchHook(&CollectDuringHook);
+    SetImportWalkFailureForTest(2, base);
+    Require(ImportWatched(base, 4 * Block, [&] {
+        bytes[0x100] = 0x11;
+        bytes[2 * Block + 0x100] = 0x11;
+        bytes[3 * Block + 0x2000] = 0x22;
+        return true;
+    }), "the import whose first span failed its page walk failed");
+    SetImportWalkFailureForTest(0);
+    SetUnwatchHook(nullptr);
+    Require(collectDuringHookCalls == 1, "the span whose page walk failed after the import did not run the unwatch hook once");
+    Require(!Watched(base, Block), "the span whose page walk failed after the import stayed watched");
+    Require(Watched(base + 2 * Block, 2 * Block), "the span whose page walk succeeded left the write watch");
+    const std::array<std::uint64_t, 2> generations{synced, synced};
+    std::array<std::uint8_t, 2> changed{};
+    std::array<std::uint8_t, 2> cpu{};
+    Require(ChangedBlocks(base + 2 * Block, 2 * Block, generations, changed, cpu), "the span after the failed one is not tracked");
+    Require(changed[0] == BlockUnchanged && UnchangedSince(base + 2 * Block, Block, synced), "a collect run by the unwatch hook of an earlier span counted a page the import touched without changing it as a CPU write");
+    Require(cpu[0] == 1, "a page the import touched lost its import window walk to the unwatch hook of an earlier span");
+    Require(changed[1] == BlockWritten && WrittenSince(base + 3 * Block, Block, synced), "a store of new bytes within the import was missed after the unwatch hook of an earlier span");
+}
+
 class PartlyCommitted {
 public:
     static constexpr std::size_t Bytes = 4 * Block;
@@ -2005,6 +2052,7 @@ int main() {
         CheckImportWindowFootprint();
         CheckUnwatchedImport();
         CheckImportWalkUnwatchHooks();
+        CheckImportWalkHookKeepsLaterWindows();
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
     } catch (const std::exception& error) {

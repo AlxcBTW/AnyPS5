@@ -1313,6 +1313,23 @@ public:
         lock.lock();
     }
 
+    class Suspension {
+    public:
+        explicit Suspension(TrackerLock& owner) : owner(owner) {
+            owner.Suspend();
+        }
+
+        ~Suspension() {
+            owner.Resume();
+        }
+
+        Suspension(const Suspension&) = delete;
+        Suspension& operator=(const Suspension&) = delete;
+
+    private:
+        TrackerLock& owner;
+    };
+
 private:
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
@@ -1696,6 +1713,7 @@ std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
 
 thread_local bool unwatchWritesProven = true;
 std::atomic<int> importWalkFailureForTest{0};
+std::atomic<std::uint64_t> importWalkFailureSpanForTest{0};
 
 void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
     const auto hook = unwatchHook.load(std::memory_order_acquire);
@@ -1745,7 +1763,8 @@ bool UnwatchWritesProven() {
     return unwatchWritesProven;
 }
 
-void SetImportWalkFailureForTest(int walk) {
+void SetImportWalkFailureForTest(int walk, std::uint64_t span) {
+    importWalkFailureSpanForTest.store(span, std::memory_order_release);
     importWalkFailureForTest.store(walk, std::memory_order_release);
 }
 
@@ -1842,29 +1861,38 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         }
     }
     const auto failWalk = importWalkFailureForTest.load(std::memory_order_acquire);
-    const auto leave = [&](std::uint64_t begin, std::uint64_t end) {
-        lock.Suspend();
-        beforeUnwatchUnproven(begin, static_cast<std::size_t>(end - begin));
-        lock.Resume();
+    const auto failSpan = importWalkFailureSpanForTest.load(std::memory_order_acquire);
+    const auto failsWalk = [&](int walk, std::uint64_t begin, std::uint64_t end) {
+        return failWalk == walk && (failSpan == 0 || (begin <= failSpan && failSpan < end));
+    };
+    const auto leave = [&](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+        if (ranges.empty()) return;
+        const TrackerLock::Suspension suspended{lock};
+        for (const auto& [begin, end] : ranges) beforeUnwatchUnproven(begin, static_cast<std::size_t>(end - begin));
     };
     std::vector<std::pair<std::uint64_t, std::uint64_t>> leaving;
     std::erase_if(spans, [&](const auto& span) {
-        if (failWalk != 1 && walkWrites(tracker, span.first, span.second, StampKind::Cpu, true)) return false;
+        if (!failsWalk(1, span.first, span.second) && walkWrites(tracker, span.first, span.second, StampKind::Cpu, true)) return false;
         leaving.push_back(span);
         return true;
     });
-    for (const auto& [begin, end] : leaving) leave(begin, end);
+    leave(leaving);
     if (!runImport()) return false;
     const WindowCopy window{first, hashes};
-    auto unwatchedFrom = first;
-    for (const auto& [begin, end] : spans) {
-        if (failWalk == 2 || !walkWrites(tracker, begin, end, StampKind::Cpu, true, &window)) {
-            leave(begin, end);
-            continue;
+    leaving.clear();
+    std::erase_if(spans, [&](const auto& span) {
+        if (failsWalk(2, span.first, span.second) || !walkWrites(tracker, span.first, span.second, StampKind::Cpu, true, &window)) {
+            leaving.push_back(span);
+            return true;
         }
 #ifdef _WIN32
-        GuestArena::GuestArenaCompareResidentWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+        GuestArena::GuestArenaCompareResidentWhenShared_nid_no_patch(static_cast<std::uintptr_t>(span.first), static_cast<std::size_t>(span.second - span.first));
 #endif
+        return false;
+    });
+    leave(leaving);
+    auto unwatchedFrom = first;
+    for (const auto& [begin, end] : spans) {
         if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
         unwatchedFrom = end;
     }
@@ -2000,9 +2028,10 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         const bool collected = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!collected) {
-            lock.Suspend();
-            beforeUnwatchUnproven(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
-            lock.Resume();
+            {
+                const TrackerLock::Suspension suspended{lock};
+                beforeUnwatchUnproven(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            }
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
