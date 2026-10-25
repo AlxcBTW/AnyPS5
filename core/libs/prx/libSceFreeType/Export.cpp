@@ -42,6 +42,7 @@ void FinalizeFace(void* object) {
     auto* host = static_cast<FT_Face>(object);
     auto* face = static_cast<GuestFace*>(host->generic.data);
     if (face->rec.generic.finalizer) face->rec.generic.finalizer(&face->rec);
+    face->finalized = true;
 }
 
 void PublishFace(GuestLibrary* library, std::unique_ptr<GuestFace> face, FT_Face host, GuestFaceRec** aface) {
@@ -114,6 +115,13 @@ int APS5_VABI FT_Done_FreeType_nid_postfix(GuestLibrary* library) {
     return error;
 }
 
+int APS5_VABI FT_Select_Size_nid_postfix(GuestFaceRec* face, std::int32_t strikeIndex) {
+    GuestFace* owner = FaceOf(face);
+    const FT_Error error = FT_Select_Size(owner ? owner->host : nullptr, strikeIndex);
+    if (owner) SyncSize(*owner);
+    return error;
+}
+
 int APS5_VABI FT_New_Face_nid_postfix(GuestLibrary* library, const char* filepathname, std::int64_t face_index, GuestFaceRec** aface) {
     if (!filepathname) return FT_Err_Invalid_Argument;
     const std::int64_t faceIndex = OpenFaceIndex(face_index);
@@ -144,10 +152,15 @@ int APS5_VABI FT_New_Memory_Face_nid_postfix(GuestLibrary* library, const unsign
     return 0;
 }
 
+int APS5_VABI FT_Reference_Face_nid_postfix(GuestFaceRec* face) {
+    const GuestFace* owner = FaceOf(face);
+    return FT_Reference_Face(owner ? owner->host : nullptr);
+}
+
 int APS5_VABI FT_Done_Face_nid_postfix(GuestFaceRec* face) {
     GuestFace* owner = FaceOf(face);
     const FT_Error error = FT_Done_Face(owner ? owner->host : nullptr);
-    if (error == 0) owner->library->faces.remove_if([owner](const auto& entry) { return entry.get() == owner; });
+    if (error == 0 && owner->finalized) owner->library->faces.remove_if([owner](const auto& entry) { return entry.get() == owner; });
     return error;
 }
 
@@ -275,6 +288,19 @@ int APS5_VABI FT_Render_Glyph_nid_postfix(GuestGlyphSlotRec* slot, std::int32_t 
     const FT_Error error = FT_Render_Glyph(owner ? owner->host->glyph : nullptr, static_cast<FT_Render_Mode>(render_mode));
     if (owner) SyncSlot(*owner);
     return error;
+}
+
+int APS5_VABI FT_Outline_Copy_nid_postfix(const GuestOutline* source, GuestOutline* target) {
+    if (!source || !target) return FT_Err_Invalid_Outline;
+    if (source->n_points != target->n_points || source->n_contours != target->n_contours) return FT_Err_Invalid_Argument;
+    if (source == target) return FT_Err_Ok;
+    if (source->n_points) {
+        std::memmove(target->points, source->points, source->n_points * sizeof(GuestVector));
+        std::memmove(target->tags, source->tags, source->n_points * sizeof(unsigned char));
+    }
+    if (source->n_contours) std::memmove(target->contours, source->contours, source->n_contours * sizeof(std::uint16_t));
+    target->flags = (source->flags & ~FT_OUTLINE_OWNER) | (target->flags & FT_OUTLINE_OWNER);
+    return FT_Err_Ok;
 }
 
 int APS5_VABI FT_Select_Charmap_nid_postfix(GuestFaceRec* face, std::int32_t encoding) {
