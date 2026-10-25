@@ -203,7 +203,7 @@ Some applications also need their original `app0/sce_sys/param.json` at runtime.
 
 Resources can also be packed into `app0.zar` beside `app0/`, a [ZArchive](https://github.com/Exzap/ZArchive) whose root is the `app0/` directory. A file present in `app0/` is read from there and any other file from the archive; the executable, `sce_module/` and `sce_sys/` stay in `app0/`. The archive is read only through `sceKernelOpen`/`open`, the read, seek and stat calls on its descriptors and `sceKernelStat`; other calls on an archived path, listing a directory that the archive also contains and opening a file in it for writing fail as described in [technical debt](../dev/debt/libkernel.md). An archive that cannot be opened stops the title at its first file access.
 
-Use the generated files printed as `Guest module:` for bundled title modules. `libs/` is for AnyPS5 system libraries, not the original PS5 `.prx` files. Placing an original PS5 module in `libs/` on Windows makes Windows try to load it as a DLL and can fail with error 193 (not a valid Win32 application). A module the title loads while it runs that was not relinked, such as one in a directory not given to `--module-dir`, is not loaded either: the title gets an error and continues, and the runtime prints `[module] dlopen: <path> was not relinked: ...` once for each file. Relink that module's directory with `--module-dir <dir>`.
+For bundled title modules, use the `.guest.prx` files the relinker writes into `app0/` and lists in the layout it prints. `libs/` is for AnyPS5 system libraries, not the original PS5 `.prx` files. Placing an original PS5 module in `libs/` on Windows makes Windows try to load it as a DLL and can fail with error 193 (not a valid Win32 application). A module the title loads while it runs that was not relinked, such as one in a directory not given to `--module-dir`, is not loaded either: the title gets an error and continues, and the runtime prints `[module] dlopen: <path> was not relinked: ...` once for each file. Relink that module's directory with `--module-dir <dir>`.
 
 On Windows, a self-built `libs/` also needs `libgcc_s_seh-1.dll`, `libstdc++-6.dll` and `libwinpthread-1.dll` from the `mingw64/bin` directory of the toolchain that built the libraries; the release archives already contain them. The libraries are loaded without searching `PATH`, so a copy elsewhere on the system is not used, and a library that needs one of them fails with error 126 (the specified module could not be found) although its `.prx` file is present. With `APS5_MIMALLOC` set, the title loads `mimalloc.dll` and `mimalloc-redirect.dll` from `libs/` and allocates through mimalloc. Copy both from `build/core/libs/libs`; the release archives contain them. Without them the title keeps the C runtime's heap and prints nothing.
 
@@ -357,6 +357,13 @@ most called traced imports (1 calls in total):
              1 libkernel.prx k+AXqu2-eBc
 ```
 
+To list every import a title calls during a run that ends without a crash, also set `APS5_TRACE_CALLS_FILE` to a file path. Every 10 seconds the file is rewritten with one line per import called so far, most called first: the number of calls, the library and the import name. It survives a run that is killed, up to its last rewrite.
+
+```
+245557 libc.prx gQX+4GDQjpM#guest
+3866 libSceAgc.prx 57labkp+rSQ
+```
+
 Limits are listed in the [libc](../dev/debt/libc.md) and [relinker](../dev/debt/relinker.md) technical debt.
 
 ### Performance overlay
@@ -443,3 +450,13 @@ Registry `nid` fields may contain either encoded NIDs or ordinary ELF symbol nam
 Exit codes: `0` nothing blocks loading, `1` there are `absent` imports or needed libraries without a file, `2` an input could not be read; the message names the file and the value.
 
 A module registry lists `nid`, `library` and `targetOffset` for each relocation against a function that no other bundled module exports, without the `#` suffix of the executable's NIDs.
+
+## Patching imports of native applications
+
+`nid_patcher --exec <file> [file2 ...]` patches imports in place and preserves the application's exports. It detects PE, ELF64 and Mach-O64 from file contents. No library name is required. Build a separate executable for each target platform.
+
+By default, imports use the library export naming rules: `_nid_no_patch` and `SDL_*` stay unchanged; `_nid_no_patch_cut` is removed without hashing; `_nid_postfix` and numeric `_nid_disambig` suffixes are removed before computing the NID. When both `foo` and `foo_nid_postfix` are imported, `foo` stays unchanged. These rules also apply to host imports unless they are explicitly preserved.
+
+`nid_patcher --exec --only-sce <file>` restricts renaming to names starting with `sce` (case-insensitive) or ending with `_nid_postfix`. Both modes accept `--preserve-exports <unpatched-library>` or `--preserve-export-list <export-list>` for explicit exclusions. The existing `nid_patcher <library_name> <file>` mode is unchanged.
+
+Unsupported layouts fail before the input file is written.
