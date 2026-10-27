@@ -1650,7 +1650,7 @@ class ImportAuditTests(unittest.TestCase):
             'APS5_EXPORT(/* nid */ "AAAAAAAAAAA", /* name */ NAME);\n',
             'APS5_EX\\\nPORT("AAAAAAAAAAA", NAME);\n',
         ]
-        for name in ("sceAliasUnknown", "sceAliasedCall"):
+        for name in ("sceAliasUnknown", "sceAliasedCall", "sceAliasedCall_nid_no_patch"):
             for alias in aliases:
                 with self.subTest(name=name, alias=alias):
                     write_source(work.source, "libSceAlias", alias.replace("NAME", name) + STUB_SOURCE.format(name=name))

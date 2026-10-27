@@ -1287,6 +1287,35 @@ class JobManagerModuleRefusalTests(unittest.TestCase):
         self.toolchain.mkdir()
         self.module = self.root / "module.self"
 
+    def test_reference_timeouts_are_bounded_before_setup(self):
+        import run_job_manager_reference
+        cases = ((None, 20), ("0.001", 0.001), ("30", 30), ("nan", None), ("NaN", None),
+                 ("-nan", None), ("inf", None), ("-inf", None), ("0", None), ("-1", None), ("30.001", None))
+        for platform in ("linux", "win32"):
+            for number, (value, expected) in enumerate(cases):
+                with self.subTest(platform=platform, value=value):
+                    output = self.root / f"artifacts-{platform}-{number}"
+                    arguments = ["run_job_manager_reference.py", "--host", "--build", str(self.build),
+                                 "--relinker", str(self.relinker), "--toolchain", str(self.toolchain),
+                                 "--output", str(output)] + ([] if value is None else [f"--timeout={value}"])
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(sys, "argv", arguments), mock.patch.object(sys, "platform", platform), \
+                            mock.patch.object(run_job_manager_reference, "run", return_value=0) as run, \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        if expected is None:
+                            with self.assertRaises(SystemExit) as stopped:
+                                run_job_manager_reference.main()
+                            self.assertEqual(stopped.exception.code, 2)
+                            self.assertIn("--timeout must be greater than zero and at most 30 seconds", stderr.getvalue())
+                            self.assertEqual(stdout.getvalue(), "")
+                            self.assertFalse(output.exists())
+                            run.assert_not_called()
+                        else:
+                            self.assertEqual(run_job_manager_reference.main(), 0)
+                            run.assert_called_once()
+                            self.assertEqual(run.call_args.args[0].timeout, expected)
+                            self.assertTrue(output.is_dir())
+
     def invoke(self, output):
         import run_job_manager_reference
         arguments = ["run_job_manager_reference.py", "--module", str(self.module),

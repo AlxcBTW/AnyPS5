@@ -566,6 +566,9 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_tls_zero_fill.py $<TARGET_FILE:relinker>)
         add_test(NAME windows_tls_protected_entries COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_tls_protected_entries.py $<TARGET_FILE:relinker>)
+        add_test(NAME gs_trap_entry_roots COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_gs_trap_entry_roots.py $<TARGET_FILE:relinker>)
+        set_tests_properties(gs_trap_entry_roots PROPERTIES TIMEOUT 30)
         set(tlsCoverageGroups metadata padding register_loads displacement_bounds alu_execution register_address_loads moved_branch rejected)
         foreach(register IN ITEMS 0 1 2 3 5 6 7 8 9 10 11 12 13 14 15)
             list(APPEND tlsCoverageGroups displacement_r${register})
@@ -581,6 +584,9 @@ if(BUILD_TESTING)
         endforeach()
         add_test(NAME tls_diagnostics COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_tls_diagnostics.py $<TARGET_FILE:relinker>)
+        add_test(NAME ignored_string_segments COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_ignored_string_segments.py $<TARGET_FILE:relinker>)
+        set_tests_properties(ignored_string_segments PROPERTIES TIMEOUT 30)
         add_test(NAME call_zero_padding COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_call_zero_padding.py $<TARGET_FILE:relinker>)
         set_tests_properties(call_zero_padding PROPERTIES TIMEOUT 60)

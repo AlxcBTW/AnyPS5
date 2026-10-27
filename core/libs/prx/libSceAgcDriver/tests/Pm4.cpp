@@ -83,6 +83,7 @@ void testCatalog() {
         if (!reason.empty()) expectFailure([&] { AgcDriver::Pm4::Validate(packet, 0); }, std::string(reason).c_str());
     }
     check(values.size() == 56, "reference opcode catalog is incomplete");
+    check(AgcDriver::Pm4::Name(makePacket(0x3a, {0})[0]) == "DRAW_INDEX_MULTI_INST", "opcode 0x3a is not DRAW_INDEX_MULTI_INST");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0xff, {0}), 0); }, "not known");
     check(AgcDriver::Pm4::KnownName(makePacket(0xff, {0})[0]).empty() && AgcDriver::Pm4::Name(makePacket(0xff, {0})[0]) == "UNKNOWN_0xff", "an unknown opcode is named");
     const std::array<std::pair<std::uint32_t, const char*>, 11> custom{{

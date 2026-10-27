@@ -134,6 +134,46 @@ def listed(root):
     return sorted(set(filter(None, output.split("\0"))))
 
 
+def workflow_run_lines(content):
+    parents = []
+    step_key_indent = None
+    block_indent = None
+    for line in content.splitlines():
+        text = line.lstrip()
+        if not text or text.startswith("#"):
+            continue
+        indent = len(line) - len(text)
+        if block_indent is not None:
+            if indent > block_indent:
+                yield line
+                continue
+            block_indent = None
+        sequence = re.match(r"-\s+", text)
+        while parents and (parents[-1][0] > indent or
+                           (parents[-1][0] == indent and not (sequence and parents[-1][1] == "steps"))):
+            parents.pop()
+        path = [key for _, key in parents]
+        step = len(path) == 3 and path[0] == "jobs" and path[2] == "steps"
+        key_indent = indent
+        if sequence:
+            key_indent += sequence.end()
+            text = text[sequence.end():]
+            if step:
+                step_key_indent = key_indent
+        match = re.match(r"(['\"]?)([A-Za-z_][\w.-]*)\1\s*:(?:\s+(.*)|$)", text)
+        if match is None:
+            continue
+        key, value = match[2], match[3] or ""
+        if key == "steps" and len(path) == 2 and path[0] == "jobs":
+            step_key_indent = None
+        if step and key_indent == step_key_indent and key == "run":
+            if value.startswith(("|", ">")):
+                block_indent = key_indent
+            elif value:
+                yield value
+        parents.append((key_indent, key))
+
+
 def run_scripts(root, files):
     run = set()
     for name in files:
@@ -143,7 +183,7 @@ def run_scripts(root, files):
                 if command == "add_test":
                     run.update(argument.rpartition("}")[2].lstrip("/") for argument in arguments)
         elif name.startswith(".github/workflows/") and name.endswith((".yml", ".yaml")):
-            for line in (Path(root) / name).read_text(encoding="utf-8", errors="replace").splitlines():
+            for line in workflow_run_lines((Path(root) / name).read_text(encoding="utf-8", errors="replace")):
                 if line.lstrip().startswith("#"):
                     continue
                 line = re.split(r"\s#", line)[0]

@@ -415,6 +415,54 @@ class ScriptRegistrationTests(unittest.TestCase):
             ["tools/tests/test_a.py", "tools/tests/test_b.py", "tools/tests/test_c.py", "tools/tests/test_d.py",
              "tools/tests/test_f.py"])
 
+    def test_workflow_metadata_does_not_register_scripts(self):
+        script = "tools/tests/test_python_probe.py"
+        job = "jobs:\n  t:\n    runs-on: ubuntu-latest\n    steps:\n"
+        echo = "      - run: echo done\n"
+        workflows = (
+            f"name: python3 {script}\n" + job + echo,
+            f"env:\n  DESCRIPTION: python3 {script}\n" + job + echo,
+            job + f"      - name: python3 {script}\n        run: echo done\n",
+            job + f"      - env:\n          DESCRIPTION: python3 {script}\n        run: echo done\n",
+            job + f"      - env:\n          run: python3 {script}\n        run: echo done\n",
+            job + f"      - uses: ./{script}\n",
+            job.replace("    steps:\n", "    defaults:\n      run:\n        shell: bash\n"
+                        f"        working-directory: {script}\n    steps:\n") + echo,
+            f"env:\n  DESCRIPTION: |\n    jobs:\n      fake:\n        steps:\n          - run: python3 {script}\n" + job + echo,
+        )
+        for workflow in workflows:
+            with self.subTest(workflow=workflow):
+                self.assertEqual(self.unrun({".github/workflows/ci.yml": workflow, script: ""}), [script])
+
+    def test_workflow_run_scalars_with_defaults_register_scripts(self):
+        header = "jobs:\n  t:\n    defaults:\n      run:\n        shell: bash\n    steps:\n"
+        steps = ("      - run: python3 tools/tests/test_inline.py\n"
+                 "      - name: named step\n        shell: bash\n        run: |\n"
+                 "          python3 \"./tools/tests/test_block.py\"\n"
+                 "      - shell: bash\n        run: 'python tools/tests/test_named.py'\n")
+        for body in (steps, steps.replace("      - ", "    - ").replace("        run:", "      run:")
+                     .replace("        shell:", "      shell:").replace("          python", "        python")):
+            source = header + body
+            for quote in ("", "'", '"'):
+                workflow = source
+                for key in ("jobs", "t", "steps", "run"):
+                    workflow = workflow.replace(f"{key}:", f"{quote}{key}{quote}:")
+                with self.subTest(workflow=workflow):
+                    self.assertEqual(self.unrun({".github/workflows/ci.yml": workflow,
+                                                "tools/tests/test_inline.py": "", "tools/tests/test_block.py": "",
+                                                "tools/tests/test_named.py": ""}), [])
+
+    def test_workflow_run_block_stops_at_sibling_metadata(self):
+        workflow = ("jobs:\n  t:\n    steps:\n      - run: |\n"
+                    "          python3 tools/tests/test_actual.py\n"
+                    "        name: python3 tools/tests/test_name.py\n"
+                    "        env:\n          DESCRIPTION: python3 tools/tests/test_env.py\n"
+                    "      - name: python3 tools/tests/test_later.py\n        run: echo done\n")
+        self.assertEqual(self.unrun({".github/workflows/ci.yml": workflow,
+                                    "tools/tests/test_actual.py": "", "tools/tests/test_name.py": "",
+                                    "tools/tests/test_env.py": "", "tools/tests/test_later.py": ""}),
+                         ["tools/tests/test_env.py", "tools/tests/test_later.py", "tools/tests/test_name.py"])
+
 
 class CheckRegistrationCliTests(unittest.TestCase):
     def test_cache_with_utf8_bom_is_read(self):

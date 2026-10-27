@@ -478,6 +478,24 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(group["todo_names"], [])
             self.assertEqual(group["inert_names"], ["Real"])
 
+    def test_explicitly_exported_nid_no_patch_definitions_are_counted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = Path(directory) / "libSceExample"
+            library.mkdir()
+            (library / "Functions.cpp").write_text(
+                "int APS5_VABI Pending_nid_no_patch() { NotImplemented_nid_no_patch(__func__); }\n"
+                "int APS5_VABI Ready_nid_no_patch() { return 1; }\n"
+                "int APS5_VABI Helper_nid_no_patch() { NotImplemented_nid_no_patch(__func__); }\n"
+                "int APS5_VABI Cut_nid_no_patch_cut() { NotImplemented_nid_no_patch(__func__); }\n", encoding="utf-8")
+            (library / "Export.cpp").write_text(
+                'APS5_EXPORT("AAAAAAAAAAA", Pending_nid_no_patch);\n'
+                'APS5_EXPORT(\n    "_ZN3sce7Example5ReadyEv",\n    Ready_nid_no_patch);\n'
+                '// APS5_EXPORT("BBBBBBBBBBB", Helper_nid_no_patch);\n'
+                'const char* text = "APS5_EXPORT(\\"CCCCCCCCCCC\\", Cut_nid_no_patch_cut)";\n', encoding="utf-8")
+            group = progress.scan_library(library)
+            self.assertEqual(group["done_names"], ["Ready_nid_no_patch"])
+            self.assertEqual(group["todo_names"], ["Pending_nid_no_patch"])
+
     def test_empty_libraries(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

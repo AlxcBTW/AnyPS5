@@ -55,7 +55,7 @@ A converted title is an ordinary program: it runs with your user account's permi
 
 Titles run natively, so the host CPU needs the extensions of the PS5's Zen 2 CPU that compiled code uses without checking, among them AVX2, FMA, F16C, BMI1, BMI2, LZCNT and MOVBE. On Linux and Windows a converted title logs the host CPU's extensions at start-up and stops before running any title code, naming the CPU and the missing extensions, if one is absent ([list](../dev/debt/libkernel.md)).
 
-The executable, registry, Windows import diagnostics, icon and desktop entry output files must not refer to the input executable or a bundled module being converted, including through a hard link or symbolic link. These collisions fail before any output is written. An existing output file can be replaced if it is separate from those inputs.
+The executable, registry, Windows import diagnostics, icon and desktop entry output files must not refer to the input executable or a bundled module being converted, including through a hard link or symbolic link. These collisions fail before any output is written. An existing output file can be replaced if it is separate from those inputs. An output path that is an existing directory also fails before any output is written.
 
 ## Options
 

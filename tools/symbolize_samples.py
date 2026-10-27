@@ -281,6 +281,13 @@ def main(argv=None):
     parser.add_argument("--thread", help="keep only this thread of an APS5_SAMPLE_THREADS file")
     parser.add_argument("--unverified", action="store_true", help="also symbolize modules the samples have no '# module' record for")
     args = parser.parse_args(argv)
+    if args.out:
+        output = Path(args.out)
+        for source in (args.samples, args.since):
+            if source is not None:
+                source = Path(source)
+                if source.resolve() == output.resolve() or (source.exists() and output.exists() and source.samefile(output)):
+                    parser.error("symbolized output must be separate from the sample captures")
     samples = load(args.samples, args.thread)
     if args.since:
         samples = window(samples, load(args.since, args.thread))
