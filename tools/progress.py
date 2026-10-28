@@ -503,8 +503,22 @@ def report(base, head):
     return "\n".join(lines)
 
 
+SITE_REPORTS = ("progress.json", "badge-libraries.svg", "badge-shaders.svg", "progress.svg", "progress.html")
+
+
+def require_distinct_reports(output):
+    paths = [output / name for name in SITE_REPORTS]
+    for index, path in enumerate(paths):
+        if not path.exists():
+            continue
+        for other in paths[index + 1:]:
+            if other.exists() and path.samefile(other):
+                raise ValueError(f"{path.name} and {other.name} in {output} are the same file")
+
+
 def write_site(output, libraries, shaders):
     output.mkdir(parents=True, exist_ok=True)
+    require_distinct_reports(output)
     (output / "progress.json").write_text(json.dumps({"libraries": libraries, "shaders": shaders}, indent=2), encoding="utf-8")
     (output / "badge-libraries.svg").write_text(badge("libraries*", libraries), encoding="utf-8")
     (output / "badge-shaders.svg").write_text(badge("shaders", shaders), encoding="utf-8")
@@ -531,6 +545,10 @@ def validate_snapshot(snapshot):
                 raise ValueError(f"{location} must be an object with a string name")
             if "shared_sources" in group and not isinstance(group["shared_sources"], str):
                 raise ValueError(f"{location}.shared_sources must be a string")
+            if section == "libraries":
+                for field in ("done", "todo"):
+                    if field in group and (type(group[field]) is not int or group[field] < 0):
+                        raise ValueError(f"{location}.{field} must be a non-negative integer")
             for field in ("done_names", "todo_names", "inert_names"):
                 values = group.get(field, [])
                 if not isinstance(values, list) or any(not isinstance(value, str) for value in values):
@@ -588,6 +606,8 @@ def main(argv=None):
         if args.output:
             try:
                 write_site(args.output, libraries, shaders)
+            except ValueError as error:
+                parser.error(str(error))
             except OSError as error:
                 parser.error(f"{args.output}: {error.strerror or error}")
         if args.json:
