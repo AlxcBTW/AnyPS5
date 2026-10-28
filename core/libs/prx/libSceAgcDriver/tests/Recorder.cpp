@@ -6511,23 +6511,25 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         ImportWatch decided;
         ~Restore() { SetImportWatch(context, decided); }
     } restore{base, decided};
-    enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite, BeforeUnwatch, UnwatchedWithoutHook, PendingWithoutHook, UnprovenUnwatch };
+    enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite, BeforeUnwatch, UnwatchedWithoutHook, PendingWithoutHook, UnprovenUnwatch, LateUnwatchedWrite, LateBeforeUnwatch, LateWithoutHook, LateUnproven };
     for (const std::uint32_t side : {256u, 1024u})
-    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite, Write::BeforeUnwatch, Write::UnwatchedWithoutHook, Write::PendingWithoutHook, Write::UnprovenUnwatch}) {
+    for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite, Write::BeforeUnwatch, Write::UnwatchedWithoutHook, Write::PendingWithoutHook, Write::UnprovenUnwatch, Write::LateUnwatchedWrite, Write::LateBeforeUnwatch, Write::LateWithoutHook, Write::LateUnproven}) {
 #ifndef _WIN32
-        if (write == Write::UnprovenUnwatch) continue;
+        if (write == Write::UnprovenUnwatch || write == Write::LateUnproven) continue;
 #endif
         const std::size_t surfaceBytes = static_cast<std::size_t>(side) * side * 4;
         const std::size_t units = surfaceBytes / unit;
         const std::size_t lastUnit = units - 1;
         const bool large = side > 256;
         const bool unwatchedWrite = write == Write::UnwatchedFullClear || write == Write::UnwatchedPartialWrite;
-        const bool unitWritten = unwatchedWrite || write == Write::BeforeUnwatch;
+        const bool late = write == Write::LateUnwatchedWrite || write == Write::LateBeforeUnwatch || write == Write::LateWithoutHook || write == Write::LateUnproven;
+        const bool lateUnwatch = write == Write::LateBeforeUnwatch || write == Write::LateUnproven;
+        const bool partial = write == Write::UnwatchedPartialWrite || late;
+        const bool unitWritten = unwatchedWrite || write == Write::BeforeUnwatch || late;
         const bool unhashed = write == Write::UnwatchedWithoutHook || write == Write::PendingWithoutHook || write == Write::UnprovenUnwatch;
         const bool pageWritten = write == Write::AfterPending || write == Write::BeforePending;
-        const std::string what = std::string(large ? "1024x1024, " : "") + (write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : write == Write::UnwatchedPartialWrite ? "a CPU write into the unwatched block before results that cover part of it" : write == Write::BeforeUnwatch ? "a CPU write into the last block while it was still watched, before it left the watch" : write == Write::UnwatchedWithoutHook ? "the last block left the watch without the unwatch hook" : write == Write::PendingWithoutHook ? "the last block left the watch without the unwatch hook while the results were pending" : "the last block left the watch through a failed collect");
-        const std::string cause = large && unwatchedWrite ? "its bytes no longer match the hash taken when its range left the watch" : unwatchedWrite ? "its bytes differ from the copy taken at its upload" : write == Write::BeforeUnwatch ? (large ? "the write watch saw CPU writes to it after its generation, before its range left the watch" : "its bytes differ from the copy taken at its upload") : write == Write::UnwatchedWithoutHook ? "no hash of its bytes was taken for its current generation" : write == Write::PendingWithoutHook ? "its results became pending while its range was watched, and its bytes were not saved when the range left the watch" : "its range left the watch through the unwatch hook without its CPU writes proven";
-        const bool mustRefuse = write == Write::BeforeUnwatch || write == Write::PendingWithoutHook || (large && (write == Write::UnwatchedPartialWrite || write == Write::UnwatchedWithoutHook || write == Write::UnprovenUnwatch));
+        const std::string what = std::string(large ? "1024x1024, " : "") + (write == Write::None ? "no CPU write" : write == Write::AfterPending ? "a CPU write after the results were pending again" : write == Write::BeforePending ? "a CPU write before the results were pending again" : write == Write::UnwatchedFullClear ? "a CPU write into the unwatched block before results that cover it" : write == Write::UnwatchedPartialWrite ? "a CPU write into the unwatched block before results that cover part of it" : write == Write::BeforeUnwatch ? "a CPU write into the last block while it was still watched, before it left the watch" : write == Write::UnwatchedWithoutHook ? "the last block left the watch without the unwatch hook" : write == Write::PendingWithoutHook ? "the last block left the watch without the unwatch hook while the results were pending" : write == Write::LateUnwatchedWrite ? "a CPU write into the unwatched block after results that cover part of it were written" : write == Write::LateBeforeUnwatch ? "a CPU write into the last block after results that cover part of it were written, before it left the watch" : write == Write::LateWithoutHook ? "a CPU write into the last block after it left the watch without the unwatch hook and results that cover part of it were written" : write == Write::LateUnproven ? "a CPU write into the last block after results that cover part of it were written, before it left the watch through a failed collect" : "the last block left the watch through a failed collect");
+        const std::string cause = !large && late ? "its bytes differ from the copy taken at its upload" : write == Write::LateUnwatchedWrite || (large && unwatchedWrite) ? "its bytes no longer match the hash taken when its range left the watch" : unwatchedWrite ? "its bytes differ from the copy taken at its upload" : write == Write::BeforeUnwatch || write == Write::LateBeforeUnwatch ? (large ? "the write watch saw CPU writes to it after its generation, before its range left the watch" : "its bytes differ from the copy taken at its upload") : write == Write::UnwatchedWithoutHook || write == Write::LateWithoutHook ? "no hash of its bytes was taken for its current generation" : write == Write::PendingWithoutHook ? "its results became pending while its range was watched, and its bytes were not saved when the range left the watch" : "its range left the watch through the unwatch hook without its CPU writes proven";
         void* block = AllocateWatched(surfaceBytes, unit);
         if (block == nullptr) {
             std::cout << "no write watching: results pending after a block left the watch not tested\n";
@@ -6606,7 +6608,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 for (std::size_t i = 0; i < unit; ++i) memory[lastUnit * unit + i] = cpuUnit(i);
             }
             const auto unwatchLast = [&] {
-                if (write == Write::UnprovenUnwatch) {
+                if (write == Write::UnprovenUnwatch || write == Write::LateUnproven) {
 #ifdef _WIN32
                     struct Unhook {
                         ~Unhook() { AgcDriver::GuestMemory::SetFreshCollectHook(nullptr); }
@@ -6614,7 +6616,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                     AgcDriver::GuestMemory::SetFreshCollectHook(&FailPendingCollect);
                     Require(AgcDriver::GuestMemory::MarkWritten(address + lastUnit * unit, 4) == 0, "(p) " + what + ": the failed collect produced trusted stamps");
 #endif
-                } else if (write == Write::UnwatchedWithoutHook || write == Write::PendingWithoutHook) {
+                } else if (write == Write::UnwatchedWithoutHook || write == Write::PendingWithoutHook || write == Write::LateWithoutHook) {
                     struct Rehook {
                         ~Rehook() { AgcDriver::GuestMemory::SetUnwatchHook(&StorageTexture::SaveBeforeUnwatch); }
                     } rehook;
@@ -6625,12 +6627,12 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 }
                 Require(!AgcDriver::GuestMemory::Watched(address, surfaceBytes) && AgcDriver::GuestMemory::Watched(address, lastUnit * unit), "(p) " + what + ": the last block did not leave the watch alone");
             };
-            if (write != Write::PendingWithoutHook) unwatchLast();
+            if (write != Write::PendingWithoutHook && !lateUnwatch) unwatchLast();
             if (write == Write::BeforePending) writePage();
             if (unwatchedWrite) {
                 for (std::size_t i = 0; i < unit; ++i) memory[lastUnit * unit + i] = cpuUnit(i);
             }
-            if (write == Write::UnwatchedPartialWrite) {
+            if (partial) {
                 constexpr std::uint32_t patch = 16;
                 Buffer staging(context, patch * patch * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                 const auto bytes = staging.Bytes();
@@ -6648,6 +6650,13 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 copy.imageExtent = {patch, patch, 1};
                 context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging.Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
                 RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                if (late) {
+                    recorder.Submit();
+                    device.WaitQueue();
+                    recorder.Sync();
+                    for (std::size_t i = 0; i < unit; ++i) memory[lastUnit * unit + i] = cpuUnit(i);
+                    if (lateUnwatch) unwatchLast();
+                }
                 image->MarkDirty();
                 recorder.Submit();
                 device.WaitQueue();
@@ -6681,9 +6690,6 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                 }
                 throw;
             }
-            if (large && write == Write::UnwatchedPartialWrite) Require(refused, "(p) " + what + ": stored over an unwatched unit the CPU wrote after its hash was taken at the unwatch");
-            if (write == Write::BeforeUnwatch) Require(refused, "(p) " + what + ": stored over an unwatched unit the CPU wrote before the unwatch, which has no baseline");
-            if (mustRefuse) Require(refused, "(p) " + what + ": stored over an unwatched unit without a baseline");
             if (refused) {
                 const std::string unitCause = "(unit " + std::to_string(write == Write::PendingWithoutHook ? 0 : lastUnit) + " of " + std::to_string(units) + ": " + cause;
                 Require(refusal.find(unitCause) != std::string::npos, "(p) " + what + ": the refusal does not name the cause '" + unitCause + "': " + refusal);
@@ -6711,13 +6717,13 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
                     Require(green || cpu, "(p) " + what + ": a texel the GPU did not write holds neither the CPU's bytes nor a result, at +0x" + std::to_string(at));
                     greens += green;
                 }
-                if (write == Write::UnwatchedFullClear) Require(greens == unit / 4, "(p) " + what + ": " + std::to_string(greens) + " of " + std::to_string(unit / 4) + " words took the GPU result");
+                if (!partial) Require(greens == unit / 4, "(p) " + what + ": " + std::to_string(greens) + " of " + std::to_string(unit / 4) + " words took the GPU result");
                 else Require(greens == 16 * 16, "(p) " + what + ": " + std::to_string(greens) + " words took the GPU result, want 256");
                 std::vector<std::byte> rest(lastUnit * unit);
                 AgcDriver::GuestMemory::Read(address, rest);
                 for (std::size_t at = 0; at < lastUnit * unit; at += 4) {
                     const bool green = std::to_integer<std::uint8_t>(rest[at]) == 0 && std::to_integer<std::uint8_t>(rest[at + 1]) == 255 && std::to_integer<std::uint8_t>(rest[at + 2]) == 0 && std::to_integer<std::uint8_t>(rest[at + 3]) == 255;
-                    if (write == Write::UnwatchedFullClear) Require(green, "(p) " + what + ": the watched units did not take the GPU result at +0x" + std::to_string(at));
+                    if (!partial) Require(green, "(p) " + what + ": the watched units did not take the GPU result at +0x" + std::to_string(at));
                     else Require(std::to_integer<std::uint8_t>(rest[at]) == 0x5a, "(p) " + what + ": the watched units changed where the GPU wrote nothing, at +0x" + std::to_string(at));
                 }
                 recorder.Sync();
